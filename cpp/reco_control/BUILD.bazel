@@ -1,0 +1,22 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+cc_library(
+    name = "reco_control",
+    srcs = [
+        "src/gopro.cpp",
+        "src/intent_json.cpp",
+        "src/intent_translator.cpp",
+        "src/keyboard.cpp",
+        "src/pose_control.cpp",
+    ],
+    hdrs = [
+        "include/reco/control/gopro.hpp",
+        "include/reco/control/intent_translator.hpp",
+        "include/reco/control/intents.hpp",
+        "include/reco/control/keyboard.hpp",
+        "include/reco/control/pose_control.hpp",
+    ],
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+    deps = ["//cpp/reco_core"],
+)

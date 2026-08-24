@@ -1,0 +1,11 @@
+load("@rules_cc//cc:defs.bzl", "cc_test")
+
+cc_test(
+    name = "reco_control_tests",
+    size = "small",
+    srcs = ["reco_control_tests.cpp"],
+    data = ["fixtures/reco_control_golden.json"],
+    deps = [
+        "//cpp/reco_control",
+    ],
+)

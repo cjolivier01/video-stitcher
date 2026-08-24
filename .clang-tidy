@@ -1,0 +1,16 @@
+Checks: >
+  bugprone-*,
+  clang-analyzer-*,
+  cppcoreguidelines-*,
+  modernize-*,
+  performance-*,
+  portability-*,
+  readability-*
+WarningsAsErrors: ''
+HeaderFilterRegex: 'cpp/.*'
+CheckOptions:
+  - key: cppcoreguidelines-avoid-magic-numbers.IgnoredIntegerValues
+    value: '0;1;2'
+  - key: readability-magic-numbers.IgnoredIntegerValues
+    value: '0;1;2'
+

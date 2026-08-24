@@ -1,0 +1,5 @@
+{"kind":"hotkey","data":"zoom_in"}
+{"kind":"pose","data":{"action":"delta_yaw_rad","value":0.1}}
+{"kind":"quality","data":{"action":"set_resolution","value":{"width":1920,"height":1080}}}
+{"kind":"capture","data":"save_replay"}
+{"kind":"model_select","data":{"action":"set_detection_interval","value":3}}

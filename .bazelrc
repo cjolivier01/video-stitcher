@@ -1,0 +1,22 @@
+build --enable_platform_specific_config
+build --cxxopt=-std=c++20
+build --host_cxxopt=-std=c++20
+build --experimental_cc_shared_library
+test --test_output=errors
+
+build:asan --copt=-fsanitize=address --linkopt=-fsanitize=address
+build:ubsan --copt=-fsanitize=undefined --linkopt=-fsanitize=undefined
+build:tsan --copt=-fsanitize=thread --linkopt=-fsanitize=thread
+
+build:profiling --define reco_profiling=true
+build:ffmpeg --define reco_ffmpeg=true
+build:gstreamer --define reco_gstreamer=true
+build:libcamera --define reco_libcamera=true
+build:v4l2 --define reco_v4l2=true
+build:cuda --define reco_cuda=true
+build:tensorrt --define reco_tensorrt=true
+build:onnxruntime --define reco_onnxruntime=true
+build:ncnn --define reco_ncnn=true
+build:qt --define reco_qt=true
+build:obs --define reco_obs=true
+
