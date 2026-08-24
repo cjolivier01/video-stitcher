@@ -1,0 +1,18 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+cc_library(
+    name = "reco_detect",
+    srcs = [
+        "src/detectors.cpp",
+        "src/probe.cpp",
+    ],
+    hdrs = [
+        "include/reco/detect/detectors.hpp",
+        "include/reco/detect/probe.hpp",
+    ],
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//cpp/reco_core",
+    ],
+)
