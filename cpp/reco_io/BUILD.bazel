@@ -3,14 +3,21 @@ load("@rules_cc//cc:defs.bzl", "cc_library")
 cc_library(
     name = "reco_io",
     srcs = [
+        "src/jsonl_sink.cpp",
         "src/output.cpp",
+        "src/settings.cpp",
         "src/stacked_video.cpp",
     ],
     hdrs = [
+        "include/reco/io/jsonl_sink.hpp",
         "include/reco/io/output.hpp",
+        "include/reco/io/settings.hpp",
         "include/reco/io/stacked_video.hpp",
     ],
     includes = ["include"],
     visibility = ["//visibility:public"],
-    deps = ["//cpp/reco_core"],
+    deps = [
+        "//cpp/reco_core",
+        "@nlohmann_json//:json",
+    ],
 )
