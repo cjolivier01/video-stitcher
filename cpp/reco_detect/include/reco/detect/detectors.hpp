@@ -3,7 +3,9 @@
 #include "reco/core/pipeline_event.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace reco::detect {
@@ -34,5 +36,7 @@ struct Detection {
 [[nodiscard]] std::vector<Detection> greedy_nms(std::vector<Detection> detections,
                                                 float iou_threshold);
 [[nodiscard]] std::vector<std::string> read_labels_file(const std::string& path);
+[[nodiscard]] std::optional<std::vector<std::string>> parse_names_dict_string(
+    std::string_view names_str);
 
 } // namespace reco::detect
