@@ -139,3 +139,13 @@ cc_test(
         "//cpp/apps/reco_cli:reco_cli_lib",
     ],
 )
+
+cc_test(
+    name = "reco_gui_state_tests",
+    size = "small",
+    srcs = ["reco_gui_state_tests.cpp"],
+    deps = [
+        "//cpp/reco_gui",
+        "@nlohmann_json//:json",
+    ],
+)

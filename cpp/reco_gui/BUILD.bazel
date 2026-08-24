@@ -1,0 +1,19 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+cc_library(
+    name = "reco_gui",
+    srcs = [
+        "src/settings.cpp",
+        "src/toast.cpp",
+    ],
+    hdrs = [
+        "include/reco/gui/settings.hpp",
+        "include/reco/gui/toast.hpp",
+    ],
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//cpp/reco_io",
+        "@nlohmann_json//:json",
+    ],
+)
