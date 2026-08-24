@@ -3,12 +3,16 @@ load("@rules_cc//cc:defs.bzl", "cc_library")
 cc_library(
     name = "reco_autocam",
     srcs = [
+        "src/ball_tracker.cpp",
+        "src/class_provider.cpp",
         "src/coaster.cpp",
         "src/roi_filter.cpp",
         "src/sweep_panner.cpp",
         "src/tracking_mode.cpp",
     ],
     hdrs = [
+        "include/reco/autocam/ball_tracker.hpp",
+        "include/reco/autocam/class_provider.hpp",
         "include/reco/autocam/coaster.hpp",
         "include/reco/autocam/roi_filter.hpp",
         "include/reco/autocam/sweep_panner.hpp",
