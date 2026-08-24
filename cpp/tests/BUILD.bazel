@@ -38,3 +38,13 @@ cc_test(
         "@nlohmann_json//:json",
     ],
 )
+
+cc_test(
+    name = "reco_autocam_policy_tests",
+    size = "small",
+    srcs = ["reco_autocam_policy_tests.cpp"],
+    deps = [
+        "//cpp/reco_autocam",
+        "//cpp/reco_core",
+    ],
+)
