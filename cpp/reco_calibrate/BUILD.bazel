@@ -1,0 +1,18 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+cc_library(
+    name = "reco_calibrate",
+    srcs = [
+        "src/geometry.cpp",
+        "src/types.cpp",
+    ],
+    hdrs = [
+        "include/reco/calibrate/geometry.hpp",
+        "include/reco/calibrate/types.hpp",
+    ],
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//cpp/reco_core",
+    ],
+)
