@@ -1,0 +1,16 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+cc_library(
+    name = "reco_io",
+    srcs = [
+        "src/output.cpp",
+        "src/stacked_video.cpp",
+    ],
+    hdrs = [
+        "include/reco/io/output.hpp",
+        "include/reco/io/stacked_video.hpp",
+    ],
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+    deps = ["//cpp/reco_core"],
+)
