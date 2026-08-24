@@ -12,7 +12,7 @@ remains authoritative and must not be removed.
 | reco-io | FFmpeg/GStreamer/libcamera/V4L2/zero-copy | `cpp/reco_io` | In progress for output codec/quality/container policy, settings persistence/MRU, JSONL pipeline-event sink, and CPU YUV420P stacked-video pack/unpack helpers for already CPU-resident frames | Deferred: `StitchJob::run`, FFmpeg/GStreamer/DeepStream/libcamera/V4L2 ingest, encoder integration, NVMM/CUDA/zero-copy paths, GPU atlas pack/unpack; add decode/encode smoke tests, camera ingest tests, zero-copy perf gates |
 | reco-calibrate | AKAZE/optimizer/audio/lens DB | `cpp/reco_calibrate` | Blocked | Fixtures, resource packaging, tolerance tests |
 | reco-detect | ORT/TensorRT/NCNN/CoreML/CUDA/NPP | `cpp/reco_detect` | Blocked | Backend probes, postprocess tests, `onnx_names` fuzz |
-| reco-autocam | panners/trackers/ROI | `cpp/reco_autocam` | In progress for `TrackingMode`, ROI anchor filtering policy, tracker coaster lifecycle, class provider, ball tracker, and deterministic sweep panner | Deferred: field panner, file panner, WGPU detector wiring; add panner/trajectory fixture tests |
+| reco-autocam | panners/trackers/ROI | `cpp/reco_autocam` | In progress for `TrackingMode`, ROI anchor filtering policy, tracker coaster lifecycle, class provider, ball tracker, deterministic sweep panner, and CSV file panner | Deferred: field panner, WGPU detector wiring; add panner/trajectory fixture tests |
 | reco-cli | `reco` binary | `cpp/apps/reco_cli` | Blocked | Help-text parity, golden CLI behavior matrix |
 | reco-gui | Slint app | Qt app | Blocked | UI workflow tests, asset/resource packaging |
 | reco-obs | Rust cdylib + libobs bindings | C++ libobs plugin | Blocked | ABI/header-version smoke tests |

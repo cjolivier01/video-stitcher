@@ -1,14 +1,18 @@
 #include "reco/autocam/ball_tracker.hpp"
 #include "reco/autocam/class_provider.hpp"
 #include "reco/autocam/coaster.hpp"
+#include "reco/autocam/file_panner.hpp"
 #include "reco/autocam/roi_filter.hpp"
 #include "reco/autocam/sweep_panner.hpp"
 #include "reco/autocam/tracking_mode.hpp"
 
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
+#include <stdexcept>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -193,6 +197,73 @@ void sweep_panner_matches_rust_phase_policy() {
   expect_near(a.yaw, b.yaw, 1.0e-6F, "sweep ignores world state");
 }
 
+void file_panner_matches_rust_csv_policy() {
+  const auto path = std::filesystem::temp_directory_path() / "reco_cpp_file_panner_policy.csv";
+  {
+    std::ofstream file(path);
+    file << "frame,yaw,pitch,fov\n";
+    file << "short\n";
+    file << "\n";
+    file << "0,0.1,0.2,45\n";
+    file << "2,0.3,0.4,\n";
+    file << "2,0.5,0.6,not-a-fov\n";
+  }
+
+  auto panner = FilePanner::from_csv(path);
+  const WorldState world;
+  expect_eq(panner.pose_count(), 2U, "file panner loaded distinct frames");
+
+  auto frame0 = panner.decide(world, PanContext{.frame_index = 0});
+  expect_near(frame0.yaw, 0.1F, 1.0e-6F, "file panner frame 0 yaw");
+  expect_near(frame0.pitch, 0.2F, 1.0e-6F, "file panner frame 0 pitch");
+  expect_true(frame0.fov_degrees.has_value() && *frame0.fov_degrees == 45.0F,
+              "file panner parses fov");
+
+  auto held = panner.decide(world, PanContext{.frame_index = 1});
+  expect_near(held.yaw, 0.1F, 1.0e-6F, "file panner holds last yaw");
+  expect_true(held.fov_degrees.has_value() && *held.fov_degrees == 45.0F,
+              "file panner holds last fov");
+
+  auto duplicate = panner.decide(world, PanContext{.frame_index = 2});
+  expect_near(duplicate.yaw, 0.5F, 1.0e-6F, "file panner duplicate frame overwrites");
+  expect_near(duplicate.pitch, 0.6F, 1.0e-6F, "file panner duplicate pitch");
+  expect_true(!duplicate.fov_degrees.has_value(), "invalid optional fov becomes absent");
+
+  std::filesystem::remove(path);
+
+  const auto invalid_path =
+      std::filesystem::temp_directory_path() / "reco_cpp_file_panner_policy_invalid.csv";
+  {
+    std::ofstream file(invalid_path);
+    file << "frame,yaw,pitch,fov\n";
+    file << "1,bad,0.2,45\n";
+  }
+  bool threw = false;
+  try {
+    (void)FilePanner::from_csv(invalid_path);
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  expect_true(threw, "file panner propagates required parse errors");
+  std::filesystem::remove(invalid_path);
+
+  const auto negative_path =
+      std::filesystem::temp_directory_path() / "reco_cpp_file_panner_policy_negative.csv";
+  {
+    std::ofstream file(negative_path);
+    file << "frame,yaw,pitch,fov\n";
+    file << "-1,0.1,0.2,45\n";
+  }
+  threw = false;
+  try {
+    (void)FilePanner::from_csv(negative_path);
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  expect_true(threw, "file panner rejects negative frame indices");
+  std::filesystem::remove(negative_path);
+}
+
 void class_provider_matches_rust_stateless_policy() {
   ClassProvider provider(0);
   std::vector<reco::core::MappedDetection> detections{
@@ -351,6 +422,7 @@ int main() {
   coaster_lifecycle_matches_rust();
   roi_filter_matches_rust_anchor_policy();
   sweep_panner_matches_rust_phase_policy();
+  file_panner_matches_rust_csv_policy();
   class_provider_matches_rust_stateless_policy();
   ball_tracker_matches_rust_singleton_policy();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
