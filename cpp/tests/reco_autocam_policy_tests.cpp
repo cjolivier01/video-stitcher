@@ -1,6 +1,7 @@
 #include "reco/autocam/ball_tracker.hpp"
 #include "reco/autocam/class_provider.hpp"
 #include "reco/autocam/coaster.hpp"
+#include "reco/autocam/field_panner.hpp"
 #include "reco/autocam/file_panner.hpp"
 #include "reco/autocam/roi_filter.hpp"
 #include "reco/autocam/sweep_panner.hpp"
@@ -15,6 +16,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 using namespace reco::autocam;
@@ -67,6 +69,37 @@ reco::core::MappedDetection mapped_detection(reco::core::CameraId camera, std::u
       .camera_size_y = 0.05F,
       .position = reco::core::ViewportPosition{.yaw = yaw, .pitch = pitch},
   };
+}
+
+reco::core::TrackedEntity tracked_player(float yaw, float pitch, std::uint64_t id,
+                                         float confidence = 0.9F) {
+  return {.id = id,
+          .class_id = 0,
+          .yaw = yaw,
+          .pitch = pitch,
+          .confidence = confidence,
+          .state = reco::core::TrackState::Tracking,
+          .age_frames = 5,
+          .origin = reco::core::CameraId::Left};
+}
+
+reco::core::TrackedEntity tracked_ball(float yaw, float pitch) {
+  return {.id = 0,
+          .class_id = 32,
+          .yaw = yaw,
+          .pitch = pitch,
+          .confidence = 0.8F,
+          .state = reco::core::TrackState::Tracking,
+          .age_frames = 1,
+          .origin = reco::core::CameraId::Left};
+}
+
+WorldState tight_world() {
+  return {.players = {tracked_player(0.28F, 0.0F, 1),
+                      tracked_player(0.32F, 0.0F, 2),
+                      tracked_player(0.36F, 0.0F, 3),
+                      tracked_player(0.40F, 0.0F, 4),
+                      tracked_player(0.44F, 0.0F, 5)}};
 }
 
 reco::core::FieldRoi full_roi() {
@@ -264,6 +297,246 @@ void file_panner_matches_rust_csv_policy() {
   std::filesystem::remove(negative_path);
 }
 
+void field_panner_matches_rust_policy() {
+  auto sanitized = FieldPannerConfig{
+      .keep_fraction = -0.2F,
+      .fov_tight = 60.0F,
+      .fov_wide = 30.0F,
+      .ball_weight = 1.5F,
+      .lookahead_reactivity = 100.0F,
+  }.sanitized();
+  expect_true(sanitized.fov_tight <= sanitized.fov_wide, "field config orders fov range");
+  expect_near(sanitized.fov_tight, 30.0F, 1.0e-6F, "field config tight fov");
+  expect_near(sanitized.fov_wide, 60.0F, 1.0e-6F, "field config wide fov");
+  expect_true(sanitized.ball_weight >= 0.0F && sanitized.ball_weight <= 1.0F,
+              "field config clamps ball weight");
+  expect_true(sanitized.keep_fraction > 0.0F, "field config clamps keep fraction");
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  FieldPannerConfig nan_config;
+  nan_config.fov_tight = nan;
+  nan_config.fov_wide = 30.0F;
+  nan_config.fov_default = nan;
+  nan_config.cluster_bandwidth_rad = nan;
+  nan_config.dead_zone_rad = nan;
+  nan_config.ball_max_dist_from_cluster = nan;
+  nan_config.lead_gain = nan;
+  nan_config.fov_alpha = nan;
+  const auto sanitized_nan = nan_config.sanitized();
+  expect_true(std::isfinite(sanitized_nan.fov_tight), "field config finite tight fov after NaN");
+  expect_true(std::isfinite(sanitized_nan.fov_wide), "field config finite wide fov after NaN");
+  expect_true(std::isnan(sanitized_nan.fov_default), "field config clamp preserves NaN default fov");
+  expect_true(std::isfinite(sanitized_nan.cluster_bandwidth_rad),
+              "field config finite bandwidth after NaN");
+  expect_true(std::isfinite(sanitized_nan.dead_zone_rad), "field config finite dead zone after NaN");
+  expect_true(std::isfinite(sanitized_nan.ball_max_dist_from_cluster),
+              "field config finite ball gate after NaN");
+  expect_true(std::isfinite(sanitized_nan.lead_gain), "field config finite lead gain after NaN");
+  expect_true(std::isnan(sanitized_nan.fov_alpha), "field config clamp preserves NaN fov alpha");
+  auto nan_range = FieldPanner(30.0F).with_fov_range(nan, 30.0F);
+  expect_true(std::isfinite(nan_range.target_fov(0.2F, 0.0F, 0.0F)), "NaN fov range sanitized");
+
+  expect_true(FieldPannerConfig::from_preset_name("broadcast").has_value(), "broadcast preset");
+  expect_true(FieldPannerConfig::from_preset_name("ACTION").has_value(), "action preset");
+  expect_true(!FieldPannerConfig::from_preset_name("nope").has_value(), "unknown preset");
+  expect_true(FieldPannerConfig::frame_all().framing == FramingMode::FrameAll, "frame_all preset");
+
+  FieldPanner trim =
+      FieldPanner::with_config(30.0F, FieldPannerConfig{.cluster_mode = ClusterMode::TrimmedMean,
+                                                        .keep_fraction = 0.6F});
+  std::vector<FieldPanner::Point> points{{0.30F, 0.0F, 1.0F},
+                                         {0.32F, 0.0F, 1.0F},
+                                         {0.34F, 0.0F, 1.0F},
+                                         {1.50F, 0.0F, 1.0F},
+                                         {1.60F, 0.0F, 1.0F}};
+  auto kept = trim.cluster_and_trim(points);
+  expect_eq(kept.size(), 3U, "field trim keeps configured fraction");
+  expect_true(std::all_of(kept.begin(), kept.end(),
+                          [](const auto& point) { return std::get<0>(point) < 0.5F; }),
+              "field trim excludes far outliers");
+  FieldPannerConfig nan_keep_config;
+  nan_keep_config.cluster_mode = ClusterMode::TrimmedMean;
+  nan_keep_config.keep_fraction = nan;
+  nan_keep_config.min_cluster = 2;
+  auto nan_keep = FieldPanner::with_config(30.0F, nan_keep_config).cluster_and_trim(points);
+  expect_eq(nan_keep.size(), 2U, "NaN keep fraction floors to min_cluster");
+
+  FieldPanner density = FieldPanner::with_config(
+      30.0F, FieldPannerConfig{.cluster_mode = ClusterMode::Density, .cluster_bandwidth_rad = 0.35F});
+  std::vector<FieldPanner::Point> bimodal{{-0.05F, 0.0F, 1.0F}, {-0.02F, 0.0F, 1.0F},
+                                          {0.00F, 0.0F, 1.0F},  {0.03F, 0.0F, 1.0F},
+                                          {0.05F, 0.0F, 1.0F},  {0.02F, 0.0F, 1.0F},
+                                          {1.35F, 0.0F, 1.0F},  {1.40F, 0.0F, 1.0F},
+                                          {1.45F, 0.0F, 1.0F}};
+  auto core = density.densest_cluster(bimodal);
+  expect_eq(core.size(), 6U, "density keeps dominant near group");
+  expect_true(std::all_of(core.begin(), core.end(),
+                          [](const auto& point) { return std::get<0>(point) < 0.5F; }),
+              "density excludes far block");
+
+  const PanContext ctx{.frame_index = 0};
+  FieldPannerConfig follow_config;
+  follow_config.dead_zone_rad = 0.0F;
+  follow_config.ball_weight = 0.0F;
+  auto follow = FieldPanner::with_config(30.0F, follow_config);
+  auto world = tight_world();
+  auto out = follow.decide(world, ctx);
+  for (std::uint64_t i = 1; i < 200; ++i) {
+    out = follow.decide(world, PanContext{.frame_index = i});
+  }
+  expect_true(out.yaw > 0.38F && out.yaw < 0.45F, "field follows player centroid with edge push");
+  expect_true(out.fov_degrees.has_value(), "field panner emits fov");
+
+  auto hold = FieldPanner(30.0F);
+  hold.set_pose_for_test(0.3F, 0.05F);
+  auto held = hold.decide(WorldState{}, ctx);
+  expect_near(held.yaw, 0.3F, 1.0e-6F, "field holds yaw without target");
+  expect_near(held.pitch, 0.05F, 1.0e-6F, "field holds pitch without target");
+
+  auto ball_only = FieldPanner::with_config(30.0F, FieldPannerConfig{.dead_zone_rad = 0.0F});
+  WorldState ball_world;
+  ball_world.ball = tracked_ball(0.5F, 0.1F);
+  auto ball_out = ball_only.decide(ball_world, ctx);
+  for (std::uint64_t i = 1; i < 300; ++i) {
+    ball_out = ball_only.decide(ball_world, PanContext{.frame_index = i});
+  }
+  expect_true(std::abs(ball_out.yaw - 0.5F) < 0.05F, "field follows ball without cluster");
+  expect_true(std::abs(ball_out.pitch - 0.1F) < 0.05F, "field follows ball pitch without cluster");
+
+  auto blended = FieldPanner(30.0F).with_ball_weight(0.3F);
+  auto blend_world = tight_world();
+  blend_world.ball = tracked_ball(0.8F, 0.0F);
+  auto blend = blended.decide(blend_world, ctx);
+  for (std::uint64_t i = 1; i < 200; ++i) {
+    blend = blended.decide(blend_world, PanContext{.frame_index = i});
+  }
+  expect_true(blend.yaw > 0.414F && blend.yaw < 0.8F, "field ball blend pulls but does not dominate");
+
+  auto lost_ball = FieldPanner::with_config(30.0F, follow_config).with_ball_weight(0.3F);
+  auto lost_world = tight_world();
+  auto lost = tracked_ball(0.8F, 0.0F);
+  lost.state = reco::core::TrackState::Lost;
+  lost_world.ball = lost;
+  auto lost_out = lost_ball.decide(lost_world, ctx);
+  for (std::uint64_t i = 1; i < 200; ++i) {
+    lost_out = lost_ball.decide(lost_world, PanContext{.frame_index = i});
+  }
+  expect_true(std::abs(lost_out.yaw - 0.414F) < 0.03F, "field ignores lost ball in blend");
+
+  FieldPannerConfig lead_config;
+  lead_config.lookahead_reactivity = 1.0F;
+  lead_config.lead_gain = 1.0F;
+  lead_config.dead_zone_rad = 0.0F;
+  auto no_lead = FieldPanner::with_config(30.0F, lead_config);
+  auto with_lead = FieldPanner::with_config(30.0F, lead_config);
+  WorldState current_action{
+      .players = {tracked_player(-0.02F, 0.0F, 1), tracked_player(0.02F, 0.0F, 2),
+                  tracked_player(0.0F, 0.0F, 3)}};
+  WorldState future_action{
+      .players = {tracked_player(0.48F, 0.0F, 1), tracked_player(0.52F, 0.0F, 2),
+                  tracked_player(0.50F, 0.0F, 3)}};
+  auto no_lead_out = no_lead.decide(current_action, ctx);
+  auto lead_out = with_lead.decide_with_lookahead(current_action, {future_action}, ctx);
+  for (std::uint64_t i = 1; i < 20; ++i) {
+    no_lead_out = no_lead.decide(current_action, PanContext{.frame_index = i});
+    lead_out =
+        with_lead.decide_with_lookahead(current_action, {future_action}, PanContext{.frame_index = i});
+  }
+  expect_true(lead_out.yaw > no_lead_out.yaw, "field lookahead aims ahead of current action");
+
+  FieldPannerConfig nan_runtime_config;
+  nan_runtime_config.dead_zone_rad = 0.0F;
+  nan_runtime_config.lookahead_reactivity = nan;
+  nan_runtime_config.velocity_alpha = nan;
+  auto nan_runtime = FieldPanner::with_config(30.0F, nan_runtime_config);
+  auto nan_runtime_out =
+      nan_runtime.decide_with_lookahead(current_action, {future_action}, PanContext{.frame_index = 0});
+  expect_true(std::isfinite(nan_runtime_out.yaw) && std::isfinite(nan_runtime_out.pitch),
+              "field NaN runtime min/max config does not poison pose");
+
+  auto frame_all = FieldPanner::with_config(
+      30.0F, FieldPannerConfig{.dead_zone_rad = 0.0F, .framing = FramingMode::FrameAll});
+  WorldState frame_world{
+      .players = {tracked_player(0.0F, 0.0F, 1), tracked_player(0.1F, 0.0F, 2),
+                  tracked_player(0.5F, 0.0F, 3)}};
+  auto frame_out = frame_all.decide(frame_world, ctx);
+  for (std::uint64_t i = 1; i < 400; ++i) {
+    frame_out = frame_all.decide(frame_world, PanContext{.frame_index = i});
+  }
+  expect_true(std::abs(frame_out.yaw - 0.25F) < 0.02F, "frame-all aims at bbox midpoint");
+  expect_true(frame_all.target_fov(0.30F, 0.0F, 0.0F) > frame_all.target_fov(0.05F, 0.0F, 0.0F),
+              "frame-all fov grows with extent");
+
+  FieldPannerConfig weighted_config;
+  weighted_config.cluster_mode = ClusterMode::TrimmedMean;
+  weighted_config.keep_fraction = 1.0F;
+  weighted_config.dead_zone_rad = 0.0F;
+  weighted_config.ball_weight = 0.0F;
+  weighted_config.confidence_weighted = true;
+  auto weighted = FieldPanner::with_config(30.0F, weighted_config);
+  FieldPannerConfig unweighted_config = weighted_config;
+  unweighted_config.confidence_weighted = false;
+  auto unweighted = FieldPanner::with_config(30.0F, unweighted_config);
+  WorldState confidence_world{
+      .players = {tracked_player(0.0F, 0.0F, 1, 0.2F), tracked_player(0.4F, 0.0F, 2, 0.95F)}};
+  auto weighted_out = weighted.decide(confidence_world, ctx);
+  auto unweighted_out = unweighted.decide(confidence_world, ctx);
+  for (std::uint64_t i = 1; i < 400; ++i) {
+    weighted_out = weighted.decide(confidence_world, PanContext{.frame_index = i});
+    unweighted_out = unweighted.decide(confidence_world, PanContext{.frame_index = i});
+  }
+  expect_true(weighted_out.yaw > unweighted_out.yaw, "confidence weighting pulls toward confident player");
+
+  FieldPannerConfig lock_config;
+  lock_config.dead_zone_rad = 0.0F;
+  lock_config.ball_weight = 0.0F;
+  lock_config.lock_pitch = true;
+  lock_config.locked_pitch_rad = 0.0F;
+  auto lock = FieldPanner::with_config(30.0F, lock_config);
+  WorldState pitched{
+      .players = {tracked_player(0.30F, 0.2F, 1), tracked_player(0.34F, 0.2F, 2),
+                  tracked_player(0.38F, 0.2F, 3)}};
+  auto locked = lock.decide(pitched, ctx);
+  for (std::uint64_t i = 1; i < 400; ++i) {
+    locked = lock.decide(pitched, PanContext{.frame_index = i});
+  }
+  expect_true(std::abs(locked.pitch) < 1.0e-3F, "lock pitch holds tilt");
+  expect_true(locked.yaw > 0.2F, "lock pitch still pans yaw");
+
+  auto nan_panner = FieldPanner(30.0F);
+  nan_panner.set_pose_for_test(0.3F, 0.05F);
+  WorldState nan_world{.players = {tracked_player(std::numeric_limits<float>::quiet_NaN(),
+                                                  std::numeric_limits<float>::quiet_NaN(), 1),
+                                   tracked_player(std::numeric_limits<float>::quiet_NaN(),
+                                                  std::numeric_limits<float>::quiet_NaN(), 2)}};
+  auto nan_out = nan_panner.decide(nan_world, ctx);
+  expect_true(std::isfinite(nan_out.yaw) && std::isfinite(nan_out.pitch), "field rejects NaN aim");
+  expect_near(nan_out.yaw, 0.3F, 1.0e-6F, "field keeps yaw on NaN");
+
+  auto fov_nan = FieldPanner(30.0F);
+  const float baseline_fov = fov_nan.current_fov();
+  expect_true(std::isnan(fov_nan.target_fov(nan, nan, nan)), "field target fov preserves NaN inputs");
+  auto fov_nan_out = fov_nan.decide(nan_world, ctx);
+  expect_true(fov_nan_out.fov_degrees.has_value() && std::isfinite(*fov_nan_out.fov_degrees),
+              "field fov does not latch NaN");
+  expect_near(*fov_nan_out.fov_degrees, baseline_fov, 1.0e-6F, "field fov holds on NaN cluster");
+
+  auto debug_panner = FieldPanner::with_config(30.0F, follow_config);
+  (void)debug_panner.decide(world, PanContext{.frame_index = 42});
+  auto debug = debug_panner.debug_event(42);
+  expect_true(debug.has_value(), "field debug event present after cluster");
+  if (debug.has_value()) {
+    const auto* event = std::get_if<reco::core::PannerDebugEvent>(&debug->variant());
+    expect_true(event != nullptr, "field debug event variant");
+    if (event != nullptr) {
+      expect_eq(event->frame_index, 42U, "field debug frame index");
+      expect_eq(event->n_players, 5U, "field debug player count");
+      expect_true(std::isfinite(event->fov_target), "field debug fov target finite");
+    }
+  }
+  (void)debug_panner.decide(WorldState{}, PanContext{.frame_index = 43});
+  expect_true(!debug_panner.debug_event(43).has_value(), "field debug clears without cluster");
+}
+
 void class_provider_matches_rust_stateless_policy() {
   ClassProvider provider(0);
   std::vector<reco::core::MappedDetection> detections{
@@ -423,6 +696,7 @@ int main() {
   roi_filter_matches_rust_anchor_policy();
   sweep_panner_matches_rust_phase_policy();
   file_panner_matches_rust_csv_policy();
+  field_panner_matches_rust_policy();
   class_provider_matches_rust_stateless_policy();
   ball_tracker_matches_rust_singleton_policy();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
