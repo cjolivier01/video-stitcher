@@ -1,0 +1,188 @@
+#include "reco/cli/cli.hpp"
+
+#include <cmath>
+#include <cstdlib>
+#include <iostream>
+#include <string>
+#include <string_view>
+#include <variant>
+#include <vector>
+
+using namespace reco::cli;
+
+namespace {
+
+int failures = 0;
+
+void expect_true(bool condition, std::string_view message) {
+  if (!condition) {
+    std::cerr << "FAIL: " << message << '\n';
+    ++failures;
+  }
+}
+
+template <typename T, typename U> void expect_eq(T actual, U expected, std::string_view message) {
+  if (actual != expected) {
+    std::cerr << "FAIL: " << message << " expected=" << expected << " actual=" << actual << '\n';
+    ++failures;
+  }
+}
+
+void expect_near(float actual, float expected, float tolerance, std::string_view message) {
+  if (!std::isfinite(actual) || std::abs(actual - expected) > tolerance) {
+    std::cerr << "FAIL: " << message << " expected=" << expected << " actual=" << actual << '\n';
+    ++failures;
+  }
+}
+
+Command expect_command(std::variant<Command, ParseError> parsed, std::string_view message) {
+  if (const auto* error = std::get_if<ParseError>(&parsed)) {
+    std::cerr << "FAIL: " << message << " unexpected error=" << error->message << '\n';
+    ++failures;
+    return HelpCommand{};
+  }
+  return std::get<Command>(std::move(parsed));
+}
+
+void expect_error(const std::variant<Command, ParseError>& parsed, std::string_view message) {
+  if (!std::holds_alternative<ParseError>(parsed)) {
+    std::cerr << "FAIL: " << message << " expected parse error\n";
+    ++failures;
+  }
+}
+
+void validators_match_rust() {
+  const auto blend = parse_blend("0.25");
+  expect_true(std::holds_alternative<float>(blend), "blend parses");
+  expect_near(std::get<float>(blend), 0.25F, 1.0e-6F, "blend value");
+  expect_true(std::holds_alternative<float>(parse_blend("0.0")), "blend lower inclusive");
+  expect_true(std::holds_alternative<float>(parse_blend("1.0")), "blend upper inclusive");
+  expect_true(std::holds_alternative<ParseError>(parse_blend("-0.1")), "blend below rejected");
+  expect_true(std::holds_alternative<ParseError>(parse_blend("1.1")), "blend above rejected");
+  expect_true(std::holds_alternative<ParseError>(parse_blend("NaN")), "blend nan rejected");
+  expect_true(std::holds_alternative<ParseError>(parse_blend("0.5x")), "blend suffix rejected");
+
+  const auto wxh = parse_wxh("1280x720");
+  expect_true(std::holds_alternative<WxH>(wxh), "wxh parses");
+  expect_eq(std::get<WxH>(wxh).width, 1280U, "wxh width");
+  expect_eq(std::get<WxH>(wxh).height, 720U, "wxh height");
+  expect_true(std::holds_alternative<WxH>(parse_wxh("856X480")), "wxh uppercase separator");
+  expect_true(std::holds_alternative<ParseError>(parse_wxh("0x720")), "zero width rejected");
+  expect_true(std::holds_alternative<ParseError>(parse_wxh("854x480")), "width alignment rejected");
+  expect_true(std::holds_alternative<ParseError>(parse_wxh("1280x721")), "height parity rejected");
+}
+
+void stitch_parse_matches_rust_defaults() {
+  const auto command = expect_command(parse_args({"stitch", "left.mp4", "right.mp4", "-c",
+                                                  "match.json", "--sync-offset", "-3",
+                                                  "--replay-scale", "1280x720",
+                                                  "--quality-value", "80", "--allow-no-tracking",
+                                                  "--no-zero-copy"}),
+                                      "stitch parse");
+  const auto* stitch = std::get_if<StitchCommand>(&command);
+  expect_true(stitch != nullptr, "stitch variant");
+  if (stitch == nullptr) return;
+  expect_eq(stitch->left, std::string("left.mp4"), "stitch left");
+  expect_eq(stitch->right, std::string("right.mp4"), "stitch right");
+  expect_eq(stitch->calibration, std::string("match.json"), "stitch calibration");
+  expect_eq(stitch->output, std::string("output.mp4"), "stitch output default");
+  expect_eq(stitch->width, 1920U, "stitch width default");
+  expect_eq(stitch->height, 1080U, "stitch height default");
+  expect_near(stitch->blend, 0.15F, 1.0e-6F, "stitch blend default");
+  expect_eq(stitch->sync_offset, -3, "stitch negative sync");
+  expect_eq(stitch->codec, std::string("h264"), "stitch codec default");
+  expect_eq(stitch->quality, std::string("balanced"), "stitch quality default");
+  expect_eq(stitch->tracking, std::string("field"), "stitch tracking default");
+  expect_true(stitch->replay_scale.has_value(), "stitch replay scale");
+  expect_eq(stitch->replay_scale->width, 1280U, "stitch replay width");
+  expect_eq(stitch->quality_value.value_or(0), 80U, "stitch quality value");
+  expect_true(stitch->allow_no_tracking, "stitch allow no tracking");
+  expect_true(stitch->no_zero_copy, "stitch no zero copy");
+}
+
+void preview_and_calibrate_parse_matches_rust_defaults() {
+  const auto preview_command =
+      expect_command(parse_args({"preview", "l.mp4", "r.mp4", "--calibration", "match.json",
+                                 "--rig-tilt", "-2.5"}),
+                     "preview parse");
+  const auto* preview = std::get_if<PreviewCommand>(&preview_command);
+  expect_true(preview != nullptr, "preview variant");
+  if (preview != nullptr) {
+    expect_eq(preview->width, 1280U, "preview width default");
+    expect_eq(preview->height, 720U, "preview height default");
+    expect_near(preview->blend, 0.15F, 1.0e-6F, "preview blend default");
+    expect_near(preview->rig_tilt, -2.5F, 1.0e-6F, "preview negative rig tilt");
+  }
+
+  const auto preview_unbounded_blend =
+      expect_command(parse_args({"preview", "l.mp4", "r.mp4", "-c", "match.json", "--blend",
+                                 "1.1"}),
+                     "preview unbounded blend parse");
+  const auto* unbounded_preview = std::get_if<PreviewCommand>(&preview_unbounded_blend);
+  expect_true(unbounded_preview != nullptr, "preview unbounded blend variant");
+  if (unbounded_preview != nullptr) {
+    expect_near(unbounded_preview->blend, 1.1F, 1.0e-6F, "preview blend is raw f32");
+  }
+
+  const auto preview_nan_blend =
+      expect_command(parse_args({"preview", "l.mp4", "r.mp4", "-c", "match.json", "--blend",
+                                 "NaN"}),
+                     "preview nan blend parse");
+  const auto* nan_preview = std::get_if<PreviewCommand>(&preview_nan_blend);
+  expect_true(nan_preview != nullptr, "preview nan blend variant");
+  if (nan_preview != nullptr) {
+    expect_true(std::isnan(nan_preview->blend), "preview blend accepts nan like raw f32");
+  }
+
+  const auto calibrate_command =
+      expect_command(parse_args({"calibrate", "l.mp4", "r.mp4", "--frames", "8",
+                                 "--no-auto-imu", "--no-auto-sync", "--output", "out.json"}),
+                     "calibrate parse");
+  const auto* calibrate = std::get_if<CalibrateCommand>(&calibrate_command);
+  expect_true(calibrate != nullptr, "calibrate variant");
+  if (calibrate != nullptr) {
+    expect_eq(calibrate->frames, 8U, "calibrate frames");
+    expect_true(calibrate->no_auto_imu, "calibrate no auto imu");
+    expect_true(!calibrate->auto_sync, "calibrate no auto sync");
+    expect_eq(calibrate->output, std::string("out.json"), "calibrate output");
+    expect_near(static_cast<float>(calibrate->akaze_threshold), 0.0001F, 1.0e-8F,
+                "calibrate akaze default");
+    expect_near(static_cast<float>(calibrate->lowe_ratio), 0.75F, 1.0e-6F,
+                "calibrate lowe default");
+  }
+}
+
+void parse_errors_are_reported() {
+  expect_error(parse_args({"stitch", "left.mp4", "right.mp4"}), "missing calibration");
+  expect_error(parse_args({"stitch", "left.mp4", "right.mp4", "-c"}), "missing option value");
+  expect_error(parse_args({"stitch", "left.mp4", "right.mp4", "-c", "--unknown"}),
+               "string value cannot be another option");
+  expect_error(parse_args({"stitch", "left.mp4", "right.mp4", "-c", "match.json", "--output",
+                           "--codec", "h264"}),
+               "string value cannot consume valid option");
+  expect_error(parse_args({"preview", "left.mp4", "right.mp4", "-c", "match.json", "--width",
+                           "1920x"}),
+               "numeric suffix rejected");
+  expect_error(parse_args({"stitch", "left.mp4", "right.mp4", "-c", "match.json",
+                           "--quality-value", "256"}),
+               "quality value u8 range rejected");
+  expect_error(parse_args({"stitch", "left.mp4", "right.mp4", "-c", "match.json",
+                           "--lookahead", "-1"}),
+               "lookahead does not allow hyphen value");
+  expect_error(parse_args({"calibrate", "left.mp4", "right.mp4", "--skip-start", "-1"}),
+               "skip start does not allow hyphen value");
+  expect_error(parse_args({"info", "--verbose"}), "info rejects options");
+
+  const auto help = expect_command(parse_args({"--help"}), "help parse");
+  expect_true(std::holds_alternative<HelpCommand>(help), "help variant");
+}
+
+} // namespace
+
+int main() {
+  validators_match_rust();
+  stitch_parse_matches_rust_defaults();
+  preview_and_calibrate_parse_matches_rust_defaults();
+  parse_errors_are_reported();
+  return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}

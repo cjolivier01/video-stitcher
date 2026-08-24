@@ -1,0 +1,15 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+
+cc_library(
+    name = "reco_cli_lib",
+    srcs = ["src/cli.cpp"],
+    hdrs = ["include/reco/cli/cli.hpp"],
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+)
+
+cc_binary(
+    name = "reco",
+    srcs = ["src/main.cpp"],
+    deps = [":reco_cli_lib"],
+)
