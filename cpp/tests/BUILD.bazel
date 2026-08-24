@@ -9,3 +9,12 @@ cc_test(
         "//cpp/reco_control",
     ],
 )
+
+cc_test(
+    name = "reco_core_data_tests",
+    size = "small",
+    srcs = ["reco_core_data_tests.cpp"],
+    deps = [
+        "//cpp/reco_core",
+    ],
+)

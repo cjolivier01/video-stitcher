@@ -1,12 +1,33 @@
-load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 
 cc_library(
     name = "reco_core",
-    srcs = ["src/rig_correction.cpp"],
+    srcs = [
+        "src/calibration.cpp",
+        "src/rig_correction.cpp",
+        "src/source.cpp",
+    ],
     hdrs = [
+        "include/reco/core/calibration.hpp",
         "include/reco/core/rig_correction.hpp",
+        "include/reco/core/source.hpp",
         "include/reco/core/viewport_position.hpp",
     ],
     includes = ["include"],
     visibility = ["//visibility:public"],
+    deps = ["@nlohmann_json//:json"],
+)
+
+cc_binary(
+    name = "calibration_json_fuzz",
+    testonly = True,
+    srcs = ["fuzz/calibration_json_fuzz.cpp"],
+    deps = [":reco_core"],
+)
+
+cc_binary(
+    name = "input_path_fuzz",
+    testonly = True,
+    srcs = ["fuzz/input_path_fuzz.cpp"],
+    deps = [":reco_core"],
 )
