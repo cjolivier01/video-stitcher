@@ -8,6 +8,7 @@ cc_library(
         "src/npp_interop.cpp",
         "src/ort_session.cpp",
         "src/probe.cpp",
+        "src/trt_engine.cpp",
     ],
     hdrs = [
         "include/reco/detect/cuda_preprocess.hpp",
@@ -15,6 +16,7 @@ cc_library(
         "include/reco/detect/npp_interop.hpp",
         "include/reco/detect/ort_session.hpp",
         "include/reco/detect/probe.hpp",
+        "include/reco/detect/trt_engine.hpp",
     ],
     includes = ["include"],
     visibility = ["//visibility:public"],
