@@ -3,6 +3,7 @@
 #include "reco/core/cuda_backend.hpp"
 #include "reco/detect/npp_interop.hpp"
 #include "reco/io/gstreamer.hpp"
+#include "reco/io/gpu_decode.hpp"
 
 #include <sstream>
 #include <utility>
@@ -20,6 +21,34 @@ void append_step(CalibrationExecutionPlan& plan, CalibrationStep step, std::stri
       CalibrationPlanStep{.step = step, .requires_gpu_residency = true, .detail = std::move(detail)});
 }
 
+std::optional<std::string> validate_decode_path(std::string_view path, std::string_view label) {
+  const std::string path_text(path);
+  const reco::io::GpuFileDecodeConfig config{
+      .path = path_text,
+      .codec = reco::io::gpu_decode_codec_for_path(path_text),
+      .elementary_stream = reco::io::gpu_decode_path_is_elementary_stream(path_text),
+      .container = reco::io::gpu_decode_container_for_path(path_text)};
+  if (const auto error = reco::io::validate_gpu_file_decode_config(config); error.has_value()) {
+    return std::string(label) + " " + *error;
+  }
+  return std::nullopt;
+}
+
+std::string gpu_decode_detail(const GpuCalibrationRequest& request) {
+  const reco::io::GpuFileDecodeConfig left{
+      .path = request.left.path,
+      .codec = reco::io::gpu_decode_codec_for_path(request.left.path),
+      .elementary_stream = reco::io::gpu_decode_path_is_elementary_stream(request.left.path),
+      .container = reco::io::gpu_decode_container_for_path(request.left.path)};
+  const reco::io::GpuFileDecodeConfig right{
+      .path = request.right.path,
+      .codec = reco::io::gpu_decode_codec_for_path(request.right.path),
+      .elementary_stream = reco::io::gpu_decode_path_is_elementary_stream(request.right.path),
+      .container = reco::io::gpu_decode_container_for_path(request.right.path)};
+  return "left: " + reco::io::build_gstreamer_gpu_file_decode_pipeline(left) +
+         " | right: " + reco::io::build_gstreamer_gpu_file_decode_pipeline(right);
+}
+
 } // namespace
 
 std::optional<std::string>
@@ -32,6 +61,12 @@ validate_gpu_calibration_request(const GpuCalibrationRequest& request) {
   }
   if (request.output.empty()) {
     return "output calibration path is required";
+  }
+  if (const auto error = validate_decode_path(request.left.path, "left"); error.has_value()) {
+    return *error;
+  }
+  if (const auto error = validate_decode_path(request.right.path, "right"); error.has_value()) {
+    return *error;
   }
   if (const auto error = request.config.validate(); error.has_value()) {
     return *error;
@@ -86,7 +121,8 @@ CalibrationExecutionPlan build_gpu_calibration_plan(const GpuCalibrationRequest&
               request.auto_sync ? "derive sync on the GPU pipeline timeline"
                                 : "use explicit frame sync offset");
   append_step(plan, CalibrationStep::ExtractingFrames,
-              "decode calibration samples into CUDA/NVMM surfaces");
+              "decode calibration samples into CUDA/NVMM surfaces via " +
+                  gpu_decode_detail(request));
   append_step(plan, CalibrationStep::Undistorting,
               "run device-resident fisheye Y-plane undistort");
   append_step(plan, CalibrationStep::FeatureMatching,

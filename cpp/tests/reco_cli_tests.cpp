@@ -275,8 +275,12 @@ void command_execution_dispatches_available_stages() {
   expect_eq(stitch_status, 2, "stitch exits blocked");
   expect_true(out.str().find("C++ reco stitch runtime plan") != std::string::npos,
               "blocked stitch writes runtime plan");
-  expect_true(out.str().find("GPU/NVMM surfaces") != std::string::npos,
-              "blocked stitch describes GPU ingest");
+  expect_true(out.str().find("nvv4l2decoder") != std::string::npos,
+              "blocked stitch describes GPU decode contract");
+  expect_true(out.str().find("qtdemux ! parsebin ! nvv4l2decoder") != std::string::npos,
+              "blocked stitch uses parser auto-detection for containers");
+  expect_true(out.str().find("video/x-raw(memory:NVMM),format=NV12") != std::string::npos,
+              "blocked stitch preserves NVMM decode caps");
   expect_true(err.str().find("error:") != std::string::npos, "blocked stitch writes stderr");
 
   out.str("");
@@ -311,6 +315,41 @@ void command_execution_dispatches_available_stages() {
   expect_eq(preview_status, 2, "preview exits blocked");
   expect_true(out.str().find("C++ reco preview runtime plan") != std::string::npos,
               "preview writes runtime plan");
+  expect_true(out.str().find("left GPU decode") != std::string::npos,
+              "preview writes decode pipeline");
+
+  out.str("");
+  out.clear();
+  err.str("");
+  err.clear();
+  PreviewCommand hevc_preview{.left = "left.hevc", .right = "right.h265", .calibration = "match.json"};
+  const auto hevc_preview_status = run_command(Command{hevc_preview}, out, err);
+  expect_eq(hevc_preview_status, 2, "HEVC preview exits blocked");
+  expect_true(out.str().find("h265parse ! nvv4l2decoder") != std::string::npos,
+              "HEVC preview plan selects HEVC parser");
+  expect_true(out.str().find("qtdemux ! h265parse") == std::string::npos,
+              "HEVC preview raw stream bypasses qtdemux");
+
+  out.str("");
+  out.clear();
+  err.str("");
+  err.clear();
+  PreviewCommand invalid_preview{
+      .left = "left.mp4 ! fakesink", .right = "right.mp4", .calibration = "match.json"};
+  const auto invalid_preview_status = run_command(Command{invalid_preview}, out, err);
+  expect_eq(invalid_preview_status, 2, "invalid preview decode path exits blocked");
+  expect_true(err.str().find("metacharacters") != std::string::npos,
+              "invalid preview decode path is reported");
+
+  out.str("");
+  out.clear();
+  err.str("");
+  err.clear();
+  PreviewCommand unsupported_preview{.left = "left.avi", .right = "right.mp4", .calibration = "match.json"};
+  const auto unsupported_preview_status = run_command(Command{unsupported_preview}, out, err);
+  expect_eq(unsupported_preview_status, 2, "unsupported preview container exits blocked");
+  expect_true(err.str().find("container is unsupported") != std::string::npos,
+              "unsupported preview container is reported");
 
   out.str("");
   out.clear();
