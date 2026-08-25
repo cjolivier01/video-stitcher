@@ -228,6 +228,99 @@ void unknown_format_records_warning_equivalent_status() {
   expect_true(parsed.input_format_used_fallback, "unknown setting format fallback status");
 }
 
+void source_state_transition_matches_update_logic() {
+  SourceState state;
+  state.warned_unsupported_format = true;
+
+  RawSettings initial;
+  initial.config_path = "a.json";
+  initial.output_width = 2560;
+  initial.output_height = 1440;
+  initial.input_width = 0;
+  initial.input_height = -1;
+  initial.input_format = "bgra";
+  initial.left_source = "Left";
+  initial.right_source = "Right";
+  initial.yaw_degrees = 10.0;
+  initial.pitch_degrees = -2.0;
+  initial.replay_enabled = true;
+  initial.replay_path = "replay.mkv";
+  initial.replay_mode = "always";
+
+  const auto first = apply_settings(state, initial);
+  expect_true(first.config_changed, "config change detected");
+  expect_true(first.output_dimensions_changed, "output dimensions changed");
+  expect_true(!first.input_dimensions_changed, "invalid input dimensions ignored");
+  expect_true(first.input_format_changed, "format change detected");
+  expect_true(first.left_source_changed, "left source changed");
+  expect_true(first.right_source_changed, "right source changed");
+  expect_true(first.left_source_resolve_requested, "left source resolve requested");
+  expect_true(first.right_source_resolve_requested, "right source resolve requested");
+  expect_true(first.pose_target_changed, "pose target changed");
+  expect_true(first.unsupported_format_warning_reset, "warning reset on format/source change");
+  expect_true(first.reload_calibration, "reload calibration on config change");
+  expect_true(first.rebuild_pipeline, "rebuild pipeline on config/dim/format change");
+  expect_true(!first.update_replay_recorder, "replay recorder waits for rebuild path");
+  expect_true(!first.input_format_used_fallback, "known format no fallback");
+  expect_eq(state.config_path, std::string("a.json"), "state config path");
+  expect_eq(state.output_width, 2560U, "state output width");
+  expect_eq(state.output_height, 1440U, "state output height");
+  expect_eq(state.input_width, 1920U, "state input width unchanged");
+  expect_eq(state.input_height, 1080U, "state input height unchanged");
+  expect_true(state.input_format == InputFormat::kBgra, "state input format");
+  expect_eq(state.left_source, std::string("Left"), "state left source");
+  expect_eq(state.right_source, std::string("Right"), "state right source");
+  expect_eq(state.yaw_degrees, 10.0, "state yaw");
+  expect_eq(state.pitch_degrees, -2.0, "state pitch");
+  expect_true(!state.warned_unsupported_format, "state warning reset");
+  expect_true(state.replay_enabled, "state replay enabled");
+  expect_eq(state.replay_path, std::string("replay.mkv"), "state replay path");
+  expect_true(!state.replay_follow_obs, "state replay follows always mode");
+
+  state.left_source_resolved = true;
+  state.right_source_resolved = true;
+  RawSettings replay_only;
+  replay_only.input_format = "bgra";
+  replay_only.left_source = "Left";
+  replay_only.right_source = "Right";
+  replay_only.replay_mode = "follow_obs";
+  const auto replay = apply_settings(state, replay_only);
+  expect_true(!replay.rebuild_pipeline, "replay-only update does not rebuild");
+  expect_true(replay.update_replay_recorder, "replay-only update refreshes recorder");
+  expect_true(state.replay_follow_obs, "state replay follows OBS");
+
+  state.left_source_resolved = false;
+  state.right_source_resolved = false;
+  state.warned_unsupported_format = true;
+  RawSettings retry_sources;
+  retry_sources.input_format = "bgra";
+  retry_sources.left_source = "Left";
+  retry_sources.right_source = "Right";
+  const auto retry = apply_settings(state, retry_sources);
+  expect_true(!retry.left_source_changed, "left source name unchanged");
+  expect_true(!retry.right_source_changed, "right source name unchanged");
+  expect_true(retry.left_source_resolve_requested, "left unresolved source retry");
+  expect_true(retry.right_source_resolve_requested, "right unresolved source retry");
+  expect_true(retry.unsupported_format_warning_reset, "retry resets warning");
+  expect_true(!state.warned_unsupported_format, "retry warning reset state");
+
+  state.calibration_present = true;
+  state.core_present = false;
+  RawSettings retry_pipeline;
+  retry_pipeline.input_format = "bgra";
+  const auto pipeline_retry = apply_settings(state, retry_pipeline);
+  expect_true(pipeline_retry.rebuild_pipeline, "calibrated missing core retries pipeline");
+  expect_true(!pipeline_retry.update_replay_recorder, "pipeline retry skips replay-only path");
+
+  RawSettings unknown_format;
+  unknown_format.input_format = "nv12";
+  const auto fallback = apply_settings(state, unknown_format);
+  expect_true(fallback.input_format_used_fallback, "state format fallback status");
+  expect_true(fallback.input_format_changed, "fallback to yuv changes bgra state");
+  expect_true(fallback.rebuild_pipeline, "format fallback rebuilds when state changes");
+  expect_true(state.input_format == InputFormat::kYuv420p, "fallback state format");
+}
+
 void log_levels_match_obs_constants() {
   expect_eq(obs_log_level(LogLevel::kError), 100, "error log level");
   expect_eq(obs_log_level(LogLevel::kWarn), 200, "warn log level");
@@ -247,6 +340,7 @@ int main() {
   replay_mode_parser_is_safe_by_default();
   raw_settings_apply_positive_dimensions_and_defaults();
   unknown_format_records_warning_equivalent_status();
+  source_state_transition_matches_update_logic();
   log_levels_match_obs_constants();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

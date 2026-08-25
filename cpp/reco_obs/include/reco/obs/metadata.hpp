@@ -143,6 +143,44 @@ struct ParsedSettings {
   bool replay_follow_obs = true;
 };
 
+struct SourceState {
+  std::string config_path;
+  std::uint32_t output_width = 1920;
+  std::uint32_t output_height = 1080;
+  std::uint32_t input_width = 1920;
+  std::uint32_t input_height = 1080;
+  InputFormat input_format = InputFormat::kYuv420p;
+  std::string left_source;
+  std::string right_source;
+  bool left_source_resolved = false;
+  bool right_source_resolved = false;
+  bool warned_unsupported_format = false;
+  bool calibration_present = false;
+  bool core_present = false;
+  double yaw_degrees = 0.0;
+  double pitch_degrees = 0.0;
+  bool replay_enabled = false;
+  std::string replay_path;
+  bool replay_follow_obs = true;
+};
+
+struct SourceUpdatePlan {
+  bool config_changed = false;
+  bool output_dimensions_changed = false;
+  bool input_dimensions_changed = false;
+  bool input_format_changed = false;
+  bool left_source_changed = false;
+  bool right_source_changed = false;
+  bool left_source_resolve_requested = false;
+  bool right_source_resolve_requested = false;
+  bool pose_target_changed = false;
+  bool unsupported_format_warning_reset = false;
+  bool reload_calibration = false;
+  bool rebuild_pipeline = false;
+  bool update_replay_recorder = true;
+  bool input_format_used_fallback = false;
+};
+
 struct RawSettings {
   std::optional<std::string> config_path;
   std::optional<std::int64_t> output_width;
@@ -167,6 +205,7 @@ struct RawSettings {
 [[nodiscard]] bool replay_mode_follows_obs(std::optional<std::string_view> value);
 [[nodiscard]] ParsedSettings parse_settings(const RawSettings& raw,
                                             const SourceDefaults& defaults = source_defaults());
+[[nodiscard]] SourceUpdatePlan apply_settings(SourceState& state, const RawSettings& raw);
 [[nodiscard]] int obs_log_level(LogLevel level);
 
 } // namespace reco::obs

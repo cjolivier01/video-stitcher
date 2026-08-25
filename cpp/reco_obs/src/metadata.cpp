@@ -123,6 +123,103 @@ ParsedSettings parse_settings(const RawSettings& raw, const SourceDefaults& defa
   return parsed;
 }
 
+SourceUpdatePlan apply_settings(SourceState& state, const RawSettings& raw) {
+  SourceUpdatePlan plan;
+
+  if (raw.config_path.has_value() && *raw.config_path != state.config_path) {
+    state.config_path = *raw.config_path;
+    plan.config_changed = true;
+  }
+
+  const auto apply_dimension = [](std::optional<std::int64_t> raw_value, std::uint32_t& target) {
+    if (!raw_value.has_value() || *raw_value <= 0) {
+      return false;
+    }
+    const auto parsed = static_cast<std::uint32_t>(*raw_value);
+    if (parsed == target) {
+      return false;
+    }
+    target = parsed;
+    return true;
+  };
+
+  const bool output_width_changed = apply_dimension(raw.output_width, state.output_width);
+  const bool output_height_changed = apply_dimension(raw.output_height, state.output_height);
+  plan.output_dimensions_changed = output_width_changed || output_height_changed;
+  const bool input_width_changed = apply_dimension(raw.input_width, state.input_width);
+  const bool input_height_changed = apply_dimension(raw.input_height, state.input_height);
+  plan.input_dimensions_changed = input_width_changed || input_height_changed;
+
+  const auto input_format =
+      parse_input_format(raw.input_format.has_value()
+                             ? std::optional<std::string_view>(*raw.input_format)
+                             : std::nullopt);
+  plan.input_format_used_fallback = input_format.used_fallback;
+  if (input_format.format != state.input_format) {
+    state.input_format = input_format.format;
+    state.core_present = false;
+    state.warned_unsupported_format = false;
+    plan.input_format_changed = true;
+    plan.unsupported_format_warning_reset = true;
+  }
+
+  if (raw.left_source.has_value()) {
+    const bool name_changed = *raw.left_source != state.left_source;
+    const bool should_retry_unresolved = !state.left_source_resolved && !raw.left_source->empty();
+    if (name_changed || should_retry_unresolved) {
+      state.left_source = *raw.left_source;
+      if (name_changed) {
+        state.left_source_resolved = false;
+      }
+      state.warned_unsupported_format = false;
+      plan.left_source_changed = name_changed;
+      plan.left_source_resolve_requested = !raw.left_source->empty();
+      plan.unsupported_format_warning_reset = true;
+    }
+  }
+  if (raw.right_source.has_value()) {
+    const bool name_changed = *raw.right_source != state.right_source;
+    const bool should_retry_unresolved = !state.right_source_resolved && !raw.right_source->empty();
+    if (name_changed || should_retry_unresolved) {
+      state.right_source = *raw.right_source;
+      if (name_changed) {
+        state.right_source_resolved = false;
+      }
+      state.warned_unsupported_format = false;
+      plan.right_source_changed = name_changed;
+      plan.right_source_resolve_requested = !raw.right_source->empty();
+      plan.unsupported_format_warning_reset = true;
+    }
+  }
+
+  if (raw.yaw_degrees.has_value() && *raw.yaw_degrees != state.yaw_degrees) {
+    state.yaw_degrees = *raw.yaw_degrees;
+    plan.pose_target_changed = true;
+  }
+  if (raw.pitch_degrees.has_value() && *raw.pitch_degrees != state.pitch_degrees) {
+    state.pitch_degrees = *raw.pitch_degrees;
+    plan.pose_target_changed = true;
+  }
+
+  if (raw.replay_enabled.has_value()) {
+    state.replay_enabled = *raw.replay_enabled;
+  }
+  if (raw.replay_path.has_value()) {
+    state.replay_path = *raw.replay_path;
+  }
+  state.replay_follow_obs =
+      replay_mode_follows_obs(raw.replay_mode.has_value()
+                                  ? std::optional<std::string_view>(*raw.replay_mode)
+                                  : std::optional<std::string_view>(kReplayModeFollowObs));
+
+  plan.reload_calibration = plan.config_changed;
+  plan.rebuild_pipeline = plan.config_changed || plan.output_dimensions_changed ||
+                          plan.input_dimensions_changed || plan.input_format_changed ||
+                          (!state.core_present && state.calibration_present);
+  plan.update_replay_recorder = !plan.rebuild_pipeline;
+  return plan;
+}
+
 int obs_log_level(LogLevel level) {
   switch (level) {
   case LogLevel::kError:
