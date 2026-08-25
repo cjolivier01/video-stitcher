@@ -1,6 +1,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -211,6 +212,60 @@ bool env_set(const char* name) {
   return value != nullptr && *value != '\0';
 }
 
+bool near(float actual, float expected) { return std::abs(actual - expected) <= 1.0e-5F; }
+
+std::size_t element_count(const std::vector<std::int64_t>& shape) {
+  std::size_t count = 1;
+  for (const auto dim : shape) {
+    if (dim <= 0) {
+      return 0;
+    }
+    count *= static_cast<std::size_t>(dim);
+  }
+  return count;
+}
+
+OrtStatusPtr validate_nv12_2x2_preprocess(const OrtCValue* input) {
+  if (input == nullptr || input->shape != std::vector<std::int64_t>({1, 3, 8, 8}) ||
+      input->f32.size() != 192) {
+    return fail("unexpected 2x2 preprocessed tensor shape");
+  }
+  constexpr std::size_t plane = 64;
+  const auto at = [&](std::size_t channel, std::size_t x, std::size_t y) {
+    return input->f32[channel * plane + y * 8 + x];
+  };
+  for (std::size_t channel = 0; channel < 3; ++channel) {
+    if (!near(at(channel, 0, 0), 80.0F / 255.0F) ||
+        !near(at(channel, 4, 0), 90.0F / 255.0F) ||
+        !near(at(channel, 0, 4), 100.0F / 255.0F) ||
+        !near(at(channel, 4, 4), 110.0F / 255.0F)) {
+      return fail("2x2 NV12 preprocessing did not produce expected neutral RGB CHW samples");
+    }
+  }
+  return ok();
+}
+
+OrtStatusPtr validate_yuv420p_4x2_letterbox(const OrtCValue* input) {
+  if (input == nullptr || input->shape != std::vector<std::int64_t>({1, 3, 8, 8}) ||
+      input->f32.size() != 192) {
+    return fail("unexpected 4x2 preprocessed tensor shape");
+  }
+  constexpr std::size_t plane = 64;
+  const auto at = [&](std::size_t channel, std::size_t x, std::size_t y) {
+    return input->f32[channel * plane + y * 8 + x];
+  };
+  for (std::size_t channel = 0; channel < 3; ++channel) {
+    if (!near(at(channel, 0, 0), 114.0F / 255.0F) ||
+        !near(at(channel, 7, 1), 114.0F / 255.0F) ||
+        !near(at(channel, 0, 2), 10.0F / 255.0F) ||
+        !near(at(channel, 2, 2), 20.0F / 255.0F) ||
+        !near(at(channel, 0, 4), 50.0F / 255.0F)) {
+      return fail("4x2 YUV420p preprocessing did not preserve letterbox/CHW samples");
+    }
+  }
+  return ok();
+}
+
 OrtStatusPtr RECO_ORT_CALL create_env(int, const char*, OrtCEnv** out) {
   *out = new OrtCEnv;
   return ok();
@@ -333,18 +388,40 @@ OrtStatusPtr RECO_ORT_CALL metadata_lookup(const OrtCModelMetadata*, OrtCAllocat
   return ok();
 }
 
-OrtStatusPtr RECO_ORT_CALL create_tensor_with_data(const OrtCMemoryInfo*, void*, std::size_t,
+OrtStatusPtr RECO_ORT_CALL create_tensor_with_data(const OrtCMemoryInfo*, void* data,
+                                                   std::size_t byte_count,
                                                    const std::int64_t* shape, std::size_t rank,
                                                    int element_type, OrtCValue** out) {
   *out = new OrtCValue;
   (*out)->shape.assign(shape, shape + rank);
   (*out)->element_type = element_type;
+  if (element_type == 1) {
+    const auto count = element_count((*out)->shape);
+    if (count > 0 && byte_count == count * sizeof(float) && data != nullptr) {
+      const auto* floats = static_cast<const float*>(data);
+      (*out)->f32.assign(floats, floats + count);
+    }
+  }
   return ok();
 }
 
 OrtStatusPtr RECO_ORT_CALL run(OrtCSession*, const OrtCRunOptions*, const char* const*,
-                               const OrtCValue* const*, std::size_t, const char* const*,
+                               const OrtCValue* const* inputs, std::size_t input_count,
+                               const char* const*,
                                std::size_t output_count, OrtCValue** outputs) {
+  if (input_count != 1) {
+    return fail("unexpected input count");
+  }
+  if (env_set("RECO_FAKE_ORT_VALIDATE_NV12_2X2")) {
+    if (auto* status = validate_nv12_2x2_preprocess(inputs[0]); status != nullptr) {
+      return status;
+    }
+  }
+  if (env_set("RECO_FAKE_ORT_VALIDATE_YUV420P_4X2")) {
+    if (auto* status = validate_yuv420p_4x2_letterbox(inputs[0]); status != nullptr) {
+      return status;
+    }
+  }
   for (std::size_t i = 0; i < output_count; ++i) {
     auto* value = new OrtCValue;
     if (env_set("RECO_FAKE_ORT_INT_OUTPUT")) {
