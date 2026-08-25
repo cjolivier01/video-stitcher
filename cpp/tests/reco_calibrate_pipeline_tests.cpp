@@ -80,10 +80,28 @@ void plan_keeps_calibration_gpu_resident() {
               "blocked reason refuses CPU fallback");
 
   const auto description = describe_calibration_plan(plan);
+  expect_true(description.find("nvv4l2decoder") != std::string::npos,
+              "plan describes hardware decode pipeline");
+  expect_true(description.find("qtdemux ! parsebin ! nvv4l2decoder") != std::string::npos,
+              "containerized inputs use parser auto-detection");
+  expect_true(description.find("video/x-raw(memory:NVMM),format=NV12") != std::string::npos,
+              "plan preserves NVMM decode caps");
   expect_true(description.find("Undistorting") != std::string::npos,
               "plan describes GPU undistort stage");
   expect_true(description.find("FeatureMatching") != std::string::npos,
               "plan describes feature matching stage");
+}
+
+void calibration_plan_selects_hevc_decode_for_hevc_paths() {
+  auto request = valid_request();
+  request.left.path = "left.hevc";
+  request.right.path = "right.h265";
+  const auto plan = build_gpu_calibration_plan(request, ready_backends());
+  const auto description = describe_calibration_plan(plan);
+  expect_true(description.find("h265parse ! nvv4l2decoder") != std::string::npos,
+              "calibration HEVC inputs use HEVC parser");
+  expect_true(description.find("qtdemux ! h265parse") == std::string::npos,
+              "calibration raw HEVC inputs bypass qtdemux");
 }
 
 void plan_reports_missing_required_backend_first() {
@@ -109,11 +127,23 @@ void plan_reports_missing_required_backend_first() {
               "NPP block is reported");
 }
 
+void invalid_decode_paths_block_calibration_plan() {
+  auto request = valid_request();
+  request.left.path = "left.mp4 ! fakesink";
+  const auto plan = build_gpu_calibration_plan(request, ready_backends());
+  expect_true(!plan.ready, "invalid decode path blocks plan");
+  expect_true(plan.blocked_reason.has_value(), "invalid decode path reason present");
+  expect_true(plan.blocked_reason->find("metacharacters") != std::string::npos,
+              "invalid decode path explains launch-string risk");
+}
+
 } // namespace
 
 int main() {
   validation_rejects_invalid_requests();
   plan_keeps_calibration_gpu_resident();
+  calibration_plan_selects_hevc_decode_for_hevc_paths();
   plan_reports_missing_required_backend_first();
+  invalid_decode_paths_block_calibration_plan();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

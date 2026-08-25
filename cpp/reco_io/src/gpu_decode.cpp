@@ -1,7 +1,11 @@
 #include "reco/io/gpu_decode.hpp"
 
+#include <algorithm>
+#include <cctype>
+#include <filesystem>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 
 namespace reco::io {
 namespace {
@@ -39,6 +43,13 @@ std::string_view parser_for_codec(GpuDecodeCodec codec) {
   return "h264parse";
 }
 
+std::string lowercase(std::string_view value) {
+  std::string out(value);
+  std::transform(out.begin(), out.end(), out.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return out;
+}
+
 } // namespace
 
 std::string_view gpu_decode_codec_name(GpuDecodeCodec codec) {
@@ -51,6 +62,45 @@ std::string_view gpu_decode_codec_name(GpuDecodeCodec codec) {
   return "h264";
 }
 
+std::string_view gpu_decode_container_demuxer(GpuDecodeContainer container) {
+  switch (container) {
+  case GpuDecodeContainer::QuickTime:
+    return "qtdemux";
+  case GpuDecodeContainer::Matroska:
+    return "matroskademux";
+  case GpuDecodeContainer::MpegTs:
+    return "tsdemux";
+  }
+  return "qtdemux";
+}
+
+GpuDecodeCodec gpu_decode_codec_for_path(std::string_view path) {
+  const auto ext = lowercase(std::filesystem::path(std::string(path)).extension().string());
+  if (ext == ".h265" || ext == ".hevc" || ext == ".265") {
+    return GpuDecodeCodec::Hevc;
+  }
+  return GpuDecodeCodec::H264;
+}
+
+bool gpu_decode_path_is_elementary_stream(std::string_view path) {
+  const auto ext = lowercase(std::filesystem::path(std::string(path)).extension().string());
+  return ext == ".h264" || ext == ".264" || ext == ".h265" || ext == ".hevc" || ext == ".265";
+}
+
+std::optional<GpuDecodeContainer> gpu_decode_container_for_path(std::string_view path) {
+  const auto ext = lowercase(std::filesystem::path(std::string(path)).extension().string());
+  if (ext == ".mp4" || ext == ".mov" || ext == ".m4v") {
+    return GpuDecodeContainer::QuickTime;
+  }
+  if (ext == ".mkv" || ext == ".webm") {
+    return GpuDecodeContainer::Matroska;
+  }
+  if (ext == ".ts" || ext == ".mts" || ext == ".m2ts") {
+    return GpuDecodeContainer::MpegTs;
+  }
+  return std::nullopt;
+}
+
 std::optional<std::string> validate_gpu_file_decode_config(const GpuFileDecodeConfig& config) {
   if (config.path.empty()) {
     return "GPU file decode path is required";
@@ -61,6 +111,9 @@ std::optional<std::string> validate_gpu_file_decode_config(const GpuFileDecodeCo
   if (config.max_buffers == 0) {
     return "GPU file decode max_buffers must be non-zero";
   }
+  if (!config.elementary_stream && !config.container.has_value()) {
+    return "GPU file decode container is unsupported";
+  }
   return std::nullopt;
 }
 
@@ -69,9 +122,13 @@ std::string build_gstreamer_gpu_file_decode_pipeline(const GpuFileDecodeConfig& 
     throw std::invalid_argument(*error);
   }
   std::ostringstream pipeline;
-  pipeline << "filesrc location=" << quote_gstreamer_property(config.path) << " ! qtdemux ! "
-           << parser_for_codec(config.codec)
-           << " ! nvv4l2decoder ! video/x-raw(memory:NVMM),format=NV12"
+  pipeline << "filesrc location=" << quote_gstreamer_property(config.path) << " ! ";
+  if (config.elementary_stream) {
+    pipeline << parser_for_codec(config.codec);
+  } else {
+    pipeline << gpu_decode_container_demuxer(*config.container) << " ! parsebin";
+  }
+  pipeline << " ! nvv4l2decoder ! video/x-raw(memory:NVMM),format=NV12"
            << " ! appsink name=sink emit-signals=false sync=false max-buffers="
            << config.max_buffers << " drop=" << (config.drop ? "true" : "false");
   return pipeline.str();

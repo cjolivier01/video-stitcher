@@ -7,6 +7,7 @@
 #include "reco/detect/ort_session.hpp"
 #include "reco/detect/probe.hpp"
 #include "reco/io/gstreamer.hpp"
+#include "reco/io/gpu_decode.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -163,21 +164,44 @@ reco::calibrate::CalibrationBackendStatus probe_cuda_npp_backends() {
                             : reco::core::CudaBackend::availability_error();
   status.npp.available = reco::detect::is_npp_available();
   status.npp.detail =
-      status.npp.available ? "NPP image primitives available" : reco::detect::npp_availability_error();
+      status.npp.available ? "NPP image primitives available"
+                           : reco::detect::npp_availability_error();
   return status;
+}
+
+std::optional<std::string> add_gpu_decode_pipeline_step(RuntimePlan& plan, std::string_view label,
+                                                        const std::string& path) {
+  const reco::io::GpuFileDecodeConfig config{.path = path,
+                                             .codec = reco::io::gpu_decode_codec_for_path(path),
+                                             .elementary_stream =
+                                                 reco::io::gpu_decode_path_is_elementary_stream(path),
+                                             .container = reco::io::gpu_decode_container_for_path(path)};
+  if (const auto error = reco::io::validate_gpu_file_decode_config(config); error.has_value()) {
+    return std::string(label) + " " + *error;
+  }
+  plan.steps.push_back(std::string(label) + " GPU decode: " +
+                       reco::io::build_gstreamer_gpu_file_decode_pipeline(config));
+  return std::nullopt;
 }
 
 RuntimePlan build_stitch_plan(const StitchCommand& command,
                               const reco::calibrate::CalibrationBackendStatus& backends) {
-  RuntimePlan plan{
-      .command = "stitch",
-      .steps = {
-          "load and validate v1 calibration JSON",
-          "decode synchronized inputs into GPU/NVMM surfaces",
-          "run stitch renderer without CPU frame readback",
-          "encode the stitched output through the GPU-capable video backend",
-      },
-  };
+  RuntimePlan plan{.command = "stitch",
+                   .steps = {
+                       "load and validate v1 calibration JSON",
+                   }};
+  if (const auto error = add_gpu_decode_pipeline_step(plan, "left", command.left);
+      error.has_value()) {
+    plan.blocked_reason = *error;
+    return plan;
+  }
+  if (const auto error = add_gpu_decode_pipeline_step(plan, "right", command.right);
+      error.has_value()) {
+    plan.blocked_reason = *error;
+    return plan;
+  }
+  plan.steps.push_back("run stitch renderer without CPU frame readback");
+  plan.steps.push_back("encode the stitched output through the GPU-capable video backend");
   if (command.no_zero_copy) {
     plan.blocked_reason = "C++ stitch does not support --no-zero-copy because it would force a CPU path";
   } else if (auto error = require_gpu_video_backend(backends, false); error.has_value()) {
@@ -189,16 +213,23 @@ RuntimePlan build_stitch_plan(const StitchCommand& command,
   return plan;
 }
 
-RuntimePlan build_preview_plan(const PreviewCommand&,
+RuntimePlan build_preview_plan(const PreviewCommand& command,
                                const reco::calibrate::CalibrationBackendStatus& backends) {
-  RuntimePlan plan{
-      .command = "preview",
-      .steps = {
-          "load and validate v1 calibration JSON",
-          "decode synchronized inputs into GPU/NVMM surfaces",
-          "render stitched preview frames directly to the GPU presentation surface",
-      },
-  };
+  RuntimePlan plan{.command = "preview",
+                   .steps = {
+                       "load and validate v1 calibration JSON",
+                   }};
+  if (const auto error = add_gpu_decode_pipeline_step(plan, "left", command.left);
+      error.has_value()) {
+    plan.blocked_reason = *error;
+    return plan;
+  }
+  if (const auto error = add_gpu_decode_pipeline_step(plan, "right", command.right);
+      error.has_value()) {
+    plan.blocked_reason = *error;
+    return plan;
+  }
+  plan.steps.push_back("render stitched preview frames directly to the GPU presentation surface");
   if (auto error = require_gpu_video_backend(backends, false); error.has_value()) {
     plan.blocked_reason = *error;
   } else {
