@@ -191,6 +191,24 @@ cc_test(
     srcs = ["reco_detect_ort_session_fake_runtime_tests.cpp"],
     data = [":libfake_onnxruntime.so"],
     deps = [
+        "//cpp/reco_core",
+        "//cpp/reco_detect",
+    ],
+)
+
+cc_binary(
+    name = "libfake_tensorrt.so",
+    testonly = True,
+    srcs = ["fake_tensorrt.cpp"],
+    linkshared = True,
+)
+
+cc_test(
+    name = "reco_detect_trt_engine_fake_runtime_tests",
+    size = "small",
+    srcs = ["reco_detect_trt_engine_fake_runtime_tests.cpp"],
+    data = [":libfake_tensorrt.so"],
+    deps = [
         "//cpp/reco_detect",
     ],
 )

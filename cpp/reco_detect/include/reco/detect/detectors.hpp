@@ -2,14 +2,18 @@
 
 #include "reco/core/cuda_backend.hpp"
 #include "reco/core/pipeline_event.hpp"
+#include "reco/detect/ort_session.hpp"
+#include "reco/detect/trt_engine.hpp"
 
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -156,6 +160,97 @@ public:
   [[nodiscard]] virtual std::optional<std::span<const std::string>> class_names() const {
     return std::nullopt;
   }
+};
+
+class CpuYoloDetector final : public UnifiedDetector {
+public:
+  explicit CpuYoloDetector(std::filesystem::path model_path);
+  CpuYoloDetector(std::filesystem::path model_path, float confidence_threshold,
+                  std::vector<std::string> labels);
+
+  [[nodiscard]] const char* name() const override;
+  [[nodiscard]] std::vector<Detection> detect(CameraId camera, const DetectorFrame& frame) override;
+  [[nodiscard]] std::optional<std::span<const std::string>> class_names() const override;
+  [[nodiscard]] std::uint32_t input_size() const;
+
+private:
+  [[nodiscard]] std::vector<Detection> detect_raw(CameraId camera, const RawFrame& frame);
+  [[nodiscard]] std::vector<Detection>
+  detect_preprocessed(CameraId camera, std::span<const float> data, std::uint32_t input_size,
+                      std::uint32_t src_width, std::uint32_t src_height);
+  [[nodiscard]] std::tuple<float, float, float> preprocess(const RawFrame& frame);
+
+  OrtSession session_;
+  float confidence_threshold_ = 0.10F;
+  std::vector<float> rgb_chw_buf_;
+};
+
+class OrtCudaYoloDetector final : public UnifiedDetector {
+public:
+  OrtCudaYoloDetector(std::filesystem::path model_path, std::uint32_t frame_width,
+                      std::uint32_t frame_height, float confidence_threshold,
+                      std::vector<std::string> labels, bool supports_p010);
+
+  [[nodiscard]] const char* name() const override;
+  [[nodiscard]] std::vector<Detection> detect(CameraId camera, const DetectorFrame& frame) override;
+  [[nodiscard]] std::optional<std::span<const std::string>> class_names() const override;
+  [[nodiscard]] std::uint32_t input_size() const;
+
+private:
+  [[nodiscard]] std::vector<Detection> detect_gpu_raw(CameraId camera, const GpuNv12Frame& frame);
+
+  core::CudaBackend backend_;
+  OrtSession session_;
+  std::uint32_t frame_width_ = 0;
+  std::uint32_t frame_height_ = 0;
+  float confidence_threshold_ = 0.10F;
+  float scale_ = 1.0F;
+  float pad_x_ = 0.0F;
+  float pad_y_ = 0.0F;
+  core::CudaDeviceBuffer tensor_f32_;
+  core::CudaDeviceBuffer nv12_8bit_y_;
+  core::CudaDeviceBuffer nv12_8bit_uv_;
+};
+
+class TrtGpuDetector final : public UnifiedDetector {
+public:
+  TrtGpuDetector(std::filesystem::path engine_path, std::uint32_t frame_width,
+                 std::uint32_t frame_height, float confidence_threshold,
+                 std::vector<std::string> labels, bool supports_p010);
+
+  [[nodiscard]] const char* name() const override;
+  [[nodiscard]] std::vector<Detection> detect(CameraId camera, const DetectorFrame& frame) override;
+  [[nodiscard]] std::optional<std::span<const std::string>> class_names() const override;
+  [[nodiscard]] std::uint32_t input_size() const { return input_size_; }
+
+private:
+  [[nodiscard]] std::vector<Detection> detect_gpu_raw(CameraId camera, const GpuNv12Frame& frame);
+  [[nodiscard]] std::vector<void*> build_binding_ptrs();
+
+  core::CudaBackend backend_;
+  std::optional<TrtEngine> engine_;
+  std::optional<TrtContext> context_;
+  std::uint32_t frame_width_ = 0;
+  std::uint32_t frame_height_ = 0;
+  std::uint32_t input_size_ = 0;
+  float confidence_threshold_ = 0.10F;
+  float scale_ = 1.0F;
+  float pad_x_ = 0.0F;
+  float pad_y_ = 0.0F;
+  std::uint32_t new_w_ = 0;
+  std::uint32_t new_h_ = 0;
+  std::vector<std::string> labels_;
+  std::size_t input_idx_ = 0;
+  std::size_t output_idx_ = 0;
+  std::size_t binding_count_ = 0;
+  std::size_t output_floats_ = 0;
+  core::CudaDeviceBuffer rgb_u8_;
+  core::CudaDeviceBuffer rgb_scratch_;
+  core::CudaDeviceBuffer resized_u8_;
+  core::CudaDeviceBuffer tensor_f32_;
+  core::CudaDeviceBuffer output_;
+  core::CudaDeviceBuffer nv12_8bit_y_;
+  core::CudaDeviceBuffer nv12_8bit_uv_;
 };
 
 [[nodiscard]] std::vector<Detection> postprocess(const std::vector<float>& data, std::size_t n,

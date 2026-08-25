@@ -1,9 +1,15 @@
 #include "reco/detect/detectors.hpp"
 
+#include "reco/detect/cuda_preprocess.hpp"
+#include "reco/detect/npp_interop.hpp"
+
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <fstream>
+#include <cstring>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -17,6 +23,7 @@ namespace {
 float clamp01(float value) { return std::clamp(value, 0.0F, 1.0F); }
 
 constexpr std::size_t kMaxClassCount = 10000;
+constexpr float kLetterboxGrey = 114.0F / 255.0F;
 
 std::string_view trim_ascii(std::string_view value) {
   constexpr std::string_view whitespace = " \t\r\n";
@@ -51,6 +58,83 @@ std::optional<std::size_t> parse_usize(std::string_view value) {
     return std::nullopt;
   }
   return parsed;
+}
+
+std::size_t checked_plane_size(std::uint32_t width, std::uint32_t height,
+                               std::string_view label) {
+  const auto w = static_cast<std::size_t>(width);
+  const auto h = static_cast<std::size_t>(height);
+  if (w != 0 && h > std::numeric_limits<std::size_t>::max() / w) {
+    throw DetectorError::inference_failed(std::string(label) + " dimensions overflow");
+  }
+  return w * h;
+}
+
+void validate_raw_frame(const RawFrame& frame) {
+  if (frame.width == 0 || frame.height == 0) {
+    throw DetectorError::inference_failed("RawFrame dimensions must be non-zero");
+  }
+  if ((frame.width % 2) != 0 || (frame.height % 2) != 0) {
+    throw DetectorError::inference_failed("RawFrame dimensions must be even for 4:2:0 chroma");
+  }
+  const auto y_size = checked_plane_size(frame.width, frame.height, "RawFrame Y");
+  if (frame.y.size() < y_size) {
+    throw DetectorError::inference_failed("RawFrame Y plane is shorter than width*height");
+  }
+  const auto chroma_size = checked_plane_size(frame.width / 2, frame.height / 2, "RawFrame chroma");
+  std::visit(
+      [&](const auto& chroma) {
+        using T = std::decay_t<decltype(chroma)>;
+        if constexpr (std::is_same_v<T, Yuv420pChroma>) {
+          if (chroma.u.size() < chroma_size || chroma.v.size() < chroma_size) {
+            throw DetectorError::inference_failed("RawFrame YUV420p chroma plane is too short");
+          }
+        } else if constexpr (std::is_same_v<T, Nv12Chroma>) {
+          if (chroma.uv.size() < chroma_size * 2) {
+            throw DetectorError::inference_failed("RawFrame NV12 chroma plane is too short");
+          }
+        }
+      },
+      frame.chroma);
+}
+
+std::pair<float, float> chroma_sample(const RawFrame& frame, std::uint32_t x, std::uint32_t y) {
+  const auto cx = static_cast<std::size_t>(x / 2);
+  const auto cy = static_cast<std::size_t>(y / 2);
+  const auto cw = static_cast<std::size_t>(frame.width / 2);
+  return std::visit(
+      [&](const auto& chroma) -> std::pair<float, float> {
+        using T = std::decay_t<decltype(chroma)>;
+        if constexpr (std::is_same_v<T, Yuv420pChroma>) {
+          const auto idx = cy * cw + cx;
+          return {static_cast<float>(chroma.u[idx]), static_cast<float>(chroma.v[idx])};
+        } else {
+          const auto idx = cy * static_cast<std::size_t>(frame.width) + cx * 2;
+          return {static_cast<float>(chroma.uv[idx]), static_cast<float>(chroma.uv[idx + 1])};
+        }
+      },
+      frame.chroma);
+}
+
+std::array<float, 3> sample_rgb(const RawFrame& frame, std::uint32_t x, std::uint32_t y) {
+  const auto y_value = static_cast<float>(frame.y[static_cast<std::size_t>(y) * frame.width + x]);
+  const auto [u_value, v_value] = chroma_sample(frame, x, y);
+  const float r = std::clamp(y_value + 1.402F * (v_value - 128.0F), 0.0F, 255.0F);
+  const float g =
+      std::clamp(y_value - 0.344136F * (u_value - 128.0F) - 0.714136F * (v_value - 128.0F),
+                 0.0F, 255.0F);
+  const float b = std::clamp(y_value + 1.772F * (u_value - 128.0F), 0.0F, 255.0F);
+  return {r, g, b};
+}
+
+std::size_t detection_count_from_output_shape(const OrtTensorOutput& output) {
+  if (output.shape.size() < 2) {
+    throw DetectorError::inference_failed("ORT detector output rank is less than 2");
+  }
+  if (output.shape[1] < 0) {
+    throw DetectorError::inference_failed("ORT detector output count dimension is dynamic");
+  }
+  return static_cast<std::size_t>(output.shape[1]);
 }
 
 } // namespace
@@ -111,6 +195,439 @@ DetectorError DetectorError::transport(std::string message) {
 
 DetectorError DetectorError::canceled() {
   return DetectorError(DetectorErrorKind::Canceled, "detection canceled");
+}
+
+CpuYoloDetector::CpuYoloDetector(std::filesystem::path model_path)
+    : CpuYoloDetector(std::move(model_path), 0.10F, {}) {}
+
+CpuYoloDetector::CpuYoloDetector(std::filesystem::path model_path, float confidence_threshold,
+                                 std::vector<std::string> labels)
+    : session_(OrtSessionConfig{
+          .model_path = std::move(model_path),
+          .fallback_labels = std::move(labels),
+          .providers = {OrtExecutionProvider::Cpu},
+      }),
+      confidence_threshold_(confidence_threshold) {
+  const auto sz = static_cast<std::size_t>(session_.metadata().input_size);
+  if (sz == 0 || sz > std::numeric_limits<std::size_t>::max() / sz / 3) {
+    throw DetectorError::inference_failed("CpuYoloDetector input dimensions overflow");
+  }
+  rgb_chw_buf_.assign(3 * sz * sz, kLetterboxGrey);
+}
+
+const char* CpuYoloDetector::name() const { return "ort-cpu"; }
+
+std::optional<std::span<const std::string>> CpuYoloDetector::class_names() const {
+  return std::span<const std::string>(session_.metadata().labels);
+}
+
+std::uint32_t CpuYoloDetector::input_size() const { return session_.metadata().input_size; }
+
+std::vector<Detection> CpuYoloDetector::detect(CameraId camera, const DetectorFrame& frame) {
+  const auto& variant = frame.variant();
+  if (const auto* raw = std::get_if<RawFrame>(&variant); raw != nullptr) {
+    return detect_raw(camera, *raw);
+  }
+  if (const auto* preprocessed = std::get_if<PreprocessedChwFrame>(&variant);
+      preprocessed != nullptr) {
+    return detect_preprocessed(camera, preprocessed->data, preprocessed->input_size,
+                               preprocessed->src_width, preprocessed->src_height);
+  }
+  throw DetectorError::unsupported_frame_kind();
+}
+
+std::tuple<float, float, float> CpuYoloDetector::preprocess(const RawFrame& frame) {
+  validate_raw_frame(frame);
+  const auto input_size = session_.metadata().input_size;
+  const float fw = static_cast<float>(frame.width);
+  const float fh = static_cast<float>(frame.height);
+  const float is = static_cast<float>(input_size);
+  const float scale = std::min(is / fw, is / fh);
+  const auto new_w = static_cast<std::uint32_t>(std::round(fw * scale));
+  const auto new_h = static_cast<std::uint32_t>(std::round(fh * scale));
+  const float pad_x = static_cast<float>(input_size - new_w) / 2.0F;
+  const float pad_y = static_cast<float>(input_size - new_h) / 2.0F;
+  const auto pad_x_i = static_cast<std::uint32_t>(pad_x);
+  const auto pad_y_i = static_cast<std::uint32_t>(pad_y);
+  const auto sz = static_cast<std::size_t>(input_size);
+  const auto plane = sz * sz;
+
+  rgb_chw_buf_.assign(rgb_chw_buf_.size(), kLetterboxGrey);
+  const auto w_max = frame.width - 1;
+  const auto h_max = frame.height - 1;
+
+  for (std::uint32_t dy = 0; dy < new_h; ++dy) {
+    for (std::uint32_t dx = 0; dx < new_w; ++dx) {
+      const float src_x = static_cast<float>(dx) / scale;
+      const float src_y = static_cast<float>(dy) / scale;
+      const auto x0 = std::min(static_cast<std::uint32_t>(std::floor(src_x)), w_max);
+      const auto y0 = std::min(static_cast<std::uint32_t>(std::floor(src_y)), h_max);
+      const auto x1 = std::min(x0 + 1, w_max);
+      const auto y1 = std::min(y0 + 1, h_max);
+      const float fx = src_x - std::floor(src_x);
+      const float fy = src_y - std::floor(src_y);
+
+      const auto c00 = sample_rgb(frame, x0, y0);
+      const auto c10 = sample_rgb(frame, x1, y0);
+      const auto c01 = sample_rgb(frame, x0, y1);
+      const auto c11 = sample_rgb(frame, x1, y1);
+      const auto lerp = [&](std::size_t channel) {
+        return c00[channel] * (1.0F - fx) * (1.0F - fy) +
+               c10[channel] * fx * (1.0F - fy) + c01[channel] * (1.0F - fx) * fy +
+               c11[channel] * fx * fy;
+      };
+
+      const auto ox = static_cast<std::size_t>(pad_x_i + dx);
+      const auto oy = static_cast<std::size_t>(pad_y_i + dy);
+      rgb_chw_buf_[oy * sz + ox] = lerp(0) / 255.0F;
+      rgb_chw_buf_[plane + oy * sz + ox] = lerp(1) / 255.0F;
+      rgb_chw_buf_[2 * plane + oy * sz + ox] = lerp(2) / 255.0F;
+    }
+  }
+  return {scale, pad_x, pad_y};
+}
+
+std::vector<Detection> CpuYoloDetector::detect_raw(CameraId camera, const RawFrame& frame) {
+  const auto [scale, pad_x, pad_y] = preprocess(frame);
+  const auto input_size = session_.metadata().input_size;
+  const std::vector<std::int64_t> shape{1, 3, static_cast<std::int64_t>(input_size),
+                                        static_cast<std::int64_t>(input_size)};
+  const auto outputs = session_.run_cpu_f32(rgb_chw_buf_, shape);
+  if (outputs.empty()) {
+    return {};
+  }
+  const std::size_t n = detection_count_from_output_shape(outputs[0]);
+  const auto& output = outputs[0].data;
+  return outputs.size() > 1
+             ? postprocess_balldet(output, n, camera, confidence_threshold_, scale, pad_x, pad_y,
+                                   frame.width, frame.height)
+             : postprocess(output, n, camera, confidence_threshold_, scale, pad_x, pad_y,
+                           frame.width, frame.height);
+}
+
+std::vector<Detection> CpuYoloDetector::detect_preprocessed(CameraId camera,
+                                                            std::span<const float> data,
+                                                            std::uint32_t input_size,
+                                                            std::uint32_t src_width,
+                                                            std::uint32_t src_height) {
+  const auto sz = static_cast<std::size_t>(input_size);
+  if (input_size == 0 || src_width == 0 || src_height == 0 ||
+      sz > std::numeric_limits<std::size_t>::max() / sz / 3) {
+    throw DetectorError::inference_failed("PreprocessedChw dimensions are invalid");
+  }
+  const auto expected = 3 * sz * sz;
+  if (data.size() != expected) {
+    throw DetectorError::inference_failed("PreprocessedChw input length does not match input_size");
+  }
+  const std::vector<std::int64_t> shape{1, 3, static_cast<std::int64_t>(input_size),
+                                        static_cast<std::int64_t>(input_size)};
+  const auto outputs = session_.run_cpu_f32(data, shape);
+  if (outputs.empty()) {
+    return {};
+  }
+
+  const float fw = static_cast<float>(src_width);
+  const float fh = static_cast<float>(src_height);
+  const float is = static_cast<float>(input_size);
+  const float scale = std::min(is / fw, is / fh);
+  const float pad_x = (is - std::round(fw * scale)) / 2.0F;
+  const float pad_y = (is - std::round(fh * scale)) / 2.0F;
+  const std::size_t n = detection_count_from_output_shape(outputs[0]);
+  const auto& output = outputs[0].data;
+  return outputs.size() > 1
+             ? postprocess_balldet(output, n, camera, confidence_threshold_, scale, pad_x, pad_y,
+                                   src_width, src_height)
+             : postprocess(output, n, camera, confidence_threshold_, scale, pad_x, pad_y,
+                           src_width, src_height);
+}
+
+OrtCudaYoloDetector::OrtCudaYoloDetector(std::filesystem::path model_path,
+                                         std::uint32_t frame_width,
+                                         std::uint32_t frame_height,
+                                         float confidence_threshold,
+                                         std::vector<std::string> labels, bool supports_p010)
+    : backend_(core::CudaBackend::create()),
+      session_(OrtSessionConfig{
+          .model_path = std::move(model_path),
+          .fallback_labels = std::move(labels),
+          .providers = {OrtExecutionProvider::Cuda},
+      }),
+      frame_width_(frame_width),
+      frame_height_(frame_height),
+      confidence_threshold_(confidence_threshold) {
+  if (frame_width_ == 0 || frame_height_ == 0) {
+    throw DetectorError::inference_failed("OrtCudaYoloDetector frame dimensions must be non-zero");
+  }
+  const auto input_size = session_.metadata().input_size;
+  if (input_size == 0) {
+    throw DetectorError::inference_failed("OrtCudaYoloDetector model input size must be non-zero");
+  }
+  const float fw = static_cast<float>(frame_width_);
+  const float fh = static_cast<float>(frame_height_);
+  const float is = static_cast<float>(input_size);
+  scale_ = std::min(is / fw, is / fh);
+  pad_x_ = static_cast<float>(input_size - static_cast<std::uint32_t>(std::round(fw * scale_))) /
+           2.0F;
+  pad_y_ = static_cast<float>(input_size - static_cast<std::uint32_t>(std::round(fh * scale_))) /
+           2.0F;
+
+  const auto sz = static_cast<std::size_t>(input_size);
+  if (sz > std::numeric_limits<std::size_t>::max() / sz / 3 / sizeof(float)) {
+    throw DetectorError::inference_failed("OrtCudaYoloDetector tensor dimensions overflow");
+  }
+  tensor_f32_ = backend_.allocate(3 * sz * sz * sizeof(float));
+  if (supports_p010) {
+    const auto y_size = checked_plane_size(frame_width_, frame_height_, "P010 Y scratch");
+    const auto uv_size = checked_plane_size(frame_width_, frame_height_ / 2, "P010 UV scratch");
+    nv12_8bit_y_ = backend_.allocate(y_size);
+    nv12_8bit_uv_ = backend_.allocate(uv_size);
+  }
+}
+
+const char* OrtCudaYoloDetector::name() const { return "ort-cuda"; }
+
+std::optional<std::span<const std::string>> OrtCudaYoloDetector::class_names() const {
+  return std::span<const std::string>(session_.metadata().labels);
+}
+
+std::uint32_t OrtCudaYoloDetector::input_size() const { return session_.metadata().input_size; }
+
+std::vector<Detection> OrtCudaYoloDetector::detect(CameraId camera, const DetectorFrame& frame) {
+  const auto& variant = frame.variant();
+  if (const auto* gpu = std::get_if<GpuNv12Frame>(&variant); gpu != nullptr) {
+    return detect_gpu_raw(camera, *gpu);
+  }
+  throw DetectorError::unsupported_frame_kind();
+}
+
+std::vector<Detection> OrtCudaYoloDetector::detect_gpu_raw(CameraId camera,
+                                                           const GpuNv12Frame& frame) {
+  if (frame.y_ptr == 0 || frame.uv_ptr == 0) {
+    throw DetectorError::inference_failed("GpuNv12Frame has null CUDA plane pointer");
+  }
+  if (frame.width != frame_width_ || frame.height != frame_height_) {
+    throw DetectorError::inference_failed("GpuNv12Frame dimensions do not match detector");
+  }
+  if ((frame.width % 2) != 0 || (frame.height % 2) != 0) {
+    throw DetectorError::inference_failed("GpuNv12Frame dimensions must be even for 4:2:0 chroma");
+  }
+  core::CudaDevicePtr nv12_y = frame.y_ptr;
+  core::CudaDevicePtr nv12_uv = frame.uv_ptr;
+  std::uint32_t nv12_y_pitch = frame.width;
+
+  if (frame.is_10bit) {
+    if (!nv12_8bit_y_ || !nv12_8bit_uv_) {
+      throw DetectorError::inference_failed("P010 frame received but detector lacks P010 scratch");
+    }
+    const auto p010_min_pitch = static_cast<std::size_t>(frame.width) * 2U;
+    if (frame.y_pitch < p010_min_pitch || frame.uv_pitch < p010_min_pitch) {
+      throw DetectorError::inference_failed("GpuNv12Frame P010 pitch is smaller than width*2");
+    }
+    p010_plane_to_nv12(backend_, frame.y_ptr, frame.y_pitch, nv12_8bit_y_.ptr(), frame.width,
+                       frame.height);
+    p010_plane_to_nv12(backend_, frame.uv_ptr, frame.uv_pitch, nv12_8bit_uv_.ptr(), frame.width,
+                       frame.height / 2);
+    nv12_y = nv12_8bit_y_.ptr();
+    nv12_uv = nv12_8bit_uv_.ptr();
+    nv12_y_pitch = frame.width;
+  } else if (frame.y_pitch != frame.uv_pitch) {
+    throw DetectorError::inference_failed("GpuNv12Frame Y and UV pitches must match");
+  } else {
+    if (frame.y_pitch < frame.width) {
+      throw DetectorError::inference_failed("GpuNv12Frame pitch is smaller than width");
+    }
+    nv12_y_pitch = static_cast<std::uint32_t>(frame.y_pitch);
+    if (static_cast<std::size_t>(nv12_y_pitch) != frame.y_pitch) {
+      throw DetectorError::inference_failed("GpuNv12Frame pitch exceeds CUDA kernel u32 limit");
+    }
+  }
+
+  const auto input_size = session_.metadata().input_size;
+  nv12_to_rgb_chw_fullrange(backend_, nv12_y, nv12_uv, tensor_f32_.ptr(), nv12_y_pitch,
+                            frame.width, frame.height, input_size, input_size,
+                            static_cast<std::uint32_t>(pad_x_), static_cast<std::uint32_t>(pad_y_),
+                            scale_, frame.rotation);
+  const std::vector<std::int64_t> shape{1, 3, static_cast<std::int64_t>(input_size),
+                                        static_cast<std::int64_t>(input_size)};
+  const auto outputs = session_.run_cuda_f32(tensor_f32_.ptr(), tensor_f32_.size(), shape);
+  if (outputs.empty()) {
+    return {};
+  }
+  const std::size_t n = detection_count_from_output_shape(outputs[0]);
+  const auto& output = outputs[0].data;
+  return postprocess(output, n, camera, confidence_threshold_, scale_, pad_x_, pad_y_, frame.width,
+                     frame.height);
+}
+
+TrtGpuDetector::TrtGpuDetector(std::filesystem::path engine_path, std::uint32_t frame_width,
+                               std::uint32_t frame_height, float confidence_threshold,
+                               std::vector<std::string> labels, bool supports_p010)
+    : backend_(core::CudaBackend::create()), labels_(std::move(labels)) {
+  if (!is_npp_available()) {
+    throw DetectorError::inference_failed("NPP is required for TensorRT detector preprocessing");
+  }
+  if (frame_width == 0 || frame_height == 0) {
+    throw DetectorError::inference_failed("TrtGpuDetector frame dimensions must be non-zero");
+  }
+  backend_.ensure_primary_context(0);
+  engine_.emplace(engine_path);
+  frame_width_ = frame_width;
+  frame_height_ = frame_height;
+  confidence_threshold_ = confidence_threshold;
+
+  const auto bindings = engine_->bindings();
+  binding_count_ = bindings.size();
+  const auto input_it = std::find_if(bindings.begin(), bindings.end(),
+                                     [](const TrtBindingInfo& binding) { return binding.is_input; });
+  const auto output_it = std::find_if(bindings.begin(), bindings.end(),
+                                      [](const TrtBindingInfo& binding) { return !binding.is_input; });
+  if (input_it == bindings.end() || output_it == bindings.end()) {
+    throw DetectorError::inference_failed("TensorRT engine must have at least one input and output binding");
+  }
+  input_idx_ = static_cast<std::size_t>(std::distance(bindings.begin(), input_it));
+  output_idx_ = static_cast<std::size_t>(std::distance(bindings.begin(), output_it));
+  if (input_it->data_type != TrtDataType::Float || input_it->dims.size() != 4 ||
+      input_it->dims[0] != 1 || input_it->dims[1] != 3 || input_it->dims[2] <= 0 ||
+      input_it->dims[3] != input_it->dims[2]) {
+    throw DetectorError::inference_failed("TensorRT input binding must be float32 [1,3,S,S]");
+  }
+  if (output_it->data_type != TrtDataType::Float || output_it->byte_size % sizeof(float) != 0) {
+    throw DetectorError::inference_failed("TensorRT output binding must be float32");
+  }
+  input_size_ = static_cast<std::uint32_t>(input_it->dims[2]);
+  output_floats_ = output_it->byte_size / sizeof(float);
+  if (output_floats_ == 0 || (output_floats_ % 6) != 0) {
+    throw DetectorError::inference_failed("TensorRT output binding must contain 6-float detections");
+  }
+
+  const float fw = static_cast<float>(frame_width_);
+  const float fh = static_cast<float>(frame_height_);
+  const float is = static_cast<float>(input_size_);
+  scale_ = std::min(is / fw, is / fh);
+  new_w_ = static_cast<std::uint32_t>(std::round(fw * scale_));
+  new_h_ = static_cast<std::uint32_t>(std::round(fh * scale_));
+  pad_x_ = static_cast<float>(input_size_ - new_w_) / 2.0F;
+  pad_y_ = static_cast<float>(input_size_ - new_h_) / 2.0F;
+
+  const auto frame_rgb_size = checked_plane_size(frame_width_, frame_height_, "TensorRT RGB");
+  if (frame_rgb_size > std::numeric_limits<std::size_t>::max() / 3U) {
+    throw DetectorError::inference_failed("TensorRT RGB dimensions overflow");
+  }
+  const auto resized_rgb_size = checked_plane_size(input_size_, input_size_, "TensorRT resized RGB");
+  if (resized_rgb_size > std::numeric_limits<std::size_t>::max() / 3U) {
+    throw DetectorError::inference_failed("TensorRT resized RGB dimensions overflow");
+  }
+  const auto tensor_plane_size = checked_plane_size(input_size_, input_size_, "TensorRT tensor");
+  if (tensor_plane_size > std::numeric_limits<std::size_t>::max() / 3U / sizeof(float)) {
+    throw DetectorError::inference_failed("TensorRT tensor dimensions overflow");
+  }
+  rgb_u8_ = backend_.allocate(frame_rgb_size * 3U);
+  rgb_scratch_ = backend_.allocate(frame_rgb_size * 3U);
+  resized_u8_ = backend_.allocate(resized_rgb_size * 3U);
+  tensor_f32_ = backend_.allocate(tensor_plane_size * 3U * sizeof(float));
+  output_ = backend_.allocate(output_it->byte_size);
+  backend_.memset_d8(resized_u8_, 114);
+  backend_.memset_d8(output_, 0);
+  if (supports_p010) {
+    nv12_8bit_y_ =
+        backend_.allocate(checked_plane_size(frame_width_, frame_height_, "TensorRT P010 Y"));
+    nv12_8bit_uv_ =
+        backend_.allocate(checked_plane_size(frame_width_, frame_height_ / 2, "TensorRT P010 UV"));
+  }
+  context_.emplace(engine_->create_context());
+}
+
+const char* TrtGpuDetector::name() const { return "tensorrt-native"; }
+
+std::optional<std::span<const std::string>> TrtGpuDetector::class_names() const {
+  return std::span<const std::string>(labels_);
+}
+
+std::vector<Detection> TrtGpuDetector::detect(CameraId camera, const DetectorFrame& frame) {
+  const auto& variant = frame.variant();
+  if (const auto* gpu = std::get_if<GpuNv12Frame>(&variant); gpu != nullptr) {
+    try {
+      return detect_gpu_raw(camera, *gpu);
+    } catch (const DetectorError&) {
+      throw;
+    } catch (const std::exception& error) {
+      throw DetectorError::inference_failed(error.what());
+    }
+  }
+  throw DetectorError::unsupported_frame_kind();
+}
+
+std::vector<void*> TrtGpuDetector::build_binding_ptrs() {
+  std::vector<void*> bindings(binding_count_, nullptr);
+  bindings[input_idx_] = reinterpret_cast<void*>(tensor_f32_.ptr());
+  bindings[output_idx_] = reinterpret_cast<void*>(output_.ptr());
+  return bindings;
+}
+
+std::vector<Detection> TrtGpuDetector::detect_gpu_raw(CameraId camera, const GpuNv12Frame& frame) {
+  backend_.ensure_primary_context(0);
+  if (frame.y_ptr == 0 || frame.uv_ptr == 0) {
+    throw DetectorError::inference_failed("GpuNv12Frame has null CUDA plane pointer");
+  }
+  if (frame.width != frame_width_ || frame.height != frame_height_) {
+    throw DetectorError::inference_failed("GpuNv12Frame dimensions do not match TensorRT detector");
+  }
+  if ((frame.width % 2) != 0 || (frame.height % 2) != 0) {
+    throw DetectorError::inference_failed("GpuNv12Frame dimensions must be even for 4:2:0 chroma");
+  }
+
+  core::CudaDevicePtr nv12_y = frame.y_ptr;
+  core::CudaDevicePtr nv12_uv = frame.uv_ptr;
+  std::size_t nv12_y_pitch = frame.y_pitch;
+  std::size_t nv12_uv_pitch = frame.uv_pitch;
+  if (frame.is_10bit) {
+    if (!nv12_8bit_y_ || !nv12_8bit_uv_) {
+      throw DetectorError::inference_failed("P010 frame received but TensorRT detector lacks scratch");
+    }
+    const auto p010_min_pitch = static_cast<std::size_t>(frame.width) * 2U;
+    if (frame.y_pitch < p010_min_pitch || frame.uv_pitch < p010_min_pitch) {
+      throw DetectorError::inference_failed("GpuNv12Frame P010 pitch is smaller than width*2");
+    }
+    p010_plane_to_nv12(backend_, frame.y_ptr, frame.y_pitch, nv12_8bit_y_.ptr(), frame.width,
+                       frame.height);
+    p010_plane_to_nv12(backend_, frame.uv_ptr, frame.uv_pitch, nv12_8bit_uv_.ptr(), frame.width,
+                       frame.height / 2);
+    nv12_y = nv12_8bit_y_.ptr();
+    nv12_uv = nv12_8bit_uv_.ptr();
+    nv12_y_pitch = frame.width;
+    nv12_uv_pitch = frame.width;
+  } else {
+    if (frame.y_pitch < frame.width || frame.uv_pitch < frame.width) {
+      throw DetectorError::inference_failed("GpuNv12Frame pitch is smaller than width");
+    }
+    if (frame.y_pitch != frame.uv_pitch) {
+      throw DetectorError::inference_failed("GpuNv12Frame Y and UV pitches must match");
+    }
+  }
+
+  npp_nv12_to_rgb(nv12_y, nv12_y_pitch, nv12_uv, nv12_uv_pitch, rgb_u8_.ptr(), frame.width,
+                  frame.height);
+  core::CudaDevicePtr rgb_for_resize = rgb_u8_.ptr();
+  if (frame.rotation == 180) {
+    npp_mirror_c3(rgb_u8_.ptr(), rgb_scratch_.ptr(), frame.width, frame.height);
+    rgb_for_resize = rgb_scratch_.ptr();
+  }
+  npp_resize_c3(rgb_for_resize, frame.width, frame.height, resized_u8_.ptr(), input_size_,
+                input_size_, NppiRect{static_cast<int>(pad_x_), static_cast<int>(pad_y_),
+                                      static_cast<int>(new_w_), static_cast<int>(new_h_)});
+  backend_.synchronize();
+  normalize_hwc_to_chw(backend_, resized_u8_.ptr(), tensor_f32_.ptr(), input_size_, input_size_);
+  backend_.synchronize();
+
+  auto bindings = build_binding_ptrs();
+  context_->enqueue(bindings, nullptr);
+  backend_.synchronize();
+
+  const auto output_bytes = backend_.copy_to_host(output_);
+  std::vector<float> output(output_floats_, 0.0F);
+  std::memcpy(output.data(), output_bytes.data(), output.size() * sizeof(float));
+  return postprocess(output, output_floats_ / 6, camera, confidence_threshold_, scale_, pad_x_,
+                     pad_y_, frame.width, frame.height);
 }
 
 std::vector<Detection> postprocess(const std::vector<float>& data, std::size_t n, CameraId camera,
