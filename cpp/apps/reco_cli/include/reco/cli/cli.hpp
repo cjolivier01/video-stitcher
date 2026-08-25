@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <iosfwd>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -88,13 +89,14 @@ struct CalibrateCommand {
 struct InfoCommand {};
 struct HelpCommand {};
 
-using Command = std::variant<StitchCommand, PreviewCommand, CalibrateCommand, InfoCommand,
-                             HelpCommand>;
+using Command =
+    std::variant<StitchCommand, PreviewCommand, CalibrateCommand, InfoCommand, HelpCommand>;
 
 [[nodiscard]] std::variant<float, ParseError> parse_blend(std::string_view value);
 [[nodiscard]] std::variant<WxH, ParseError> parse_wxh(std::string_view value);
 [[nodiscard]] std::variant<Command, ParseError> parse_args(const std::vector<std::string>& args);
 [[nodiscard]] std::string_view command_name(const Command& command);
 [[nodiscard]] std::string help_text();
+int run_command(const Command& command, std::ostream& out, std::ostream& err);
 
 } // namespace reco::cli

@@ -1,8 +1,17 @@
 #include "reco/cli/cli.hpp"
 
+#include "reco/core/cuda_backend.hpp"
+#include "reco/detect/coreml_session.hpp"
+#include "reco/detect/npp_interop.hpp"
+#include "reco/detect/ort_session.hpp"
+#include "reco/detect/probe.hpp"
+#include "reco/io/gstreamer.hpp"
+
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <cstdlib>
+#include <iostream>
 #include <limits>
 #include <sstream>
 #include <type_traits>
@@ -90,6 +99,15 @@ std::optional<std::string> take_value_or_error(Cursor& cursor, std::string_view 
   return std::get<std::string>(std::move(value));
 }
 
+void write_probe(std::ostream& out, std::string_view label, bool available,
+                 std::string_view detail) {
+  out << "  " << label << ": " << (available ? "available" : "unavailable");
+  if (!detail.empty()) {
+    out << " (" << detail << ")";
+  }
+  out << '\n';
+}
+
 template <typename T, typename Parser>
 bool assign_next_or_error(Cursor& cursor, std::string_view option, Parser parser, T& out,
                           std::optional<ParseError>& err, bool allow_hyphen_value = false) {
@@ -131,82 +149,94 @@ std::variant<StitchCommand, ParseError> parse_stitch(Cursor& cursor) {
     const std::string arg = cursor.take();
     auto next = [&](std::string_view option) { return cursor.value(option); };
     if (arg == "-c" || arg == "--calibration") {
-      if (!assign_or_error(next(arg), command.calibration, err)) return *err;
+      if (!assign_or_error(next(arg), command.calibration, err))
+        return *err;
     } else if (arg == "-o" || arg == "--output") {
-      if (!assign_or_error(next(arg), command.output, err)) return *err;
+      if (!assign_or_error(next(arg), command.output, err))
+        return *err;
     } else if (arg == "--width") {
-      if (!assign_next_or_error(cursor, arg,
-                                [&](std::string_view v) {
-                                  return parse_integral<std::uint32_t>(v, arg);
-                                },
-                                command.width, err)) return *err;
+      if (!assign_next_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint32_t>(v, arg); },
+              command.width, err))
+        return *err;
     } else if (arg == "--height") {
-      if (!assign_next_or_error(cursor, arg,
-                                [&](std::string_view v) {
-                                  return parse_integral<std::uint32_t>(v, arg);
-                                },
-                                command.height, err)) return *err;
+      if (!assign_next_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint32_t>(v, arg); },
+              command.height, err))
+        return *err;
     } else if (arg == "--start-time") {
-      if (!assign_next_optional_or_error(cursor, arg,
-                                         [&](std::string_view v) { return parse_double(v, arg); },
-                                         command.start_time, err)) return *err;
+      if (!assign_next_optional_or_error(
+              cursor, arg, [&](std::string_view v) { return parse_double(v, arg); },
+              command.start_time, err))
+        return *err;
     } else if (arg == "--end-time") {
-      if (!assign_next_optional_or_error(cursor, arg,
-                                         [&](std::string_view v) { return parse_double(v, arg); },
-                                         command.end_time, err)) return *err;
+      if (!assign_next_optional_or_error(
+              cursor, arg, [&](std::string_view v) { return parse_double(v, arg); },
+              command.end_time, err))
+        return *err;
     } else if (arg == "--max-frames") {
-      if (!assign_next_optional_or_error(cursor, arg,
-                                         [&](std::string_view v) {
-                                           return parse_integral<std::uint64_t>(v, arg);
-                                         },
-                                         command.max_frames, err)) return *err;
+      if (!assign_next_optional_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint64_t>(v, arg); },
+              command.max_frames, err))
+        return *err;
     } else if (arg == "--encoder") {
-      if (!assign_optional_or_error(next(arg), command.encoder, err)) return *err;
+      if (!assign_optional_or_error(next(arg), command.encoder, err))
+        return *err;
     } else if (arg == "--codec") {
-      if (!assign_or_error(next(arg), command.codec, err)) return *err;
+      if (!assign_or_error(next(arg), command.codec, err))
+        return *err;
     } else if (arg == "--quality") {
-      if (!assign_or_error(next(arg), command.quality, err)) return *err;
+      if (!assign_or_error(next(arg), command.quality, err))
+        return *err;
     } else if (arg == "--blend") {
       if (!assign_next_or_error(cursor, arg, parse_blend, command.blend, err)) {
         return *err;
       }
     } else if (arg == "--sync-offset") {
-      if (!assign_next_or_error(cursor, arg,
-                                [&](std::string_view v) {
-                                  return parse_integral<std::int64_t>(v, arg);
-                                },
-                                command.sync_offset, err, true)) return *err;
+      if (!assign_next_or_error(
+              cursor, arg, [&](std::string_view v) { return parse_integral<std::int64_t>(v, arg); },
+              command.sync_offset, err, true))
+        return *err;
     } else if (arg == "--model") {
-      if (!assign_optional_or_error(next(arg), command.model, err)) return *err;
+      if (!assign_optional_or_error(next(arg), command.model, err))
+        return *err;
     } else if (arg == "--detection-interval") {
-      if (!assign_next_or_error(cursor, arg,
-                                [&](std::string_view v) {
-                                  return parse_integral<std::uint64_t>(v, arg);
-                                },
-                                command.detection_interval, err)) return *err;
+      if (!assign_next_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint64_t>(v, arg); },
+              command.detection_interval, err))
+        return *err;
     } else if (arg == "--lookahead") {
-      if (!assign_next_or_error(cursor, arg,
-                                [&](std::string_view v) { return parse_double(v, arg); },
-                                command.lookahead, err)) return *err;
+      if (!assign_next_or_error(
+              cursor, arg, [&](std::string_view v) { return parse_double(v, arg); },
+              command.lookahead, err))
+        return *err;
     } else if (arg == "--tracking") {
-      if (!assign_or_error(next(arg), command.tracking, err)) return *err;
+      if (!assign_or_error(next(arg), command.tracking, err))
+        return *err;
     } else if (arg == "--quality-value") {
       std::uint32_t value = 0;
-      if (!assign_next_or_error(cursor, arg,
-                                [&](std::string_view v) {
-                                  return parse_integral<std::uint32_t>(v, arg);
-                                },
-                                value, err)) return *err;
+      if (!assign_next_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint32_t>(v, arg); }, value,
+              err))
+        return *err;
       if (value > std::numeric_limits<std::uint8_t>::max()) {
         return ParseError{"invalid --quality-value " + std::to_string(value)};
       }
       command.quality_value = static_cast<std::uint8_t>(value);
     } else if (arg == "--preset") {
-      if (!assign_optional_or_error(next(arg), command.preset, err)) return *err;
+      if (!assign_optional_or_error(next(arg), command.preset, err))
+        return *err;
     } else if (arg == "--container") {
-      if (!assign_optional_or_error(next(arg), command.container, err)) return *err;
+      if (!assign_optional_or_error(next(arg), command.container, err))
+        return *err;
     } else if (arg == "--replay") {
-      if (!assign_optional_or_error(next(arg), command.replay, err)) return *err;
+      if (!assign_optional_or_error(next(arg), command.replay, err))
+        return *err;
     } else if (arg == "--replay-scale") {
       if (!assign_next_optional_or_error(cursor, arg, parse_wxh, command.replay_scale, err)) {
         return *err;
@@ -216,13 +246,17 @@ std::variant<StitchCommand, ParseError> parse_stitch(Cursor& cursor) {
     } else if (arg == "--no-zero-copy") {
       command.no_zero_copy = true;
     } else if (arg == "--events") {
-      if (!assign_optional_or_error(next(arg), command.events, err)) return *err;
+      if (!assign_optional_or_error(next(arg), command.events, err))
+        return *err;
     } else if (arg == "--trajectory") {
-      if (!assign_optional_or_error(next(arg), command.trajectory, err)) return *err;
+      if (!assign_optional_or_error(next(arg), command.trajectory, err))
+        return *err;
     } else if (arg == "--panner-config") {
-      if (!assign_optional_or_error(next(arg), command.panner_config, err)) return *err;
+      if (!assign_optional_or_error(next(arg), command.panner_config, err))
+        return *err;
     } else if (arg == "--panner-preset") {
-      if (!assign_optional_or_error(next(arg), command.panner_preset, err)) return *err;
+      if (!assign_optional_or_error(next(arg), command.panner_preset, err))
+        return *err;
     } else if (!arg.empty() && arg.front() == '-') {
       return ParseError{"unknown stitch option " + arg};
     } else {
@@ -249,33 +283,35 @@ std::variant<PreviewCommand, ParseError> parse_preview(Cursor& cursor) {
     const std::string arg = cursor.take();
     auto next = [&](std::string_view option) { return cursor.value(option); };
     if (arg == "-c" || arg == "--calibration") {
-      if (!assign_or_error(next(arg), command.calibration, err)) return *err;
+      if (!assign_or_error(next(arg), command.calibration, err))
+        return *err;
     } else if (arg == "--width") {
-      if (!assign_next_or_error(cursor, arg,
-                                [&](std::string_view v) {
-                                  return parse_integral<std::uint32_t>(v, arg);
-                                },
-                                command.width, err)) return *err;
+      if (!assign_next_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint32_t>(v, arg); },
+              command.width, err))
+        return *err;
     } else if (arg == "--height") {
-      if (!assign_next_or_error(cursor, arg,
-                                [&](std::string_view v) {
-                                  return parse_integral<std::uint32_t>(v, arg);
-                                },
-                                command.height, err)) return *err;
+      if (!assign_next_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint32_t>(v, arg); },
+              command.height, err))
+        return *err;
     } else if (arg == "--sync-offset") {
-      if (!assign_next_or_error(cursor, arg,
-                                [&](std::string_view v) {
-                                  return parse_integral<std::int64_t>(v, arg);
-                                },
-                                command.sync_offset, err, true)) return *err;
+      if (!assign_next_or_error(
+              cursor, arg, [&](std::string_view v) { return parse_integral<std::int64_t>(v, arg); },
+              command.sync_offset, err, true))
+        return *err;
     } else if (arg == "--blend") {
-      if (!assign_next_or_error(cursor, arg,
-                                [&](std::string_view v) { return parse_float(v, arg); },
-                                command.blend, err)) return *err;
+      if (!assign_next_or_error(
+              cursor, arg, [&](std::string_view v) { return parse_float(v, arg); }, command.blend,
+              err))
+        return *err;
     } else if (arg == "--rig-tilt") {
-      if (!assign_next_or_error(cursor, arg,
-                                [&](std::string_view v) { return parse_float(v, arg); },
-                                command.rig_tilt, err, true)) return *err;
+      if (!assign_next_or_error(
+              cursor, arg, [&](std::string_view v) { return parse_float(v, arg); },
+              command.rig_tilt, err, true))
+        return *err;
     } else if (!arg.empty() && arg.front() == '-') {
       return ParseError{"unknown preview option " + arg};
     } else {
@@ -301,22 +337,24 @@ std::variant<CalibrateCommand, ParseError> parse_calibrate(Cursor& cursor) {
     const std::string arg = cursor.take();
     auto next = [&](std::string_view option) { return cursor.value(option); };
     if (arg == "--left-profile") {
-      if (!assign_optional_or_error(next(arg), command.left_profile, err)) return *err;
+      if (!assign_optional_or_error(next(arg), command.left_profile, err))
+        return *err;
     } else if (arg == "--right-profile") {
-      if (!assign_optional_or_error(next(arg), command.right_profile, err)) return *err;
+      if (!assign_optional_or_error(next(arg), command.right_profile, err))
+        return *err;
     } else if (arg == "--frames") {
-      if (!assign_next_or_error(cursor, arg,
-                                [&](std::string_view v) {
-                                  return parse_integral<std::size_t>(v, arg);
-                                },
-                                command.frames, err)) return *err;
+      if (!assign_next_or_error(
+              cursor, arg, [&](std::string_view v) { return parse_integral<std::size_t>(v, arg); },
+              command.frames, err))
+        return *err;
     } else if (arg == "--no-auto-imu") {
       command.no_auto_imu = true;
     } else if (arg == "--no-auto-sync") {
       command.auto_sync = false;
     } else if (arg == "--auto-sync") {
       std::string value;
-      if (!assign_or_error(next(arg), value, err)) return *err;
+      if (!assign_or_error(next(arg), value, err))
+        return *err;
       if (value == "true") {
         command.auto_sync = true;
       } else if (value == "false") {
@@ -325,57 +363,66 @@ std::variant<CalibrateCommand, ParseError> parse_calibrate(Cursor& cursor) {
         return ParseError{"--auto-sync expects true or false"};
       }
     } else if (arg == "--sync-offset") {
-      if (!assign_next_or_error(cursor, arg,
-                                [&](std::string_view v) {
-                                  return parse_integral<std::int64_t>(v, arg);
-                                },
-                                command.sync_offset, err, true)) return *err;
+      if (!assign_next_or_error(
+              cursor, arg, [&](std::string_view v) { return parse_integral<std::int64_t>(v, arg); },
+              command.sync_offset, err, true))
+        return *err;
     } else if (arg == "--skip-start") {
-      if (!assign_next_or_error(cursor, arg,
-                                [&](std::string_view v) { return parse_double(v, arg); },
-                                command.skip_start, err)) return *err;
+      if (!assign_next_or_error(
+              cursor, arg, [&](std::string_view v) { return parse_double(v, arg); },
+              command.skip_start, err))
+        return *err;
     } else if (arg == "--skip-end") {
-      if (!assign_next_or_error(cursor, arg,
-                                [&](std::string_view v) { return parse_double(v, arg); },
-                                command.skip_end, err)) return *err;
+      if (!assign_next_or_error(
+              cursor, arg, [&](std::string_view v) { return parse_double(v, arg); },
+              command.skip_end, err))
+        return *err;
     } else if (arg == "--akaze-threshold") {
-      if (!assign_next_or_error(cursor, arg,
-                                [&](std::string_view v) { return parse_double(v, arg); },
-                                command.akaze_threshold, err)) return *err;
+      if (!assign_next_or_error(
+              cursor, arg, [&](std::string_view v) { return parse_double(v, arg); },
+              command.akaze_threshold, err))
+        return *err;
     } else if (arg == "--lowe-ratio") {
-      if (!assign_next_or_error(cursor, arg,
-                                [&](std::string_view v) { return parse_double(v, arg); },
-                                command.lowe_ratio, err)) return *err;
+      if (!assign_next_or_error(
+              cursor, arg, [&](std::string_view v) { return parse_double(v, arg); },
+              command.lowe_ratio, err))
+        return *err;
     } else if (arg == "--detect-x") {
-      if (!assign_next_or_error(cursor, arg,
-                                [&](std::string_view v) { return parse_double(v, arg); },
-                                command.detect_x, err)) return *err;
+      if (!assign_next_or_error(
+              cursor, arg, [&](std::string_view v) { return parse_double(v, arg); },
+              command.detect_x, err))
+        return *err;
     } else if (arg == "--detect-y-min") {
-      if (!assign_next_or_error(cursor, arg,
-                                [&](std::string_view v) { return parse_double(v, arg); },
-                                command.detect_y_min, err)) return *err;
+      if (!assign_next_or_error(
+              cursor, arg, [&](std::string_view v) { return parse_double(v, arg); },
+              command.detect_y_min, err))
+        return *err;
     } else if (arg == "--detect-y-max") {
-      if (!assign_next_or_error(cursor, arg,
-                                [&](std::string_view v) { return parse_double(v, arg); },
-                                command.detect_y_max, err)) return *err;
+      if (!assign_next_or_error(
+              cursor, arg, [&](std::string_view v) { return parse_double(v, arg); },
+              command.detect_y_max, err))
+        return *err;
     } else if (arg == "--lock-cam-d") {
       command.lock_cam_d = true;
     } else if (arg == "--lock-z-rx") {
       command.lock_z_rx = true;
     } else if (arg == "--trim") {
-      if (!assign_next_or_error(cursor, arg,
-                                [&](std::string_view v) { return parse_double(v, arg); },
-                                command.trim, err)) {
+      if (!assign_next_or_error(
+              cursor, arg, [&](std::string_view v) { return parse_double(v, arg); }, command.trim,
+              err)) {
         return *err;
       }
     } else if (arg == "--seam-sigma") {
-      if (!assign_next_or_error(cursor, arg,
-                                [&](std::string_view v) { return parse_double(v, arg); },
-                                command.seam_sigma, err)) return *err;
+      if (!assign_next_or_error(
+              cursor, arg, [&](std::string_view v) { return parse_double(v, arg); },
+              command.seam_sigma, err))
+        return *err;
     } else if (arg == "--debug-dir") {
-      if (!assign_optional_or_error(next(arg), command.debug_dir, err)) return *err;
+      if (!assign_optional_or_error(next(arg), command.debug_dir, err))
+        return *err;
     } else if (arg == "-o" || arg == "--output") {
-      if (!assign_or_error(next(arg), command.output, err)) return *err;
+      if (!assign_or_error(next(arg), command.output, err))
+        return *err;
     } else if (!arg.empty() && arg.front() == '-') {
       return ParseError{"unknown calibrate option " + arg};
     } else {
@@ -443,19 +490,29 @@ std::variant<Command, ParseError> parse_args(const std::vector<std::string>& arg
   }
   Cursor cursor(args);
   const std::string subcommand = cursor.take();
+  if (subcommand == "stitch" || subcommand == "preview" || subcommand == "calibrate" ||
+      subcommand == "info") {
+    if (std::find(args.begin() + 1, args.end(), "--help") != args.end() ||
+        std::find(args.begin() + 1, args.end(), "-h") != args.end()) {
+      return Command{HelpCommand{}};
+    }
+  }
   if (subcommand == "stitch") {
     auto parsed = parse_stitch(cursor);
-    if (const auto* error = std::get_if<ParseError>(&parsed)) return *error;
+    if (const auto* error = std::get_if<ParseError>(&parsed))
+      return *error;
     return Command{std::get<StitchCommand>(std::move(parsed))};
   }
   if (subcommand == "preview") {
     auto parsed = parse_preview(cursor);
-    if (const auto* error = std::get_if<ParseError>(&parsed)) return *error;
+    if (const auto* error = std::get_if<ParseError>(&parsed))
+      return *error;
     return Command{std::get<PreviewCommand>(std::move(parsed))};
   }
   if (subcommand == "calibrate") {
     auto parsed = parse_calibrate(cursor);
-    if (const auto* error = std::get_if<ParseError>(&parsed)) return *error;
+    if (const auto* error = std::get_if<ParseError>(&parsed))
+      return *error;
     return Command{std::get<CalibrateCommand>(std::move(parsed))};
   }
   if (subcommand == "info") {
@@ -471,10 +528,14 @@ std::string_view command_name(const Command& command) {
   return std::visit(
       [](const auto& value) -> std::string_view {
         using T = std::decay_t<decltype(value)>;
-        if constexpr (std::is_same_v<T, StitchCommand>) return "stitch";
-        if constexpr (std::is_same_v<T, PreviewCommand>) return "preview";
-        if constexpr (std::is_same_v<T, CalibrateCommand>) return "calibrate";
-        if constexpr (std::is_same_v<T, InfoCommand>) return "info";
+        if constexpr (std::is_same_v<T, StitchCommand>)
+          return "stitch";
+        if constexpr (std::is_same_v<T, PreviewCommand>)
+          return "preview";
+        if constexpr (std::is_same_v<T, CalibrateCommand>)
+          return "calibrate";
+        if constexpr (std::is_same_v<T, InfoCommand>)
+          return "info";
         return "help";
       },
       command);
@@ -488,6 +549,67 @@ std::string help_text() {
          "  reco calibrate LEFT RIGHT [options]\n"
          "  reco info\n\n"
          "Runtime command execution is staged behind the remaining GPU/backend ports.";
+}
+
+int run_command(const Command& command, std::ostream& out, std::ostream& err) {
+  if (std::holds_alternative<HelpCommand>(command)) {
+    out << help_text() << '\n';
+    return 0;
+  }
+
+  if (std::holds_alternative<InfoCommand>(command)) {
+    out << "Reco C++ capability report\n";
+    const bool cuda_available = reco::core::CudaBackend::is_available();
+    if (cuda_available) {
+      auto backend = reco::core::CudaBackend::create();
+      const int devices = backend.device_count();
+      out << "CUDA: available (" << devices << " device";
+      if (devices != 1) {
+        out << 's';
+      }
+      out << ")\n";
+      for (int ordinal = 0; ordinal < devices; ++ordinal) {
+        const auto device = backend.device_info(ordinal);
+        out << "  cuda[" << ordinal << "]: " << device.name << '\n';
+      }
+    } else {
+      out << "CUDA: unavailable (" << reco::core::CudaBackend::availability_error() << ")\n";
+    }
+
+    write_probe(out, "NPP", reco::detect::is_npp_available(),
+                reco::detect::npp_availability_error());
+
+    const auto gst = reco::io::probe_gstreamer_runtime();
+    write_probe(out, "GStreamer", gst.available, gst.available ? gst.library : gst.error);
+    const auto deepstream = reco::io::probe_deepstream_runtime();
+    write_probe(out, "DeepStream", deepstream.available,
+                deepstream.available ? deepstream.library : deepstream.error);
+    const auto nvbuf = reco::io::probe_nvbufsurface_runtime();
+    write_probe(out, "NvBufSurface", nvbuf.available,
+                nvbuf.available ? nvbuf.library : nvbuf.error);
+
+    const auto ort = reco::detect::probe_ort_runtime();
+    write_probe(out, "ONNX Runtime", ort.available, ort.available ? ort.version : ort.error);
+    const auto coreml = reco::detect::probe_coreml_runtime();
+    write_probe(out, "CoreML", coreml.available, coreml.available ? coreml.provider : coreml.error);
+    const auto ai = reco::detect::probe_execution_providers();
+    out << "AI providers:";
+    if (ai.providers.empty()) {
+      out << " none";
+    } else {
+      for (const auto& provider : ai.providers) {
+        out << ' ' << provider;
+      }
+    }
+    out << '\n';
+    out << "GPU frame inference: " << (ai.can_run_on_gpu_frames ? "available" : "unavailable")
+        << '\n';
+    return 0;
+  }
+
+  err << "error: C++ reco " << command_name(command)
+      << " execution is not ported yet; GPU/runtime backend stages remain authoritative in Rust.\n";
+  return 2;
 }
 
 } // namespace reco::cli

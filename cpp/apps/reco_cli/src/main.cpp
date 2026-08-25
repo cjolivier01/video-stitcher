@@ -18,13 +18,5 @@ int main(int argc, char** argv) {
   }
 
   const auto command = std::get<reco::cli::Command>(std::move(parsed));
-  if (std::holds_alternative<reco::cli::HelpCommand>(command)) {
-    std::cout << reco::cli::help_text() << '\n';
-    return 0;
-  }
-
-  std::cerr << "error: C++ reco " << reco::cli::command_name(command)
-            << " execution is not ported yet; GPU/runtime backend stages remain authoritative in "
-               "Rust.\n";
-  return 2;
+  return reco::cli::run_command(command, std::cout, std::cerr);
 }
