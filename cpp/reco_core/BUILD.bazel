@@ -1,0 +1,12 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+cc_library(
+    name = "reco_core",
+    srcs = ["src/rig_correction.cpp"],
+    hdrs = [
+        "include/reco/core/rig_correction.hpp",
+        "include/reco/core/viewport_position.hpp",
+    ],
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+)
