@@ -5,11 +5,13 @@ cc_library(
     srcs = [
         "src/cuda_preprocess.cpp",
         "src/detectors.cpp",
+        "src/npp_interop.cpp",
         "src/probe.cpp",
     ],
     hdrs = [
         "include/reco/detect/cuda_preprocess.hpp",
         "include/reco/detect/detectors.hpp",
+        "include/reco/detect/npp_interop.hpp",
         "include/reco/detect/probe.hpp",
     ],
     includes = ["include"],
