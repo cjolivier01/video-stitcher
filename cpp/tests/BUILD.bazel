@@ -1,4 +1,4 @@
-load("@rules_cc//cc:defs.bzl", "cc_test")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_test")
 
 cc_test(
     name = "reco_control_tests",
@@ -174,6 +174,23 @@ cc_test(
     srcs = ["reco_detect_npp_interop_tests.cpp"],
     deps = [
         "//cpp/reco_core",
+        "//cpp/reco_detect",
+    ],
+)
+
+cc_binary(
+    name = "libfake_onnxruntime.so",
+    testonly = True,
+    srcs = ["fake_onnxruntime.cpp"],
+    linkshared = True,
+)
+
+cc_test(
+    name = "reco_detect_ort_session_fake_runtime_tests",
+    size = "small",
+    srcs = ["reco_detect_ort_session_fake_runtime_tests.cpp"],
+    data = [":libfake_onnxruntime.so"],
+    deps = [
         "//cpp/reco_detect",
     ],
 )

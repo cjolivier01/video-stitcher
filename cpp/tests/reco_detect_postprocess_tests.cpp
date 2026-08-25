@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <stdexcept>
 #include <string_view>
 #include <type_traits>
 #include <vector>
@@ -37,6 +38,18 @@ template <typename Fn> void expect_invalid_argument(Fn&& fn, std::string_view me
     std::cerr << "FAIL: " << message << " did not throw\n";
     ++failures;
   } catch (const std::invalid_argument&) {
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: " << message << " threw unexpected exception: " << error.what() << '\n';
+    ++failures;
+  }
+}
+
+template <typename Fn> void expect_runtime_error(Fn&& fn, std::string_view message) {
+  try {
+    fn();
+    std::cerr << "FAIL: " << message << " did not throw\n";
+    ++failures;
+  } catch (const std::runtime_error&) {
   } catch (const std::exception& error) {
     std::cerr << "FAIL: " << message << " threw unexpected exception: " << error.what() << '\n';
     ++failures;
@@ -209,6 +222,72 @@ void labels_and_probe_match_rust() {
   expect_true(cache.parent_path().filename() == "reco", "cache dir reco parent");
 }
 
+void ort_session_contract_matches_rust() {
+  expect_invalid_argument([] { (void)OrtSession(OrtSessionConfig{}); },
+                          "empty ORT model path rejected before runtime load");
+
+  const auto missing_model =
+      std::filesystem::temp_directory_path() / "reco_missing_model_for_ort_session_test.onnx";
+  expect_runtime_error(
+      [&] {
+        (void)OrtSession(OrtSessionConfig{
+            .model_path = missing_model,
+            .fallback_labels = {},
+            .providers = {OrtExecutionProvider::Cpu},
+        });
+      },
+      "missing ORT model rejected before runtime load");
+
+  const std::string marker_path =
+      (std::filesystem::temp_directory_path() / "reco_not_an_onnx_model.txt").string();
+  {
+    std::ofstream file(marker_path);
+    file << "not onnx";
+  }
+  expect_runtime_error(
+      [&] {
+        (void)OrtSession(OrtSessionConfig{
+            .model_path = marker_path,
+            .fallback_labels = {"ball"},
+            .providers = {OrtExecutionProvider::Cuda},
+        });
+      },
+      "gpu-only ORT provider rejected until provider registration is ported");
+  expect_runtime_error(
+      [&] {
+        (void)OrtSession(OrtSessionConfig{
+            .model_path = marker_path,
+            .fallback_labels = {"ball"},
+            .providers = {OrtExecutionProvider::Cuda, OrtExecutionProvider::Cpu},
+        });
+      },
+      "mixed GPU/CPU ORT provider config rejected until GPU provider registration is ported");
+
+  const char* model_env = std::getenv("RECO_TEST_ONNX_MODEL_PATH");
+  if (model_env == nullptr || *model_env == '\0') {
+    return;
+  }
+
+  OrtSession session(OrtSessionConfig{
+      .model_path = model_env,
+      .fallback_labels = {"ball"},
+      .providers = {OrtExecutionProvider::Cpu},
+  });
+  expect_true(!session.metadata().input_names.empty(), "ort session input names");
+  expect_true(!session.metadata().output_names.empty(), "ort session output names");
+  expect_true(!session.metadata().labels.empty(), "ort session labels");
+  expect_true(session.metadata().input_size > 0, "ort session input size");
+  const std::vector<float> one_input{0.0F};
+  const std::vector<std::int64_t> dynamic_shape{1, 3, 0, 0};
+  const std::vector<std::int64_t> mismatched_shape{1, 3, 2, 2};
+  expect_invalid_argument(
+      [&] { (void)session.run_cpu_f32({}, dynamic_shape); },
+      "ort session rejects unresolved input shape");
+  expect_invalid_argument(
+      [&] { (void)session.run_cpu_f32(one_input, mismatched_shape); },
+      "ort session rejects input length mismatch");
+}
+
 class FakeDetector final : public UnifiedDetector {
 public:
   explicit FakeDetector(std::vector<std::string> labels) : labels_(std::move(labels)) {}
@@ -372,6 +451,7 @@ int main() {
   nan_and_class_guards_match_rust();
   ball_detector_adapter_matches_rust();
   labels_and_probe_match_rust();
+  ort_session_contract_matches_rust();
   unified_detector_contract_matches_rust();
   onnx_names_parser_matches_rust();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
