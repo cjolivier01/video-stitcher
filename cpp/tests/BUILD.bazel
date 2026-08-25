@@ -121,3 +121,12 @@ cc_test(
         "//cpp/reco_calibrate",
     ],
 )
+
+cc_test(
+    name = "reco_detect_postprocess_tests",
+    size = "small",
+    srcs = ["reco_detect_postprocess_tests.cpp"],
+    deps = [
+        "//cpp/reco_detect",
+    ],
+)
