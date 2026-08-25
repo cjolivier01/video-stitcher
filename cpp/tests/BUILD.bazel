@@ -38,6 +38,15 @@ cc_test(
 )
 
 cc_test(
+    name = "reco_core_render_layout_tests",
+    size = "small",
+    srcs = ["reco_core_render_layout_tests.cpp"],
+    deps = [
+        "//cpp/reco_core",
+    ],
+)
+
+cc_test(
     name = "reco_io_config_tests",
     size = "small",
     srcs = ["reco_io_config_tests.cpp"],
