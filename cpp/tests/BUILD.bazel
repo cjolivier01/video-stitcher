@@ -168,6 +168,16 @@ cc_test(
 )
 
 cc_test(
+    name = "reco_calibrate_gpu_undistort_tests",
+    size = "small",
+    srcs = ["reco_calibrate_gpu_undistort_tests.cpp"],
+    deps = [
+        "//cpp/reco_calibrate",
+        "//cpp/reco_core",
+    ],
+)
+
+cc_test(
     name = "reco_detect_postprocess_tests",
     size = "small",
     srcs = ["reco_detect_postprocess_tests.cpp"],
