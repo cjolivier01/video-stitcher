@@ -1,14 +1,18 @@
+#include "fixture_gpu_decode_source.hpp"
 #include "reco/io/gpu_decode.hpp"
 #include "reco/io/gstreamer.hpp"
 
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 
 using namespace reco::io;
+using reco::tests::make_fixture_gpu_file_decode_source;
 
 namespace {
 
@@ -193,11 +197,86 @@ void gpu_file_decode_pipeline_preserves_nvmm() {
       "unsupported default container rejected");
 }
 
+GpuDecodedFrame valid_gpu_frame() {
+  return {.nvmm = {.dmabuf_fd = 12,
+                   .width = 1920,
+                   .height = 1080,
+                   .y_offset = 0,
+                   .y_pitch = 1920,
+                   .uv_offset = 1920 * 1080,
+                   .uv_pitch = 1920,
+                   .total_size = 1920 * 1080 + 1920 * 540,
+                   .surface_ptr = reinterpret_cast<void*>(0x1234)},
+          .owner = std::make_shared<int>(1),
+          .frame_index = 7,
+          .pts_ns = 33'333'333,
+          .duration_ns = 33'333'333};
+}
+
+void gpu_decode_frame_source_preserves_gpu_residency() {
+  auto frame = valid_gpu_frame();
+  expect_true(!validate_gpu_decoded_frame(frame).has_value(), "valid NVMM frame accepted");
+
+  auto source = make_fixture_gpu_file_decode_source(
+      {.path = "/data/left.mp4", .container = gpu_decode_container_for_path("/data/left.mp4")},
+      {frame});
+  expect_true(source->gpu_resident(), "fixture source is GPU resident");
+  expect_true(source->pipeline().find("video/x-raw(memory:NVMM),format=NV12") != std::string::npos,
+              "fixture source exposes NVMM decode pipeline");
+
+  const auto first = source->read();
+  expect_true(first.status == GpuDecodeFrameStatus::Frame, "first read returns frame");
+  expect_true(first.frame.has_value(), "frame payload present");
+  expect_eq(first.frame->frame_index, 7U, "frame index preserved");
+  expect_eq(first.frame->nvmm.dmabuf_fd, 12, "DMA-BUF fd preserved");
+
+  const auto eos = source->read();
+  expect_true(eos.status == GpuDecodeFrameStatus::EndOfStream, "second read returns EOS");
+  expect_true(!eos.frame.has_value(), "EOS has no frame payload");
+
+  frame.nvmm.dmabuf_fd = -1;
+  expect_true(validate_gpu_decoded_frame(frame).has_value(), "CPU/host frame rejected");
+  expect_invalid_argument(
+      [&] {
+        (void)make_fixture_gpu_file_decode_source(
+            {.path = "/data/left.mp4",
+             .container = gpu_decode_container_for_path("/data/left.mp4")},
+            {frame});
+      },
+      "fixture source rejects non-GPU frame");
+
+  frame = valid_gpu_frame();
+  frame.nvmm.total_size = frame.nvmm.uv_offset;
+  expect_true(validate_gpu_decoded_frame(frame).has_value(), "truncated NVMM frame rejected");
+
+  frame = valid_gpu_frame();
+  frame.nvmm.uv_offset = 1;
+  expect_true(validate_gpu_decoded_frame(frame).has_value(), "overlapping NV12 planes rejected");
+
+  frame = valid_gpu_frame();
+  frame.nvmm.surface_ptr = nullptr;
+  expect_true(validate_gpu_decoded_frame(frame).has_value(), "null NvBufSurface pointer rejected");
+
+  frame = valid_gpu_frame();
+  frame.owner.reset();
+  expect_true(validate_gpu_decoded_frame(frame).has_value(), "missing buffer owner rejected");
+
+  frame = valid_gpu_frame();
+  frame.nvmm.height = UINT32_MAX;
+  frame.nvmm.y_pitch = UINT32_MAX;
+  frame.nvmm.uv_pitch = UINT32_MAX;
+  frame.nvmm.uv_offset = UINT32_MAX;
+  frame.nvmm.total_size = UINT32_MAX;
+  expect_true(validate_gpu_decoded_frame(frame).has_value(),
+              "max odd height cannot wrap UV row validation");
+}
+
 } // namespace
 
 int main() {
   pipeline_builders_match_rust_policy();
   runtime_probes_are_stable();
   gpu_file_decode_pipeline_preserves_nvmm();
+  gpu_decode_frame_source_preserves_gpu_residency();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

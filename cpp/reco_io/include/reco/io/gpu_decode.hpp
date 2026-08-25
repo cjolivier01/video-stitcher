@@ -1,6 +1,9 @@
 #pragma once
 
+#include "reco/io/nvmm.hpp"
+
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -27,6 +30,34 @@ struct GpuFileDecodeConfig {
   bool drop = false;
 };
 
+enum class GpuDecodeFrameStatus {
+  Frame,
+  EndOfStream,
+};
+
+struct GpuDecodedFrame {
+  NvmmFrameInfo nvmm;
+  std::shared_ptr<void> owner;
+  std::uint64_t frame_index = 0;
+  std::int64_t pts_ns = 0;
+  std::int64_t duration_ns = 0;
+};
+
+struct GpuDecodeReadResult {
+  GpuDecodeFrameStatus status = GpuDecodeFrameStatus::EndOfStream;
+  std::optional<GpuDecodedFrame> frame;
+};
+
+class GpuFileDecodeSource {
+public:
+  virtual ~GpuFileDecodeSource() = default;
+
+  [[nodiscard]] virtual const GpuFileDecodeConfig& config() const = 0;
+  [[nodiscard]] virtual std::string_view pipeline() const = 0;
+  [[nodiscard]] virtual bool gpu_resident() const = 0;
+  [[nodiscard]] virtual GpuDecodeReadResult read() = 0;
+};
+
 [[nodiscard]] std::string_view gpu_decode_codec_name(GpuDecodeCodec codec);
 [[nodiscard]] std::string_view gpu_decode_container_demuxer(GpuDecodeContainer container);
 [[nodiscard]] GpuDecodeCodec gpu_decode_codec_for_path(std::string_view path);
@@ -35,7 +66,10 @@ struct GpuFileDecodeConfig {
 gpu_decode_container_for_path(std::string_view path);
 [[nodiscard]] std::optional<std::string>
 validate_gpu_file_decode_config(const GpuFileDecodeConfig& config);
+[[nodiscard]] std::optional<std::string> validate_gpu_decoded_frame(const GpuDecodedFrame& frame);
 [[nodiscard]] std::string
 build_gstreamer_gpu_file_decode_pipeline(const GpuFileDecodeConfig& config);
+[[nodiscard]] GpuDecodeReadResult make_gpu_decode_eos();
+[[nodiscard]] GpuDecodeReadResult make_gpu_decode_frame(GpuDecodedFrame frame);
 
 } // namespace reco::io
