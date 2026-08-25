@@ -130,3 +130,12 @@ cc_test(
         "//cpp/reco_detect",
     ],
 )
+
+cc_test(
+    name = "reco_cli_tests",
+    size = "small",
+    srcs = ["reco_cli_tests.cpp"],
+    deps = [
+        "//cpp/apps/reco_cli:reco_cli_lib",
+    ],
+)
