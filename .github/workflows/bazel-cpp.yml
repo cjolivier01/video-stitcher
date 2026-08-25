@@ -17,10 +17,10 @@ jobs:
           disk-cache: true
           repository-cache: true
       - name: Test C++ port scaffold
-        run: bazel test //cpp/tests:reco_control_tests //cpp/tests:reco_core_data_tests //cpp/tests:reco_core_math_events_tests //cpp/tests:reco_io_config_tests
+        run: bazel test //cpp/tests:reco_control_tests //cpp/tests:reco_core_data_tests //cpp/tests:reco_core_math_events_tests //cpp/tests:reco_io_config_tests //cpp/tests:reco_autocam_policy_tests
       - name: Test C++ port scaffold with ASan
-        run: bazel test --config=asan //cpp/tests:reco_control_tests //cpp/tests:reco_core_data_tests //cpp/tests:reco_core_math_events_tests //cpp/tests:reco_io_config_tests
+        run: bazel test --config=asan //cpp/tests:reco_control_tests //cpp/tests:reco_core_data_tests //cpp/tests:reco_core_math_events_tests //cpp/tests:reco_io_config_tests //cpp/tests:reco_autocam_policy_tests
       - name: Test C++ port scaffold with UBSan
-        run: bazel test --config=ubsan //cpp/tests:reco_control_tests //cpp/tests:reco_core_data_tests //cpp/tests:reco_core_math_events_tests //cpp/tests:reco_io_config_tests
+        run: bazel test --config=ubsan //cpp/tests:reco_control_tests //cpp/tests:reco_core_data_tests //cpp/tests:reco_core_math_events_tests //cpp/tests:reco_io_config_tests //cpp/tests:reco_autocam_policy_tests
       - name: Build C++ fuzz harnesses
         run: bazel build //cpp/reco_core:input_path_fuzz //cpp/reco_core:calibration_json_fuzz

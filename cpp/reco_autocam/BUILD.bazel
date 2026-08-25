@@ -1,0 +1,22 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+cc_library(
+    name = "reco_autocam",
+    srcs = [
+        "src/coaster.cpp",
+        "src/roi_filter.cpp",
+        "src/sweep_panner.cpp",
+        "src/tracking_mode.cpp",
+    ],
+    hdrs = [
+        "include/reco/autocam/coaster.hpp",
+        "include/reco/autocam/roi_filter.hpp",
+        "include/reco/autocam/sweep_panner.hpp",
+        "include/reco/autocam/tracking_mode.hpp",
+    ],
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//cpp/reco_core",
+    ],
+)
