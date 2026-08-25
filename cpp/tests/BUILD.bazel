@@ -18,3 +18,12 @@ cc_test(
         "//cpp/reco_core",
     ],
 )
+
+cc_test(
+    name = "reco_core_math_events_tests",
+    size = "small",
+    srcs = ["reco_core_math_events_tests.cpp"],
+    deps = [
+        "//cpp/reco_core",
+    ],
+)
