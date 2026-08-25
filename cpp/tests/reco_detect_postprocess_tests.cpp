@@ -178,6 +178,51 @@ void labels_and_probe_match_rust() {
   expect_true(!empty.is_available(), "probe unavailable");
 }
 
+void onnx_names_parser_matches_rust() {
+  const auto happy = parse_names_dict_string("{0: 'person', 1: 'bicycle', 2: 'car'}");
+  expect_true(happy.has_value(), "happy path parses");
+  expect_eq(happy->size(), 3U, "happy path count");
+  expect_eq((*happy)[0], std::string("person"), "happy first label");
+  expect_eq((*happy)[1], std::string("bicycle"), "happy second label");
+  expect_eq((*happy)[2], std::string("car"), "happy third label");
+
+  const auto gaps = parse_names_dict_string("{0: 'ball', 3: 'goal'}");
+  expect_true(gaps.has_value(), "gaps parse");
+  expect_eq(gaps->size(), 4U, "gaps count");
+  expect_eq((*gaps)[0], std::string("ball"), "gaps first label");
+  expect_eq((*gaps)[1], std::string("class_1"), "gap class 1");
+  expect_eq((*gaps)[2], std::string("class_2"), "gap class 2");
+  expect_eq((*gaps)[3], std::string("goal"), "gaps final label");
+
+  expect_true(!parse_names_dict_string("{9999999999: 'ball'}").has_value(),
+              "huge class index rejected");
+  expect_true(!parse_names_dict_string("{10000: 'class'}").has_value(),
+              "class cap boundary rejected");
+
+  const auto just_below = parse_names_dict_string("{0: 'a', 9999: 'b'}");
+  expect_true(just_below.has_value(), "class below cap accepted");
+  expect_eq(just_below->size(), 10000U, "class below cap count");
+  expect_eq((*just_below)[0], std::string("a"), "class below cap first");
+  expect_eq((*just_below)[9999], std::string("b"), "class below cap last");
+
+  expect_true(!parse_names_dict_string("{}").has_value(), "empty dict rejected");
+  expect_true(!parse_names_dict_string("[0: 'x']").has_value(), "non dict rejected");
+  expect_true(!parse_names_dict_string("random garbage").has_value(), "garbage rejected");
+
+  const auto mixed = parse_names_dict_string("{bad: 'skip', 2: \"two\"}");
+  expect_true(mixed.has_value(), "malformed entries skipped");
+  expect_eq(mixed->size(), 3U, "malformed skip count");
+  expect_eq((*mixed)[0], std::string("class_0"), "malformed skip gap");
+  expect_eq((*mixed)[2], std::string("two"), "double quote trimmed");
+
+  const auto duplicate = parse_names_dict_string("{0: 'first', 0: 'shadow', 2: 'blocked'}");
+  expect_true(duplicate.has_value(), "duplicate index parses");
+  expect_eq(duplicate->size(), 3U, "duplicate index count");
+  expect_eq((*duplicate)[0], std::string("first"), "duplicate index keeps first");
+  expect_eq((*duplicate)[1], std::string("class_1"), "duplicate index blocks iterator");
+  expect_eq((*duplicate)[2], std::string("class_2"), "duplicate index shadows later label");
+}
+
 } // namespace
 
 int main() {
@@ -185,5 +230,6 @@ int main() {
   nan_and_class_guards_match_rust();
   ball_detector_adapter_matches_rust();
   labels_and_probe_match_rust();
+  onnx_names_parser_matches_rust();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
