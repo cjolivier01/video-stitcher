@@ -7,6 +7,7 @@ cc_library(
         "src/features.cpp",
         "src/filter.cpp",
         "src/geometry.cpp",
+        "src/lens_database.cpp",
         "src/optimizer.cpp",
         "src/ransac.cpp",
         "src/sampling.cpp",
@@ -17,6 +18,7 @@ cc_library(
         "include/reco/calibrate/features.hpp",
         "include/reco/calibrate/filter.hpp",
         "include/reco/calibrate/geometry.hpp",
+        "include/reco/calibrate/lens_database.hpp",
         "include/reco/calibrate/optimizer.hpp",
         "include/reco/calibrate/ransac.hpp",
         "include/reco/calibrate/sampling.hpp",
@@ -27,5 +29,6 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//cpp/reco_core",
+        "@nlohmann_json//:json",
     ],
 )
