@@ -1,4 +1,5 @@
 #include "reco/io/gstreamer.hpp"
+#include "reco/io/gpu_decode.hpp"
 
 #include <cstdlib>
 #include <iostream>
@@ -119,10 +120,47 @@ void runtime_probes_are_stable() {
   }
 }
 
+void gpu_file_decode_pipeline_preserves_nvmm() {
+  GpuFileDecodeConfig config{.path = "/data/left video.mp4"};
+  expect_eq(gpu_decode_codec_name(config.codec), std::string_view("h264"),
+            "GPU decode codec name");
+  const auto pipeline = build_gstreamer_gpu_file_decode_pipeline(config);
+  expect_true(pipeline.find("filesrc location=\"/data/left video.mp4\"") != std::string::npos,
+              "GPU file source is quoted");
+  expect_true(pipeline.find("h264parse ! nvv4l2decoder") != std::string::npos,
+              "H264 hardware decode selected");
+  expect_true(pipeline.find("video/x-raw(memory:NVMM),format=NV12") != std::string::npos,
+              "NVMM NV12 caps preserved");
+  expect_true(pipeline.find("appsink name=sink") != std::string::npos, "appsink selected");
+
+  config.codec = GpuDecodeCodec::Hevc;
+  const auto hevc = build_gstreamer_gpu_file_decode_pipeline(config);
+  expect_true(hevc.find("h265parse ! nvv4l2decoder") != std::string::npos,
+              "HEVC hardware decode selected");
+
+  config.path = "/data/left \"quoted\" video.mp4";
+  const auto quoted = build_gstreamer_gpu_file_decode_pipeline(config);
+  expect_true(quoted.find("left \\\"quoted\\\" video.mp4") != std::string::npos,
+              "GPU file source quotes are escaped");
+
+  config.path = "left.mp4 num-buffers=1";
+  const auto property_like = build_gstreamer_gpu_file_decode_pipeline(config);
+  expect_true(property_like.find("location=\"left.mp4 num-buffers=1\"") != std::string::npos,
+              "property-looking path remains inside location value");
+
+  expect_invalid_argument([] {
+    (void)build_gstreamer_gpu_file_decode_pipeline({.path = "left.mp4 ! fakesink"});
+  }, "pipeline injection in file path rejected");
+  expect_invalid_argument([] {
+    (void)build_gstreamer_gpu_file_decode_pipeline({.path = "left.mp4", .max_buffers = 0});
+  }, "zero max buffers rejected");
+}
+
 } // namespace
 
 int main() {
   pipeline_builders_match_rust_policy();
   runtime_probes_are_stable();
+  gpu_file_decode_pipeline_preserves_nvmm();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
