@@ -5,18 +5,22 @@ cc_library(
     srcs = [
         "src/app_model.cpp",
         "src/settings.cpp",
+        "src/runtime.cpp",
         "src/telemetry.cpp",
         "src/toast.cpp",
     ],
     hdrs = [
         "include/reco/gui/app_model.hpp",
         "include/reco/gui/settings.hpp",
+        "include/reco/gui/runtime.hpp",
         "include/reco/gui/telemetry.hpp",
         "include/reco/gui/toast.hpp",
     ],
     includes = ["include"],
     visibility = ["//visibility:public"],
     deps = [
+        "//cpp/reco_core",
+        "//cpp/reco_detect",
         "//cpp/reco_io",
         "@nlohmann_json//:json",
     ],
