@@ -1,5 +1,6 @@
 #include "reco/cli/cli.hpp"
 
+#include "reco/calibrate/pipeline.hpp"
 #include "reco/core/cuda_backend.hpp"
 #include "reco/detect/coreml_session.hpp"
 #include "reco/detect/npp_interop.hpp"
@@ -927,6 +928,48 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err) {
     out << '\n';
     out << "GPU frame inference: " << (ai.can_run_on_gpu_frames ? "available" : "unavailable")
         << '\n';
+    return 0;
+  }
+
+  if (const auto* calibrate = std::get_if<CalibrateCommand>(&command)) {
+    reco::calibrate::GpuCalibrationRequest request;
+    request.left.path = calibrate->left;
+    request.left.lens_profile = calibrate->left_profile;
+    request.right.path = calibrate->right;
+    request.right.lens_profile = calibrate->right_profile;
+    request.config.num_frames = calibrate->frames;
+    request.config.skip_start_secs = calibrate->skip_start;
+    request.config.skip_end_secs = calibrate->skip_end;
+    request.config.akaze.threshold = calibrate->akaze_threshold;
+    request.config.akaze.detect_y_min = calibrate->detect_y_min;
+    request.config.akaze.detect_y_max = calibrate->detect_y_max;
+    request.config.matching.lowe_ratio = calibrate->lowe_ratio;
+    request.config.matching.spatial_x_threshold = calibrate->detect_x;
+    request.config.optimizer.lock_cam_d = calibrate->lock_cam_d;
+    request.config.optimizer.lock_z_rx = calibrate->lock_z_rx;
+    request.config.optimizer.trim_fraction = calibrate->trim;
+    request.config.optimizer.seam_sigma = calibrate->seam_sigma;
+    request.no_auto_imu = calibrate->no_auto_imu;
+    request.auto_sync = calibrate->auto_sync;
+    request.manual_sync_offset = calibrate->sync_offset;
+    request.debug_dir = calibrate->debug_dir;
+    request.output = calibrate->output;
+
+    const auto backends = reco::calibrate::probe_calibration_backends();
+    const auto plan = reco::calibrate::build_gpu_calibration_plan(request, backends);
+    out << reco::calibrate::describe_calibration_plan(plan);
+    if (!plan.ready) {
+      err << "error: " << plan.blocked_reason.value_or("C++ GPU calibration is unavailable")
+          << '\n';
+      return 2;
+    }
+
+    try {
+      (void)reco::calibrate::run_gpu_calibration(request, backends);
+    } catch (const reco::calibrate::CalibrationExecutionError& error) {
+      err << "error: " << error.what() << '\n';
+      return 2;
+    }
     return 0;
   }
 

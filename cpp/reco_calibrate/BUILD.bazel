@@ -10,6 +10,7 @@ cc_library(
         "src/gpu_undistort.cpp",
         "src/lens_database.cpp",
         "src/optimizer.cpp",
+        "src/pipeline.cpp",
         "src/ransac.cpp",
         "src/sampling.cpp",
         "src/telemetry.cpp",
@@ -23,6 +24,7 @@ cc_library(
         "include/reco/calibrate/gpu_undistort.hpp",
         "include/reco/calibrate/lens_database.hpp",
         "include/reco/calibrate/optimizer.hpp",
+        "include/reco/calibrate/pipeline.hpp",
         "include/reco/calibrate/ransac.hpp",
         "include/reco/calibrate/sampling.hpp",
         "include/reco/calibrate/telemetry.hpp",
@@ -33,6 +35,8 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//cpp/reco_core",
+        "//cpp/reco_detect",
+        "//cpp/reco_io",
         "@nlohmann_json//:json",
     ],
 )
