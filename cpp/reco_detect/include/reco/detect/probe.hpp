@@ -14,4 +14,6 @@ struct AiProbeResult {
   [[nodiscard]] bool is_available() const;
 };
 
+[[nodiscard]] AiProbeResult probe_execution_providers();
+
 } // namespace reco::detect
