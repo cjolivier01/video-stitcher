@@ -169,6 +169,16 @@ cc_test(
 )
 
 cc_test(
+    name = "reco_detect_npp_interop_tests",
+    size = "small",
+    srcs = ["reco_detect_npp_interop_tests.cpp"],
+    deps = [
+        "//cpp/reco_core",
+        "//cpp/reco_detect",
+    ],
+)
+
+cc_test(
     name = "reco_cli_tests",
     size = "small",
     srcs = ["reco_cli_tests.cpp"],
