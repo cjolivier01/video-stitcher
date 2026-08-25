@@ -108,6 +108,30 @@ int main() {
                             "normalize zero width");
     expect_invalid_argument([&] { normalize_rgba_to_chw(backend, 1, 2, 1, 0); },
                             "normalize zero height");
+    expect_invalid_argument(
+        [&] { nv12_to_rgb_chw_fullrange(backend, 0, 1, 2, 2, 2, 2, 2, 2, 0, 0, 1.0F, 0); },
+        "nv12 null y pointer");
+    expect_invalid_argument(
+        [&] { nv12_to_rgb_chw_fullrange(backend, 1, 2, 3, 1, 2, 2, 2, 2, 0, 0, 1.0F, 0); },
+        "nv12 narrow pitch");
+    expect_invalid_argument(
+        [&] { nv12_to_rgb_chw_fullrange(backend, 1, 2, 3, 3, 3, 2, 2, 2, 0, 0, 1.0F, 0); },
+        "nv12 odd source width");
+    expect_invalid_argument(
+        [&] { nv12_to_rgb_chw_fullrange(backend, 1, 2, 3, 2, 2, 3, 2, 2, 0, 0, 1.0F, 0); },
+        "nv12 odd source height");
+    expect_invalid_argument(
+        [&] { nv12_to_rgb_chw_fullrange(backend, 1, 2, 3, 2, 2, 2, 2, 2, 0, 0, 0.0F, 0); },
+        "nv12 zero scale");
+    expect_invalid_argument(
+        [&] { nv12_to_rgb_chw_fullrange(backend, 1, 2, 3, 2, 2, 2, 2, 2, 2, 0, 1.0F, 0); },
+        "nv12 invalid padding");
+    expect_invalid_argument(
+        [&] { nv12_to_rgb_chw_fullrange(backend, 1, 2, 3, 2, 2, 2, 2, 2, 1, 0, 1.0F, 0); },
+        "nv12 exact-half x padding");
+    expect_invalid_argument(
+        [&] { nv12_to_rgb_chw_fullrange(backend, 1, 2, 3, 2, 2, 2, 2, 2, 0, 1, 1.0F, 0); },
+        "nv12 exact-half y padding");
 
     const std::vector<std::uint16_t> p010_samples{0x0000, 0x0100, 0x8000, 0xAB00, 0xFFFF};
     std::vector<std::uint8_t> p010_bytes(p010_samples.size() * sizeof(std::uint16_t));
@@ -189,6 +213,50 @@ int main() {
     expect_near(rgba_chw[5], 128.0F / 255.0F, 1.0e-6F, "rgba g1");
     expect_near(rgba_chw[10], 64.0F / 255.0F, 1.0e-6F, "rgba b2");
     expect_near(rgba_chw[11], 75.0F / 255.0F, 1.0e-6F, "rgba b3");
+
+    const std::vector<std::uint8_t> y_plane{10, 20, 30, 40};
+    const std::vector<std::uint8_t> uv_plane{128, 128};
+    auto y_buffer = backend.allocate(y_plane.size());
+    auto uv_buffer = backend.allocate(uv_plane.size());
+    auto nv12_dst = backend.allocate(3 * width * height * sizeof(float));
+    upload_bytes(backend, y_plane, y_buffer);
+    upload_bytes(backend, uv_plane, uv_buffer);
+    nv12_to_rgb_chw_fullrange(backend, y_buffer.ptr(), uv_buffer.ptr(), nv12_dst.ptr(), width,
+                              width, height, width, height, 0, 0, 1.0F, 0);
+    const auto nv12_chw = copy_floats(backend, nv12_dst, 3 * width * height);
+    for (std::size_t i = 0; i < y_plane.size(); ++i) {
+      const float expected = static_cast<float>(y_plane[i]) / 255.0F;
+      expect_near(nv12_chw[i], expected, 1.0e-5F, "nv12 neutral R");
+      expect_near(nv12_chw[i + y_plane.size()], expected, 1.0e-5F, "nv12 neutral G");
+      expect_near(nv12_chw[i + 2 * y_plane.size()], expected, 1.0e-5F, "nv12 neutral B");
+    }
+
+    auto rotated_dst = backend.allocate(3 * width * height * sizeof(float));
+    nv12_to_rgb_chw_fullrange(backend, y_buffer.ptr(), uv_buffer.ptr(), rotated_dst.ptr(), width,
+                              width, height, width, height, 0, 0, 1.0F, 180);
+    const auto rotated = copy_floats(backend, rotated_dst, 3 * width * height);
+    expect_near(rotated[0], static_cast<float>(y_plane[3]) / 255.0F, 1.0e-5F,
+                "nv12 rotation R0");
+    expect_near(rotated[3], static_cast<float>(y_plane[0]) / 255.0F, 1.0e-5F,
+                "nv12 rotation R3");
+
+    const std::vector<std::uint8_t> chroma_y{120, 120, 120, 120};
+    const std::vector<std::uint8_t> chroma_uv{140, 150};
+    auto chroma_y_buffer = backend.allocate(chroma_y.size());
+    auto chroma_uv_buffer = backend.allocate(chroma_uv.size());
+    auto chroma_dst = backend.allocate(3 * width * height * sizeof(float));
+    upload_bytes(backend, chroma_y, chroma_y_buffer);
+    upload_bytes(backend, chroma_uv, chroma_uv_buffer);
+    nv12_to_rgb_chw_fullrange(backend, chroma_y_buffer.ptr(), chroma_uv_buffer.ptr(),
+                              chroma_dst.ptr(), width, width, height, width, height, 0, 0, 1.0F,
+                              0);
+    const auto chroma = copy_floats(backend, chroma_dst, 3 * width * height);
+    expect_near(chroma[0], (120.0F + 1.5748F * 22.0F) / 255.0F, 1.0e-5F,
+                "nv12 bt709 R");
+    expect_near(chroma[4], (120.0F - 0.1873F * 12.0F - 0.4681F * 22.0F) / 255.0F, 1.0e-5F,
+                "nv12 bt709 G");
+    expect_near(chroma[8], (120.0F + 1.8556F * 12.0F) / 255.0F, 1.0e-5F,
+                "nv12 bt709 B");
   } catch (const std::exception& error) {
     std::cerr << "FAIL: " << error.what() << '\n';
     ++failures;

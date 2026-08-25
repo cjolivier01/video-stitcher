@@ -1,5 +1,6 @@
 #include "reco/detect/cuda_preprocess.hpp"
 
+#include <cmath>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -236,6 +237,171 @@ done:
 }
 )ptx";
 
+constexpr char kNv12ToRgbChwFullrangePtx[] = R"ptx(
+.version 7.0
+.target sm_50
+.address_size 64
+
+.visible .entry nv12_to_rgb_chw_fullrange(
+    .param .u64 y_ptr,
+    .param .u64 uv_ptr,
+    .param .u64 dst,
+    .param .u32 y_pitch,
+    .param .u32 src_w,
+    .param .u32 src_h,
+    .param .u32 dst_w,
+    .param .u32 dst_h,
+    .param .u32 pad_x,
+    .param .u32 pad_y,
+    .param .f32 scale,
+    .param .u32 flip180
+)
+{
+    .reg .u32 %ox, %oy, %dw, %dh, %px, %py, %sw, %sh, %ypitch;
+    .reg .u32 %sx0, %sy0;
+    .reg .u32 %tmp, %tmp2, %plane, %didx;
+    .reg .u64 %yp, %uvp, %dp, %addr;
+    .reg .f32 %srcx, %srcy, %inv_scale;
+    .reg .f32 %zero, %f255, %c128;
+    .reg .f32 %y00, %u_val, %v_val, %r, %g, %b;
+    .reg .f32 %t1, %t2;
+    .reg .u16 %pix;
+    .reg .pred %p, %q;
+
+    mov.u32 %tmp, %ctaid.x;
+    mov.u32 %tmp2, %ntid.x;
+    mul.lo.u32 %ox, %tmp, %tmp2;
+    mov.u32 %tmp, %tid.x;
+    add.u32 %ox, %ox, %tmp;
+
+    mov.u32 %tmp, %ctaid.y;
+    mov.u32 %tmp2, %ntid.y;
+    mul.lo.u32 %oy, %tmp, %tmp2;
+    mov.u32 %tmp, %tid.y;
+    add.u32 %oy, %oy, %tmp;
+
+    ld.param.u32 %dw, [dst_w];
+    ld.param.u32 %dh, [dst_h];
+    setp.ge.u32 %p, %ox, %dw;
+    @%p bra done;
+    setp.ge.u32 %p, %oy, %dh;
+    @%p bra done;
+
+    ld.param.u32 %px, [pad_x];
+    ld.param.u32 %py, [pad_y];
+    ld.param.u32 %sw, [src_w];
+    ld.param.u32 %sh, [src_h];
+    ld.param.f32 %inv_scale, [scale];
+
+    setp.lt.u32 %p, %ox, %px;
+    @%p bra done;
+    setp.lt.u32 %p, %oy, %py;
+    @%p bra done;
+    sub.u32 %tmp, %dw, %px;
+    setp.ge.u32 %p, %ox, %tmp;
+    @%p bra done;
+    sub.u32 %tmp, %dh, %py;
+    setp.ge.u32 %p, %oy, %tmp;
+    @%p bra done;
+
+    sub.u32 %tmp, %ox, %px;
+    cvt.rn.f32.u32 %srcx, %tmp;
+    div.rn.f32 %srcx, %srcx, %inv_scale;
+    cvt.rzi.u32.f32 %sx0, %srcx;
+    sub.u32 %tmp2, %sw, 1;
+    min.u32 %sx0, %sx0, %tmp2;
+
+    sub.u32 %tmp, %oy, %py;
+    cvt.rn.f32.u32 %srcy, %tmp;
+    div.rn.f32 %srcy, %srcy, %inv_scale;
+    cvt.rzi.u32.f32 %sy0, %srcy;
+    sub.u32 %tmp2, %sh, 1;
+    min.u32 %sy0, %sy0, %tmp2;
+
+    ld.param.u32 %tmp, [flip180];
+    setp.ne.u32 %q, %tmp, 0;
+    sub.u32 %tmp, %sw, 1;
+    @%q sub.u32 %sx0, %tmp, %sx0;
+    sub.u32 %tmp, %sh, 1;
+    @%q sub.u32 %sy0, %tmp, %sy0;
+
+    ld.param.u64 %yp, [y_ptr];
+    ld.param.u32 %ypitch, [y_pitch];
+    mul.lo.u32 %tmp, %sy0, %ypitch;
+    add.u32 %tmp, %tmp, %sx0;
+    cvt.u64.u32 %addr, %tmp;
+    add.u64 %addr, %yp, %addr;
+    ld.global.u8 %pix, [%addr];
+    cvt.rn.f32.u16 %y00, %pix;
+
+    ld.param.u64 %uvp, [uv_ptr];
+    shr.u32 %tmp, %sy0, 1;
+    mul.lo.u32 %tmp, %tmp, %ypitch;
+    shr.u32 %tmp2, %sx0, 1;
+    shl.b32 %tmp2, %tmp2, 1;
+    add.u32 %tmp, %tmp, %tmp2;
+    cvt.u64.u32 %addr, %tmp;
+    add.u64 %addr, %uvp, %addr;
+    ld.global.u8 %pix, [%addr];
+    cvt.rn.f32.u16 %u_val, %pix;
+    ld.global.u8 %pix, [%addr+1];
+    cvt.rn.f32.u16 %v_val, %pix;
+
+    mov.f32 %c128, 0f43000000;
+    sub.f32 %u_val, %u_val, %c128;
+    sub.f32 %v_val, %v_val, %c128;
+
+    mov.f32 %t1, 0f3FC9930C;
+    fma.rn.f32 %r, %t1, %v_val, %y00;
+    mov.f32 %t1, 0fBE3FCB92;
+    fma.rn.f32 %g, %t1, %u_val, %y00;
+    mov.f32 %t2, 0fBEEFAACE;
+    fma.rn.f32 %g, %t2, %v_val, %g;
+    mov.f32 %t1, 0f3FED844D;
+    fma.rn.f32 %b, %t1, %u_val, %y00;
+
+    mov.f32 %zero, 0f00000000;
+    mov.f32 %f255, 0f437F0000;
+    max.f32 %r, %r, %zero;
+    min.f32 %r, %r, %f255;
+    max.f32 %g, %g, %zero;
+    min.f32 %g, %g, %f255;
+    max.f32 %b, %b, %zero;
+    min.f32 %b, %b, %f255;
+
+    mov.f32 %t1, 0f3B808081;
+    mul.f32 %r, %r, %t1;
+    mul.f32 %g, %g, %t1;
+    mul.f32 %b, %b, %t1;
+
+    mul.lo.u32 %plane, %dw, %dh;
+    mul.lo.u32 %didx, %oy, %dw;
+    add.u32 %didx, %didx, %ox;
+    ld.param.u64 %dp, [dst];
+
+    cvt.u64.u32 %addr, %didx;
+    shl.b64 %addr, %addr, 2;
+    add.u64 %addr, %dp, %addr;
+    st.global.f32 [%addr], %r;
+
+    add.u32 %tmp, %plane, %didx;
+    cvt.u64.u32 %addr, %tmp;
+    shl.b64 %addr, %addr, 2;
+    add.u64 %addr, %dp, %addr;
+    st.global.f32 [%addr], %g;
+
+    add.u32 %tmp, %plane, %plane;
+    add.u32 %tmp, %tmp, %didx;
+    cvt.u64.u32 %addr, %tmp;
+    shl.b64 %addr, %addr, 2;
+    add.u64 %addr, %dp, %addr;
+    st.global.f32 [%addr], %b;
+
+done:
+    ret;
+}
+)ptx";
+
 void validate_device_ptrs(CudaDevicePtr src, CudaDevicePtr dst) {
   if (src == 0 || dst == 0) {
     throw std::invalid_argument("CUDA preprocess requires live source and destination pointers");
@@ -278,6 +444,9 @@ const reco::core::CudaKernel& cached_kernel(CudaBackend& backend, std::string_vi
     cache = &rgb;
   } else if (name == "normalize_rgba_to_chw") {
     cache = &rgba;
+  } else if (name == "nv12_to_rgb_chw_fullrange") {
+    static KernelCache nv12;
+    cache = &nv12;
   } else {
     throw std::invalid_argument("unknown CUDA preprocess kernel");
   }
@@ -373,6 +542,55 @@ void normalize_rgba_to_chw(CudaBackend& backend, CudaDevicePtr src, CudaDevicePt
   std::uint32_t width_arg = width;
   std::uint32_t height_arg = height;
   void* args[] = {&src_arg, &dst_arg, &width_arg, &height_arg};
+  kernel.launch({.grid = grid, .block = block}, args);
+  kernel.synchronize();
+}
+
+void nv12_to_rgb_chw_fullrange(CudaBackend& backend, CudaDevicePtr y, CudaDevicePtr uv,
+                               CudaDevicePtr dst, std::uint32_t y_pitch,
+                               std::uint32_t src_width, std::uint32_t src_height,
+                               std::uint32_t dst_width, std::uint32_t dst_height,
+                               std::uint32_t pad_x, std::uint32_t pad_y, float scale,
+                               int rotation_degrees) {
+  if (y == 0 || uv == 0 || dst == 0) {
+    throw std::invalid_argument("CUDA NV12 preprocess requires live source and destination pointers");
+  }
+  validate_extent(src_width, src_height);
+  validate_extent(dst_width, dst_height);
+  if (src_width % 2 != 0 || src_height % 2 != 0) {
+    throw std::invalid_argument("CUDA NV12 source dimensions must be even");
+  }
+  if (y_pitch < src_width) {
+    throw std::invalid_argument("CUDA NV12 pitch is smaller than source width");
+  }
+  if (!std::isfinite(scale) || scale <= 0.0F) {
+    throw std::invalid_argument("CUDA NV12 scale must be finite and positive");
+  }
+  if (pad_x > dst_width || pad_y > dst_height || pad_x >= dst_width - pad_x ||
+      pad_y >= dst_height - pad_y) {
+    throw std::invalid_argument("CUDA NV12 padding leaves no content region");
+  }
+
+  const auto& kernel =
+      cached_kernel(backend, kNv12ToRgbChwFullrangePtx, "nv12_to_rgb_chw_fullrange");
+  constexpr reco::core::CudaDim3 block{.x = 16, .y = 16, .z = 1};
+  const reco::core::CudaDim3 grid{.x = ceil_div_u32(dst_width, block.x),
+                                  .y = ceil_div_u32(dst_height, block.y),
+                                  .z = 1};
+  CudaDevicePtr y_arg = y;
+  CudaDevicePtr uv_arg = uv;
+  CudaDevicePtr dst_arg = dst;
+  std::uint32_t pitch_arg = y_pitch;
+  std::uint32_t src_w_arg = src_width;
+  std::uint32_t src_h_arg = src_height;
+  std::uint32_t dst_w_arg = dst_width;
+  std::uint32_t dst_h_arg = dst_height;
+  std::uint32_t pad_x_arg = pad_x;
+  std::uint32_t pad_y_arg = pad_y;
+  float scale_arg = scale;
+  std::uint32_t flip_arg = rotation_degrees == 180 ? 1U : 0U;
+  void* args[] = {&y_arg,     &uv_arg,    &dst_arg,   &pitch_arg, &src_w_arg, &src_h_arg,
+                  &dst_w_arg, &dst_h_arg, &pad_x_arg, &pad_y_arg, &scale_arg, &flip_arg};
   kernel.launch({.grid = grid, .block = block}, args);
   kernel.synchronize();
 }
