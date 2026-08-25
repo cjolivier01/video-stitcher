@@ -149,3 +149,13 @@ cc_test(
         "@nlohmann_json//:json",
     ],
 )
+
+cc_test(
+    name = "reco_gui_telemetry_tests",
+    size = "small",
+    srcs = ["reco_gui_telemetry_tests.cpp"],
+    deps = [
+        "//cpp/reco_gui",
+        "@nlohmann_json//:json",
+    ],
+)
