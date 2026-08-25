@@ -5,6 +5,7 @@ cc_library(
     srcs = [
         "src/gstreamer.cpp",
         "src/jsonl_sink.cpp",
+        "src/nvmm.cpp",
         "src/output.cpp",
         "src/settings.cpp",
         "src/stacked_video.cpp",
@@ -12,6 +13,7 @@ cc_library(
     hdrs = [
         "include/reco/io/gstreamer.hpp",
         "include/reco/io/jsonl_sink.hpp",
+        "include/reco/io/nvmm.hpp",
         "include/reco/io/output.hpp",
         "include/reco/io/settings.hpp",
         "include/reco/io/stacked_video.hpp",

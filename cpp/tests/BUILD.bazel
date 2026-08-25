@@ -76,6 +76,15 @@ cc_test(
 )
 
 cc_test(
+    name = "reco_io_nvmm_tests",
+    size = "small",
+    srcs = ["reco_io_nvmm_tests.cpp"],
+    deps = [
+        "//cpp/reco_io",
+    ],
+)
+
+cc_test(
     name = "reco_autocam_policy_tests",
     size = "small",
     srcs = ["reco_autocam_policy_tests.cpp"],
