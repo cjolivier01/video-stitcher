@@ -86,11 +86,75 @@ struct CalibrateCommand {
   std::string output = "match.json";
 };
 
+struct CameraCommand {
+  std::string left_device;
+  std::string right_device;
+  std::string calibration;
+  std::string output;
+  std::uint32_t capture_width = 3840;
+  std::uint32_t capture_height = 2160;
+  std::uint32_t capture_fps = 30;
+  std::uint32_t width = 1920;
+  std::uint32_t height = 1080;
+  std::optional<std::string> encoder;
+  std::string codec = "h264";
+  std::string quality = "fast";
+  float blend = 0.15F;
+  std::optional<std::uint64_t> max_frames;
+  std::optional<double> end_time;
+  std::optional<std::string> model;
+  std::uint64_t detection_interval = 1;
+  std::optional<std::uint8_t> quality_value;
+  std::optional<std::string> preset;
+  std::optional<std::string> container;
+  std::optional<std::string> stream_url;
+  std::string tracking = "field";
+  bool unconstrained = false;
+  std::optional<std::string> replay;
+  std::optional<WxH> replay_scale;
+  bool v4l2_direct = false;
+  std::uint32_t exposure = 780;
+  std::uint32_t sensor_gain = 16;
+  bool live_calibrate = false;
+  std::size_t calibrate_frames = 8;
+  std::optional<std::string> left_lens_profile;
+};
+
+struct LibcameraCommand {
+  std::uint32_t left_camera = 0;
+  std::uint32_t right_camera = 1;
+  std::string calibration;
+  std::string output;
+  std::uint32_t capture_width = 1920;
+  std::uint32_t capture_height = 1080;
+  std::uint32_t capture_fps = 30;
+  std::uint32_t width = 1920;
+  std::uint32_t height = 1080;
+  std::optional<std::string> encoder;
+  std::string codec = "h264";
+  std::string quality = "fast";
+  float blend = 0.15F;
+  std::optional<std::uint64_t> max_frames;
+  std::optional<double> end_time;
+  std::optional<std::string> model;
+  std::uint64_t detection_interval = 1;
+  std::optional<std::uint8_t> quality_value;
+  std::optional<std::string> preset;
+};
+
+struct GoproCommand {
+  std::optional<std::string> serial;
+  std::optional<std::string> url;
+  bool start = false;
+  bool stop = false;
+  bool sports_preset = false;
+};
+
 struct InfoCommand {};
 struct HelpCommand {};
 
-using Command =
-    std::variant<StitchCommand, PreviewCommand, CalibrateCommand, InfoCommand, HelpCommand>;
+using Command = std::variant<StitchCommand, PreviewCommand, CalibrateCommand, CameraCommand,
+                             LibcameraCommand, GoproCommand, InfoCommand, HelpCommand>;
 
 [[nodiscard]] std::variant<float, ParseError> parse_blend(std::string_view value);
 [[nodiscard]] std::variant<WxH, ParseError> parse_wxh(std::string_view value);

@@ -151,6 +151,62 @@ void preview_and_calibrate_parse_matches_rust_defaults() {
   }
 }
 
+void live_command_parse_matches_rust_defaults() {
+  const auto camera_command = expect_command(
+      parse_args({"camera", "--left-device", "0", "--right-device", "1", "-c", "match.json", "-o",
+                  "out.mp4", "--stream-url", "rtmp://example/live", "--replay-scale", "1280x720",
+                  "--live-calibrate", "--left-lens-profile", "lens.json"}),
+      "camera parse");
+  const auto* camera = std::get_if<CameraCommand>(&camera_command);
+  expect_true(camera != nullptr, "camera variant");
+  if (camera != nullptr) {
+    expect_eq(camera->left_device, std::string("0"), "camera left device");
+    expect_eq(camera->right_device, std::string("1"), "camera right device");
+    expect_eq(camera->capture_width, 3840U, "camera capture width default");
+    expect_eq(camera->capture_height, 2160U, "camera capture height default");
+    expect_eq(camera->capture_fps, 30U, "camera fps default");
+    expect_eq(camera->width, 1920U, "camera output width default");
+    expect_eq(camera->height, 1080U, "camera output height default");
+    expect_eq(camera->quality, std::string("fast"), "camera quality default");
+    expect_eq(camera->tracking, std::string("field"), "camera tracking default");
+    expect_true(camera->stream_url.has_value(), "camera stream url");
+    expect_true(camera->replay_scale.has_value(), "camera replay scale");
+    expect_true(camera->live_calibrate, "camera live calibrate");
+    expect_eq(camera->calibrate_frames, 8U, "camera calibrate frames default");
+    expect_eq(camera->exposure, 780U, "camera exposure default");
+    expect_eq(camera->sensor_gain, 16U, "camera sensor gain default");
+    expect_eq(camera->left_lens_profile.value_or(""), std::string("lens.json"),
+              "camera lens profile");
+  }
+
+  const auto libcamera_command = expect_command(
+      parse_args({"libcamera", "-c", "match.json", "-o", "out.mp4", "--left-camera", "2",
+                  "--right-camera", "3", "--quality-value", "70", "--preset", "fast"}),
+      "libcamera parse");
+  const auto* libcamera = std::get_if<LibcameraCommand>(&libcamera_command);
+  expect_true(libcamera != nullptr, "libcamera variant");
+  if (libcamera != nullptr) {
+    expect_eq(libcamera->left_camera, 2U, "libcamera left camera");
+    expect_eq(libcamera->right_camera, 3U, "libcamera right camera");
+    expect_eq(libcamera->capture_width, 1920U, "libcamera capture width default");
+    expect_eq(libcamera->capture_height, 1080U, "libcamera capture height default");
+    expect_eq(libcamera->quality, std::string("fast"), "libcamera quality default");
+    expect_eq(libcamera->quality_value.value_or(0), 70U, "libcamera quality value");
+    expect_eq(libcamera->preset.value_or(""), std::string("fast"), "libcamera preset");
+  }
+
+  const auto gopro_command = expect_command(
+      parse_args({"gopro", "--serial", "123", "--start", "--sports-preset"}), "gopro parse");
+  const auto* gopro = std::get_if<GoproCommand>(&gopro_command);
+  expect_true(gopro != nullptr, "gopro variant");
+  if (gopro != nullptr) {
+    expect_eq(gopro->serial.value_or(""), std::string("123"), "gopro serial");
+    expect_true(gopro->start, "gopro start");
+    expect_true(!gopro->stop, "gopro stop default");
+    expect_true(gopro->sports_preset, "gopro sports preset");
+  }
+}
+
 void parse_errors_are_reported() {
   expect_error(parse_args({"stitch", "left.mp4", "right.mp4"}), "missing calibration");
   expect_error(parse_args({"stitch", "left.mp4", "right.mp4", "-c"}), "missing option value");
@@ -171,6 +227,10 @@ void parse_errors_are_reported() {
   expect_error(parse_args({"calibrate", "left.mp4", "right.mp4", "--skip-start", "-1"}),
                "skip start does not allow hyphen value");
   expect_error(parse_args({"info", "--verbose"}), "info rejects options");
+  expect_error(parse_args({"camera", "--right-device", "1", "-c", "match.json", "-o", "out.mp4"}),
+               "camera requires left device");
+  expect_error(parse_args({"libcamera", "-c", "match.json"}), "libcamera requires output");
+  expect_error(parse_args({"gopro", "--bogus"}), "gopro rejects unknown option");
 
   const auto help = expect_command(parse_args({"--help"}), "help parse");
   expect_true(std::holds_alternative<HelpCommand>(help), "help variant");
@@ -180,6 +240,9 @@ void parse_errors_are_reported() {
       expect_command(parse_args({"stitch", "left.mp4", "--help"}), "partial stitch help parse");
   expect_true(std::holds_alternative<HelpCommand>(partial_stitch_help),
               "partial stitch help variant");
+  const auto camera_help =
+      expect_command(parse_args({"camera", "--left-device", "0", "--help"}), "camera help parse");
+  expect_true(std::holds_alternative<HelpCommand>(camera_help), "camera help variant");
 }
 
 void command_execution_dispatches_available_stages() {
@@ -221,6 +284,7 @@ int main() {
   validators_match_rust();
   stitch_parse_matches_rust_defaults();
   preview_and_calibrate_parse_matches_rust_defaults();
+  live_command_parse_matches_rust_defaults();
   parse_errors_are_reported();
   command_execution_dispatches_available_stages();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
