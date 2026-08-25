@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <iostream>
+#include <stdexcept>
 #include <string_view>
 #include <thread>
 #include <vector>
@@ -23,6 +24,18 @@ void expect_true(bool condition, std::string_view message) {
 template <typename T, typename U> void expect_eq(T actual, U expected, std::string_view message) {
   if (actual != expected) {
     std::cerr << "FAIL: " << message << " expected=" << expected << " actual=" << actual << '\n';
+    ++failures;
+  }
+}
+
+template <typename Fn> void expect_invalid_argument(Fn&& fn, std::string_view message) {
+  try {
+    fn();
+    std::cerr << "FAIL: " << message << " did not throw\n";
+    ++failures;
+  } catch (const std::invalid_argument&) {
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: " << message << " threw unexpected exception: " << error.what() << '\n';
     ++failures;
   }
 }
@@ -115,6 +128,124 @@ int main() {
       if (byte != 0xA5) {
         expect_true(false, "device memset byte pattern");
         break;
+      }
+    }
+
+    constexpr std::size_t width = 17;
+    constexpr std::size_t height = 5;
+    constexpr std::size_t src_pitch = 23;
+    constexpr std::size_t device_src_pitch = 32;
+    constexpr std::size_t device_dst_pitch = 40;
+    constexpr std::size_t dst_pitch = 29;
+
+    std::vector<std::uint8_t> host_src(src_pitch * height, 0x11);
+    for (std::size_t row = 0; row < height; ++row) {
+      for (std::size_t col = 0; col < width; ++col) {
+        host_src[row * src_pitch + col] = static_cast<std::uint8_t>(row * 31 + col);
+      }
+    }
+    auto src_device = backend.allocate(device_src_pitch * height);
+    auto dst_device = backend.allocate(device_dst_pitch * height);
+    backend.memset_d8(src_device, 0);
+    backend.memset_d8(dst_device, 0xEE);
+    expect_invalid_argument(
+        [&] {
+          backend.copy_host_to_device_2d({.src = nullptr,
+                                          .src_pitch = src_pitch,
+                                          .dst = src_device.ptr(),
+                                          .dst_pitch = device_src_pitch,
+                                          .width_bytes = width,
+                                          .height = height});
+        },
+        "2D HtoD null source validation");
+    expect_invalid_argument(
+        [&] {
+          backend.copy_device_to_device_2d({.src = 0,
+                                            .src_pitch = device_src_pitch,
+                                            .dst = dst_device.ptr(),
+                                            .dst_pitch = device_dst_pitch,
+                                            .width_bytes = width,
+                                            .height = height});
+        },
+        "2D DtoD null source validation");
+    expect_invalid_argument(
+        [&] {
+          backend.copy_device_to_host_2d({.dst = nullptr,
+                                          .dst_pitch = dst_pitch,
+                                          .src = dst_device.ptr(),
+                                          .src_pitch = device_dst_pitch,
+                                          .width_bytes = width,
+                                          .height = height});
+        },
+        "2D DtoH null destination validation");
+    expect_invalid_argument(
+        [&] {
+          backend.copy_device_to_device_2d({.src = src_device.ptr(),
+                                            .src_pitch = device_src_pitch,
+                                            .dst = dst_device.ptr(),
+                                            .dst_pitch = device_dst_pitch,
+                                            .width_bytes = 0,
+                                            .height = height});
+        },
+        "2D zero width validation");
+    expect_invalid_argument(
+        [&] {
+          backend.copy_device_to_device_2d({.src = src_device.ptr(),
+                                            .src_pitch = device_src_pitch,
+                                            .dst = dst_device.ptr(),
+                                            .dst_pitch = device_dst_pitch,
+                                            .width_bytes = width,
+                                            .height = 0});
+        },
+        "2D zero height validation");
+    expect_invalid_argument(
+        [&] {
+          backend.copy_device_to_device_2d({.src = src_device.ptr(),
+                                            .src_pitch = width - 1,
+                                            .dst = dst_device.ptr(),
+                                            .dst_pitch = device_dst_pitch,
+                                            .width_bytes = width,
+                                            .height = height});
+        },
+        "2D source pitch validation");
+    expect_invalid_argument(
+        [&] {
+          backend.copy_device_to_device_2d({.src = src_device.ptr(),
+                                            .src_pitch = device_src_pitch,
+                                            .dst = dst_device.ptr(),
+                                            .dst_pitch = width - 1,
+                                            .width_bytes = width,
+                                            .height = height});
+        },
+        "2D destination pitch validation");
+    backend.copy_host_to_device_2d({.src = host_src.data(),
+                                    .src_pitch = src_pitch,
+                                    .dst = src_device.ptr(),
+                                    .dst_pitch = device_src_pitch,
+                                    .width_bytes = width,
+                                    .height = height});
+    backend.copy_device_to_device_2d({.src = src_device.ptr(),
+                                      .src_pitch = device_src_pitch,
+                                      .dst = dst_device.ptr(),
+                                      .dst_pitch = device_dst_pitch,
+                                      .width_bytes = width,
+                                      .height = height});
+    std::vector<std::uint8_t> host_dst(dst_pitch * height, 0xCD);
+    backend.copy_device_to_host_2d({.dst = host_dst.data(),
+                                    .dst_pitch = dst_pitch,
+                                    .src = dst_device.ptr(),
+                                    .src_pitch = device_dst_pitch,
+                                    .width_bytes = width,
+                                    .height = height});
+    backend.synchronize();
+    for (std::size_t row = 0; row < height; ++row) {
+      for (std::size_t col = 0; col < width; ++col) {
+        expect_eq(host_dst[row * dst_pitch + col], host_src[row * src_pitch + col],
+                  "2D copied payload byte");
+      }
+      for (std::size_t col = width; col < dst_pitch; ++col) {
+        expect_eq(host_dst[row * dst_pitch + col], static_cast<std::uint8_t>(0xCD),
+                  "2D destination padding untouched");
       }
     }
   } catch (const std::exception& error) {

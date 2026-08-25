@@ -23,6 +23,33 @@ struct CudaMemoryInfo {
   std::size_t total_bytes = 0;
 };
 
+struct Cuda2DCopy {
+  CudaDevicePtr src = 0;
+  std::size_t src_pitch = 0;
+  CudaDevicePtr dst = 0;
+  std::size_t dst_pitch = 0;
+  std::size_t width_bytes = 0;
+  std::size_t height = 0;
+};
+
+struct CudaHostToDevice2DCopy {
+  const void* src = nullptr;
+  std::size_t src_pitch = 0;
+  CudaDevicePtr dst = 0;
+  std::size_t dst_pitch = 0;
+  std::size_t width_bytes = 0;
+  std::size_t height = 0;
+};
+
+struct CudaDeviceToHost2DCopy {
+  void* dst = nullptr;
+  std::size_t dst_pitch = 0;
+  CudaDevicePtr src = 0;
+  std::size_t src_pitch = 0;
+  std::size_t width_bytes = 0;
+  std::size_t height = 0;
+};
+
 class CudaDeviceBuffer {
 public:
   CudaDeviceBuffer() = default;
@@ -60,6 +87,9 @@ public:
   [[nodiscard]] CudaDeviceBuffer allocate(std::size_t bytes) const;
   void memset_d8(const CudaDeviceBuffer& buffer, std::uint8_t value) const;
   [[nodiscard]] std::vector<std::uint8_t> copy_to_host(const CudaDeviceBuffer& buffer) const;
+  void copy_host_to_device_2d(const CudaHostToDevice2DCopy& copy) const;
+  void copy_device_to_device_2d(const Cuda2DCopy& copy) const;
+  void copy_device_to_host_2d(const CudaDeviceToHost2DCopy& copy) const;
   void synchronize() const;
 
 private:
