@@ -1,5 +1,5 @@
-#include "reco/core/cuda_backend.hpp"
 #include "reco/gui/app_model.hpp"
+#include "reco/gui/runtime.hpp"
 
 #include <QApplication>
 #include <QCheckBox>
@@ -190,23 +190,30 @@ public:
 
 private:
   void try_initialize_gpu() {
-    cuda_available_ = reco::core::CudaBackend::is_available();
-    model_.set_gpu_ready(false);
+    runtime_probe_ = reco::gui::GuiRuntimeProbe{};
+    if (reco::gui::preview_runtime_probe_required(model_.files())) {
+      runtime_probe_ = reco::gui::probe_gui_runtime();
+    }
+    preview_readiness_ = reco::gui::evaluate_preview_runtime(model_.files(), runtime_probe_);
+    model_.set_gpu_ready(preview_readiness_.ready);
   }
 
   void refresh() {
     const auto status = model_.preview_status();
     const auto status_name = QString::fromUtf8(
         preview_status_name(status).data(), static_cast<int>(preview_status_name(status).size()));
-    const QString cuda_status = cuda_available_ ? "CUDA available" : "CUDA unavailable";
-    status_->setText("GPU preview status: " + status_name + "\n" + cuda_status +
-                     "\nGPU preview bridge execution is not ported in this stage.");
+    const auto runtime_name = reco::gui::preview_runtime_state_name(preview_readiness_.state);
+    const QString runtime_status =
+        QString::fromUtf8(runtime_name.data(), static_cast<int>(runtime_name.size()));
+    status_->setText("GPU preview status: " + status_name + "\nRuntime: " + runtime_status +
+                     "\n" + QString::fromStdString(preview_readiness_.detail));
     export_->setEnabled(model_.can_export());
     statusBar()->showMessage("GPU preview: " + status_name);
   }
 
   reco::gui::GuiAppModel model_{reco::gui::GuiSettings::load()};
-  bool cuda_available_ = false;
+  reco::gui::GuiRuntimeProbe runtime_probe_;
+  reco::gui::PreviewRuntimeReadiness preview_readiness_;
   QLineEdit* left_ = nullptr;
   QLineEdit* right_ = nullptr;
   QLineEdit* calibration_ = nullptr;

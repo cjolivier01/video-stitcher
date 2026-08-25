@@ -315,6 +315,15 @@ cc_test(
 )
 
 cc_test(
+    name = "reco_gui_runtime_tests",
+    size = "small",
+    srcs = ["reco_gui_runtime_tests.cpp"],
+    deps = [
+        "//cpp/reco_gui",
+    ],
+)
+
+cc_test(
     name = "reco_obs_metadata_tests",
     size = "small",
     srcs = ["reco_obs_metadata_tests.cpp"],
