@@ -3,11 +3,13 @@ load("@rules_cc//cc:defs.bzl", "cc_library")
 cc_library(
     name = "reco_gui",
     srcs = [
+        "src/app_model.cpp",
         "src/settings.cpp",
         "src/telemetry.cpp",
         "src/toast.cpp",
     ],
     hdrs = [
+        "include/reco/gui/app_model.hpp",
         "include/reco/gui/settings.hpp",
         "include/reco/gui/telemetry.hpp",
         "include/reco/gui/toast.hpp",

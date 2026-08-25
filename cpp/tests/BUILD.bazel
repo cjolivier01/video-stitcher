@@ -287,6 +287,15 @@ cc_test(
 )
 
 cc_test(
+    name = "reco_gui_app_model_tests",
+    size = "small",
+    srcs = ["reco_gui_app_model_tests.cpp"],
+    deps = [
+        "//cpp/reco_gui",
+    ],
+)
+
+cc_test(
     name = "reco_gui_telemetry_tests",
     size = "small",
     srcs = ["reco_gui_telemetry_tests.cpp"],
