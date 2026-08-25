@@ -276,6 +276,19 @@ void command_execution_dispatches_available_stages() {
   expect_true(out.str().empty(), "blocked stitch writes no stdout");
   expect_true(err.str().find("execution is not ported yet") != std::string::npos,
               "blocked stitch explains staged execution");
+
+  out.str("");
+  out.clear();
+  err.str("");
+  err.clear();
+  CalibrateCommand calibrate{.left = "left.mp4", .right = "right.mp4"};
+  const auto calibrate_status = run_command(Command{calibrate}, out, err);
+  expect_eq(calibrate_status, 2, "calibrate exits blocked until GPU pipeline is complete");
+  expect_true(out.str().find("GPU calibration plan") != std::string::npos,
+              "calibrate writes GPU plan");
+  expect_true(out.str().find("FeatureMatching") != std::string::npos,
+              "calibrate writes AKAZE stage");
+  expect_true(err.str().find("error:") != std::string::npos, "calibrate writes stderr error");
 }
 
 } // namespace

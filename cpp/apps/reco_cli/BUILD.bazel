@@ -7,6 +7,7 @@ cc_library(
     includes = ["include"],
     visibility = ["//visibility:public"],
     deps = [
+        "//cpp/reco_calibrate",
         "//cpp/reco_core",
         "//cpp/reco_detect",
         "//cpp/reco_io",
