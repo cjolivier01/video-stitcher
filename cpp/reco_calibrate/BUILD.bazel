@@ -3,10 +3,14 @@ load("@rules_cc//cc:defs.bzl", "cc_library")
 cc_library(
     name = "reco_calibrate",
     srcs = [
+        "src/features.cpp",
+        "src/filter.cpp",
         "src/geometry.cpp",
         "src/types.cpp",
     ],
     hdrs = [
+        "include/reco/calibrate/features.hpp",
+        "include/reco/calibrate/filter.hpp",
         "include/reco/calibrate/geometry.hpp",
         "include/reco/calibrate/types.hpp",
     ],
