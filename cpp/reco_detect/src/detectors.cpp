@@ -6,7 +6,10 @@
 #include <fstream>
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 
 namespace reco::detect {
 namespace {
@@ -51,6 +54,64 @@ std::optional<std::size_t> parse_usize(std::string_view value) {
 }
 
 } // namespace
+
+std::string_view DetectorFrame::variant_name() const {
+  return std::visit(
+      [](const auto& frame) -> std::string_view {
+        using T = std::decay_t<decltype(frame)>;
+        if constexpr (std::is_same_v<T, RawFrame>) {
+          return "Cpu";
+        } else if constexpr (std::is_same_v<T, GpuNv12Frame>) {
+          return "Cuda";
+        } else if constexpr (std::is_same_v<T, PreprocessedChwFrame>) {
+          return "PreprocessedChw";
+        } else if constexpr (std::is_same_v<T, RgbaFrame>) {
+          return "Rgba";
+        } else if constexpr (std::is_same_v<T, CudaRgbaFrame>) {
+          return "CudaRgba";
+        } else if constexpr (std::is_same_v<T, CudaRgbaLetterboxedFrame>) {
+          return "CudaRgbaLetterboxed";
+        } else if constexpr (std::is_same_v<T, MetalFrame>) {
+          return "Metal";
+        } else if constexpr (std::is_same_v<T, WgpuNv12Frame>) {
+          return "WgpuNv12";
+        }
+      },
+      frame_);
+}
+
+DetectorError::DetectorError(DetectorErrorKind kind, std::string message, std::string detail,
+                             std::optional<std::chrono::nanoseconds> after)
+    : std::runtime_error(std::move(message)), kind_(kind), detail_(std::move(detail)),
+      after_(after) {}
+
+DetectorError DetectorError::inference_failed(std::string message) {
+  const auto detail = message;
+  return DetectorError(DetectorErrorKind::InferenceFailed, "inference failed: " + message, detail);
+}
+
+DetectorError DetectorError::timeout(std::chrono::nanoseconds after) {
+  if (after < std::chrono::nanoseconds::zero()) {
+    throw std::invalid_argument("detector timeout duration must be non-negative");
+  }
+  std::ostringstream message;
+  message << "detector timed out after " << after.count() << "ns";
+  return DetectorError(DetectorErrorKind::Timeout, message.str(), {}, after);
+}
+
+DetectorError DetectorError::unsupported_frame_kind() {
+  return DetectorError(DetectorErrorKind::UnsupportedFrameKind,
+                       "detector does not support this frame variant");
+}
+
+DetectorError DetectorError::transport(std::string message) {
+  const auto detail = message;
+  return DetectorError(DetectorErrorKind::Transport, "transport error: " + message, detail);
+}
+
+DetectorError DetectorError::canceled() {
+  return DetectorError(DetectorErrorKind::Canceled, "detection canceled");
+}
 
 std::vector<Detection> postprocess(const std::vector<float>& data, std::size_t n, CameraId camera,
                                    float confidence_threshold, float scale, float pad_x,
@@ -110,9 +171,8 @@ std::vector<Detection> postprocess(const std::vector<float>& data, std::size_t n
 }
 
 std::vector<Detection> postprocess_balldet(const std::vector<float>& data, std::size_t n,
-                                           CameraId camera, float confidence_threshold,
-                                           float scale, float pad_x, float pad_y,
-                                           std::uint32_t frame_width,
+                                           CameraId camera, float confidence_threshold, float scale,
+                                           float pad_x, float pad_y, std::uint32_t frame_width,
                                            std::uint32_t frame_height) {
   const std::size_t expected_len = n * 6;
   if (data.size() < expected_len) {
@@ -224,9 +284,8 @@ std::optional<std::vector<std::string>> parse_names_dict_string(std::string_view
   std::size_t start = 0;
   while (start <= inner.size()) {
     const auto comma = inner.find(',', start);
-    const auto entry = trim_ascii(inner.substr(start, comma == std::string_view::npos
-                                                         ? std::string_view::npos
-                                                         : comma - start));
+    const auto entry = trim_ascii(inner.substr(
+        start, comma == std::string_view::npos ? std::string_view::npos : comma - start));
     const auto colon = entry.find(':');
     if (colon != std::string_view::npos) {
       if (const auto idx = parse_usize(entry.substr(0, colon)); idx.has_value()) {

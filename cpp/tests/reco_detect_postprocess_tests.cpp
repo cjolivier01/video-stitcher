@@ -8,6 +8,7 @@
 #include <iostream>
 #include <limits>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 using namespace reco::detect;
@@ -26,6 +27,18 @@ void expect_true(bool condition, std::string_view message) {
 template <typename T, typename U> void expect_eq(T actual, U expected, std::string_view message) {
   if (actual != expected) {
     std::cerr << "FAIL: " << message << " expected=" << expected << " actual=" << actual << '\n';
+    ++failures;
+  }
+}
+
+template <typename Fn> void expect_invalid_argument(Fn&& fn, std::string_view message) {
+  try {
+    fn();
+    std::cerr << "FAIL: " << message << " did not throw\n";
+    ++failures;
+  } catch (const std::invalid_argument&) {
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: " << message << " threw unexpected exception: " << error.what() << '\n';
     ++failures;
   }
 }
@@ -196,6 +209,117 @@ void labels_and_probe_match_rust() {
   expect_true(cache.parent_path().filename() == "reco", "cache dir reco parent");
 }
 
+class FakeDetector final : public UnifiedDetector {
+public:
+  explicit FakeDetector(std::vector<std::string> labels) : labels_(std::move(labels)) {}
+
+  [[nodiscard]] const char* name() const override { return "fake-cpu-only"; }
+
+  [[nodiscard]] std::vector<Detection> detect(CameraId camera,
+                                              const DetectorFrame& frame) override {
+    if (!std::holds_alternative<RawFrame>(frame.variant())) {
+      throw DetectorError::unsupported_frame_kind();
+    }
+    return {{.camera = camera,
+             .class_id = 0,
+             .confidence = 0.9F,
+             .center_x = 0.5F,
+             .center_y = 0.5F,
+             .width = 0.1F,
+             .height = 0.1F}};
+  }
+
+  [[nodiscard]] std::optional<std::span<const std::string>> class_names() const override {
+    return std::span<const std::string>(labels_);
+  }
+
+private:
+  std::vector<std::string> labels_;
+};
+
+void unified_detector_contract_matches_rust() {
+  static_assert(!std::is_copy_constructible_v<DetectorFrame>);
+  static_assert(std::is_move_constructible_v<DetectorFrame>);
+  static_assert(!std::is_constructible_v<DetectorError, DetectorErrorKind, std::string>);
+
+  const std::vector<std::uint8_t> y{0, 1, 2, 3};
+  const std::vector<std::uint8_t> u{128};
+  const std::vector<std::uint8_t> v{128};
+  const DetectorFrame cpu_frame(RawFrame{
+      .y = y,
+      .chroma = Yuv420pChroma{.u = u, .v = v},
+      .width = 2,
+      .height = 2,
+  });
+  expect_eq(cpu_frame.variant_name(), std::string_view("Cpu"), "cpu variant name");
+
+  const DetectorFrame nv12_frame(RawFrame{
+      .y = y,
+      .chroma = Nv12Chroma{.uv = u},
+      .width = 2,
+      .height = 2,
+  });
+  expect_eq(nv12_frame.variant_name(), std::string_view("Cpu"), "nv12 cpu variant name");
+
+  const std::vector<float> chw(12, 0.0F);
+  expect_eq(DetectorFrame(
+                PreprocessedChwFrame{.data = chw, .input_size = 2, .src_width = 2, .src_height = 2})
+                .variant_name(),
+            std::string_view("PreprocessedChw"), "preprocessed variant name");
+  expect_eq(DetectorFrame(RgbaFrame{.data = y, .width = 1, .height = 1}).variant_name(),
+            std::string_view("Rgba"), "rgba variant name");
+  expect_eq(DetectorFrame(
+                GpuNv12Frame{
+                    .y_ptr = 1, .uv_ptr = 2, .y_pitch = 2, .uv_pitch = 2, .width = 2, .height = 2})
+                .variant_name(),
+            std::string_view("Cuda"), "cuda variant name");
+  expect_eq(
+      DetectorFrame(CudaRgbaFrame{.ptr = 3, .pitch = 4, .width = 1, .height = 1}).variant_name(),
+      std::string_view("CudaRgba"), "cuda rgba variant name");
+  expect_eq(DetectorFrame(CudaRgbaLetterboxedFrame{.ptr = 5, .src_width = 4, .src_height = 4})
+                .variant_name(),
+            std::string_view("CudaRgbaLetterboxed"), "cuda rgba letterboxed variant name");
+  expect_eq(
+      DetectorFrame(MetalFrame{.cv_pixel_buffer = nullptr, .width = 1, .height = 1}).variant_name(),
+      std::string_view("Metal"), "metal variant name");
+  expect_eq(
+      DetectorFrame(WgpuNv12Frame{.y_view = nullptr, .uv_view = nullptr, .width = 2, .height = 2})
+          .variant_name(),
+      std::string_view("WgpuNv12"), "wgpu variant name");
+
+  FakeDetector detector({"ball"});
+  expect_eq(std::string_view(detector.name()), std::string_view("fake-cpu-only"), "detector name");
+  const auto detections = detector.detect(CameraId::Left, cpu_frame);
+  expect_eq(detections.size(), 1U, "fake detector detection count");
+  expect_true(detections[0].camera == CameraId::Left, "fake detector camera");
+  const auto labels = detector.class_names();
+  expect_true(labels.has_value(), "fake detector labels");
+  expect_eq((*labels)[0], std::string("ball"), "fake detector label");
+
+  try {
+    (void)detector.detect(CameraId::Left,
+                          DetectorFrame(RgbaFrame{.data = y, .width = 1, .height = 1}));
+    std::cerr << "FAIL: unsupported frame did not throw\n";
+    ++failures;
+  } catch (const DetectorError& error) {
+    expect_true(error.kind() == DetectorErrorKind::UnsupportedFrameKind, "unsupported error kind");
+  }
+
+  const auto inference_error = DetectorError::inference_failed("engine");
+  expect_true(inference_error.kind() == DetectorErrorKind::InferenceFailed, "inference error kind");
+  expect_eq(inference_error.detail(), std::string("engine"), "inference error detail");
+  const auto timeout_error = DetectorError::timeout(std::chrono::microseconds(5));
+  expect_true(timeout_error.kind() == DetectorErrorKind::Timeout, "timeout error kind");
+  expect_true(timeout_error.after() == std::chrono::microseconds(5), "timeout error duration");
+  expect_invalid_argument([] { (void)DetectorError::timeout(-std::chrono::nanoseconds(1)); },
+                          "negative timeout rejected");
+  const auto transport_error = DetectorError::transport("grpc");
+  expect_true(transport_error.kind() == DetectorErrorKind::Transport, "transport error kind");
+  expect_eq(transport_error.detail(), std::string("grpc"), "transport error detail");
+  expect_eq(DetectorError::canceled().what(), std::string("detection canceled"),
+            "canceled error message");
+}
+
 void onnx_names_parser_matches_rust() {
   const auto happy = parse_names_dict_string("{0: 'person', 1: 'bicycle', 2: 'car'}");
   expect_true(happy.has_value(), "happy path parses");
@@ -248,6 +372,7 @@ int main() {
   nan_and_class_guards_match_rust();
   ball_detector_adapter_matches_rust();
   labels_and_probe_match_rust();
+  unified_detector_contract_matches_rust();
   onnx_names_parser_matches_rust();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
