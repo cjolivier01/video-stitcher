@@ -1,4 +1,5 @@
 #include "reco/detect/detectors.hpp"
+#include "reco/detect/coreml_session.hpp"
 #include "reco/detect/ort_session.hpp"
 #include "reco/detect/probe.hpp"
 
@@ -209,7 +210,8 @@ void labels_and_probe_match_rust() {
   expect_eq(runtime_first.version, runtime_second.version, "ort runtime probe cached version");
 
   const auto probed = probe_execution_providers();
-  if (runtime_first.available) {
+  const auto coreml = probe_coreml_runtime();
+  if (runtime_first.available || coreml.available) {
     expect_true(!probed.is_available(), "provider probe stays conservative until session port");
     expect_true(!probed.errors.empty(), "provider probe explains missing session port");
   } else {

@@ -1,5 +1,6 @@
 #include "reco/detect/probe.hpp"
 
+#include "reco/detect/coreml_session.hpp"
 #include "reco/detect/ort_session.hpp"
 
 namespace reco::detect {
@@ -15,10 +16,16 @@ AiProbeResult probe_execution_providers() {
   const auto ort = probe_ort_runtime();
   if (!ort.available) {
     result.errors.push_back(ort.error);
-    return result;
+  } else {
+    result.errors.push_back("ORT provider registration probe is not ported to C++ yet");
   }
 
-  result.errors.push_back("ORT provider registration probe is not ported to C++ yet");
+  const auto coreml = probe_coreml_runtime();
+  if (coreml.available) {
+    result.errors.push_back("CoreML prediction bridge is not ported to C++ yet");
+  } else if (!coreml.error.empty()) {
+    result.errors.push_back(coreml.error);
+  }
   return result;
 }
 
