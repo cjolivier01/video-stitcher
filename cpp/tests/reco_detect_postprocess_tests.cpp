@@ -1,4 +1,5 @@
 #include "reco/detect/detectors.hpp"
+#include "reco/detect/ort_session.hpp"
 #include "reco/detect/probe.hpp"
 
 #include <cmath>
@@ -30,7 +31,8 @@ template <typename T, typename U> void expect_eq(T actual, U expected, std::stri
 }
 
 void expect_near(float actual, float expected, float tolerance, std::string_view message) {
-  if (!std::isfinite(actual) || !std::isfinite(expected) || std::abs(actual - expected) > tolerance) {
+  if (!std::isfinite(actual) || !std::isfinite(expected) ||
+      std::abs(actual - expected) > tolerance) {
     std::cerr << "FAIL: " << message << " expected=" << expected << " actual=" << actual << '\n';
     ++failures;
   }
@@ -56,9 +58,9 @@ float pad_x() { return (kModelSize - (static_cast<float>(kFrameW) * scale())) / 
 float pad_y() { return (kModelSize - (static_cast<float>(kFrameH) * scale())) / 2.0F; }
 
 void stock_yolo_postprocess_matches_rust() {
-  const auto valid = postprocess(tensor({{300.0F, 300.0F, 340.0F, 340.0F, 0.85F, 0.0F}}), 1,
-                                 CameraId::Left, 0.10F, scale(), pad_x(), pad_y(), kFrameW,
-                                 kFrameH);
+  const auto valid =
+      postprocess(tensor({{300.0F, 300.0F, 340.0F, 340.0F, 0.85F, 0.0F}}), 1, CameraId::Left, 0.10F,
+                  scale(), pad_x(), pad_y(), kFrameW, kFrameH);
   expect_eq(valid.size(), 1U, "valid detection count");
   expect_eq(valid[0].class_id, 0U, "valid class id");
   expect_near(valid[0].confidence, 0.85F, 1.0e-6F, "valid confidence");
@@ -76,16 +78,16 @@ void stock_yolo_postprocess_matches_rust() {
   expect_true(postprocess({}, 0, CameraId::Left, 0.10F, scale(), pad_x(), pad_y(), kFrameW, kFrameH)
                   .empty(),
               "zero detections");
-  expect_true(postprocess({1.0F, 2.0F, 3.0F}, 1, CameraId::Left, 0.10F, scale(), pad_x(),
-                          pad_y(), kFrameW, kFrameH)
+  expect_true(postprocess({1.0F, 2.0F, 3.0F}, 1, CameraId::Left, 0.10F, scale(), pad_x(), pad_y(),
+                          kFrameW, kFrameH)
                   .empty(),
               "short buffer");
   expect_true(postprocess(tensor({{300.0F, 300.0F, 340.0F, 340.0F, 0.05F, 0.0F}}), 1,
                           CameraId::Left, 0.10F, scale(), pad_x(), pad_y(), kFrameW, kFrameH)
                   .empty(),
               "low confidence filtered");
-  expect_eq(postprocess(tensor({{300.0F, 300.0F, 340.0F, 340.0F, 0.10F, 0.0F}}), 1,
-                        CameraId::Left, 0.10F, scale(), pad_x(), pad_y(), kFrameW, kFrameH)
+  expect_eq(postprocess(tensor({{300.0F, 300.0F, 340.0F, 340.0F, 0.10F, 0.0F}}), 1, CameraId::Left,
+                        0.10F, scale(), pad_x(), pad_y(), kFrameW, kFrameH)
                 .size(),
             1U, "exact threshold passes");
   expect_true(postprocess(tensor({{-500.0F, -500.0F, -400.0F, -400.0F, 0.90F, 0.0F}}), 1,
@@ -96,12 +98,12 @@ void stock_yolo_postprocess_matches_rust() {
 
 void nan_and_class_guards_match_rust() {
   expect_true(postprocess(tensor({{300.0F, 300.0F, 340.0F, 340.0F,
-                                  std::numeric_limits<float>::quiet_NaN(), 0.0F}}),
+                                   std::numeric_limits<float>::quiet_NaN(), 0.0F}}),
                           1, CameraId::Left, 0.10F, scale(), pad_x(), pad_y(), kFrameW, kFrameH)
                   .empty(),
               "nan confidence filtered");
   expect_true(postprocess(tensor({{300.0F, 300.0F, 340.0F, 340.0F,
-                                  std::numeric_limits<float>::infinity(), 0.0F}}),
+                                   std::numeric_limits<float>::infinity(), 0.0F}}),
                           1, CameraId::Left, 0.10F, scale(), pad_x(), pad_y(), kFrameW, kFrameH)
                   .empty(),
               "infinite confidence filtered");
@@ -114,7 +116,7 @@ void nan_and_class_guards_match_rust() {
                 "nan bbox filtered");
   }
   expect_true(postprocess(tensor({{300.0F, 300.0F, 340.0F, 340.0F, 0.80F,
-                                  std::numeric_limits<float>::quiet_NaN()}}),
+                                   std::numeric_limits<float>::quiet_NaN()}}),
                           1, CameraId::Left, 0.10F, scale(), pad_x(), pad_y(), kFrameW, kFrameH)
                   .empty(),
               "nan class filtered");
@@ -122,8 +124,8 @@ void nan_and_class_guards_match_rust() {
                           CameraId::Left, 0.10F, scale(), pad_x(), pad_y(), kFrameW, kFrameH)
                   .empty(),
               "class range filtered");
-  expect_true(postprocess(tensor({{0.0F, 0.0F, 0.0F, 0.0F, 0.80F, 0.0F}}), 1,
-                          CameraId::Left, 0.10F, 0.0F, 0.0F, 0.0F, 1000, 1000)
+  expect_true(postprocess(tensor({{0.0F, 0.0F, 0.0F, 0.0F, 0.80F, 0.0F}}), 1, CameraId::Left, 0.10F,
+                          0.0F, 0.0F, 0.0F, 1000, 1000)
                   .empty(),
               "derived nan stock coords filtered");
 }
@@ -136,25 +138,22 @@ void ball_detector_adapter_matches_rust() {
   expect_near(decoded[0].center_x, 0.5F, 1.0e-3F, "ball center x");
   expect_near(decoded[0].width, 0.04F, 1.0e-3F, "ball width");
 
-  const std::vector<float> data{
-      500.0F, 250.0F, 40.0F, 40.0F, 1.0F, 0.10F,
-      500.0F, 250.0F, 40.0F, 40.0F, 1.0F, 0.90F,
-      505.0F, 252.0F, 40.0F, 40.0F, 1.0F, 0.80F,
-      100.0F, 100.0F, 30.0F, 30.0F, 1.0F, 0.70F};
-  const auto nms = postprocess_balldet(data, 4, CameraId::Left, 0.25F, 1.0F, 0.0F, 0.0F, 1000,
-                                       1000);
+  const std::vector<float> data{500.0F, 250.0F, 40.0F,  40.0F,  1.0F,   0.10F,  500.0F, 250.0F,
+                                40.0F,  40.0F,  1.0F,   0.90F,  505.0F, 252.0F, 40.0F,  40.0F,
+                                1.0F,   0.80F,  100.0F, 100.0F, 30.0F,  30.0F,  1.0F,   0.70F};
+  const auto nms =
+      postprocess_balldet(data, 4, CameraId::Left, 0.25F, 1.0F, 0.0F, 0.0F, 1000, 1000);
   expect_eq(nms.size(), 2U, "ball nms count");
   expect_near(nms[0].confidence, 0.90F, 1.0e-6F, "ball nms highest first");
 
-  expect_true(postprocess_balldet({0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.90F}, 1,
-                                  CameraId::Left, 0.25F, 0.0F, 0.0F, 0.0F, 1000, 1000)
+  expect_true(postprocess_balldet({0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.90F}, 1, CameraId::Left, 0.25F,
+                                  0.0F, 0.0F, 0.0F, 1000, 1000)
                   .empty(),
               "derived nan ball coords filtered");
 
   const auto equal_conf = postprocess_balldet(
-      {500.0F, 250.0F, 40.0F, 40.0F, 1.0F, 0.90F, 505.0F, 252.0F, 40.0F, 40.0F, 1.0F,
-       0.90F},
-      2, CameraId::Left, 0.25F, 1.0F, 0.0F, 0.0F, 1000, 1000);
+      {500.0F, 250.0F, 40.0F, 40.0F, 1.0F, 0.90F, 505.0F, 252.0F, 40.0F, 40.0F, 1.0F, 0.90F}, 2,
+      CameraId::Left, 0.25F, 1.0F, 0.0F, 0.0F, 1000, 1000);
   expect_eq(equal_conf.size(), 1U, "equal confidence nms keeps one");
   expect_near(equal_conf[0].center_x, 0.5F, 1.0e-6F, "equal confidence keeps first input");
 }
@@ -173,9 +172,28 @@ void labels_and_probe_match_rust() {
   const AiProbeResult result{.providers = {"TensorRT", "CPU"}, .can_run_on_gpu_frames = true};
   expect_eq(result.best_provider(), std::string("TensorRT"), "best provider");
   expect_true(result.is_available(), "probe available");
-  const AiProbeResult empty{.providers = {}, .can_run_on_gpu_frames = false, .errors = {"ORT init"}};
+  const AiProbeResult empty{
+      .providers = {}, .can_run_on_gpu_frames = false, .errors = {"ORT init"}};
   expect_eq(empty.best_provider(), std::string("unavailable"), "empty best provider");
   expect_true(!empty.is_available(), "probe unavailable");
+
+  const auto runtime_first = probe_ort_runtime();
+  const auto runtime_second = probe_ort_runtime();
+  expect_eq(runtime_first.available, runtime_second.available, "ort runtime probe cached verdict");
+  expect_eq(runtime_first.version, runtime_second.version, "ort runtime probe cached version");
+
+  const auto probed = probe_execution_providers();
+  if (runtime_first.available) {
+    expect_true(!probed.is_available(), "provider probe stays conservative until session port");
+    expect_true(!probed.errors.empty(), "provider probe explains missing session port");
+  } else {
+    expect_true(!probed.is_available(), "runtime unavailable has no provider");
+    expect_true(!probed.errors.empty(), "runtime unavailable reports error");
+  }
+
+  const auto cache = reco_cache_dir("ort-session-test");
+  expect_true(cache.filename() == "ort-session-test", "cache dir subdir");
+  expect_true(cache.parent_path().filename() == "reco", "cache dir reco parent");
 }
 
 void onnx_names_parser_matches_rust() {
