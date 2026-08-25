@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
@@ -58,6 +59,39 @@ bool address_sanitizer_build() {
   return false;
 #endif
 }
+
+constexpr char kFillBytesPtx[] = R"ptx(
+.version 8.0
+.target sm_50
+.address_size 64
+
+.visible .entry fill_bytes(
+    .param .u64 fill_bytes_param_0,
+    .param .u32 fill_bytes_param_1,
+    .param .u32 fill_bytes_param_2
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<5>;
+
+    ld.param.u64 %rd1, [fill_bytes_param_0];
+    ld.param.u32 %r1, [fill_bytes_param_1];
+    ld.param.u32 %r2, [fill_bytes_param_2];
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %ntid.x;
+    mov.u32 %r5, %tid.x;
+    mad.lo.u32 %r6, %r3, %r4, %r5;
+    setp.ge.u32 %p1, %r6, %r2;
+    @%p1 bra DONE;
+    cvt.u64.u32 %rd2, %r6;
+    add.u64 %rd3, %rd1, %rd2;
+    st.global.u8 [%rd3], %r1;
+
+DONE:
+    ret;
+}
+)ptx";
 
 } // namespace
 
@@ -127,6 +161,62 @@ int main() {
     for (const auto byte : host) {
       if (byte != 0xA5) {
         expect_true(false, "device memset byte pattern");
+        break;
+      }
+    }
+
+    expect_invalid_argument(
+        [&] {
+          auto ignored = backend.load_kernel_from_ptx("", "fill_bytes");
+          (void)ignored;
+        },
+        "empty PTX validation");
+    expect_invalid_argument(
+        [&] {
+          auto ignored = backend.load_kernel_from_ptx(kFillBytesPtx, "");
+          (void)ignored;
+        },
+        "empty kernel name validation");
+    std::string ptx_with_interior_nul(kFillBytesPtx);
+    ptx_with_interior_nul.insert(ptx_with_interior_nul.size() / 2, 1, '\0');
+    expect_invalid_argument(
+        [&] {
+          auto ignored = backend.load_kernel_from_ptx(ptx_with_interior_nul, "fill_bytes");
+          (void)ignored;
+        },
+        "interior PTX NUL validation");
+    std::string null_terminated_ptx(kFillBytesPtx);
+    null_terminated_ptx.push_back('\0');
+    auto null_terminated_kernel = backend.load_kernel_from_ptx(null_terminated_ptx, "fill_bytes");
+    expect_true(static_cast<bool>(null_terminated_kernel), "loaded null-terminated CUDA kernel");
+    null_terminated_kernel.reset();
+    const auto kernel = backend.load_kernel_from_ptx(kFillBytesPtx, "fill_bytes");
+    expect_true(static_cast<bool>(kernel), "loaded CUDA kernel");
+    auto kernel_buffer = backend.allocate(257);
+    backend.memset_d8(kernel_buffer, 0);
+    CudaDevicePtr kernel_ptr = kernel_buffer.ptr();
+    std::uint32_t fill_value = 0x5C;
+    std::uint32_t fill_count = static_cast<std::uint32_t>(kernel_buffer.size());
+    void* kernel_args[] = {&kernel_ptr, &fill_value, &fill_count};
+    expect_invalid_argument(
+        [&] {
+          kernel.launch({.grid = {.x = 0, .y = 1, .z = 1}, .block = {.x = 32, .y = 1, .z = 1}},
+                        kernel_args);
+        },
+        "zero kernel grid validation");
+    expect_invalid_argument(
+        [&] {
+          kernel.launch({.grid = {.x = 9, .y = 1, .z = 1}, .block = {.x = 0, .y = 1, .z = 1}},
+                        kernel_args);
+        },
+        "zero kernel block validation");
+    kernel.launch({.grid = {.x = 9, .y = 1, .z = 1}, .block = {.x = 32, .y = 1, .z = 1}},
+                  kernel_args);
+    kernel.synchronize();
+    const auto filled = backend.copy_to_host(kernel_buffer);
+    for (const auto byte : filled) {
+      if (byte != static_cast<std::uint8_t>(fill_value)) {
+        expect_true(false, "kernel-filled byte pattern");
         break;
       }
     }

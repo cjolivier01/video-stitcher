@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <span>
+#include <string_view>
 #include <string>
 #include <vector>
 
@@ -21,6 +23,18 @@ struct CudaDeviceInfo {
 struct CudaMemoryInfo {
   std::size_t free_bytes = 0;
   std::size_t total_bytes = 0;
+};
+
+struct CudaDim3 {
+  std::uint32_t x = 1;
+  std::uint32_t y = 1;
+  std::uint32_t z = 1;
+};
+
+struct CudaLaunchConfig {
+  CudaDim3 grid;
+  CudaDim3 block;
+  std::uint32_t shared_memory_bytes = 0;
 };
 
 struct Cuda2DCopy {
@@ -74,6 +88,8 @@ private:
   std::function<void(CudaDevicePtr)> free_;
 };
 
+class CudaKernel;
+
 class CudaBackend {
 public:
   [[nodiscard]] static bool is_available();
@@ -90,15 +106,45 @@ public:
   void copy_host_to_device_2d(const CudaHostToDevice2DCopy& copy) const;
   void copy_device_to_device_2d(const Cuda2DCopy& copy) const;
   void copy_device_to_host_2d(const CudaDeviceToHost2DCopy& copy) const;
+  [[nodiscard]] CudaKernel load_kernel_from_ptx(std::string_view ptx,
+                                                std::string_view function_name) const;
   void synchronize() const;
 
 private:
   friend class CudaDeviceBuffer;
+  friend class CudaKernel;
 
   struct Impl;
 
   explicit CudaBackend(std::shared_ptr<Impl> impl);
   std::shared_ptr<Impl> impl_;
+};
+
+class CudaKernel {
+public:
+  CudaKernel() = default;
+  CudaKernel(const CudaKernel&) = delete;
+  CudaKernel& operator=(const CudaKernel&) = delete;
+  CudaKernel(CudaKernel&& other) noexcept;
+  CudaKernel& operator=(CudaKernel&& other) noexcept;
+  ~CudaKernel();
+
+  [[nodiscard]] explicit operator bool() const {
+    return context_ != nullptr && module_ != nullptr && function_ != nullptr;
+  }
+  void launch(const CudaLaunchConfig& config, std::span<void*> args) const;
+  void synchronize() const;
+  void reset();
+
+private:
+  friend class CudaBackend;
+
+  CudaKernel(std::shared_ptr<CudaBackend::Impl> backend, void* context, void* module, void* function);
+
+  std::shared_ptr<CudaBackend::Impl> backend_;
+  void* context_ = nullptr;
+  void* module_ = nullptr;
+  void* function_ = nullptr;
 };
 
 } // namespace reco::core
