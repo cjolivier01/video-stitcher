@@ -6,6 +6,75 @@ SourceMetadata source_metadata() { return {}; }
 
 SourceDefaults source_defaults() { return {}; }
 
+std::vector<PropertyDescriptor> source_properties(bool include_replay) {
+  std::vector<PropertyDescriptor> properties = {
+      {.key = kLeftSourceKey, .label = "Left camera source", .kind = PropertyKind::kSourceList},
+      {.key = kRightSourceKey, .label = "Right camera source", .kind = PropertyKind::kSourceList},
+      {.key = kInputFormatKey,
+       .label = "Input format",
+       .kind = PropertyKind::kStringList,
+       .choices = {{"I420 (Media Source, V4L2)", std::string(kInputFormatI420)},
+                   {"BGRA (Browser Source, Screen Capture)", std::string(kInputFormatBgra)}}},
+      {.key = kConfigPathKey,
+       .label = "Calibration file",
+       .kind = PropertyKind::kPathOpen,
+       .filter = "JSON files (*.json)"},
+      {.key = kOutputWidthKey,
+       .label = "Output width",
+       .kind = PropertyKind::kInteger,
+       .range = NumericRange{.min = 320.0, .max = 7680.0, .step = 1.0}},
+      {.key = kOutputHeightKey,
+       .label = "Output height",
+       .kind = PropertyKind::kInteger,
+       .range = NumericRange{.min = 240.0, .max = 4320.0, .step = 1.0}},
+      {.key = kInputWidthKey,
+       .label = "Input width (per camera)",
+       .kind = PropertyKind::kInteger,
+       .range = NumericRange{.min = 320.0, .max = 7680.0, .step = 1.0}},
+      {.key = kInputHeightKey,
+       .label = "Input height (per camera)",
+       .kind = PropertyKind::kInteger,
+       .range = NumericRange{.min = 240.0, .max = 4320.0, .step = 1.0}},
+      {.key = kYawKey,
+       .label = "Camera yaw (degrees)",
+       .kind = PropertyKind::kFloat,
+       .range = NumericRange{.min = -180.0, .max = 180.0, .step = 0.1}},
+      {.key = kPitchKey,
+       .label = "Camera pitch (degrees)",
+       .kind = PropertyKind::kFloat,
+       .range = NumericRange{.min = -90.0, .max = 90.0, .step = 0.1}},
+  };
+
+  if (include_replay) {
+    properties.push_back({.key = kReplayEnabledKey,
+                          .label = "Record replay (stacked video)",
+                          .kind = PropertyKind::kBoolean});
+    properties.push_back({.key = kReplayPathKey,
+                          .label = "Replay output path (.mkv)",
+                          .kind = PropertyKind::kPathSave,
+                          .filter = "Matroska video (*.mkv)"});
+    properties.push_back({.key = kReplayModeKey,
+                          .label = "Replay trigger",
+                          .kind = PropertyKind::kStringList,
+                          .choices = {{"Follow OBS Record / Stream",
+                                       std::string(kReplayModeFollowObs)},
+                                      {"Record independently (advanced)",
+                                       std::string(kReplayModeAlways)}}});
+  }
+
+  return properties;
+}
+
+UpstreamSourceStatus classify_upstream_source(UpstreamSourceFlags flags) {
+  if (!flags.video) {
+    return UpstreamSourceStatus::kNoVideo;
+  }
+  if (!flags.async_video) {
+    return UpstreamSourceStatus::kSyncVideo;
+  }
+  return UpstreamSourceStatus::kAsyncVideo;
+}
+
 InputFormatParseResult parse_input_format(std::optional<std::string_view> value) {
   if (!value.has_value() || value->empty() || *value == kInputFormatI420) {
     return {.format = InputFormat::kYuv420p, .used_fallback = false};

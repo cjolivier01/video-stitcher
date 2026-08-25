@@ -4,6 +4,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace reco::obs {
 
@@ -54,9 +55,50 @@ enum class LogLevel {
   kTrace,
 };
 
+enum class PropertyKind {
+  kSourceList,
+  kStringList,
+  kPathOpen,
+  kPathSave,
+  kInteger,
+  kFloat,
+  kBoolean,
+};
+
+enum class UpstreamSourceStatus {
+  kAsyncVideo,
+  kNoVideo,
+  kSyncVideo,
+};
+
 struct SourceFlags {
   bool video = true;
   bool interaction = true;
+};
+
+struct UpstreamSourceFlags {
+  bool video = false;
+  bool async_video = false;
+};
+
+struct PropertyChoice {
+  std::string label;
+  std::string value;
+};
+
+struct NumericRange {
+  double min = 0.0;
+  double max = 0.0;
+  double step = 1.0;
+};
+
+struct PropertyDescriptor {
+  std::string_view key;
+  std::string label;
+  PropertyKind kind = PropertyKind::kInteger;
+  std::optional<std::string> filter;
+  std::optional<NumericRange> range;
+  std::vector<PropertyChoice> choices;
 };
 
 struct SourceMetadata {
@@ -119,6 +161,8 @@ struct RawSettings {
 
 [[nodiscard]] SourceMetadata source_metadata();
 [[nodiscard]] SourceDefaults source_defaults();
+[[nodiscard]] std::vector<PropertyDescriptor> source_properties(bool include_replay = false);
+[[nodiscard]] UpstreamSourceStatus classify_upstream_source(UpstreamSourceFlags flags);
 [[nodiscard]] InputFormatParseResult parse_input_format(std::optional<std::string_view> value);
 [[nodiscard]] bool replay_mode_follows_obs(std::optional<std::string_view> value);
 [[nodiscard]] ParsedSettings parse_settings(const RawSettings& raw,
