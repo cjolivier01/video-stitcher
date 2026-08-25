@@ -61,6 +61,12 @@ std::vector<Binding> bindings_for_marker(const void* data, std::size_t size) {
   if (marker.find("bad_rank") != std::string::npos) {
     return {{"images", true, {1, 3, 8, 8, 1, 1, 1, 1, 1}, 0}};
   }
+  if (marker.find("batch2") != std::string::npos) {
+    return {
+        {"images", true, {2, 3, 8, 8}, 0},
+        {"detections", false, {1, 300, 6}, 0},
+    };
+  }
   if (marker.find("negative_count") != std::string::npos) {
     return {};
   }
@@ -156,6 +162,12 @@ RECO_TRT_EXPORT int RECO_TRT_CALL trt_enqueue_v2(void*, void** bindings, void* s
         bindings[1] != reinterpret_cast<void*>(0x56780000U) ||
         stream != reinterpret_cast<void*>(0x90120000U)) {
       return 2;
+    }
+  }
+  if (env_set("RECO_FAKE_TRT_VALIDATE_DETECTOR_BINDINGS")) {
+    if (bindings == nullptr || bindings[0] == nullptr || bindings[1] == nullptr ||
+        bindings[2] != nullptr) {
+      return 3;
     }
   }
   return 0;

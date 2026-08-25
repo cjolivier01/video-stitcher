@@ -1,3 +1,6 @@
+#include "reco/core/cuda_backend.hpp"
+#include "reco/detect/detectors.hpp"
+#include "reco/detect/npp_interop.hpp"
 #include "reco/detect/trt_engine.hpp"
 
 #include <cstdlib>
@@ -156,9 +159,109 @@ void fake_runtime_engine_contract() {
   unset_env("RECO_FAKE_TRT_CONTEXT_FAIL");
 }
 
+void fake_runtime_detector_contract() {
+  if (!reco::core::CudaBackend::is_available() || !is_npp_available()) {
+    if (std::getenv("RECO_REQUIRE_CUDA_TEST") != nullptr ||
+        std::getenv("RECO_REQUIRE_NPP_TEST") != nullptr) {
+      std::cerr << "FAIL: CUDA/NPP required but unavailable: "
+                << reco::core::CudaBackend::availability_error() << ' '
+                << npp_availability_error() << '\n';
+      ++failures;
+    }
+    return;
+  }
+
+  TrtGpuDetector detector(write_engine("ok"), 4, 4, 0.10F, {"ball"}, false);
+  expect_eq(std::string_view(detector.name()), std::string_view("tensorrt-native"),
+            "trt detector name");
+  expect_eq(detector.input_size(), 8U, "trt detector input size");
+
+  const auto backend = reco::core::CudaBackend::create();
+  const std::vector<std::uint8_t> y{
+      16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136,
+  };
+  const std::vector<std::uint8_t> uv{
+      128, 128, 128, 128, 128, 128, 128, 128,
+  };
+  auto y_device = backend.allocate(y.size());
+  auto uv_device = backend.allocate(uv.size());
+  backend.copy_host_to_device_2d(reco::core::CudaHostToDevice2DCopy{
+      .src = y.data(),
+      .src_pitch = 4,
+      .dst = y_device.ptr(),
+      .dst_pitch = 4,
+      .width_bytes = 4,
+      .height = 4,
+  });
+  backend.copy_host_to_device_2d(reco::core::CudaHostToDevice2DCopy{
+      .src = uv.data(),
+      .src_pitch = 4,
+      .dst = uv_device.ptr(),
+      .dst_pitch = 4,
+      .width_bytes = 4,
+      .height = 2,
+  });
+
+  set_env("RECO_FAKE_TRT_VALIDATE_DETECTOR_BINDINGS", "1");
+  const auto detections = detector.detect(
+      CameraId::Left, DetectorFrame(GpuNv12Frame{
+                          .y_ptr = y_device.ptr(),
+                          .uv_ptr = uv_device.ptr(),
+                          .y_pitch = 4,
+                          .uv_pitch = 4,
+                          .width = 4,
+                          .height = 4,
+                      }));
+  unset_env("RECO_FAKE_TRT_VALIDATE_DETECTOR_BINDINGS");
+  expect_eq(detections.size(), 0U, "fake TensorRT detector has zeroed output");
+
+  set_env("RECO_FAKE_TRT_ENQUEUE_FAIL", "1");
+  try {
+    (void)detector.detect(CameraId::Left, DetectorFrame(GpuNv12Frame{
+                                            .y_ptr = y_device.ptr(),
+                                            .uv_ptr = uv_device.ptr(),
+                                            .y_pitch = 4,
+                                            .uv_pitch = 4,
+                                            .width = 4,
+                                            .height = 4,
+                                        }));
+    std::cerr << "FAIL: TensorRT detector enqueue failure was not mapped\n";
+    ++failures;
+  } catch (const DetectorError& error) {
+    expect_true(error.kind() == DetectorErrorKind::InferenceFailed,
+                "TensorRT detector maps enqueue failure to DetectorError");
+  }
+  unset_env("RECO_FAKE_TRT_ENQUEUE_FAIL");
+
+  try {
+    (void)TrtGpuDetector(write_engine("batch2"), 4, 4, 0.10F, {"ball"}, false);
+    std::cerr << "FAIL: TensorRT detector accepted batch > 1 input\n";
+    ++failures;
+  } catch (const DetectorError& error) {
+    expect_true(error.kind() == DetectorErrorKind::InferenceFailed,
+                "TensorRT detector rejects batch > 1 input");
+  }
+
+  try {
+    const std::vector<float> chw(1 * 3 * 8 * 8, 0.5F);
+    (void)detector.detect(CameraId::Left, DetectorFrame(PreprocessedChwFrame{
+                                            .data = chw,
+                                            .input_size = 8,
+                                            .src_width = 4,
+                                            .src_height = 4,
+                                        }));
+    std::cerr << "FAIL: TensorRT detector accepted CPU preprocessed frame\n";
+    ++failures;
+  } catch (const DetectorError& error) {
+    expect_true(error.kind() == DetectorErrorKind::UnsupportedFrameKind,
+                "TensorRT detector rejects CPU frames");
+  }
+}
+
 } // namespace
 
 int main() {
   fake_runtime_engine_contract();
+  fake_runtime_detector_contract();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
