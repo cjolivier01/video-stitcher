@@ -29,8 +29,11 @@ constexpr unsigned int kMinimumOrtMinorVersion = 23;
 constexpr int kOrtLoggingLevelWarning = 2;
 constexpr int kOrtEnableAllGraphOptimizations = 99;
 constexpr int kOnnxTensorElementDataTypeFloat = 1;
+constexpr int kOrtDeviceAllocator = 0;
 constexpr int kOrtArenaAllocator = 1;
 constexpr int kOrtMemTypeDefault = 0;
+constexpr const char* kOrtSessionOptionsDisableCpuEpFallback =
+    "session.disable_cpu_ep_fallback";
 
 #if defined(_WIN32)
 #define RECO_ORT_CALL __stdcall
@@ -62,6 +65,7 @@ struct OrtApiBase {
 
 using OrtGetApiBase = const OrtApiBase*(RECO_ORT_CALL*)();
 using OrtStatusPtr = OrtCStatus*;
+using OrtAppendCudaProvider = OrtCStatus*(RECO_ORT_CALL*)(OrtCSessionOptions*, int);
 
 #if defined(_WIN32)
 using OrtPathChar = wchar_t;
@@ -150,7 +154,7 @@ struct OrtApi {
                                                      OrtCTensorTypeAndShapeInfo**);
   void* GetTypeInfo;
   void* GetValueType;
-  void* CreateMemoryInfo;
+  OrtStatusPtr(RECO_ORT_CALL* CreateMemoryInfo)(const char*, int, int, int, OrtCMemoryInfo**);
   OrtStatusPtr(RECO_ORT_CALL* CreateCpuMemoryInfo)(int, int, OrtCMemoryInfo**);
   void* CompareMemoryInfo;
   void* MemoryInfoGetName;
@@ -203,6 +207,18 @@ struct OrtApi {
                                                                     char**);
   void* ModelMetadataGetVersion;
   void(RECO_ORT_CALL* ReleaseModelMetadata)(OrtCModelMetadata*);
+  void* CreateEnvWithGlobalThreadPools;
+  void* DisablePerSessionThreads;
+  void* CreateThreadingOptions;
+  void* ReleaseThreadingOptions;
+  void* ModelMetadataGetCustomMetadataMapKeys;
+  void* AddFreeDimensionOverrideByName;
+  void* GetAvailableProviders;
+  void* ReleaseAvailableProviders;
+  void* GetStringTensorElementLength;
+  void* GetStringTensorElement;
+  void* FillStringTensorElement;
+  OrtStatusPtr(RECO_ORT_CALL* AddSessionConfigEntry)(OrtCSessionOptions*, const char*, const char*);
 };
 
 class DynamicLibrary {
@@ -379,8 +395,13 @@ const OrtRuntimeProbe& cached_ort_probe() {
   return probe;
 }
 
-const OrtApi& ort_api() {
-  static const OrtApi* api = [] {
+struct OrtRuntimeApi {
+  const OrtApi* api = nullptr;
+  OrtAppendCudaProvider append_cuda_provider = nullptr;
+};
+
+const OrtRuntimeApi& ort_runtime_api() {
+  static const OrtRuntimeApi runtime = [] {
     const auto probe = cached_ort_probe();
     if (!probe.available) {
       throw std::runtime_error(probe.error);
@@ -398,9 +419,20 @@ const OrtApi& ort_api() {
       throw std::runtime_error("ONNX Runtime at `" + path.string() +
                                "` does not support ORT C API version 23");
     }
-    return api;
+    OrtAppendCudaProvider append_cuda_provider = nullptr;
+    try {
+      append_cuda_provider =
+          pinned_library->symbol<OrtAppendCudaProvider>("OrtSessionOptionsAppendExecutionProvider_CUDA");
+    } catch (const std::exception&) {
+      append_cuda_provider = nullptr;
+    }
+    return OrtRuntimeApi{.api = api, .append_cuda_provider = append_cuda_provider};
   }();
-  return *api;
+  return runtime;
+}
+
+const OrtApi& ort_api() {
+  return *ort_runtime_api().api;
 }
 
 std::string status_message(const OrtApi& api, OrtCStatus* status) {
@@ -568,10 +600,11 @@ OrtSessionConfig validate_ort_session_config(OrtSessionConfig config) {
   if (config.providers.empty()) {
     throw std::invalid_argument("OrtSessionConfig.providers must not be empty");
   }
-  const bool cpu_only = config.providers.size() == 1 &&
-                        config.providers.front() == OrtExecutionProvider::Cpu;
-  if (!cpu_only) {
-    throw std::runtime_error("GPU ORT execution providers are not registered in the C++ port yet");
+  const bool supported_provider =
+      config.providers.size() == 1 && (config.providers.front() == OrtExecutionProvider::Cpu ||
+                                       config.providers.front() == OrtExecutionProvider::Cuda);
+  if (!supported_provider) {
+    throw std::runtime_error("requested ORT execution provider stack is not registered in the C++ port yet");
   }
   return config;
 }
@@ -617,7 +650,9 @@ std::filesystem::path reco_cache_dir(std::string_view subdir) {
 
 struct OrtSession::Impl {
   explicit Impl(OrtSessionConfig config) : api(&ort_api()), env(*api, nullptr), options(*api, nullptr),
-                                           session(*api, nullptr), cpu_memory_info(*api, nullptr) {
+                                           session(*api, nullptr), cpu_memory_info(*api, nullptr),
+                                           cuda_memory_info(*api, nullptr),
+                                           provider(config.providers.front()) {
     throw_if_error(*api, api->CreateEnv(kOrtLoggingLevelWarning, "reco-detect", env.out()),
                    "CreateEnv");
     throw_if_error(*api, api->CreateSessionOptions(options.out()), "CreateSessionOptions");
@@ -627,6 +662,18 @@ struct OrtSession::Impl {
                    "SetSessionGraphOptimizationLevel");
     throw_if_error(*api, api->SetSessionLogSeverityLevel(options.get(), kOrtLoggingLevelWarning),
                    "SetSessionLogSeverityLevel");
+    if (provider == OrtExecutionProvider::Cuda) {
+      const auto append_cuda_provider = ort_runtime_api().append_cuda_provider;
+      if (append_cuda_provider == nullptr) {
+        throw std::runtime_error("ONNX Runtime CUDA execution provider entry point is unavailable");
+      }
+      throw_if_error(*api,
+                     api->AddSessionConfigEntry(options.get(),
+                                                kOrtSessionOptionsDisableCpuEpFallback, "1"),
+                     "AddSessionConfigEntry(session.disable_cpu_ep_fallback)");
+      throw_if_error(*api, append_cuda_provider(options.get(), 0),
+                     "OrtSessionOptionsAppendExecutionProvider_CUDA");
+    }
 
     const auto model_path = ort_model_path(config.model_path);
     throw_if_error(*api, api->CreateSession(env.get(), model_path.c_str(), options.get(), session.out()),
@@ -635,6 +682,12 @@ struct OrtSession::Impl {
                    api->CreateCpuMemoryInfo(kOrtArenaAllocator, kOrtMemTypeDefault,
                                             cpu_memory_info.out()),
                    "CreateCpuMemoryInfo");
+    if (provider == OrtExecutionProvider::Cuda) {
+      throw_if_error(*api,
+                     api->CreateMemoryInfo("Cuda", kOrtDeviceAllocator, 0, kOrtMemTypeDefault,
+                                           cuda_memory_info.out()),
+                     "CreateMemoryInfo(Cuda)");
+    }
 
     OrtCAllocator* allocator = nullptr;
     throw_if_error(*api, api->GetAllocatorWithDefaultOptions(&allocator),
@@ -657,6 +710,8 @@ struct OrtSession::Impl {
   SessionOptionsHandle options;
   SessionHandle session;
   MemoryInfoHandle cpu_memory_info;
+  MemoryInfoHandle cuda_memory_info;
+  OrtExecutionProvider provider = OrtExecutionProvider::Cpu;
   OrtSessionMetadata metadata;
 };
 
@@ -673,6 +728,9 @@ const OrtSessionMetadata& OrtSession::metadata() const { return impl_->metadata;
 
 std::vector<OrtTensorOutput> OrtSession::run_cpu_f32(std::span<const float> input,
                                                      std::span<const std::int64_t> shape) {
+  if (impl_->provider != OrtExecutionProvider::Cpu) {
+    throw std::invalid_argument("run_cpu_f32 requires a CPU ORT session");
+  }
   if (shape.empty()) {
     throw std::invalid_argument("run_cpu_f32 requires a non-empty input shape");
   }
@@ -698,6 +756,123 @@ std::vector<OrtTensorOutput> OrtSession::run_cpu_f32(std::span<const float> inpu
                      shape.data(), shape.size(), kOnnxTensorElementDataTypeFloat,
                      input_value.out()),
                  "CreateTensorWithDataAsOrtValue");
+
+  std::vector<const char*> input_names;
+  input_names.reserve(impl_->metadata.input_names.size());
+  for (const auto& name : impl_->metadata.input_names) {
+    input_names.push_back(name.c_str());
+  }
+  std::vector<const char*> output_names;
+  output_names.reserve(impl_->metadata.output_names.size());
+  for (const auto& name : impl_->metadata.output_names) {
+    output_names.push_back(name.c_str());
+  }
+  std::vector<const OrtCValue*> inputs = {input_value.get()};
+  std::vector<OrtCValue*> raw_outputs(output_names.size(), nullptr);
+  throw_if_error(*impl_->api,
+                 impl_->api->Run(impl_->session.get(), nullptr, input_names.data(), inputs.data(),
+                                 inputs.size(), output_names.data(), output_names.size(),
+                                 raw_outputs.data()),
+                 "Run");
+
+  std::vector<ValueHandle> outputs;
+  outputs.reserve(raw_outputs.size());
+  for (auto* output : raw_outputs) {
+    outputs.emplace_back(*impl_->api, output);
+  }
+
+  std::vector<OrtTensorOutput> result;
+  result.reserve(outputs.size());
+  for (const auto& output : outputs) {
+    TensorInfoHandle tensor_info(*impl_->api, nullptr);
+    throw_if_error(*impl_->api,
+                   impl_->api->GetTensorTypeAndShape(output.get(), tensor_info.out()),
+                   "GetTensorTypeAndShape");
+    std::size_t rank = 0;
+    throw_if_error(*impl_->api, impl_->api->GetDimensionsCount(tensor_info.get(), &rank),
+                   "GetDimensionsCount");
+    OrtTensorOutput tensor;
+    tensor.shape.assign(rank, 0);
+    if (rank > 0) {
+      throw_if_error(*impl_->api,
+                     impl_->api->GetDimensions(tensor_info.get(), tensor.shape.data(),
+                                               tensor.shape.size()),
+                     "GetDimensions");
+    }
+    int element_type = 0;
+    throw_if_error(*impl_->api,
+                   impl_->api->GetTensorElementType(tensor_info.get(), &element_type),
+                   "GetTensorElementType");
+    if (element_type != kOnnxTensorElementDataTypeFloat) {
+      throw std::runtime_error("ORT output tensor is not float32");
+    }
+    std::size_t output_elements = 1;
+    for (const auto dim : tensor.shape) {
+      if (dim < 0) {
+        throw std::runtime_error("ORT output has unresolved dynamic shape");
+      }
+      const auto u_dim = static_cast<std::size_t>(dim);
+      if (u_dim == 0) {
+        output_elements = 0;
+        break;
+      }
+      if (output_elements > std::numeric_limits<std::size_t>::max() / u_dim) {
+        throw std::overflow_error("ORT output shape overflows size_t");
+      }
+      output_elements *= u_dim;
+    }
+    void* data = nullptr;
+    throw_if_error(*impl_->api, impl_->api->GetTensorMutableData(output.get(), &data),
+                   "GetTensorMutableData");
+    if (output_elements == 0) {
+      result.push_back(std::move(tensor));
+      continue;
+    }
+    if (data == nullptr) {
+      throw std::runtime_error("ORT output tensor data pointer is null");
+    }
+    const auto* floats = static_cast<const float*>(data);
+    tensor.data.assign(floats, floats + output_elements);
+    result.push_back(std::move(tensor));
+  }
+  return result;
+}
+
+std::vector<OrtTensorOutput> OrtSession::run_cuda_f32(core::CudaDevicePtr input,
+                                                      std::size_t byte_count,
+                                                      std::span<const std::int64_t> shape) {
+  if (impl_->provider != OrtExecutionProvider::Cuda) {
+    throw std::invalid_argument("run_cuda_f32 requires a CUDA ORT session");
+  }
+  if (input == 0 || byte_count == 0) {
+    throw std::invalid_argument("run_cuda_f32 requires a non-empty CUDA input buffer");
+  }
+  if (shape.empty()) {
+    throw std::invalid_argument("run_cuda_f32 requires a non-empty input shape");
+  }
+  std::size_t element_count = 1;
+  for (const auto dim : shape) {
+    if (dim <= 0) {
+      throw std::invalid_argument("run_cuda_f32 requires concrete positive input dimensions");
+    }
+    const auto u_dim = static_cast<std::size_t>(dim);
+    if (element_count > std::numeric_limits<std::size_t>::max() / u_dim) {
+      throw std::overflow_error("run_cuda_f32 input shape overflows size_t");
+    }
+    element_count *= u_dim;
+  }
+  if (element_count > std::numeric_limits<std::size_t>::max() / sizeof(float) ||
+      byte_count != element_count * sizeof(float)) {
+    throw std::invalid_argument("run_cuda_f32 byte count does not match shape");
+  }
+
+  ValueHandle input_value(*impl_->api, nullptr);
+  throw_if_error(*impl_->api,
+                 impl_->api->CreateTensorWithDataAsOrtValue(
+                     impl_->cuda_memory_info.get(), reinterpret_cast<void*>(input), byte_count,
+                     shape.data(), shape.size(), kOnnxTensorElementDataTypeFloat,
+                     input_value.out()),
+                 "CreateTensorWithDataAsOrtValue(Cuda)");
 
   std::vector<const char*> input_names;
   input_names.reserve(impl_->metadata.input_names.size());

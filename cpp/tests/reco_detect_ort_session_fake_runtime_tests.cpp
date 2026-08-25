@@ -1,5 +1,6 @@
 #include "reco/detect/detectors.hpp"
 #include "reco/detect/ort_session.hpp"
+#include "reco/core/cuda_backend.hpp"
 
 #include <cstdlib>
 #include <filesystem>
@@ -133,6 +134,29 @@ void fake_runtime_session_contract() {
   expect_eq(empty_outputs[0].data.size(), 0U, "zero-sized ORT output copied as empty");
   unset_env("RECO_FAKE_ORT_EMPTY_OUTPUT");
 
+  set_env("RECO_FAKE_ORT_REQUIRE_CUDA_NO_CPU_FALLBACK", "1");
+  OrtSession cuda_session(OrtSessionConfig{
+      .model_path = model,
+      .fallback_labels = {"ball"},
+      .providers = {OrtExecutionProvider::Cuda},
+  });
+  unset_env("RECO_FAKE_ORT_REQUIRE_CUDA_NO_CPU_FALLBACK");
+  set_env("RECO_FAKE_ORT_VALIDATE_CUDA_INPUT", "1");
+  const auto cuda_outputs =
+      cuda_session.run_cuda_f32(0x12340000U, input.size() * sizeof(float), shape);
+  unset_env("RECO_FAKE_ORT_VALIDATE_CUDA_INPUT");
+  expect_eq(cuda_outputs[0].data.size(), 12U, "cuda session output copied");
+  try {
+    (void)cuda_session.run_cpu_f32(input, shape);
+    std::cerr << "FAIL: cpu run on cuda session did not throw\n";
+    ++failures;
+  } catch (const std::invalid_argument&) {
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: cpu run rejected on cuda session threw unexpected exception: "
+              << error.what() << '\n';
+    ++failures;
+  }
+
   set_env("RECO_FAKE_ORT_METADATA_FAIL", "1");
   OrtSession fallback_session(OrtSessionConfig{
       .model_path = model,
@@ -219,10 +243,77 @@ void fake_runtime_cpu_detector_contract() {
   }
 }
 
+void fake_runtime_cuda_detector_contract() {
+  if (!reco::core::CudaBackend::is_available()) {
+    if (std::getenv("RECO_REQUIRE_CUDA_TEST") != nullptr) {
+      std::cerr << "FAIL: CUDA required but unavailable: "
+                << reco::core::CudaBackend::availability_error() << '\n';
+      ++failures;
+    }
+    return;
+  }
+
+  const auto model = write_marker_model();
+  OrtCudaYoloDetector detector(model, 2, 2, 0.10F, {}, false);
+  expect_eq(std::string_view(detector.name()), std::string_view("ort-cuda"), "cuda detector name");
+  expect_eq(detector.input_size(), 8U, "cuda detector input size");
+
+  const auto backend = reco::core::CudaBackend::create();
+  const std::vector<std::uint8_t> y{80, 90, 100, 110};
+  const std::vector<std::uint8_t> uv{128, 128};
+  auto y_device = backend.allocate(y.size());
+  auto uv_device = backend.allocate(uv.size());
+  backend.copy_host_to_device_2d(reco::core::CudaHostToDevice2DCopy{
+      .src = y.data(),
+      .src_pitch = 2,
+      .dst = y_device.ptr(),
+      .dst_pitch = 2,
+      .width_bytes = 2,
+      .height = 2,
+  });
+  backend.copy_host_to_device_2d(reco::core::CudaHostToDevice2DCopy{
+      .src = uv.data(),
+      .src_pitch = 2,
+      .dst = uv_device.ptr(),
+      .dst_pitch = 2,
+      .width_bytes = 2,
+      .height = 1,
+  });
+
+  set_env("RECO_FAKE_ORT_VALIDATE_CUDA_INPUT_ANY", "1");
+  const auto detections = detector.detect(
+      CameraId::Left, DetectorFrame(GpuNv12Frame{
+                          .y_ptr = y_device.ptr(),
+                          .uv_ptr = uv_device.ptr(),
+                          .y_pitch = 2,
+                          .uv_pitch = 2,
+                          .width = 2,
+                          .height = 2,
+                      }));
+  unset_env("RECO_FAKE_ORT_VALIDATE_CUDA_INPUT_ANY");
+  expect_eq(detections.size(), 2U, "cuda detector detections");
+
+  try {
+    const std::vector<float> chw(1 * 3 * 8 * 8, 0.5F);
+    (void)detector.detect(CameraId::Left, DetectorFrame(PreprocessedChwFrame{
+                                            .data = chw,
+                                            .input_size = 8,
+                                            .src_width = 2,
+                                            .src_height = 2,
+                                        }));
+    std::cerr << "FAIL: cuda detector accepted CPU frame\n";
+    ++failures;
+  } catch (const DetectorError& error) {
+    expect_true(error.kind() == DetectorErrorKind::UnsupportedFrameKind,
+                "cuda detector rejects CPU frames");
+  }
+}
+
 } // namespace
 
 int main() {
   fake_runtime_session_contract();
   fake_runtime_cpu_detector_contract();
+  fake_runtime_cuda_detector_contract();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -1,5 +1,7 @@
 #include "reco/detect/detectors.hpp"
 
+#include "reco/detect/cuda_preprocess.hpp"
+
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -334,6 +336,124 @@ std::vector<Detection> CpuYoloDetector::detect_preprocessed(CameraId camera,
                                    src_width, src_height)
              : postprocess(output, n, camera, confidence_threshold_, scale, pad_x, pad_y,
                            src_width, src_height);
+}
+
+OrtCudaYoloDetector::OrtCudaYoloDetector(std::filesystem::path model_path,
+                                         std::uint32_t frame_width,
+                                         std::uint32_t frame_height,
+                                         float confidence_threshold,
+                                         std::vector<std::string> labels, bool supports_p010)
+    : backend_(core::CudaBackend::create()),
+      session_(OrtSessionConfig{
+          .model_path = std::move(model_path),
+          .fallback_labels = std::move(labels),
+          .providers = {OrtExecutionProvider::Cuda},
+      }),
+      frame_width_(frame_width),
+      frame_height_(frame_height),
+      confidence_threshold_(confidence_threshold) {
+  if (frame_width_ == 0 || frame_height_ == 0) {
+    throw DetectorError::inference_failed("OrtCudaYoloDetector frame dimensions must be non-zero");
+  }
+  const auto input_size = session_.metadata().input_size;
+  if (input_size == 0) {
+    throw DetectorError::inference_failed("OrtCudaYoloDetector model input size must be non-zero");
+  }
+  const float fw = static_cast<float>(frame_width_);
+  const float fh = static_cast<float>(frame_height_);
+  const float is = static_cast<float>(input_size);
+  scale_ = std::min(is / fw, is / fh);
+  pad_x_ = static_cast<float>(input_size - static_cast<std::uint32_t>(std::round(fw * scale_))) /
+           2.0F;
+  pad_y_ = static_cast<float>(input_size - static_cast<std::uint32_t>(std::round(fh * scale_))) /
+           2.0F;
+
+  const auto sz = static_cast<std::size_t>(input_size);
+  if (sz > std::numeric_limits<std::size_t>::max() / sz / 3 / sizeof(float)) {
+    throw DetectorError::inference_failed("OrtCudaYoloDetector tensor dimensions overflow");
+  }
+  tensor_f32_ = backend_.allocate(3 * sz * sz * sizeof(float));
+  if (supports_p010) {
+    const auto y_size = checked_plane_size(frame_width_, frame_height_, "P010 Y scratch");
+    const auto uv_size = checked_plane_size(frame_width_, frame_height_ / 2, "P010 UV scratch");
+    nv12_8bit_y_ = backend_.allocate(y_size);
+    nv12_8bit_uv_ = backend_.allocate(uv_size);
+  }
+}
+
+const char* OrtCudaYoloDetector::name() const { return "ort-cuda"; }
+
+std::optional<std::span<const std::string>> OrtCudaYoloDetector::class_names() const {
+  return std::span<const std::string>(session_.metadata().labels);
+}
+
+std::uint32_t OrtCudaYoloDetector::input_size() const { return session_.metadata().input_size; }
+
+std::vector<Detection> OrtCudaYoloDetector::detect(CameraId camera, const DetectorFrame& frame) {
+  const auto& variant = frame.variant();
+  if (const auto* gpu = std::get_if<GpuNv12Frame>(&variant); gpu != nullptr) {
+    return detect_gpu_raw(camera, *gpu);
+  }
+  throw DetectorError::unsupported_frame_kind();
+}
+
+std::vector<Detection> OrtCudaYoloDetector::detect_gpu_raw(CameraId camera,
+                                                           const GpuNv12Frame& frame) {
+  if (frame.y_ptr == 0 || frame.uv_ptr == 0) {
+    throw DetectorError::inference_failed("GpuNv12Frame has null CUDA plane pointer");
+  }
+  if (frame.width != frame_width_ || frame.height != frame_height_) {
+    throw DetectorError::inference_failed("GpuNv12Frame dimensions do not match detector");
+  }
+  if ((frame.width % 2) != 0 || (frame.height % 2) != 0) {
+    throw DetectorError::inference_failed("GpuNv12Frame dimensions must be even for 4:2:0 chroma");
+  }
+  core::CudaDevicePtr nv12_y = frame.y_ptr;
+  core::CudaDevicePtr nv12_uv = frame.uv_ptr;
+  std::uint32_t nv12_y_pitch = frame.width;
+
+  if (frame.is_10bit) {
+    if (!nv12_8bit_y_ || !nv12_8bit_uv_) {
+      throw DetectorError::inference_failed("P010 frame received but detector lacks P010 scratch");
+    }
+    const auto p010_min_pitch = static_cast<std::size_t>(frame.width) * 2U;
+    if (frame.y_pitch < p010_min_pitch || frame.uv_pitch < p010_min_pitch) {
+      throw DetectorError::inference_failed("GpuNv12Frame P010 pitch is smaller than width*2");
+    }
+    p010_plane_to_nv12(backend_, frame.y_ptr, frame.y_pitch, nv12_8bit_y_.ptr(), frame.width,
+                       frame.height);
+    p010_plane_to_nv12(backend_, frame.uv_ptr, frame.uv_pitch, nv12_8bit_uv_.ptr(), frame.width,
+                       frame.height / 2);
+    nv12_y = nv12_8bit_y_.ptr();
+    nv12_uv = nv12_8bit_uv_.ptr();
+    nv12_y_pitch = frame.width;
+  } else if (frame.y_pitch != frame.uv_pitch) {
+    throw DetectorError::inference_failed("GpuNv12Frame Y and UV pitches must match");
+  } else {
+    if (frame.y_pitch < frame.width) {
+      throw DetectorError::inference_failed("GpuNv12Frame pitch is smaller than width");
+    }
+    nv12_y_pitch = static_cast<std::uint32_t>(frame.y_pitch);
+    if (static_cast<std::size_t>(nv12_y_pitch) != frame.y_pitch) {
+      throw DetectorError::inference_failed("GpuNv12Frame pitch exceeds CUDA kernel u32 limit");
+    }
+  }
+
+  const auto input_size = session_.metadata().input_size;
+  nv12_to_rgb_chw_fullrange(backend_, nv12_y, nv12_uv, tensor_f32_.ptr(), nv12_y_pitch,
+                            frame.width, frame.height, input_size, input_size,
+                            static_cast<std::uint32_t>(pad_x_), static_cast<std::uint32_t>(pad_y_),
+                            scale_, frame.rotation);
+  const std::vector<std::int64_t> shape{1, 3, static_cast<std::int64_t>(input_size),
+                                        static_cast<std::int64_t>(input_size)};
+  const auto outputs = session_.run_cuda_f32(tensor_f32_.ptr(), tensor_f32_.size(), shape);
+  if (outputs.empty()) {
+    return {};
+  }
+  const std::size_t n = detection_count_from_output_shape(outputs[0]);
+  const auto& output = outputs[0].data;
+  return postprocess(output, n, camera, confidence_threshold_, scale_, pad_x_, pad_y_, frame.width,
+                     frame.height);
 }
 
 std::vector<Detection> postprocess(const std::vector<float>& data, std::size_t n, CameraId camera,

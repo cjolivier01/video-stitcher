@@ -184,6 +184,33 @@ private:
   std::vector<float> rgb_chw_buf_;
 };
 
+class OrtCudaYoloDetector final : public UnifiedDetector {
+public:
+  OrtCudaYoloDetector(std::filesystem::path model_path, std::uint32_t frame_width,
+                      std::uint32_t frame_height, float confidence_threshold,
+                      std::vector<std::string> labels, bool supports_p010);
+
+  [[nodiscard]] const char* name() const override;
+  [[nodiscard]] std::vector<Detection> detect(CameraId camera, const DetectorFrame& frame) override;
+  [[nodiscard]] std::optional<std::span<const std::string>> class_names() const override;
+  [[nodiscard]] std::uint32_t input_size() const;
+
+private:
+  [[nodiscard]] std::vector<Detection> detect_gpu_raw(CameraId camera, const GpuNv12Frame& frame);
+
+  core::CudaBackend backend_;
+  OrtSession session_;
+  std::uint32_t frame_width_ = 0;
+  std::uint32_t frame_height_ = 0;
+  float confidence_threshold_ = 0.10F;
+  float scale_ = 1.0F;
+  float pad_x_ = 0.0F;
+  float pad_y_ = 0.0F;
+  core::CudaDeviceBuffer tensor_f32_;
+  core::CudaDeviceBuffer nv12_8bit_y_;
+  core::CudaDeviceBuffer nv12_8bit_uv_;
+};
+
 [[nodiscard]] std::vector<Detection> postprocess(const std::vector<float>& data, std::size_t n,
                                                  CameraId camera, float confidence_threshold,
                                                  float scale, float pad_x, float pad_y,
