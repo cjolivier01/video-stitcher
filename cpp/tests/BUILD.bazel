@@ -112,3 +112,12 @@ cc_test(
         "//cpp/reco_calibrate",
     ],
 )
+
+cc_test(
+    name = "reco_calibrate_telemetry_tests",
+    size = "small",
+    srcs = ["reco_calibrate_telemetry_tests.cpp"],
+    deps = [
+        "//cpp/reco_calibrate",
+    ],
+)

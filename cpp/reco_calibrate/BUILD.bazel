@@ -11,6 +11,7 @@ cc_library(
         "src/optimizer.cpp",
         "src/ransac.cpp",
         "src/sampling.cpp",
+        "src/telemetry.cpp",
         "src/types.cpp",
     ],
     hdrs = [
@@ -22,6 +23,7 @@ cc_library(
         "include/reco/calibrate/optimizer.hpp",
         "include/reco/calibrate/ransac.hpp",
         "include/reco/calibrate/sampling.hpp",
+        "include/reco/calibrate/telemetry.hpp",
         "include/reco/calibrate/traits.hpp",
         "include/reco/calibrate/types.hpp",
     ],
