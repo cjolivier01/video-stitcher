@@ -22,9 +22,30 @@ using CUresult = int;
 using CUdeviceptr = std::uint64_t;
 
 constexpr CUresult kCudaSuccess = 0;
+constexpr unsigned int kMemoryTypeHost = 1;
+constexpr unsigned int kMemoryTypeDevice = 2;
 
 struct CUuuid {
   std::uint8_t bytes[16];
+};
+
+struct CudaMemcpy2D {
+  std::size_t src_x_in_bytes = 0;
+  std::size_t src_y = 0;
+  unsigned int src_memory_type = 0;
+  const void* src_host = nullptr;
+  CUdeviceptr src_device = 0;
+  const void* src_array = nullptr;
+  std::size_t src_pitch = 0;
+  std::size_t dst_x_in_bytes = 0;
+  std::size_t dst_y = 0;
+  unsigned int dst_memory_type = 0;
+  void* dst_host = nullptr;
+  CUdeviceptr dst_device = 0;
+  const void* dst_array = nullptr;
+  std::size_t dst_pitch = 0;
+  std::size_t width_in_bytes = 0;
+  std::size_t height = 0;
 };
 
 class DynamicLibrary {
@@ -82,6 +103,19 @@ void check_cuda(const char* function, CUresult result) {
   }
 }
 
+void validate_2d_shape(std::size_t src_pitch, std::size_t dst_pitch, std::size_t width_bytes,
+                       std::size_t height) {
+  if (width_bytes == 0 || height == 0) {
+    throw std::invalid_argument("CUDA 2D copy dimensions must be non-zero");
+  }
+  if (src_pitch < width_bytes) {
+    throw std::invalid_argument("CUDA 2D copy source pitch is smaller than width");
+  }
+  if (dst_pitch < width_bytes) {
+    throw std::invalid_argument("CUDA 2D copy destination pitch is smaller than width");
+  }
+}
+
 } // namespace
 
 struct CudaBackend::Impl {
@@ -105,6 +139,7 @@ struct CudaBackend::Impl {
     cu_mem_alloc = driver.symbol<decltype(cu_mem_alloc)>("cuMemAlloc_v2");
     cu_mem_free = driver.symbol<decltype(cu_mem_free)>("cuMemFree_v2");
     cu_memset_d8 = driver.symbol<decltype(cu_memset_d8)>("cuMemsetD8_v2");
+    cu_memcpy_2d = driver.symbol<decltype(cu_memcpy_2d)>("cuMemcpy2D_v2");
     cu_memcpy_dtoh = driver.symbol<decltype(cu_memcpy_dtoh)>("cuMemcpyDtoH_v2");
     cu_mem_get_info = driver.symbol<decltype(cu_mem_get_info)>("cuMemGetInfo_v2");
     check_cuda("cuInit", cu_init(0));
@@ -143,6 +178,15 @@ struct CudaBackend::Impl {
     check_cuda("cuCtxSetCurrent", cu_ctx_set_current(context));
   }
 
+  void ensure_current_context_for_copy() {
+    CUcontext current = nullptr;
+    check_cuda("cuCtxGetCurrent", cu_ctx_get_current(&current));
+    if (current != nullptr) {
+      return;
+    }
+    ensure_primary_context(0);
+  }
+
   DynamicLibrary driver;
   std::mutex context_mutex;
   std::unordered_map<int, CUcontext> retained_contexts;
@@ -159,6 +203,7 @@ struct CudaBackend::Impl {
   CUresult (*cu_mem_alloc)(CUdeviceptr*, std::size_t) = nullptr;
   CUresult (*cu_mem_free)(CUdeviceptr) = nullptr;
   CUresult (*cu_memset_d8)(CUdeviceptr, unsigned char, std::size_t) = nullptr;
+  CUresult (*cu_memcpy_2d)(const CudaMemcpy2D*) = nullptr;
   CUresult (*cu_memcpy_dtoh)(void*, CUdeviceptr, std::size_t) = nullptr;
   CUresult (*cu_mem_get_info)(std::size_t*, std::size_t*) = nullptr;
 };
@@ -290,6 +335,63 @@ std::vector<std::uint8_t> CudaBackend::copy_to_host(const CudaDeviceBuffer& buff
   std::vector<std::uint8_t> out(buffer.size());
   check_cuda("cuMemcpyDtoH_v2", impl_->cu_memcpy_dtoh(out.data(), buffer.ptr(), buffer.size()));
   return out;
+}
+
+void CudaBackend::copy_host_to_device_2d(const CudaHostToDevice2DCopy& copy) const {
+  if (copy.src == nullptr || copy.dst == 0) {
+    throw std::invalid_argument("CUDA HtoD 2D copy requires live source and destination");
+  }
+  validate_2d_shape(copy.src_pitch, copy.dst_pitch, copy.width_bytes, copy.height);
+  impl_->ensure_current_context_for_copy();
+  const CudaMemcpy2D desc = {
+      .src_memory_type = kMemoryTypeHost,
+      .src_host = copy.src,
+      .src_pitch = copy.src_pitch,
+      .dst_memory_type = kMemoryTypeDevice,
+      .dst_device = copy.dst,
+      .dst_pitch = copy.dst_pitch,
+      .width_in_bytes = copy.width_bytes,
+      .height = copy.height,
+  };
+  check_cuda("cuMemcpy2D_v2 (HtoD)", impl_->cu_memcpy_2d(&desc));
+}
+
+void CudaBackend::copy_device_to_device_2d(const Cuda2DCopy& copy) const {
+  if (copy.src == 0 || copy.dst == 0) {
+    throw std::invalid_argument("CUDA DtoD 2D copy requires live source and destination");
+  }
+  validate_2d_shape(copy.src_pitch, copy.dst_pitch, copy.width_bytes, copy.height);
+  impl_->ensure_current_context_for_copy();
+  const CudaMemcpy2D desc = {
+      .src_memory_type = kMemoryTypeDevice,
+      .src_device = copy.src,
+      .src_pitch = copy.src_pitch,
+      .dst_memory_type = kMemoryTypeDevice,
+      .dst_device = copy.dst,
+      .dst_pitch = copy.dst_pitch,
+      .width_in_bytes = copy.width_bytes,
+      .height = copy.height,
+  };
+  check_cuda("cuMemcpy2D_v2 (DtoD)", impl_->cu_memcpy_2d(&desc));
+}
+
+void CudaBackend::copy_device_to_host_2d(const CudaDeviceToHost2DCopy& copy) const {
+  if (copy.dst == nullptr || copy.src == 0) {
+    throw std::invalid_argument("CUDA DtoH 2D copy requires live source and destination");
+  }
+  validate_2d_shape(copy.src_pitch, copy.dst_pitch, copy.width_bytes, copy.height);
+  impl_->ensure_current_context_for_copy();
+  const CudaMemcpy2D desc = {
+      .src_memory_type = kMemoryTypeDevice,
+      .src_device = copy.src,
+      .src_pitch = copy.src_pitch,
+      .dst_memory_type = kMemoryTypeHost,
+      .dst_host = copy.dst,
+      .dst_pitch = copy.dst_pitch,
+      .width_in_bytes = copy.width_bytes,
+      .height = copy.height,
+  };
+  check_cuda("cuMemcpy2D_v2 (DtoH)", impl_->cu_memcpy_2d(&desc));
 }
 
 void CudaBackend::synchronize() const {
