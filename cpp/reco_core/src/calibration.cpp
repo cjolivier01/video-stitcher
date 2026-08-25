@@ -1,7 +1,9 @@
 #include "reco/core/calibration.hpp"
 
 #include <cmath>
+#include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -455,9 +457,18 @@ std::optional<MatchCalibration> load_match_calibration_file(const std::string& p
     }
     return std::nullopt;
   }
+  std::error_code status_error;
+  const auto file_size = std::filesystem::file_size(path, status_error);
+  if (status_error || file_size > kMaxCalibrationFileSize) {
+    if (error != nullptr) {
+      *error = status_error ? "cannot stat calibration file" : "calibration file too large";
+    }
+    return std::nullopt;
+  }
   std::ostringstream contents;
-  contents << input.rdbuf();
-  const auto text = contents.str();
+  std::string text(kMaxCalibrationFileSize + 1, '\0');
+  input.read(text.data(), static_cast<std::streamsize>(text.size()));
+  text.resize(static_cast<std::size_t>(input.gcount()));
   if (text.size() > kMaxCalibrationFileSize) {
     if (error != nullptr) {
       *error = "calibration file too large";
@@ -473,6 +484,7 @@ std::optional<MatchCalibration> load_match_calibration_file(const std::string& p
 
 std::string calibration_to_json(const MatchCalibration& calibration) {
   std::ostringstream out;
+  out << std::setprecision(std::numeric_limits<double>::max_digits10);
   out << "{\"left_uniforms\":{\"width\":" << calibration.left.width
       << ",\"height\":" << calibration.left.height << ",\"fx\":" << calibration.left.fx
       << ",\"fy\":" << calibration.left.fy << ",\"cx\":" << calibration.left.cx

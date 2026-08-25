@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <string_view>
 
@@ -68,11 +69,21 @@ void validation_rejects_invalid_requests() {
   request.config.akaze.detect_y_max = 0.1;
   error = validate_gpu_calibration_request(request);
   expect_true(error.has_value(), "invalid Y detection range rejected");
+
+  request = valid_request();
+  request.config.skip_start_secs = std::numeric_limits<double>::quiet_NaN();
+  error = validate_gpu_calibration_request(request);
+  expect_true(error.has_value(), "nan skip start rejected");
+
+  request = valid_request();
+  request.config.akaze.detect_y_min = std::numeric_limits<double>::quiet_NaN();
+  error = validate_gpu_calibration_request(request);
+  expect_true(error.has_value(), "nan Y detection range rejected");
 }
 
 void plan_keeps_calibration_gpu_resident() {
   const auto plan = build_gpu_calibration_plan(valid_request(), ready_backends());
-  expect_true(plan.gpu_resident, "plan is marked GPU resident");
+  expect_true(!plan.gpu_resident, "blocked plan is not marked GPU resident");
   expect_eq(plan.steps.size(), 7U, "all Rust calibration stages are represented");
   expect_true(!plan.ready, "AKAZE execution remains explicitly blocked");
   expect_true(plan.blocked_reason.has_value(), "blocked reason present");
@@ -80,6 +91,8 @@ void plan_keeps_calibration_gpu_resident() {
               "blocked reason refuses CPU fallback");
 
   const auto description = describe_calibration_plan(plan);
+  expect_true(description.find("(device-resident)") == std::string::npos,
+              "blocked plan does not claim verified device residency");
   expect_true(description.find("nvv4l2decoder") != std::string::npos,
               "plan describes hardware decode pipeline");
   expect_true(description.find("qtdemux ! parsebin ! nvv4l2decoder") != std::string::npos,

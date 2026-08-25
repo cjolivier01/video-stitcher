@@ -1,5 +1,5 @@
-#include "reco/io/gstreamer.hpp"
 #include "reco/io/gpu_decode.hpp"
+#include "reco/io/gstreamer.hpp"
 
 #include <cstdlib>
 #include <iostream>
@@ -50,46 +50,47 @@ void pipeline_builders_match_rust_policy() {
               "Jetson path device rejected");
   expect_true(!validate_capture_device("/dev/video12", CapturePlatform::LinuxV4l2).has_value(),
               "Linux V4L2 path accepted");
-  expect_true(validate_capture_device("/dev/video0 ! fakesink", CapturePlatform::LinuxV4l2)
-                  .has_value(),
-              "Linux pipeline injection rejected");
+  expect_true(
+      validate_capture_device("/dev/video0 ! fakesink", CapturePlatform::LinuxV4l2).has_value(),
+      "Linux pipeline injection rejected");
   expect_true(validate_capture_device("camera0", CapturePlatform::Macos).has_value(),
               "macOS nonnumeric device rejected");
 
-  const auto jetson =
-      build_capture_pipeline_string("1", 1920, 1080, 60, CaptureFormat::Nv12,
-                                    CapturePlatform::Jetson);
+  const auto jetson = build_capture_pipeline_string("1", 1920, 1080, 60, CaptureFormat::Nv12,
+                                                    CapturePlatform::Jetson);
   expect_true(jetson.find("nvarguscamerasrc sensor-id=1") != std::string::npos,
               "Jetson source selected");
   expect_true(jetson.find("video/x-raw(memory:NVMM)") != std::string::npos,
               "Jetson NVMM caps preserved");
   expect_true(jetson.find("format=NV12") != std::string::npos, "Jetson NV12 output");
 
-  const auto linux =
-      build_capture_pipeline_string("/dev/video2", 1280, 720, 30, CaptureFormat::I420,
-                                    CapturePlatform::LinuxV4l2);
+  const auto linux = build_capture_pipeline_string("/dev/video2", 1280, 720, 30,
+                                                   CaptureFormat::I420, CapturePlatform::LinuxV4l2);
   expect_true(linux.find("v4l2src device=/dev/video2") != std::string::npos,
               "Linux V4L2 source selected");
   expect_true(linux.find("format=I420") != std::string::npos, "Linux I420 output");
 
-  const auto mac = build_capture_pipeline_string("0", 640, 480, 30, CaptureFormat::Nv12,
-                                                 CapturePlatform::Macos);
-  expect_true(mac.find("avfvideosrc device-index=0") != std::string::npos,
-              "macOS source selected");
+  const auto mac =
+      build_capture_pipeline_string("0", 640, 480, 30, CaptureFormat::Nv12, CapturePlatform::Macos);
+  expect_true(mac.find("avfvideosrc device-index=0") != std::string::npos, "macOS source selected");
 
   const auto windows = build_capture_pipeline_string("0", 640, 480, 30, CaptureFormat::Nv12,
                                                      CapturePlatform::Windows);
   expect_true(windows.find("mfvideosrc device-index=0") != std::string::npos,
               "Windows source selected");
 
-  expect_invalid_argument([] {
-    (void)build_capture_pipeline_string("/dev/video0", 0, 480, 30, CaptureFormat::I420,
-                                        CapturePlatform::LinuxV4l2);
-  }, "zero dimensions rejected");
-  expect_invalid_argument([] {
-    (void)build_capture_pipeline_string("0 ! fakesink", 640, 480, 30, CaptureFormat::Nv12,
-                                        CapturePlatform::Jetson);
-  }, "invalid device rejected before pipeline interpolation");
+  expect_invalid_argument(
+      [] {
+        (void)build_capture_pipeline_string("/dev/video0", 0, 480, 30, CaptureFormat::I420,
+                                            CapturePlatform::LinuxV4l2);
+      },
+      "zero dimensions rejected");
+  expect_invalid_argument(
+      [] {
+        (void)build_capture_pipeline_string("0 ! fakesink", 640, 480, 30, CaptureFormat::Nv12,
+                                            CapturePlatform::Jetson);
+      },
+      "invalid device rejected before pipeline interpolation");
 }
 
 void runtime_probes_are_stable() {
@@ -124,8 +125,7 @@ void runtime_probes_are_stable() {
 void gpu_file_decode_pipeline_preserves_nvmm() {
   GpuFileDecodeConfig config{.path = "/data/left video.mp4",
                              .container = gpu_decode_container_for_path("/data/left video.mp4")};
-  expect_eq(gpu_decode_codec_name(config.codec), std::string_view("h264"),
-            "GPU decode codec name");
+  expect_eq(gpu_decode_codec_name(config.codec), std::string_view("h264"), "GPU decode codec name");
   expect_true(gpu_decode_codec_for_path("clip.hevc") == GpuDecodeCodec::Hevc,
               "HEVC extension selects HEVC parser");
   expect_true(gpu_decode_path_is_elementary_stream("clip.hevc"),
@@ -148,6 +148,8 @@ void gpu_file_decode_pipeline_preserves_nvmm() {
   expect_true(pipeline.find("video/x-raw(memory:NVMM),format=NV12") != std::string::npos,
               "NVMM NV12 caps preserved");
   expect_true(pipeline.find("appsink name=sink") != std::string::npos, "appsink selected");
+  expect_true(pipeline.find("drop=false") != std::string::npos,
+              "offline GPU decode is lossless by default");
 
   config.path = "/data/left.hevc";
   config.codec = gpu_decode_codec_for_path(config.path);
@@ -178,15 +180,17 @@ void gpu_file_decode_pipeline_preserves_nvmm() {
   expect_true(property_like.find("location=\"left num-buffers=1.mp4\"") != std::string::npos,
               "property-looking path remains inside location value");
 
-  expect_invalid_argument([] {
-    (void)build_gstreamer_gpu_file_decode_pipeline({.path = "left.mp4 ! fakesink"});
-  }, "pipeline injection in file path rejected");
-  expect_invalid_argument([] {
-    (void)build_gstreamer_gpu_file_decode_pipeline({.path = "left.mp4", .max_buffers = 0});
-  }, "zero max buffers rejected");
-  expect_invalid_argument([] {
-    (void)build_gstreamer_gpu_file_decode_pipeline({.path = "left.avi"});
-  }, "unsupported default container rejected");
+  expect_invalid_argument(
+      [] { (void)build_gstreamer_gpu_file_decode_pipeline({.path = "left.mp4 ! fakesink"}); },
+      "pipeline injection in file path rejected");
+  expect_invalid_argument(
+      [] {
+        (void)build_gstreamer_gpu_file_decode_pipeline({.path = "left.mp4", .max_buffers = 0});
+      },
+      "zero max buffers rejected");
+  expect_invalid_argument(
+      [] { (void)build_gstreamer_gpu_file_decode_pipeline({.path = "left.avi"}); },
+      "unsupported default container rejected");
 }
 
 } // namespace

@@ -47,7 +47,7 @@ struct CalibrationPlanStep {
 
 struct CalibrationExecutionPlan {
   std::vector<CalibrationPlanStep> steps;
-  bool gpu_resident = true;
+  bool gpu_resident = false;
   bool ready = false;
   std::optional<std::string> blocked_reason;
 };
