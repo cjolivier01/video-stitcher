@@ -1,0 +1,4 @@
+exports_files([
+    "nlohmann_json_module_rules_cc.patch",
+    "nlohmann_json_rules_cc.patch",
+])
