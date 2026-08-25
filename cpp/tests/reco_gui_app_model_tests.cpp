@@ -121,6 +121,9 @@ void export_request_uses_settings_and_selection() {
   expect_invalid_argument([&] { (void)model.export_request(""); }, "empty export output");
   expect_invalid_argument([&] { model.set_default_codec(""); }, "empty codec");
   expect_invalid_argument([&] { model.set_default_quality(""); }, "empty quality");
+  model.set_default_blend_width(2.0F);
+  expect_eq(model.settings().default_blend_width, 0.3F, "default blend setter clamps settings");
+  expect_eq(model.preview().blend_width, 0.3F, "default blend setter clamps preview");
   model.set_ai_model("");
   expect_true(!model.settings().ai_model_path.has_value(), "empty ai path clears");
 }

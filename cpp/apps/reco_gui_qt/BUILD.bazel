@@ -1,0 +1,13 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+
+cc_binary(
+    name = "reco_gui_qt",
+    srcs = ["main.cpp"],
+    local_defines = ["QT_NO_KEYWORDS"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//cpp/reco_core",
+        "//cpp/reco_gui",
+        "@local_config_qt//:qt_widgets",
+    ],
+)

@@ -15,3 +15,7 @@ single_version_override(
     patch_strip = 0,
     version = "3.11.3",
 )
+
+qt_configure = use_repo_rule("//tools/bazel:qt_configure.bzl", "qt_configure")
+
+qt_configure(name = "local_config_qt")

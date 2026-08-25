@@ -66,6 +66,7 @@ public:
   void set_preview_controls(PreviewControls controls);
   void set_default_codec(std::string codec);
   void set_default_quality(std::string quality);
+  void set_default_blend_width(float blend_width);
   void set_ai_model(std::optional<std::filesystem::path> path);
 
 private:

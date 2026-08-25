@@ -156,6 +156,14 @@ void GuiAppModel::set_default_quality(std::string quality) {
   settings_.default_quality = std::move(quality);
 }
 
+void GuiAppModel::set_default_blend_width(float blend_width) {
+  PreviewControls controls = preview_;
+  controls.blend_width = blend_width;
+  controls.clamp();
+  preview_ = controls;
+  settings_.default_blend_width = controls.blend_width;
+}
+
 void GuiAppModel::set_ai_model(std::optional<std::filesystem::path> path) {
   settings_.ai_model_path = std::move(path);
   if (settings_.ai_model_path.has_value() && settings_.ai_model_path->empty()) {
