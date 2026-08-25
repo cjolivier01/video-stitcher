@@ -630,6 +630,63 @@ std::vector<Detection> TrtGpuDetector::detect_gpu_raw(CameraId camera, const Gpu
                      pad_y_, frame.width, frame.height);
 }
 
+NcnnYoloDetector::NcnnYoloDetector(std::filesystem::path model_dir, std::uint32_t input_size,
+                                   std::uint32_t frame_width, std::uint32_t frame_height,
+                                   float confidence_threshold, std::vector<std::string> labels)
+    : session_(NcnnSessionConfig{.model_dir = std::move(model_dir)}),
+      input_size_(input_size),
+      frame_width_(frame_width),
+      frame_height_(frame_height),
+      confidence_threshold_(confidence_threshold),
+      labels_(std::move(labels)) {
+  if (input_size_ == 0 || frame_width_ == 0 || frame_height_ == 0) {
+    throw DetectorError::inference_failed("NcnnYoloDetector dimensions must be non-zero");
+  }
+  const float fw = static_cast<float>(frame_width_);
+  const float fh = static_cast<float>(frame_height_);
+  const float is = static_cast<float>(input_size_);
+  scale_ = std::min(is / fw, is / fh);
+  pad_x_ = static_cast<float>(input_size_ - static_cast<std::uint32_t>(std::round(fw * scale_))) /
+           2.0F;
+  pad_y_ = static_cast<float>(input_size_ - static_cast<std::uint32_t>(std::round(fh * scale_))) /
+           2.0F;
+}
+
+const char* NcnnYoloDetector::name() const { return "ncnn"; }
+
+std::optional<std::span<const std::string>> NcnnYoloDetector::class_names() const {
+  return std::span<const std::string>(labels_);
+}
+
+std::vector<Detection> NcnnYoloDetector::detect(CameraId camera, const DetectorFrame& frame) {
+  const auto& variant = frame.variant();
+  if (const auto* preprocessed = std::get_if<PreprocessedChwFrame>(&variant);
+      preprocessed != nullptr) {
+    return detect_preprocessed(camera, *preprocessed);
+  }
+  throw DetectorError::unsupported_frame_kind();
+}
+
+std::vector<Detection> NcnnYoloDetector::detect_preprocessed(CameraId camera,
+                                                             const PreprocessedChwFrame& frame) {
+  if (frame.input_size != input_size_ || frame.src_width != frame_width_ ||
+      frame.src_height != frame_height_) {
+    throw DetectorError::inference_failed("PreprocessedChw dimensions do not match NCNN detector");
+  }
+  try {
+    const auto output = session_.run_preprocessed_chw(frame.data, frame.input_size);
+    if (output.width <= 0 || output.height <= 0) {
+      return {};
+    }
+    return postprocess_yolo_transposed(output.data, static_cast<std::size_t>(output.width),
+                                       static_cast<std::size_t>(output.height), camera,
+                                       confidence_threshold_, scale_, pad_x_, pad_y_,
+                                       frame.src_width, frame.src_height, nms_threshold_);
+  } catch (const NcnnError& error) {
+    throw DetectorError::inference_failed(error.what());
+  }
+}
+
 std::vector<Detection> postprocess(const std::vector<float>& data, std::size_t n, CameraId camera,
                                    float confidence_threshold, float scale, float pad_x,
                                    float pad_y, std::uint32_t frame_width,
@@ -685,6 +742,93 @@ std::vector<Detection> postprocess(const std::vector<float>& data, std::size_t n
                           .height = clamp01(h)});
   }
   return detections;
+}
+
+std::vector<Detection> postprocess_yolo_transposed(const std::vector<float>& data,
+                                                   std::size_t num_proposals,
+                                                   std::size_t num_features, CameraId camera,
+                                                   float confidence_threshold, float scale,
+                                                   float pad_x, float pad_y,
+                                                   std::uint32_t frame_width,
+                                                   std::uint32_t frame_height,
+                                                   float nms_threshold) {
+  if (num_proposals == 0 || num_features <= 4) {
+    return {};
+  }
+  if (num_features > std::numeric_limits<std::size_t>::max() / num_proposals ||
+      data.size() < num_features * num_proposals) {
+    return {};
+  }
+
+  const auto num_classes = num_features - 4U;
+  const float fw = static_cast<float>(frame_width);
+  const float fh = static_cast<float>(frame_height);
+  std::vector<Detection> candidates;
+  for (std::size_t proposal = 0; proposal < num_proposals; ++proposal) {
+    std::size_t best_class = 0;
+    float best_score = 0.0F;
+    for (std::size_t class_idx = 0; class_idx < num_classes; ++class_idx) {
+      const float score = data[(4U + class_idx) * num_proposals + proposal];
+      if (std::isfinite(score) && score > best_score) {
+        best_score = score;
+        best_class = class_idx;
+      }
+    }
+    if (best_score < confidence_threshold ||
+        best_class > std::numeric_limits<std::uint16_t>::max()) {
+      continue;
+    }
+
+    const float cx_p = data[proposal];
+    const float cy_p = data[num_proposals + proposal];
+    const float w_p = data[(2U * num_proposals) + proposal];
+    const float h_p = data[(3U * num_proposals) + proposal];
+    if (!std::isfinite(cx_p) || !std::isfinite(cy_p) || !std::isfinite(w_p) ||
+        !std::isfinite(h_p)) {
+      continue;
+    }
+
+    const float x1 = cx_p - w_p / 2.0F;
+    const float y1 = cy_p - h_p / 2.0F;
+    const float x2 = cx_p + w_p / 2.0F;
+    const float y2 = cy_p + h_p / 2.0F;
+    const float orig_x1 = (x1 - pad_x) / scale;
+    const float orig_y1 = (y1 - pad_y) / scale;
+    const float orig_x2 = (x2 - pad_x) / scale;
+    const float orig_y2 = (y2 - pad_y) / scale;
+    const float center_x = ((orig_x1 + orig_x2) / 2.0F) / fw;
+    const float center_y = ((orig_y1 + orig_y2) / 2.0F) / fh;
+    const float width = std::abs(orig_x2 - orig_x1) / fw;
+    const float height = std::abs(orig_y2 - orig_y1) / fh;
+    if (!std::isfinite(center_x) || !std::isfinite(center_y) || !std::isfinite(width) ||
+        !std::isfinite(height)) {
+      continue;
+    }
+    if (center_x < 0.0F || center_x > 1.0F || center_y < 0.0F || center_y > 1.0F) {
+      continue;
+    }
+    candidates.push_back({.camera = camera,
+                          .class_id = static_cast<std::uint16_t>(best_class),
+                          .confidence = best_score,
+                          .center_x = clamp01(center_x),
+                          .center_y = clamp01(center_y),
+                          .width = clamp01(width),
+                          .height = clamp01(height)});
+  }
+
+  std::stable_sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
+    return a.confidence > b.confidence;
+  });
+  std::vector<Detection> keep;
+  for (const auto& detection : candidates) {
+    const auto same_class_overlap = [&](const auto& kept) {
+      return kept.class_id == detection.class_id && box_iou(kept, detection) > nms_threshold;
+    };
+    if (std::none_of(keep.begin(), keep.end(), same_class_overlap)) {
+      keep.push_back(detection);
+    }
+  }
+  return keep;
 }
 
 std::vector<Detection> postprocess_balldet(const std::vector<float>& data, std::size_t n,
