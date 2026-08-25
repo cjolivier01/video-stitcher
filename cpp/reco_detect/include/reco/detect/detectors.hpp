@@ -2,6 +2,7 @@
 
 #include "reco/core/cuda_backend.hpp"
 #include "reco/core/pipeline_event.hpp"
+#include "reco/detect/ncnn_session.hpp"
 #include "reco/detect/ort_session.hpp"
 #include "reco/detect/trt_engine.hpp"
 
@@ -253,11 +254,44 @@ private:
   core::CudaDeviceBuffer nv12_8bit_uv_;
 };
 
+class NcnnYoloDetector final : public UnifiedDetector {
+public:
+  NcnnYoloDetector(std::filesystem::path model_dir, std::uint32_t input_size,
+                   std::uint32_t frame_width, std::uint32_t frame_height,
+                   float confidence_threshold, std::vector<std::string> labels);
+
+  [[nodiscard]] const char* name() const override;
+  [[nodiscard]] std::vector<Detection> detect(CameraId camera, const DetectorFrame& frame) override;
+  [[nodiscard]] std::optional<std::span<const std::string>> class_names() const override;
+  [[nodiscard]] std::uint32_t input_size() const { return input_size_; }
+
+private:
+  [[nodiscard]] std::vector<Detection> detect_preprocessed(CameraId camera,
+                                                           const PreprocessedChwFrame& frame);
+
+  NcnnSession session_;
+  std::uint32_t input_size_ = 0;
+  std::uint32_t frame_width_ = 0;
+  std::uint32_t frame_height_ = 0;
+  float confidence_threshold_ = 0.10F;
+  float nms_threshold_ = 0.45F;
+  float scale_ = 1.0F;
+  float pad_x_ = 0.0F;
+  float pad_y_ = 0.0F;
+  std::vector<std::string> labels_;
+};
+
 [[nodiscard]] std::vector<Detection> postprocess(const std::vector<float>& data, std::size_t n,
                                                  CameraId camera, float confidence_threshold,
                                                  float scale, float pad_x, float pad_y,
                                                  std::uint32_t frame_width,
                                                  std::uint32_t frame_height);
+
+[[nodiscard]] std::vector<Detection>
+postprocess_yolo_transposed(const std::vector<float>& data, std::size_t num_proposals,
+                            std::size_t num_features, CameraId camera, float confidence_threshold,
+                            float scale, float pad_x, float pad_y, std::uint32_t frame_width,
+                            std::uint32_t frame_height, float nms_threshold);
 
 [[nodiscard]] std::vector<Detection>
 postprocess_balldet(const std::vector<float>& data, std::size_t n, CameraId camera,

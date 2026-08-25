@@ -1,3 +1,4 @@
+#include "reco/detect/detectors.hpp"
 #include "reco/detect/ncnn_session.hpp"
 
 #include <algorithm>
@@ -34,6 +35,23 @@ template <typename Fn> void expect_ncnn_error(Fn&& fn, std::string_view message)
     std::cerr << "FAIL: " << message << " did not throw\n";
     ++failures;
   } catch (const NcnnError&) {
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: " << message << " threw unexpected exception: " << error.what() << '\n';
+    ++failures;
+  }
+}
+
+template <typename Fn> void expect_detector_error(Fn&& fn, DetectorErrorKind kind,
+                                                  std::string_view message) {
+  try {
+    fn();
+    std::cerr << "FAIL: " << message << " did not throw\n";
+    ++failures;
+  } catch (const DetectorError& error) {
+    if (error.kind() != kind) {
+      std::cerr << "FAIL: " << message << " unexpected kind\n";
+      ++failures;
+    }
   } catch (const std::exception& error) {
     std::cerr << "FAIL: " << message << " threw unexpected exception: " << error.what() << '\n';
     ++failures;
@@ -141,6 +159,34 @@ void fake_runtime_session_contract() {
   set_env("RECO_FAKE_NCNN_NULL_OUTPUT", "1");
   expect_ncnn_error([&] { (void)session.run_preprocessed_chw(input, 7); }, "null output");
   unset_env("RECO_FAKE_NCNN_NULL_OUTPUT");
+
+  NcnnYoloDetector detector(write_model_dir("detector"), 7, 7, 7, 0.10F, {"ball"});
+  DetectorFrame preprocessed(PreprocessedChwFrame{
+      .data = input,
+      .input_size = 7,
+      .src_width = 7,
+      .src_height = 7,
+  });
+  const auto detections = detector.detect(CameraId::Right, preprocessed);
+  expect_eq(detector.name(), std::string_view("ncnn"), "NCNN detector name");
+  expect_eq(detector.input_size(), 7U, "NCNN detector input size");
+  expect_eq(detector.class_names()->size(), 1U, "NCNN detector labels");
+  expect_eq(detections.size(), 2U, "NCNN detector transposed detections");
+  expect_true(detections[0].camera == CameraId::Right, "NCNN detector camera preserved");
+  expect_eq(detections[0].class_id, 0U, "NCNN detector class id");
+  expect_eq(detections[0].confidence, 0.90F, "NCNN detector confidence sorted first");
+
+  DetectorFrame wrong_size(PreprocessedChwFrame{
+      .data = input,
+      .input_size = 8,
+      .src_width = 7,
+      .src_height = 7,
+  });
+  expect_detector_error([&] { (void)detector.detect(CameraId::Left, wrong_size); },
+                        DetectorErrorKind::InferenceFailed, "NCNN detector input size mismatch");
+  DetectorFrame raw(RawFrame{});
+  expect_detector_error([&] { (void)detector.detect(CameraId::Left, raw); },
+                        DetectorErrorKind::UnsupportedFrameKind, "NCNN detector rejects raw frame");
 }
 
 } // namespace
