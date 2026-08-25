@@ -9,6 +9,12 @@
 #include <thread>
 #include <vector>
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
 using namespace reco::core;
 
 namespace {
@@ -57,6 +63,22 @@ bool address_sanitizer_build() {
 #endif
 #else
   return false;
+#endif
+}
+
+bool valid_shareable_handle(CudaShareableHandle handle) {
+#if defined(_WIN32)
+  return handle != nullptr;
+#else
+  return handle >= 0;
+#endif
+}
+
+void close_released_handle(CudaShareableHandle handle) {
+#if defined(_WIN32)
+  CloseHandle(handle);
+#else
+  close(handle);
 #endif
 }
 
@@ -337,6 +359,47 @@ int main() {
         expect_eq(host_dst[row * dst_pitch + col], static_cast<std::uint8_t>(0xCD),
                   "2D destination padding untouched");
       }
+    }
+
+    expect_invalid_argument(
+        [&] {
+          auto ignored = backend.allocate_shared_memory(0);
+          (void)ignored;
+        },
+        "zero shared allocation validation");
+    auto shared_memory = backend.allocate_shared_memory(12345);
+    expect_true(static_cast<bool>(shared_memory), "shared memory allocation");
+    expect_true(shared_memory.ptr() != 0, "shared memory device pointer");
+    expect_true(shared_memory.size() >= 12345, "shared memory size rounded up");
+    expect_true(valid_shareable_handle(shared_memory.shareable_handle()), "shared memory OS handle");
+    auto released_memory = backend.allocate_shared_memory(4096);
+    const CudaShareableHandle released_handle = released_memory.release_shareable_handle();
+    expect_true(valid_shareable_handle(released_handle), "released shared memory OS handle");
+    expect_true(!valid_shareable_handle(released_memory.shareable_handle()),
+                "released shared memory no longer owns handle");
+    close_released_handle(released_handle);
+    released_memory.reset();
+    constexpr std::size_t shared_width = 19;
+    std::vector<std::uint8_t> shared_src(shared_width);
+    for (std::size_t i = 0; i < shared_src.size(); ++i) {
+      shared_src[i] = static_cast<std::uint8_t>(0x40 + i);
+    }
+    backend.copy_host_to_device_2d({.src = shared_src.data(),
+                                    .src_pitch = shared_width,
+                                    .dst = shared_memory.ptr(),
+                                    .dst_pitch = shared_width,
+                                    .width_bytes = shared_width,
+                                    .height = 1});
+    std::vector<std::uint8_t> shared_dst(shared_width, 0);
+    backend.copy_device_to_host_2d({.dst = shared_dst.data(),
+                                    .dst_pitch = shared_width,
+                                    .src = shared_memory.ptr(),
+                                    .src_pitch = shared_width,
+                                    .width_bytes = shared_width,
+                                    .height = 1});
+    backend.synchronize();
+    for (std::size_t i = 0; i < shared_width; ++i) {
+      expect_eq(shared_dst[i], shared_src[i], "shared memory copied byte");
     }
   } catch (const std::exception& error) {
     std::cerr << "FAIL: " << error.what() << '\n';

@@ -14,6 +14,12 @@ namespace reco::core {
 
 using CudaDevicePtr = std::uint64_t;
 
+#if defined(_WIN32)
+using CudaShareableHandle = void*;
+#else
+using CudaShareableHandle = int;
+#endif
+
 struct CudaDeviceInfo {
   int ordinal = 0;
   std::string name;
@@ -88,6 +94,7 @@ private:
   std::function<void(CudaDevicePtr)> free_;
 };
 
+class CudaSharedMemory;
 class CudaKernel;
 
 class CudaBackend {
@@ -101,6 +108,7 @@ public:
   void ensure_primary_context(int ordinal = 0) const;
   [[nodiscard]] CudaMemoryInfo memory_info() const;
   [[nodiscard]] CudaDeviceBuffer allocate(std::size_t bytes) const;
+  [[nodiscard]] CudaSharedMemory allocate_shared_memory(std::size_t bytes) const;
   void memset_d8(const CudaDeviceBuffer& buffer, std::uint8_t value) const;
   [[nodiscard]] std::vector<std::uint8_t> copy_to_host(const CudaDeviceBuffer& buffer) const;
   void copy_host_to_device_2d(const CudaHostToDevice2DCopy& copy) const;
@@ -112,12 +120,50 @@ public:
 
 private:
   friend class CudaDeviceBuffer;
+  friend class CudaSharedMemory;
   friend class CudaKernel;
 
   struct Impl;
 
   explicit CudaBackend(std::shared_ptr<Impl> impl);
   std::shared_ptr<Impl> impl_;
+};
+
+class CudaSharedMemory {
+public:
+  CudaSharedMemory() = default;
+  CudaSharedMemory(const CudaSharedMemory&) = delete;
+  CudaSharedMemory& operator=(const CudaSharedMemory&) = delete;
+  CudaSharedMemory(CudaSharedMemory&& other) noexcept;
+  CudaSharedMemory& operator=(CudaSharedMemory&& other) noexcept;
+  ~CudaSharedMemory();
+
+  [[nodiscard]] CudaDevicePtr ptr() const { return ptr_; }
+  [[nodiscard]] std::size_t size() const { return size_; }
+  // Borrow the exported OS handle without transferring ownership.
+  [[nodiscard]] CudaShareableHandle shareable_handle() const { return shareable_handle_; }
+  [[nodiscard]] explicit operator bool() const { return ptr_ != 0 && size_ != 0; }
+  // Transfer the exported OS handle to a graphics API import path such as Vulkan.
+  // After release, this object still owns the CUDA VMM mapping but will not close the handle.
+  [[nodiscard]] CudaShareableHandle release_shareable_handle();
+  void reset();
+
+private:
+  friend class CudaBackend;
+
+  CudaSharedMemory(std::shared_ptr<CudaBackend::Impl> backend, void* context, CudaDevicePtr ptr,
+                   std::size_t size, CudaShareableHandle shareable_handle);
+
+  std::shared_ptr<CudaBackend::Impl> backend_;
+  void* context_ = nullptr;
+  CudaDevicePtr ptr_ = 0;
+  std::size_t size_ = 0;
+#if defined(_WIN32)
+  CudaShareableHandle shareable_handle_ = nullptr;
+#else
+  CudaShareableHandle shareable_handle_ = -1;
+#endif
+  bool owns_shareable_handle_ = false;
 };
 
 class CudaKernel {
