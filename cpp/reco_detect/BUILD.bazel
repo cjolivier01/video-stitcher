@@ -5,6 +5,7 @@ cc_library(
     srcs = [
         "src/cuda_preprocess.cpp",
         "src/detectors.cpp",
+        "src/ncnn_session.cpp",
         "src/npp_interop.cpp",
         "src/ort_session.cpp",
         "src/probe.cpp",
@@ -13,6 +14,7 @@ cc_library(
     hdrs = [
         "include/reco/detect/cuda_preprocess.hpp",
         "include/reco/detect/detectors.hpp",
+        "include/reco/detect/ncnn_session.hpp",
         "include/reco/detect/npp_interop.hpp",
         "include/reco/detect/ort_session.hpp",
         "include/reco/detect/probe.hpp",
