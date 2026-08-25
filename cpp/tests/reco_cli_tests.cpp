@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -73,15 +74,15 @@ void validators_match_rust() {
 }
 
 void stitch_parse_matches_rust_defaults() {
-  const auto command = expect_command(parse_args({"stitch", "left.mp4", "right.mp4", "-c",
-                                                  "match.json", "--sync-offset", "-3",
-                                                  "--replay-scale", "1280x720",
-                                                  "--quality-value", "80", "--allow-no-tracking",
-                                                  "--no-zero-copy"}),
-                                      "stitch parse");
+  const auto command =
+      expect_command(parse_args({"stitch", "left.mp4", "right.mp4", "-c", "match.json",
+                                 "--sync-offset", "-3", "--replay-scale", "1280x720",
+                                 "--quality-value", "80", "--allow-no-tracking", "--no-zero-copy"}),
+                     "stitch parse");
   const auto* stitch = std::get_if<StitchCommand>(&command);
   expect_true(stitch != nullptr, "stitch variant");
-  if (stitch == nullptr) return;
+  if (stitch == nullptr)
+    return;
   expect_eq(stitch->left, std::string("left.mp4"), "stitch left");
   expect_eq(stitch->right, std::string("right.mp4"), "stitch right");
   expect_eq(stitch->calibration, std::string("match.json"), "stitch calibration");
@@ -114,20 +115,18 @@ void preview_and_calibrate_parse_matches_rust_defaults() {
     expect_near(preview->rig_tilt, -2.5F, 1.0e-6F, "preview negative rig tilt");
   }
 
-  const auto preview_unbounded_blend =
-      expect_command(parse_args({"preview", "l.mp4", "r.mp4", "-c", "match.json", "--blend",
-                                 "1.1"}),
-                     "preview unbounded blend parse");
+  const auto preview_unbounded_blend = expect_command(
+      parse_args({"preview", "l.mp4", "r.mp4", "-c", "match.json", "--blend", "1.1"}),
+      "preview unbounded blend parse");
   const auto* unbounded_preview = std::get_if<PreviewCommand>(&preview_unbounded_blend);
   expect_true(unbounded_preview != nullptr, "preview unbounded blend variant");
   if (unbounded_preview != nullptr) {
     expect_near(unbounded_preview->blend, 1.1F, 1.0e-6F, "preview blend is raw f32");
   }
 
-  const auto preview_nan_blend =
-      expect_command(parse_args({"preview", "l.mp4", "r.mp4", "-c", "match.json", "--blend",
-                                 "NaN"}),
-                     "preview nan blend parse");
+  const auto preview_nan_blend = expect_command(
+      parse_args({"preview", "l.mp4", "r.mp4", "-c", "match.json", "--blend", "NaN"}),
+      "preview nan blend parse");
   const auto* nan_preview = std::get_if<PreviewCommand>(&preview_nan_blend);
   expect_true(nan_preview != nullptr, "preview nan blend variant");
   if (nan_preview != nullptr) {
@@ -135,8 +134,8 @@ void preview_and_calibrate_parse_matches_rust_defaults() {
   }
 
   const auto calibrate_command =
-      expect_command(parse_args({"calibrate", "l.mp4", "r.mp4", "--frames", "8",
-                                 "--no-auto-imu", "--no-auto-sync", "--output", "out.json"}),
+      expect_command(parse_args({"calibrate", "l.mp4", "r.mp4", "--frames", "8", "--no-auto-imu",
+                                 "--no-auto-sync", "--output", "out.json"}),
                      "calibrate parse");
   const auto* calibrate = std::get_if<CalibrateCommand>(&calibrate_command);
   expect_true(calibrate != nullptr, "calibrate variant");
@@ -160,21 +159,60 @@ void parse_errors_are_reported() {
   expect_error(parse_args({"stitch", "left.mp4", "right.mp4", "-c", "match.json", "--output",
                            "--codec", "h264"}),
                "string value cannot consume valid option");
-  expect_error(parse_args({"preview", "left.mp4", "right.mp4", "-c", "match.json", "--width",
-                           "1920x"}),
-               "numeric suffix rejected");
-  expect_error(parse_args({"stitch", "left.mp4", "right.mp4", "-c", "match.json",
-                           "--quality-value", "256"}),
-               "quality value u8 range rejected");
-  expect_error(parse_args({"stitch", "left.mp4", "right.mp4", "-c", "match.json",
-                           "--lookahead", "-1"}),
-               "lookahead does not allow hyphen value");
+  expect_error(
+      parse_args({"preview", "left.mp4", "right.mp4", "-c", "match.json", "--width", "1920x"}),
+      "numeric suffix rejected");
+  expect_error(
+      parse_args({"stitch", "left.mp4", "right.mp4", "-c", "match.json", "--quality-value", "256"}),
+      "quality value u8 range rejected");
+  expect_error(
+      parse_args({"stitch", "left.mp4", "right.mp4", "-c", "match.json", "--lookahead", "-1"}),
+      "lookahead does not allow hyphen value");
   expect_error(parse_args({"calibrate", "left.mp4", "right.mp4", "--skip-start", "-1"}),
                "skip start does not allow hyphen value");
   expect_error(parse_args({"info", "--verbose"}), "info rejects options");
 
   const auto help = expect_command(parse_args({"--help"}), "help parse");
   expect_true(std::holds_alternative<HelpCommand>(help), "help variant");
+  const auto stitch_help = expect_command(parse_args({"stitch", "--help"}), "stitch help parse");
+  expect_true(std::holds_alternative<HelpCommand>(stitch_help), "stitch help variant");
+  const auto partial_stitch_help =
+      expect_command(parse_args({"stitch", "left.mp4", "--help"}), "partial stitch help parse");
+  expect_true(std::holds_alternative<HelpCommand>(partial_stitch_help),
+              "partial stitch help variant");
+}
+
+void command_execution_dispatches_available_stages() {
+  std::ostringstream out;
+  std::ostringstream err;
+  const auto help_status = run_command(HelpCommand{}, out, err);
+  expect_eq(help_status, 0, "help exits success");
+  expect_true(out.str().find("Usage:") != std::string::npos, "help writes usage");
+  expect_true(err.str().empty(), "help writes no stderr");
+
+  out.str("");
+  out.clear();
+  err.str("");
+  err.clear();
+  const auto info_status = run_command(InfoCommand{}, out, err);
+  expect_eq(info_status, 0, "info exits success");
+  expect_true(out.str().find("Reco C++ capability report") != std::string::npos,
+              "info writes report heading");
+  expect_true(out.str().find("CUDA:") != std::string::npos, "info writes CUDA probe");
+  expect_true(out.str().find("GStreamer:") != std::string::npos, "info writes GStreamer probe");
+  expect_true(out.str().find("AI providers:") != std::string::npos, "info writes AI probe");
+  expect_true(err.str().empty(), "info writes no stderr");
+
+  out.str("");
+  out.clear();
+  err.str("");
+  err.clear();
+  StitchCommand stitch{.left = "left.mp4", .right = "right.mp4", .calibration = "match.json"};
+  const auto stitch_status = run_command(Command{stitch}, out, err);
+  expect_eq(stitch_status, 2, "stitch exits blocked");
+  expect_true(out.str().empty(), "blocked stitch writes no stdout");
+  expect_true(err.str().find("execution is not ported yet") != std::string::npos,
+              "blocked stitch explains staged execution");
 }
 
 } // namespace
@@ -184,5 +222,6 @@ int main() {
   stitch_parse_matches_rust_defaults();
   preview_and_calibrate_parse_matches_rust_defaults();
   parse_errors_are_reported();
+  command_execution_dispatches_available_stages();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

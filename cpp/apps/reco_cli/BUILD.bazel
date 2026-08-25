@@ -6,6 +6,11 @@ cc_library(
     hdrs = ["include/reco/cli/cli.hpp"],
     includes = ["include"],
     visibility = ["//visibility:public"],
+    deps = [
+        "//cpp/reco_core",
+        "//cpp/reco_detect",
+        "//cpp/reco_io",
+    ],
 )
 
 cc_binary(
