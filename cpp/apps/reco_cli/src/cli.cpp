@@ -14,8 +14,10 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <type_traits>
+#include <vector>
 
 namespace reco::cli {
 namespace {
@@ -107,6 +109,179 @@ void write_probe(std::ostream& out, std::string_view label, bool available,
     out << " (" << detail << ")";
   }
   out << '\n';
+}
+
+struct RuntimePlan {
+  std::string command;
+  std::vector<std::string> steps;
+  std::optional<std::string> blocked_reason;
+};
+
+void write_runtime_plan(std::ostream& out, const RuntimePlan& plan) {
+  out << "C++ reco " << plan.command << " runtime plan:\n";
+  for (const auto& step : plan.steps) {
+    out << "  - " << step << '\n';
+  }
+  if (plan.blocked_reason.has_value()) {
+    out << "blocked: " << *plan.blocked_reason << '\n';
+  }
+}
+
+std::optional<std::string> require_gpu_video_backend(
+    const reco::calibrate::CalibrationBackendStatus& backends, bool require_nvbufsurface) {
+  if (!backends.cuda.available) {
+    return "CUDA is required for the C++ GPU video path: " + backends.cuda.detail;
+  }
+  if (!backends.gstreamer.available) {
+    return "GStreamer is required for the C++ GPU video path: " + backends.gstreamer.detail;
+  }
+  if (!backends.npp.available) {
+    return "NPP is required for GPU resize/color interop: " + backends.npp.detail;
+  }
+  if (require_nvbufsurface && !backends.nvbufsurface.available) {
+    return "NvBufSurface is required for zero-copy camera ingest: " + backends.nvbufsurface.detail;
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string>
+require_cuda_npp_backend(const reco::calibrate::CalibrationBackendStatus& backends) {
+  if (!backends.cuda.available) {
+    return "CUDA is required for the C++ GPU video path: " + backends.cuda.detail;
+  }
+  if (!backends.npp.available) {
+    return "NPP is required for GPU resize/color interop: " + backends.npp.detail;
+  }
+  return std::nullopt;
+}
+
+reco::calibrate::CalibrationBackendStatus probe_cuda_npp_backends() {
+  reco::calibrate::CalibrationBackendStatus status;
+  status.cuda.available = reco::core::CudaBackend::is_available();
+  status.cuda.detail =
+      status.cuda.available ? "CUDA driver/runtime available"
+                            : reco::core::CudaBackend::availability_error();
+  status.npp.available = reco::detect::is_npp_available();
+  status.npp.detail =
+      status.npp.available ? "NPP image primitives available" : reco::detect::npp_availability_error();
+  return status;
+}
+
+RuntimePlan build_stitch_plan(const StitchCommand& command,
+                              const reco::calibrate::CalibrationBackendStatus& backends) {
+  RuntimePlan plan{
+      .command = "stitch",
+      .steps = {
+          "load and validate v1 calibration JSON",
+          "decode synchronized inputs into GPU/NVMM surfaces",
+          "run stitch renderer without CPU frame readback",
+          "encode the stitched output through the GPU-capable video backend",
+      },
+  };
+  if (command.no_zero_copy) {
+    plan.blocked_reason = "C++ stitch does not support --no-zero-copy because it would force a CPU path";
+  } else if (auto error = require_gpu_video_backend(backends, false); error.has_value()) {
+    plan.blocked_reason = *error;
+  } else {
+    plan.blocked_reason =
+        "C++ GPU stitch renderer and encode execution are not ported yet; refusing CPU fallback";
+  }
+  return plan;
+}
+
+RuntimePlan build_preview_plan(const PreviewCommand&,
+                               const reco::calibrate::CalibrationBackendStatus& backends) {
+  RuntimePlan plan{
+      .command = "preview",
+      .steps = {
+          "load and validate v1 calibration JSON",
+          "decode synchronized inputs into GPU/NVMM surfaces",
+          "render stitched preview frames directly to the GPU presentation surface",
+      },
+  };
+  if (auto error = require_gpu_video_backend(backends, false); error.has_value()) {
+    plan.blocked_reason = *error;
+  } else {
+    plan.blocked_reason =
+        "C++ GPU preview presentation is not ported yet; refusing CPU fallback";
+  }
+  return plan;
+}
+
+RuntimePlan build_camera_plan(const CameraCommand& command,
+                              const reco::calibrate::CalibrationBackendStatus& backends) {
+  RuntimePlan plan{.command = "camera"};
+  if (command.v4l2_direct) {
+    plan.steps = {
+        "open paired V4L2 devices through the direct capture backend",
+        "demosaic raw sensor frames on the GPU",
+        "optionally run live GPU calibration on sampled frames",
+        "stitch and encode the live output without CPU frame readback",
+    };
+    if (const auto error =
+            reco::io::validate_capture_device(command.left_device, reco::io::CapturePlatform::LinuxV4l2);
+        error.has_value()) {
+      plan.blocked_reason = "left V4L2 device is invalid: " + *error;
+    } else if (const auto error = reco::io::validate_capture_device(
+                   command.right_device, reco::io::CapturePlatform::LinuxV4l2);
+               error.has_value()) {
+      plan.blocked_reason = "right V4L2 device is invalid: " + *error;
+    } else if (auto error = require_cuda_npp_backend(backends); error.has_value()) {
+      plan.blocked_reason = *error;
+    } else {
+      plan.blocked_reason =
+          "C++ V4L2-direct GPU capture/demosaic execution is not ported yet; refusing CPU fallback";
+    }
+    return plan;
+  }
+
+  plan.steps = {
+      "open paired live capture sources as GPU/NVMM surfaces",
+      "optionally run live GPU calibration on sampled frames",
+      "stitch and encode the live output without CPU frame readback",
+  };
+  const auto platform = reco::io::detect_capture_platform();
+  if (const auto error = reco::io::validate_capture_device(command.left_device, platform);
+      error.has_value()) {
+    plan.blocked_reason = "left camera device is invalid for this platform: " + *error;
+  } else if (const auto error = reco::io::validate_capture_device(command.right_device, platform);
+             error.has_value()) {
+    plan.blocked_reason = "right camera device is invalid for this platform: " + *error;
+  } else if (platform != reco::io::CapturePlatform::Jetson) {
+    plan.blocked_reason =
+        "C++ generic GStreamer camera ingest is CPU-resident; use a GPU/NVMM path or --v4l2-direct";
+  } else if (auto error = require_gpu_video_backend(backends, true); error.has_value()) {
+    plan.blocked_reason = *error;
+  } else {
+    plan.blocked_reason =
+        "C++ live camera ingest/stitch/encode execution is not ported yet; refusing CPU fallback";
+  }
+  return plan;
+}
+
+RuntimePlan build_libcamera_plan(const LibcameraCommand&) {
+  RuntimePlan plan{
+      .command = "libcamera",
+      .steps = {
+          "open paired libcamera sensors through rpicam-vid",
+          "bridge captured frames into a GPU-resident stitch input",
+          "stitch and encode the live output without CPU frame readback",
+      },
+  };
+  plan.blocked_reason =
+      "C++ libcamera capture is not GPU-resident yet; refusing the CPU YUV420P path";
+  return plan;
+}
+
+RuntimePlan build_gopro_plan(const GoproCommand&) {
+  return {
+      .command = "gopro",
+      .steps = {
+          "discover or address a GoPro control endpoint",
+          "send start/stop/preset commands with explicit HTTP error handling",
+      },
+      .blocked_reason = "C++ GoPro control execution is not ported yet",
+  };
 }
 
 template <typename T, typename Parser>
@@ -971,6 +1146,30 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err) {
       return 2;
     }
     return 0;
+  }
+
+  RuntimePlan runtime_plan;
+  if (const auto* stitch = std::get_if<StitchCommand>(&command)) {
+    const auto backends = reco::calibrate::probe_calibration_backends();
+    runtime_plan = build_stitch_plan(*stitch, backends);
+  } else if (const auto* preview = std::get_if<PreviewCommand>(&command)) {
+    const auto backends = reco::calibrate::probe_calibration_backends();
+    runtime_plan = build_preview_plan(*preview, backends);
+  } else if (const auto* camera = std::get_if<CameraCommand>(&command)) {
+    const auto backends =
+        camera->v4l2_direct ? probe_cuda_npp_backends() : reco::calibrate::probe_calibration_backends();
+    runtime_plan = build_camera_plan(*camera, backends);
+  } else if (const auto* libcamera = std::get_if<LibcameraCommand>(&command)) {
+    runtime_plan = build_libcamera_plan(*libcamera);
+  } else if (const auto* gopro = std::get_if<GoproCommand>(&command)) {
+    runtime_plan = build_gopro_plan(*gopro);
+  }
+
+  if (!runtime_plan.command.empty()) {
+    write_runtime_plan(out, runtime_plan);
+    err << "error: " << runtime_plan.blocked_reason.value_or("C++ runtime execution is unavailable")
+        << '\n';
+    return 2;
   }
 
   err << "error: C++ reco " << command_name(command)

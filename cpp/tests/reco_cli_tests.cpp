@@ -273,9 +273,21 @@ void command_execution_dispatches_available_stages() {
   StitchCommand stitch{.left = "left.mp4", .right = "right.mp4", .calibration = "match.json"};
   const auto stitch_status = run_command(Command{stitch}, out, err);
   expect_eq(stitch_status, 2, "stitch exits blocked");
-  expect_true(out.str().empty(), "blocked stitch writes no stdout");
-  expect_true(err.str().find("execution is not ported yet") != std::string::npos,
-              "blocked stitch explains staged execution");
+  expect_true(out.str().find("C++ reco stitch runtime plan") != std::string::npos,
+              "blocked stitch writes runtime plan");
+  expect_true(out.str().find("GPU/NVMM surfaces") != std::string::npos,
+              "blocked stitch describes GPU ingest");
+  expect_true(err.str().find("error:") != std::string::npos, "blocked stitch writes stderr");
+
+  out.str("");
+  out.clear();
+  err.str("");
+  err.clear();
+  stitch.no_zero_copy = true;
+  const auto cpu_stitch_status = run_command(Command{stitch}, out, err);
+  expect_eq(cpu_stitch_status, 2, "stitch no-zero-copy exits blocked");
+  expect_true(err.str().find("force a CPU path") != std::string::npos,
+              "stitch rejects CPU decode fallback");
 
   out.str("");
   out.clear();
@@ -289,6 +301,56 @@ void command_execution_dispatches_available_stages() {
   expect_true(out.str().find("FeatureMatching") != std::string::npos,
               "calibrate writes AKAZE stage");
   expect_true(err.str().find("error:") != std::string::npos, "calibrate writes stderr error");
+
+  out.str("");
+  out.clear();
+  err.str("");
+  err.clear();
+  PreviewCommand preview{.left = "left.mp4", .right = "right.mp4", .calibration = "match.json"};
+  const auto preview_status = run_command(Command{preview}, out, err);
+  expect_eq(preview_status, 2, "preview exits blocked");
+  expect_true(out.str().find("C++ reco preview runtime plan") != std::string::npos,
+              "preview writes runtime plan");
+
+  out.str("");
+  out.clear();
+  err.str("");
+  err.clear();
+  GoproCommand gopro{.start = true};
+  const auto gopro_status = run_command(Command{gopro}, out, err);
+  expect_eq(gopro_status, 2, "gopro exits blocked");
+  expect_true(out.str().find("C++ reco gopro runtime plan") != std::string::npos,
+              "gopro writes runtime plan");
+
+  out.str("");
+  out.clear();
+  err.str("");
+  err.clear();
+  CameraCommand camera{.left_device = "/dev/video0",
+                       .right_device = "/dev/video1",
+                       .calibration = "match.json",
+                       .output = "out.mp4",
+                       .v4l2_direct = true};
+  const auto camera_status = run_command(Command{camera}, out, err);
+  expect_eq(camera_status, 2, "camera exits blocked");
+  expect_true(out.str().find("V4L2 devices") != std::string::npos,
+              "camera writes V4L2-direct plan");
+  expect_true(err.str().find("CPU fallback") != std::string::npos ||
+                  err.str().find("CUDA is required") != std::string::npos ||
+                  err.str().find("NPP is required") != std::string::npos,
+              "camera keeps V4L2-direct GPU gated");
+
+  out.str("");
+  out.clear();
+  err.str("");
+  err.clear();
+  LibcameraCommand libcamera{.calibration = "match.json", .output = "out.mp4"};
+  const auto libcamera_status = run_command(Command{libcamera}, out, err);
+  expect_eq(libcamera_status, 2, "libcamera exits blocked");
+  expect_true(out.str().find("rpicam-vid") != std::string::npos,
+              "libcamera writes rpicam plan");
+  expect_true(err.str().find("CPU YUV420P") != std::string::npos,
+              "libcamera refuses CPU-resident path");
 }
 
 } // namespace
