@@ -16,5 +16,5 @@ remains authoritative and must not be removed.
 | reco-cli | `reco` binary | `cpp/apps/reco_cli` | Blocked | Help-text parity, golden CLI behavior matrix |
 | reco-gui | Slint app | Qt app | Blocked | UI workflow tests, asset/resource packaging |
 | reco-obs | Rust cdylib + libobs bindings | C++ libobs plugin | Blocked | ABI/header-version smoke tests |
-| Fuzz | `calibration_json`, `onnx_names`, `input_path` | C++ libFuzzer | In progress for `calibration_json` and `input_path` harness builds | Add `onnx_names`, run bounded libFuzzer jobs, sanitizer tested |
+| Fuzz | `calibration_json`, `onnx_names`, `input_path` | C++ libFuzzer | In progress for `calibration_json`, `onnx_names`, and `input_path` harness builds | Run bounded libFuzzer jobs, sanitizer tested |
 | Release | GitHub release workflow | Bazel release workflow | Blocked | Linux x86_64/arm64, macOS arm64/x86_64, Windows x86_64 packages |
