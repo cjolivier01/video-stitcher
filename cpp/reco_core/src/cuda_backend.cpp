@@ -3,6 +3,7 @@
 #include <array>
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -13,6 +14,7 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#include <unistd.h>
 #endif
 
 namespace reco::core {
@@ -25,13 +27,41 @@ using CUmodule = void*;
 using CUresult = int;
 using CUstream = void*;
 using CUdeviceptr = std::uint64_t;
+using CUmemGenericAllocationHandle = std::uint64_t;
 
 constexpr CUresult kCudaSuccess = 0;
 constexpr unsigned int kMemoryTypeHost = 1;
 constexpr unsigned int kMemoryTypeDevice = 2;
+constexpr unsigned int kMemAllocationTypePinned = 1;
+constexpr unsigned int kMemLocationTypeDevice = 1;
+#if defined(_WIN32)
+constexpr unsigned int kMemHandleType = 2;
+#else
+constexpr unsigned int kMemHandleType = 1;
+#endif
+constexpr unsigned int kMemAccessFlagsProtReadWrite = 3;
+constexpr unsigned int kMemAllocGranularityMinimum = 0;
 
 struct CUuuid {
   std::uint8_t bytes[16];
+};
+
+struct CudaMemLocation {
+  unsigned int type = 0;
+  int id = 0;
+};
+
+struct CudaMemAllocationProp {
+  unsigned int type = 0;
+  unsigned int requested_handle_types = 0;
+  CudaMemLocation location;
+  void* win32_handle_meta_data = nullptr;
+  std::uint64_t reserved[8]{};
+};
+
+struct CudaMemAccessDesc {
+  CudaMemLocation location;
+  unsigned int flags = 0;
 };
 
 struct CudaMemcpy2D {
@@ -146,6 +176,48 @@ void validate_ptx(std::string_view ptx) {
   }
 }
 
+std::size_t round_up_to_granularity(std::size_t bytes, std::size_t granularity) {
+  if (granularity == 0) {
+    throw std::runtime_error("CUDA VMM allocation granularity is zero");
+  }
+  const std::size_t remainder = bytes % granularity;
+  if (remainder == 0) {
+    return bytes;
+  }
+  const std::size_t delta = granularity - remainder;
+  if (bytes > std::numeric_limits<std::size_t>::max() - delta) {
+    throw std::overflow_error("CUDA VMM allocation size overflow");
+  }
+  return bytes + delta;
+}
+
+bool valid_shareable_handle(CudaShareableHandle handle) {
+#if defined(_WIN32)
+  return handle != nullptr;
+#else
+  return handle >= 0;
+#endif
+}
+
+void close_shareable_handle(CudaShareableHandle handle) {
+  if (!valid_shareable_handle(handle)) {
+    return;
+  }
+#if defined(_WIN32)
+  CloseHandle(handle);
+#else
+  close(handle);
+#endif
+}
+
+CudaShareableHandle invalid_shareable_handle() {
+#if defined(_WIN32)
+  return nullptr;
+#else
+  return -1;
+#endif
+}
+
 } // namespace
 
 struct CudaBackend::Impl {
@@ -172,6 +244,19 @@ struct CudaBackend::Impl {
     cu_memcpy_2d = driver.symbol<decltype(cu_memcpy_2d)>("cuMemcpy2D_v2");
     cu_memcpy_dtoh = driver.symbol<decltype(cu_memcpy_dtoh)>("cuMemcpyDtoH_v2");
     cu_mem_get_info = driver.symbol<decltype(cu_mem_get_info)>("cuMemGetInfo_v2");
+    cu_mem_get_allocation_granularity =
+        driver.symbol<decltype(cu_mem_get_allocation_granularity)>(
+            "cuMemGetAllocationGranularity");
+    cu_mem_address_reserve = driver.symbol<decltype(cu_mem_address_reserve)>("cuMemAddressReserve");
+    cu_mem_create = driver.symbol<decltype(cu_mem_create)>("cuMemCreate");
+    cu_mem_export_to_shareable_handle =
+        driver.symbol<decltype(cu_mem_export_to_shareable_handle)>(
+            "cuMemExportToShareableHandle");
+    cu_mem_map = driver.symbol<decltype(cu_mem_map)>("cuMemMap");
+    cu_mem_set_access = driver.symbol<decltype(cu_mem_set_access)>("cuMemSetAccess");
+    cu_mem_release = driver.symbol<decltype(cu_mem_release)>("cuMemRelease");
+    cu_mem_unmap = driver.symbol<decltype(cu_mem_unmap)>("cuMemUnmap");
+    cu_mem_address_free = driver.symbol<decltype(cu_mem_address_free)>("cuMemAddressFree");
     cu_module_load_data = driver.symbol<decltype(cu_module_load_data)>("cuModuleLoadData");
     cu_module_unload = driver.symbol<decltype(cu_module_unload)>("cuModuleUnload");
     cu_module_get_function = driver.symbol<decltype(cu_module_get_function)>("cuModuleGetFunction");
@@ -250,6 +335,21 @@ struct CudaBackend::Impl {
   CUresult (*cu_memcpy_2d)(const CudaMemcpy2D*) = nullptr;
   CUresult (*cu_memcpy_dtoh)(void*, CUdeviceptr, std::size_t) = nullptr;
   CUresult (*cu_mem_get_info)(std::size_t*, std::size_t*) = nullptr;
+  CUresult (*cu_mem_get_allocation_granularity)(std::size_t*, const CudaMemAllocationProp*,
+                                                unsigned int) = nullptr;
+  CUresult (*cu_mem_address_reserve)(CUdeviceptr*, std::size_t, std::size_t, CUdeviceptr,
+                                     std::uint64_t) = nullptr;
+  CUresult (*cu_mem_create)(CUmemGenericAllocationHandle*, std::size_t,
+                            const CudaMemAllocationProp*, std::uint64_t) = nullptr;
+  CUresult (*cu_mem_export_to_shareable_handle)(void*, CUmemGenericAllocationHandle, unsigned int,
+                                                std::uint64_t) = nullptr;
+  CUresult (*cu_mem_map)(CUdeviceptr, std::size_t, std::size_t, CUmemGenericAllocationHandle,
+                         std::uint64_t) = nullptr;
+  CUresult (*cu_mem_set_access)(CUdeviceptr, std::size_t, const CudaMemAccessDesc*,
+                                std::size_t) = nullptr;
+  CUresult (*cu_mem_release)(CUmemGenericAllocationHandle) = nullptr;
+  CUresult (*cu_mem_unmap)(CUdeviceptr, std::size_t) = nullptr;
+  CUresult (*cu_mem_address_free)(CUdeviceptr, std::size_t) = nullptr;
   CUresult (*cu_module_load_data)(CUmodule*, const void*) = nullptr;
   CUresult (*cu_module_unload)(CUmodule) = nullptr;
   CUresult (*cu_module_get_function)(CUfunction*, CUmodule, const char*) = nullptr;
@@ -292,6 +392,73 @@ void CudaDeviceBuffer::reset() {
   ptr_ = 0;
   size_ = 0;
   free_ = {};
+}
+
+CudaSharedMemory::CudaSharedMemory(std::shared_ptr<CudaBackend::Impl> backend, void* context,
+                                   CudaDevicePtr ptr, std::size_t size,
+                                   CudaShareableHandle shareable_handle)
+    : backend_(std::move(backend)),
+      context_(context),
+      ptr_(ptr),
+      size_(size),
+      shareable_handle_(shareable_handle),
+      owns_shareable_handle_(valid_shareable_handle(shareable_handle)) {}
+
+CudaSharedMemory::CudaSharedMemory(CudaSharedMemory&& other) noexcept
+    : backend_(std::move(other.backend_)),
+      context_(std::exchange(other.context_, nullptr)),
+      ptr_(std::exchange(other.ptr_, 0)),
+      size_(std::exchange(other.size_, 0)),
+      shareable_handle_(std::exchange(other.shareable_handle_, invalid_shareable_handle())),
+      owns_shareable_handle_(std::exchange(other.owns_shareable_handle_, false)) {}
+
+CudaSharedMemory& CudaSharedMemory::operator=(CudaSharedMemory&& other) noexcept {
+  if (this != &other) {
+    reset();
+    backend_ = std::move(other.backend_);
+    context_ = std::exchange(other.context_, nullptr);
+    ptr_ = std::exchange(other.ptr_, 0);
+    size_ = std::exchange(other.size_, 0);
+    shareable_handle_ = std::exchange(other.shareable_handle_, invalid_shareable_handle());
+    owns_shareable_handle_ = std::exchange(other.owns_shareable_handle_, false);
+  }
+  return *this;
+}
+
+CudaSharedMemory::~CudaSharedMemory() { reset(); }
+
+CudaShareableHandle CudaSharedMemory::release_shareable_handle() {
+  owns_shareable_handle_ = false;
+  return std::exchange(shareable_handle_, invalid_shareable_handle());
+}
+
+void CudaSharedMemory::reset() {
+  if (owns_shareable_handle_) {
+    close_shareable_handle(shareable_handle_);
+  }
+  shareable_handle_ = invalid_shareable_handle();
+  owns_shareable_handle_ = false;
+
+  if (ptr_ == 0) {
+    size_ = 0;
+    context_ = nullptr;
+    backend_.reset();
+    return;
+  }
+  try {
+    const CUcontext previous_context = backend_->current_context();
+    backend_->set_current_context(static_cast<CUcontext>(context_));
+    const auto unmap_result = backend_->cu_mem_unmap(ptr_, size_);
+    (void)unmap_result;
+    const auto free_result = backend_->cu_mem_address_free(ptr_, size_);
+    (void)free_result;
+    backend_->set_current_context(previous_context);
+  } catch (...) {
+  }
+  ptr_ = 0;
+  size_ = 0;
+  context_ = nullptr;
+  backend_.reset();
 }
 
 CudaKernel::CudaKernel(std::shared_ptr<CudaBackend::Impl> backend, void* context, void* module,
@@ -449,6 +616,72 @@ CudaDeviceBuffer CudaBackend::allocate(std::size_t bytes) const {
     impl->ensure_primary_context(0);
     check_cuda("cuMemFree_v2", impl->cu_mem_free(ptr));
   });
+}
+
+CudaSharedMemory CudaBackend::allocate_shared_memory(std::size_t bytes) const {
+  if (bytes == 0) {
+    throw std::invalid_argument("CUDA shared allocation size must be non-zero");
+  }
+  impl_->ensure_current_context_for_copy();
+  const CUcontext context = impl_->current_context();
+  if (context == nullptr) {
+    throw std::runtime_error("CUDA shared allocation did not establish a current context");
+  }
+  CUdevice current_device = 0;
+  check_cuda("cuCtxGetDevice", impl_->cu_ctx_get_device(&current_device));
+
+  const CudaMemAllocationProp prop = {
+      .type = kMemAllocationTypePinned,
+      .requested_handle_types = kMemHandleType,
+      .location = {.type = kMemLocationTypeDevice, .id = current_device},
+  };
+  std::size_t granularity = 0;
+  check_cuda("cuMemGetAllocationGranularity",
+             impl_->cu_mem_get_allocation_granularity(&granularity, &prop,
+                                                      kMemAllocGranularityMinimum));
+  const std::size_t alloc_size = round_up_to_granularity(bytes, granularity);
+
+  CUdeviceptr ptr = 0;
+  CUmemGenericAllocationHandle allocation_handle = 0;
+  bool allocation_handle_live = false;
+  bool mapped = false;
+  CudaShareableHandle shareable_handle = invalid_shareable_handle();
+
+  try {
+    check_cuda("cuMemAddressReserve",
+               impl_->cu_mem_address_reserve(&ptr, alloc_size, granularity, 0, 0));
+    check_cuda("cuMemCreate", impl_->cu_mem_create(&allocation_handle, alloc_size, &prop, 0));
+    allocation_handle_live = true;
+    check_cuda("cuMemExportToShareableHandle",
+               impl_->cu_mem_export_to_shareable_handle(&shareable_handle, allocation_handle,
+                                                        kMemHandleType, 0));
+    check_cuda("cuMemMap", impl_->cu_mem_map(ptr, alloc_size, 0, allocation_handle, 0));
+    mapped = true;
+    check_cuda("cuMemRelease", impl_->cu_mem_release(allocation_handle));
+    allocation_handle_live = false;
+    const CudaMemAccessDesc access = {
+        .location = {.type = kMemLocationTypeDevice, .id = current_device},
+        .flags = kMemAccessFlagsProtReadWrite,
+    };
+    check_cuda("cuMemSetAccess", impl_->cu_mem_set_access(ptr, alloc_size, &access, 1));
+  } catch (...) {
+    if (allocation_handle_live) {
+      const auto release_result = impl_->cu_mem_release(allocation_handle);
+      (void)release_result;
+    }
+    if (mapped) {
+      const auto unmap_result = impl_->cu_mem_unmap(ptr, alloc_size);
+      (void)unmap_result;
+    }
+    if (ptr != 0) {
+      const auto free_result = impl_->cu_mem_address_free(ptr, alloc_size);
+      (void)free_result;
+    }
+    close_shareable_handle(shareable_handle);
+    throw;
+  }
+
+  return CudaSharedMemory(impl_, context, ptr, alloc_size, shareable_handle);
 }
 
 void CudaBackend::memset_d8(const CudaDeviceBuffer& buffer, std::uint8_t value) const {
