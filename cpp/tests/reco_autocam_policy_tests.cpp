@@ -1,3 +1,5 @@
+#include "reco/autocam/ball_tracker.hpp"
+#include "reco/autocam/class_provider.hpp"
 #include "reco/autocam/coaster.hpp"
 #include "reco/autocam/roi_filter.hpp"
 #include "reco/autocam/sweep_panner.hpp"
@@ -6,6 +8,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -46,6 +49,20 @@ Detection detection(reco::core::CameraId camera, std::uint16_t class_id, float c
           .center_y = cy,
           .width = w,
           .height = h};
+}
+
+reco::core::MappedDetection mapped_detection(reco::core::CameraId camera, std::uint16_t class_id,
+                                             float yaw, float pitch, float confidence) {
+  return {
+      .camera = camera,
+      .class_id = class_id,
+      .confidence = confidence,
+      .camera_center_x = 0.5F,
+      .camera_center_y = 0.5F,
+      .camera_size_x = 0.05F,
+      .camera_size_y = 0.05F,
+      .position = reco::core::ViewportPosition{.yaw = yaw, .pitch = pitch},
+  };
 }
 
 reco::core::FieldRoi full_roi() {
@@ -176,6 +193,157 @@ void sweep_panner_matches_rust_phase_policy() {
   expect_near(a.yaw, b.yaw, 1.0e-6F, "sweep ignores world state");
 }
 
+void class_provider_matches_rust_stateless_policy() {
+  ClassProvider provider(0);
+  std::vector<reco::core::MappedDetection> detections{
+      mapped_detection(reco::core::CameraId::Left, 0, 0.0F, 0.0F, 0.9F),
+      mapped_detection(reco::core::CameraId::Left, 0, 0.5F, 0.0F, 0.8F),
+      mapped_detection(reco::core::CameraId::Right, 0, -0.5F, 0.0F, 0.7F),
+  };
+  auto out = provider.update(detections, 0.0);
+  expect_eq(out.size(), 3U, "class provider emits all configured detections");
+  expect_true(out[0].state == reco::core::TrackState::Tracking, "provider state tracking");
+  expect_near(out[2].yaw, -0.5F, 1.0e-6F, "provider yaw passthrough");
+  expect_true(out[2].origin == reco::core::CameraId::Right, "provider origin passthrough");
+
+  auto same = provider.update(detections, 16.7);
+  expect_eq(same.size(), out.size(), "provider deterministic count");
+  expect_near(same[1].yaw, out[1].yaw, 1.0e-6F, "provider deterministic yaw");
+
+  auto other = mapped_detection(reco::core::CameraId::Left, 5, 0.3F, 0.0F, 0.9F);
+  auto keep = mapped_detection(reco::core::CameraId::Left, 0, 0.1F, 0.0F, 0.9F);
+  auto filtered = provider.update({other, keep}, 0.0);
+  expect_eq(filtered.size(), 1U, "provider filters other classes");
+  expect_near(filtered[0].yaw, 0.1F, 1.0e-6F, "provider kept class yaw");
+
+  keep.position = std::nullopt;
+  expect_true(provider.update({keep}, 0.0).empty(), "provider skips missing position");
+  expect_eq(provider.class_id(), 0U, "provider class id");
+}
+
+void ball_tracker_matches_rust_singleton_policy() {
+  BallTracker empty(0);
+  expect_true(empty.update({}, 0.0).empty(), "empty detections produce nothing");
+
+  BallTracker tracker(0);
+  auto first =
+      tracker.update({mapped_detection(reco::core::CameraId::Left, 0, 0.2F, 0.1F, 0.8F)}, 0.0);
+  expect_eq(first.size(), 1U, "first detection emits");
+  expect_true(first[0].state == reco::core::TrackState::Tracking, "first detection tracking");
+  expect_near(first[0].yaw, 0.2F, 1.0e-6F, "first yaw");
+  expect_true(first[0].origin == reco::core::CameraId::Left, "first origin");
+
+  BallTracker wrong_class(32);
+  expect_true(
+      wrong_class.update({mapped_detection(reco::core::CameraId::Left, 0, 0.2F, 0.1F, 0.8F)}, 0.0)
+          .empty(),
+      "wrong class ignored");
+
+  auto no_pos = mapped_detection(reco::core::CameraId::Left, 0, 0.2F, 0.1F, 0.8F);
+  no_pos.position = std::nullopt;
+  expect_true(BallTracker(0).update({no_pos}, 0.0).empty(), "missing position ignored");
+
+  auto coasting = BallTracker(0).with_max_coast_frames(2);
+  (void)coasting.update({mapped_detection(reco::core::CameraId::Left, 0, 0.2F, 0.1F, 0.8F)}, 0.0);
+  expect_true(coasting.update({}, 16.6)[0].state == reco::core::TrackState::Coasting, "coast one");
+  expect_true(coasting.update({}, 33.3)[0].state == reco::core::TrackState::Coasting, "coast two");
+  auto lost = coasting.update({}, 50.0);
+  expect_true(lost[0].state == reco::core::TrackState::Lost, "coast then lost");
+  expect_true(coasting.update({}, 66.6).empty(), "lost emits once");
+
+  auto gated = BallTracker(0).with_max_jump_rad(0.1F);
+  (void)gated.update({mapped_detection(reco::core::CameraId::Left, 0, 0.0F, 0.0F, 0.9F)}, 0.0);
+  auto jump =
+      gated.update({mapped_detection(reco::core::CameraId::Left, 0, 1.0F, 0.0F, 0.9F)}, 16.6);
+  expect_true(jump[0].state == reco::core::TrackState::Coasting, "big jump rejected");
+  expect_near(jump[0].yaw, 0.0F, 1.0e-6F, "coast holds last yaw");
+
+  auto handoff = BallTracker(0).with_max_jump_rad(0.3F);
+  (void)handoff.update({mapped_detection(reco::core::CameraId::Left, 0, 0.15F, 0.0F, 0.8F)}, 0.0);
+  auto right =
+      handoff.update({mapped_detection(reco::core::CameraId::Right, 0, 0.20F, 0.0F, 0.75F)}, 16.6);
+  expect_true(right[0].state == reco::core::TrackState::Tracking, "cross camera handoff");
+  expect_true(right[0].origin == reco::core::CameraId::Right, "handoff origin");
+
+  auto anchored = BallTracker(0).with_player_anchor_rad(0.1F);
+  anchored.set_players({reco::core::TrackedEntity{.id = 1,
+                                                  .class_id = 0,
+                                                  .yaw = 1.0F,
+                                                  .pitch = 0.0F,
+                                                  .confidence = 0.9F,
+                                                  .state = reco::core::TrackState::Tracking,
+                                                  .age_frames = 5,
+                                                  .origin = reco::core::CameraId::Right}});
+  expect_true(
+      anchored.update({mapped_detection(reco::core::CameraId::Left, 0, 0.2F, 0.0F, 0.9F)}, 0.0)
+          .empty(),
+      "player anchor rejects far ball");
+  auto no_anchor = BallTracker(0).with_player_anchor_rad(0.1F);
+  expect_eq(
+      no_anchor.update({mapped_detection(reco::core::CameraId::Left, 0, 0.2F, 0.0F, 0.9F)}, 0.0)
+          .size(),
+      1U, "no players anchor is noop");
+
+  WorldState world;
+  world.players = {reco::core::TrackedEntity{.id = 7,
+                                             .class_id = 0,
+                                             .yaw = 1.0F,
+                                             .pitch = 0.0F,
+                                             .confidence = 0.9F,
+                                             .state = reco::core::TrackState::Tracking,
+                                             .age_frames = 3,
+                                             .origin = reco::core::CameraId::Right}};
+  auto observed = BallTracker(0).with_player_anchor_rad(0.1F);
+  observed.observe_world(world);
+  expect_true(
+      observed.update({mapped_detection(reco::core::CameraId::Left, 0, 0.2F, 0.0F, 0.9F)}, 0.0)
+          .empty(),
+      "observe_world populates anchors");
+  observed.observe_world(WorldState{});
+  expect_eq(
+      observed.update({mapped_detection(reco::core::CameraId::Left, 0, 0.2F, 0.0F, 0.9F)}, 0.0)
+          .size(),
+      1U, "empty world clears anchors");
+
+  auto chooser = BallTracker(0).with_max_jump_rad(1.0F);
+  (void)chooser.update({mapped_detection(reco::core::CameraId::Left, 0, 0.0F, 0.0F, 0.9F)}, 0.0);
+  auto chosen =
+      chooser.update({mapped_detection(reco::core::CameraId::Left, 0, 0.40F, 0.0F, 0.95F),
+                      mapped_detection(reco::core::CameraId::Left, 0, 0.05F, 0.0F, 0.55F)},
+                     16.6);
+  expect_near(chosen[0].yaw, 0.05F, 1.0e-6F, "closer candidate beats confidence");
+  expect_eq(BallTracker(32).class_id(), 32U, "ball tracker class id");
+
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  auto nan_jump = BallTracker(0).with_max_jump_rad(nan);
+  (void)nan_jump.update({mapped_detection(reco::core::CameraId::Left, 0, 0.0F, 0.0F, 0.9F)}, 0.0);
+  auto rejected =
+      nan_jump.update({mapped_detection(reco::core::CameraId::Left, 0, 0.01F, 0.0F, 0.9F)}, 16.6);
+  expect_true(rejected[0].state == reco::core::TrackState::Coasting,
+              "NaN max jump clamps to zero");
+  expect_near(rejected[0].yaw, 0.0F, 1.0e-6F, "NaN max jump holds last pose");
+
+  auto nan_anchor = BallTracker(0).with_player_anchor_rad(nan);
+  nan_anchor.set_players({reco::core::TrackedEntity{.id = 1,
+                                                    .class_id = 0,
+                                                    .yaw = 0.2F,
+                                                    .pitch = 0.0F,
+                                                    .confidence = 0.9F,
+                                                    .state = reco::core::TrackState::Tracking,
+                                                    .age_frames = 5,
+                                                    .origin = reco::core::CameraId::Right}});
+  expect_eq(
+      nan_anchor.update({mapped_detection(reco::core::CameraId::Left, 0, 0.2F, 0.0F, 0.9F)}, 0.0)
+          .size(),
+      1U, "NaN player anchor clamps to exact-match zero radius");
+
+  auto nan_score = BallTracker(0);
+  auto first_nan =
+      nan_score.update({mapped_detection(reco::core::CameraId::Left, 0, 0.2F, 0.0F, nan)}, 0.0);
+  expect_eq(first_nan.size(), 1U, "sole NaN confidence candidate is still selected");
+  expect_true(std::isnan(first_nan[0].confidence), "NaN confidence passthrough");
+}
+
 } // namespace
 
 int main() {
@@ -183,5 +351,7 @@ int main() {
   coaster_lifecycle_matches_rust();
   roi_filter_matches_rust_anchor_policy();
   sweep_panner_matches_rust_phase_policy();
+  class_provider_matches_rust_stateless_policy();
+  ball_tracker_matches_rust_singleton_policy();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
