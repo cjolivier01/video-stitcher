@@ -10,6 +10,7 @@ cc_library(
     name = "reco_core",
     srcs = [
         "src/calibration.cpp",
+        "src/cuda_backend.cpp",
         "src/pipeline_event.cpp",
         "src/projection.cpp",
         "src/replay_buffer.cpp",
@@ -21,6 +22,7 @@ cc_library(
     ],
     hdrs = [
         "include/reco/core/calibration.hpp",
+        "include/reco/core/cuda_backend.hpp",
         "include/reco/core/pipeline_event.hpp",
         "include/reco/core/projection.hpp",
         "include/reco/core/replay_buffer.hpp",
