@@ -25,8 +25,11 @@ constexpr std::uint32_t kCudaStreamNonBlocking = 1;
 using CudaStream = void*;
 using CudaError = int;
 using CudaSetDevice = CudaError (*)(int);
+using CudaGetDevice = CudaError (*)(int*);
+using CudaDeviceGetAttribute = CudaError (*)(int*, int, int);
 using CudaStreamCreateWithFlags = CudaError (*)(CudaStream*, std::uint32_t);
 using CudaStreamDestroy = CudaError (*)(CudaStream);
+using CudaStreamGetFlags = CudaError (*)(CudaStream, std::uint32_t*);
 
 struct NppStreamContext {
   CudaStream h_stream = nullptr;
@@ -40,6 +43,13 @@ struct NppStreamContext {
   std::uint32_t n_stream_flags = 0;
   int n_reserved0 = 0;
 };
+
+constexpr int kCudaDevAttrMaxThreadsPerBlock = 1;
+constexpr int kCudaDevAttrMaxSharedMemoryPerBlock = 8;
+constexpr int kCudaDevAttrMultiProcessorCount = 16;
+constexpr int kCudaDevAttrMaxThreadsPerMultiProcessor = 39;
+constexpr int kCudaDevAttrComputeCapabilityMajor = 75;
+constexpr int kCudaDevAttrComputeCapabilityMinor = 76;
 
 static_assert(sizeof(NppiSize) == 8);
 static_assert(sizeof(NppiRect) == 16);
@@ -170,8 +180,11 @@ create_stream_context(const std::optional<DynamicLibrary>& cudart) {
     }
 
     auto set_device = cudart->symbol<CudaSetDevice>("cudaSetDevice");
+    auto get_device = cudart->symbol<CudaGetDevice>("cudaGetDevice");
+    auto device_get_attribute = cudart->symbol<CudaDeviceGetAttribute>("cudaDeviceGetAttribute");
     auto stream_create = cudart->symbol<CudaStreamCreateWithFlags>("cudaStreamCreateWithFlags");
     auto stream_destroy = cudart->symbol<CudaStreamDestroy>("cudaStreamDestroy");
+    auto stream_get_flags = cudart->symbol<CudaStreamGetFlags>("cudaStreamGetFlags");
 
     const CudaError set_rc = set_device(0);
     if (set_rc != 0) {
@@ -184,9 +197,45 @@ create_stream_context(const std::optional<DynamicLibrary>& cudart) {
       return {};
     }
 
+    int device_id = 0;
+    if (get_device(&device_id) != 0) {
+      (void)stream_destroy(stream);
+      return {};
+    }
+
+    auto get_attr = [&](int attr, bool allow_zero = false) -> std::optional<int> {
+      int value = 0;
+      if (device_get_attribute(&value, attr, device_id) != 0 ||
+          (allow_zero ? value < 0 : value <= 0)) {
+        return std::nullopt;
+      }
+      return value;
+    };
+    const auto multi_processor_count = get_attr(kCudaDevAttrMultiProcessorCount);
+    const auto max_threads_per_multi_processor = get_attr(kCudaDevAttrMaxThreadsPerMultiProcessor);
+    const auto max_threads_per_block = get_attr(kCudaDevAttrMaxThreadsPerBlock);
+    const auto shared_mem_per_block = get_attr(kCudaDevAttrMaxSharedMemoryPerBlock);
+    const auto compute_capability_major = get_attr(kCudaDevAttrComputeCapabilityMajor);
+    const auto compute_capability_minor = get_attr(kCudaDevAttrComputeCapabilityMinor, true);
+    std::uint32_t stream_flags = 0;
+    if (!multi_processor_count.has_value() || !max_threads_per_multi_processor.has_value() ||
+        !max_threads_per_block.has_value() || !shared_mem_per_block.has_value() ||
+        !compute_capability_major.has_value() || !compute_capability_minor.has_value() ||
+        stream_get_flags(stream, &stream_flags) != 0) {
+      (void)stream_destroy(stream);
+      return {};
+    }
+
     NppStreamContext context;
     context.h_stream = stream;
-    context.n_cuda_device_id = 0;
+    context.n_cuda_device_id = device_id;
+    context.n_multi_processor_count = *multi_processor_count;
+    context.n_max_threads_per_multi_processor = *max_threads_per_multi_processor;
+    context.n_max_threads_per_block = *max_threads_per_block;
+    context.n_shared_mem_per_block = static_cast<std::size_t>(*shared_mem_per_block);
+    context.n_cuda_dev_attr_compute_capability_major = *compute_capability_major;
+    context.n_cuda_dev_attr_compute_capability_minor = *compute_capability_minor;
+    context.n_stream_flags = stream_flags;
     return {context, stream_destroy};
   } catch (const std::exception&) {
     return {};
@@ -208,6 +257,10 @@ std::unique_ptr<NppFunctions> load_npp() {
   );
 
   auto [stream_ctx, stream_destroy] = create_stream_context(functions->cudart);
+  if (!functions->cudart.has_value() || stream_ctx.h_stream == nullptr ||
+      !stream_destroy.has_value()) {
+    throw NppError("NPP requires libcudart and a CUDA stream context");
+  }
   functions->stream_ctx = stream_ctx;
   functions->stream_destroy = stream_destroy;
   functions->nv12_to_rgb = functions->nppicc.symbol<NppiNv12ToRgb>("nppiNV12ToRGB_8u_P2C3R_Ctx");

@@ -53,10 +53,10 @@ std::string gyroflow_profile(std::string_view model, std::uint32_t width, std::u
 }
 
 void load_json_formats_match_rust() {
-  const auto flat = load_lens_from_json(
-      "{\"width\":1920,\"height\":1080,\"fx\":900.0,\"fy\":901.0,\"cx\":960.0,"
-      "\"cy\":540.0,\"d\":[0.01,0.02,0.03,0.04]}",
-      "flat");
+  const auto flat =
+      load_lens_from_json("{\"width\":1920,\"height\":1080,\"fx\":900.0,\"fy\":901.0,\"cx\":960.0,"
+                          "\"cy\":540.0,\"d\":[0.01,0.02,0.03,0.04]}",
+                          "flat");
   expect_eq(flat.width, 1920U, "flat width");
   expect_near(flat.d[3], 0.04, 1.0e-12, "flat distortion");
 
@@ -104,6 +104,27 @@ void load_json_formats_match_rust() {
     malformed_flat_distortion_threw = err.kind == LensLoadErrorKind::Parse;
   }
   expect_true(malformed_flat_distortion_threw, "malformed flat distortion throws typed error");
+
+  bool oversized_flat_dimension_threw = false;
+  try {
+    (void)load_lens_from_json(
+        "{\"width\":4294967296,\"height\":1080,\"fx\":900.0,\"fy\":901.0,\"cx\":960.0,"
+        "\"cy\":540.0,\"d\":[0.01,0.02,0.03,0.04]}",
+        "oversized-flat");
+  } catch (const LensLoadError& err) {
+    oversized_flat_dimension_threw = err.kind == LensLoadErrorKind::Parse;
+  }
+  expect_true(oversized_flat_dimension_threw, "oversized flat dimensions throw typed error");
+
+  bool zero_flat_dimension_threw = false;
+  try {
+    (void)load_lens_from_json("{\"width\":0,\"height\":1080,\"fx\":900.0,\"fy\":901.0,\"cx\":960.0,"
+                              "\"cy\":540.0,\"d\":[0.01,0.02,0.03,0.04]}",
+                              "zero-flat");
+  } catch (const LensLoadError& err) {
+    zero_flat_dimension_threw = err.kind == LensLoadErrorKind::Parse;
+  }
+  expect_true(zero_flat_dimension_threw, "zero flat dimensions throw typed error");
 }
 
 void database_lookup_matches_rust_policy() {
@@ -130,8 +151,7 @@ void database_lookup_matches_rust_policy() {
   db.add_profile_from_json(gyroflow_profile("HERO11 Black", 3840, 2160, "Wide"), "hero11-wide");
   db.add_profile_from_json(gyroflow_profile("HERO11 Black Mini", 3840, 2160, "Linear"),
                            "hero11-mini-linear");
-  const auto parent_fov =
-      db.find("GoPro", "HERO11 Black Mini", 3840, 2160, std::string("Wide"));
+  const auto parent_fov = db.find("GoPro", "HERO11 Black Mini", 3840, 2160, std::string("Wide"));
   expect_true(parent_fov.has_value(), "variant with exact profiles uses parent fov fallback");
   expect_eq(parent_fov->second.camera, std::string("GoPro HERO11 Black"),
             "parent fov fallback camera");

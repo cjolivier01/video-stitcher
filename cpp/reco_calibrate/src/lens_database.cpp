@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <fstream>
+#include <limits>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -94,7 +95,11 @@ std::optional<std::uint32_t> json_u32(const Json& object, const char* key) {
   if (it == object.end() || !it->is_number_unsigned()) {
     return std::nullopt;
   }
-  return static_cast<std::uint32_t>(it->get<std::uint64_t>());
+  const auto value = it->get<std::uint64_t>();
+  if (value == 0 || value > std::numeric_limits<std::uint32_t>::max()) {
+    return std::nullopt;
+  }
+  return static_cast<std::uint32_t>(value);
 }
 
 std::optional<double> json_number(const Json& object, const char* key) {
@@ -155,8 +160,7 @@ std::optional<ParsedProfile> parse_profile_value(const Json& value, const std::s
   const Json* camera_matrix = nullptr;
   if (const auto it = value.find("camera_matrix"); it != value.end()) {
     camera_matrix = &*it;
-  } else if (const auto fp = value.find("fisheye_params");
-             fp != value.end() && fp->is_object()) {
+  } else if (const auto fp = value.find("fisheye_params"); fp != value.end() && fp->is_object()) {
     if (const auto it = fp->find("camera_matrix"); it != fp->end()) {
       camera_matrix = &*it;
     }
@@ -205,8 +209,7 @@ std::optional<ParsedProfile> parse_profile_value(const Json& value, const std::s
   const Json* distortion = nullptr;
   if (const auto it = value.find("distortion_coeffs"); it != value.end()) {
     distortion = &*it;
-  } else if (const auto fp = value.find("fisheye_params");
-             fp != value.end() && fp->is_object()) {
+  } else if (const auto fp = value.find("fisheye_params"); fp != value.end() && fp->is_object()) {
     if (const auto it = fp->find("distortion_coeffs"); it != fp->end()) {
       distortion = &*it;
     }
@@ -282,9 +285,9 @@ std::size_t LensDatabase::len() const { return profiles_.size(); }
 
 bool LensDatabase::is_empty() const { return profiles_.empty(); }
 
-std::optional<std::pair<reco::core::CameraParams, LensProfileInfo>> LensDatabase::find(
-    const std::string& brand, const std::string& model, std::uint32_t width, std::uint32_t height,
-    const std::optional<std::string>& lens_info) const {
+std::optional<std::pair<reco::core::CameraParams, LensProfileInfo>>
+LensDatabase::find(const std::string& brand, const std::string& model, std::uint32_t width,
+                   std::uint32_t height, const std::optional<std::string>& lens_info) const {
   const auto key = normalize_camera_key(brand, model);
   std::vector<std::size_t> indices;
   std::vector<std::size_t> parent_indices;
@@ -326,9 +329,9 @@ std::optional<std::pair<reco::core::CameraParams, LensProfileInfo>> LensDatabase
       }
     }
   }
-  const auto& candidates =
-      !fov_filtered.empty() ? fov_filtered
-                            : (!parent_fov_filtered.empty() ? parent_fov_filtered : indices);
+  const auto& candidates = !fov_filtered.empty()
+                               ? fov_filtered
+                               : (!parent_fov_filtered.empty() ? parent_fov_filtered : indices);
 
   for (const auto idx : candidates) {
     const auto& p = profiles_[idx];
@@ -422,9 +425,9 @@ std::vector<LensProfileSummary> LensDatabase::search(const std::string& query, s
   std::vector<std::pair<std::size_t, int>> hits;
   for (std::size_t i = 0; i < profiles_.size(); ++i) {
     const auto& p = profiles_[i];
-    const auto haystack = lower_copy(p.brand + " " + p.model + " " + p.lens_model + " " +
-                                     p.camera_setting + " " + std::to_string(p.width) + "x" +
-                                     std::to_string(p.height));
+    const auto haystack =
+        lower_copy(p.brand + " " + p.model + " " + p.lens_model + " " + p.camera_setting + " " +
+                   std::to_string(p.width) + "x" + std::to_string(p.height));
     if (std::all_of(words.begin(), words.end(),
                     [&](const std::string& w) { return haystack.find(w) != std::string::npos; })) {
       int priority = 2;
@@ -521,8 +524,8 @@ reco::core::CameraParams load_lens_from_json(const std::string& json_text,
             .fy = *fy,
             .cx = *cx,
             .cy = *cy,
-            .d = {*json_array_number(*d, 0), *json_array_number(*d, 1),
-                  *json_array_number(*d, 2), *json_array_number(*d, 3)}};
+            .d = {*json_array_number(*d, 0), *json_array_number(*d, 1), *json_array_number(*d, 2),
+                  *json_array_number(*d, 3)}};
   }
 
   if (const auto parsed = parse_profile_value(value, source); parsed.has_value()) {

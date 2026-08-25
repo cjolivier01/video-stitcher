@@ -1,13 +1,14 @@
 #include "reco/cli/cli.hpp"
 
 #include "reco/calibrate/pipeline.hpp"
+#include "reco/core/calibration.hpp"
 #include "reco/core/cuda_backend.hpp"
 #include "reco/detect/coreml_session.hpp"
 #include "reco/detect/npp_interop.hpp"
 #include "reco/detect/ort_session.hpp"
 #include "reco/detect/probe.hpp"
-#include "reco/io/gstreamer.hpp"
 #include "reco/io/gpu_decode.hpp"
+#include "reco/io/gstreamer.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -45,6 +46,9 @@ std::variant<double, ParseError> parse_double(std::string_view value, std::strin
   if (text.empty() || end != text.c_str() + text.size()) {
     return ParseError{"invalid " + std::string(name) + " " + text};
   }
+  if (!std::isfinite(parsed)) {
+    return ParseError{"invalid " + std::string(name) + " " + text};
+  }
   return parsed;
 }
 
@@ -53,6 +57,9 @@ std::variant<float, ParseError> parse_float(std::string_view value, std::string_
   char* end = nullptr;
   const float parsed = std::strtof(text.c_str(), &end);
   if (text.empty() || end != text.c_str() + text.size()) {
+    return ParseError{"invalid " + std::string(name) + " " + text};
+  }
+  if (!std::isfinite(parsed)) {
     return ParseError{"invalid " + std::string(name) + " " + text};
   }
   return parsed;
@@ -128,8 +135,9 @@ void write_runtime_plan(std::ostream& out, const RuntimePlan& plan) {
   }
 }
 
-std::optional<std::string> require_gpu_video_backend(
-    const reco::calibrate::CalibrationBackendStatus& backends, bool require_nvbufsurface) {
+std::optional<std::string>
+require_gpu_video_backend(const reco::calibrate::CalibrationBackendStatus& backends,
+                          bool require_nvbufsurface) {
   if (!backends.cuda.available) {
     return "CUDA is required for the C++ GPU video path: " + backends.cuda.detail;
   }
@@ -159,28 +167,34 @@ require_cuda_npp_backend(const reco::calibrate::CalibrationBackendStatus& backen
 reco::calibrate::CalibrationBackendStatus probe_cuda_npp_backends() {
   reco::calibrate::CalibrationBackendStatus status;
   status.cuda.available = reco::core::CudaBackend::is_available();
-  status.cuda.detail =
-      status.cuda.available ? "CUDA driver/runtime available"
-                            : reco::core::CudaBackend::availability_error();
+  status.cuda.detail = status.cuda.available ? "CUDA driver/runtime available"
+                                             : reco::core::CudaBackend::availability_error();
   status.npp.available = reco::detect::is_npp_available();
-  status.npp.detail =
-      status.npp.available ? "NPP image primitives available"
-                           : reco::detect::npp_availability_error();
+  status.npp.detail = status.npp.available ? "NPP image primitives available"
+                                           : reco::detect::npp_availability_error();
   return status;
 }
 
 std::optional<std::string> add_gpu_decode_pipeline_step(RuntimePlan& plan, std::string_view label,
                                                         const std::string& path) {
-  const reco::io::GpuFileDecodeConfig config{.path = path,
-                                             .codec = reco::io::gpu_decode_codec_for_path(path),
-                                             .elementary_stream =
-                                                 reco::io::gpu_decode_path_is_elementary_stream(path),
-                                             .container = reco::io::gpu_decode_container_for_path(path)};
+  const reco::io::GpuFileDecodeConfig config{
+      .path = path,
+      .codec = reco::io::gpu_decode_codec_for_path(path),
+      .elementary_stream = reco::io::gpu_decode_path_is_elementary_stream(path),
+      .container = reco::io::gpu_decode_container_for_path(path)};
   if (const auto error = reco::io::validate_gpu_file_decode_config(config); error.has_value()) {
     return std::string(label) + " " + *error;
   }
   plan.steps.push_back(std::string(label) + " GPU decode: " +
                        reco::io::build_gstreamer_gpu_file_decode_pipeline(config));
+  return std::nullopt;
+}
+
+std::optional<std::string> validate_calibration_file_for_plan(const std::string& path) {
+  std::string error;
+  if (!reco::core::load_match_calibration_file(path, &error).has_value()) {
+    return error.empty() ? "invalid calibration JSON" : error;
+  }
   return std::nullopt;
 }
 
@@ -190,6 +204,11 @@ RuntimePlan build_stitch_plan(const StitchCommand& command,
                    .steps = {
                        "load and validate v1 calibration JSON",
                    }};
+  if (const auto error = validate_calibration_file_for_plan(command.calibration);
+      error.has_value()) {
+    plan.blocked_reason = *error;
+    return plan;
+  }
   if (const auto error = add_gpu_decode_pipeline_step(plan, "left", command.left);
       error.has_value()) {
     plan.blocked_reason = *error;
@@ -203,7 +222,8 @@ RuntimePlan build_stitch_plan(const StitchCommand& command,
   plan.steps.push_back("run stitch renderer without CPU frame readback");
   plan.steps.push_back("encode the stitched output through the GPU-capable video backend");
   if (command.no_zero_copy) {
-    plan.blocked_reason = "C++ stitch does not support --no-zero-copy because it would force a CPU path";
+    plan.blocked_reason =
+        "C++ stitch does not support --no-zero-copy because it would force a CPU path";
   } else if (auto error = require_gpu_video_backend(backends, false); error.has_value()) {
     plan.blocked_reason = *error;
   } else {
@@ -219,6 +239,11 @@ RuntimePlan build_preview_plan(const PreviewCommand& command,
                    .steps = {
                        "load and validate v1 calibration JSON",
                    }};
+  if (const auto error = validate_calibration_file_for_plan(command.calibration);
+      error.has_value()) {
+    plan.blocked_reason = *error;
+    return plan;
+  }
   if (const auto error = add_gpu_decode_pipeline_step(plan, "left", command.left);
       error.has_value()) {
     plan.blocked_reason = *error;
@@ -233,8 +258,7 @@ RuntimePlan build_preview_plan(const PreviewCommand& command,
   if (auto error = require_gpu_video_backend(backends, false); error.has_value()) {
     plan.blocked_reason = *error;
   } else {
-    plan.blocked_reason =
-        "C++ GPU preview presentation is not ported yet; refusing CPU fallback";
+    plan.blocked_reason = "C++ GPU preview presentation is not ported yet; refusing CPU fallback";
   }
   return plan;
 }
@@ -249,9 +273,12 @@ RuntimePlan build_camera_plan(const CameraCommand& command,
         "optionally run live GPU calibration on sampled frames",
         "stitch and encode the live output without CPU frame readback",
     };
-    if (const auto error =
-            reco::io::validate_capture_device(command.left_device, reco::io::CapturePlatform::LinuxV4l2);
+    if (const auto error = validate_calibration_file_for_plan(command.calibration);
         error.has_value()) {
+      plan.blocked_reason = *error;
+    } else if (const auto error = reco::io::validate_capture_device(
+                   command.left_device, reco::io::CapturePlatform::LinuxV4l2);
+               error.has_value()) {
       plan.blocked_reason = "left V4L2 device is invalid: " + *error;
     } else if (const auto error = reco::io::validate_capture_device(
                    command.right_device, reco::io::CapturePlatform::LinuxV4l2);
@@ -272,8 +299,11 @@ RuntimePlan build_camera_plan(const CameraCommand& command,
       "stitch and encode the live output without CPU frame readback",
   };
   const auto platform = reco::io::detect_capture_platform();
-  if (const auto error = reco::io::validate_capture_device(command.left_device, platform);
+  if (const auto error = validate_calibration_file_for_plan(command.calibration);
       error.has_value()) {
+    plan.blocked_reason = *error;
+  } else if (const auto error = reco::io::validate_capture_device(command.left_device, platform);
+             error.has_value()) {
     plan.blocked_reason = "left camera device is invalid for this platform: " + *error;
   } else if (const auto error = reco::io::validate_capture_device(command.right_device, platform);
              error.has_value()) {
@@ -290,27 +320,34 @@ RuntimePlan build_camera_plan(const CameraCommand& command,
   return plan;
 }
 
-RuntimePlan build_libcamera_plan(const LibcameraCommand&) {
+RuntimePlan build_libcamera_plan(const LibcameraCommand& command) {
   RuntimePlan plan{
       .command = "libcamera",
-      .steps = {
-          "open paired libcamera sensors through rpicam-vid",
-          "bridge captured frames into a GPU-resident stitch input",
-          "stitch and encode the live output without CPU frame readback",
-      },
+      .steps =
+          {
+              "open paired libcamera sensors through rpicam-vid",
+              "bridge captured frames into a GPU-resident stitch input",
+              "stitch and encode the live output without CPU frame readback",
+          },
   };
-  plan.blocked_reason =
-      "C++ libcamera capture is not GPU-resident yet; refusing the CPU YUV420P path";
+  if (const auto error = validate_calibration_file_for_plan(command.calibration);
+      error.has_value()) {
+    plan.blocked_reason = *error;
+  } else {
+    plan.blocked_reason =
+        "C++ libcamera capture is not GPU-resident yet; refusing the CPU YUV420P path";
+  }
   return plan;
 }
 
 RuntimePlan build_gopro_plan(const GoproCommand&) {
   return {
       .command = "gopro",
-      .steps = {
-          "discover or address a GoPro control endpoint",
-          "send start/stop/preset commands with explicit HTTP error handling",
-      },
+      .steps =
+          {
+              "discover or address a GoPro control endpoint",
+              "send start/stop/preset commands with explicit HTTP error handling",
+          },
       .blocked_reason = "C++ GoPro control execution is not ported yet",
   };
 }
@@ -1187,8 +1224,8 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err) {
     const auto backends = reco::calibrate::probe_calibration_backends();
     runtime_plan = build_preview_plan(*preview, backends);
   } else if (const auto* camera = std::get_if<CameraCommand>(&command)) {
-    const auto backends =
-        camera->v4l2_direct ? probe_cuda_npp_backends() : reco::calibrate::probe_calibration_backends();
+    const auto backends = camera->v4l2_direct ? probe_cuda_npp_backends()
+                                              : reco::calibrate::probe_calibration_backends();
     runtime_plan = build_camera_plan(*camera, backends);
   } else if (const auto* libcamera = std::get_if<LibcameraCommand>(&command)) {
     runtime_plan = build_libcamera_plan(*libcamera);

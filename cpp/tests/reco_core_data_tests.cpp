@@ -163,6 +163,21 @@ void calibration_json_parse_defaults_and_roundtrip() {
   const auto roundtrip = parse_match_calibration_json(calibration_to_json(*parsed));
   expect_true(roundtrip.has_value(), "roundtrip parses");
   expect_eq(roundtrip->right.height, 2160U, "roundtrip height");
+  expect_near(roundtrip->left.fx, parsed->left.fx, 0.0, "roundtrip left fx precision");
+  expect_near(roundtrip->layout.x_rz, parsed->layout.x_rz, 0.0, "roundtrip layout xRz precision");
+}
+
+void calibration_file_loader_rejects_large_files_before_parse() {
+  const auto dir = scratch_dir();
+  const auto path = dir / "too-large.json";
+  {
+    std::ofstream output(path, std::ios::binary);
+    output << std::string(1024 * 1024 + 1, ' ');
+  }
+  std::string error;
+  const auto parsed = load_match_calibration_file(path.string(), &error);
+  expect_true(!parsed.has_value(), "large calibration file rejected");
+  expect_eq(error, std::string("calibration file too large"), "large calibration error");
 }
 
 void calibration_json_parses_and_serializes_field_roi() {
@@ -649,6 +664,7 @@ int main() {
   camera_input_contract_matches_rust();
   calibration_validation_matches_rust_guards();
   calibration_json_parse_defaults_and_roundtrip();
+  calibration_file_loader_rejects_large_files_before_parse();
   calibration_json_parses_and_serializes_field_roi();
   calibration_json_parses_top_level_non_defaults();
   calibration_json_rejects_schema_that_rust_rejects();

@@ -47,6 +47,15 @@ cc_test(
 )
 
 cc_test(
+    name = "reco_core_performance_tests",
+    size = "small",
+    srcs = ["reco_core_performance_tests.cpp"],
+    deps = [
+        "//cpp/reco_core",
+    ],
+)
+
+cc_test(
     name = "reco_core_cuda_backend_tests",
     size = "small",
     srcs = ["reco_core_cuda_backend_tests.cpp"],

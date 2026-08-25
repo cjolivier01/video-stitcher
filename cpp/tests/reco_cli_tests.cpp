@@ -2,6 +2,8 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -43,6 +45,40 @@ Command expect_command(std::variant<Command, ParseError> parsed, std::string_vie
     return HelpCommand{};
   }
   return std::get<Command>(std::move(parsed));
+}
+
+std::string valid_calibration_json() {
+  return R"json({
+    "left_uniforms": {
+      "width": 3840, "height": 2160,
+      "fx": 1796.32, "fy": 1797.22,
+      "cx": 1919.37, "cy": 1063.17,
+      "d": [0.0342, 0.0677, -0.0741, 0.0299]
+    },
+    "right_uniforms": {
+      "width": 3840, "height": 2160,
+      "fx": 1796.32, "fy": 1797.22,
+      "cx": 1919.37, "cy": 1063.17,
+      "d": [0.0342, 0.0677, -0.0741, 0.0299]
+    },
+    "params": {
+      "cameraAxisOffset": 0.2398,
+      "intersect": 0.5446,
+      "xTy": 0.00476,
+      "xRz": 0.00753,
+      "zRx": -0.00431
+    }
+  })json";
+}
+
+std::filesystem::path write_valid_calibration_file() {
+  const auto dir = std::filesystem::temp_directory_path() / "reco_cli_tests";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  const auto path = dir / "match.json";
+  std::ofstream output(path, std::ios::binary);
+  output << valid_calibration_json();
+  return path;
 }
 
 void expect_error(const std::variant<Command, ParseError>& parsed, std::string_view message) {
@@ -124,14 +160,8 @@ void preview_and_calibrate_parse_matches_rust_defaults() {
     expect_near(unbounded_preview->blend, 1.1F, 1.0e-6F, "preview blend is raw f32");
   }
 
-  const auto preview_nan_blend = expect_command(
-      parse_args({"preview", "l.mp4", "r.mp4", "-c", "match.json", "--blend", "NaN"}),
-      "preview nan blend parse");
-  const auto* nan_preview = std::get_if<PreviewCommand>(&preview_nan_blend);
-  expect_true(nan_preview != nullptr, "preview nan blend variant");
-  if (nan_preview != nullptr) {
-    expect_true(std::isnan(nan_preview->blend), "preview blend accepts nan like raw f32");
-  }
+  expect_error(parse_args({"preview", "l.mp4", "r.mp4", "-c", "match.json", "--blend", "NaN"}),
+               "preview blend rejects nan");
 
   const auto calibrate_command =
       expect_command(parse_args({"calibrate", "l.mp4", "r.mp4", "--frames", "8", "--no-auto-imu",
@@ -226,6 +256,8 @@ void parse_errors_are_reported() {
       "lookahead does not allow hyphen value");
   expect_error(parse_args({"calibrate", "left.mp4", "right.mp4", "--skip-start", "-1"}),
                "skip start does not allow hyphen value");
+  expect_error(parse_args({"calibrate", "left.mp4", "right.mp4", "--akaze-threshold", "NaN"}),
+               "calibrate rejects non-finite double");
   expect_error(parse_args({"info", "--verbose"}), "info rejects options");
   expect_error(parse_args({"camera", "--right-device", "1", "-c", "match.json", "-o", "out.mp4"}),
                "camera requires left device");
@@ -246,6 +278,7 @@ void parse_errors_are_reported() {
 }
 
 void command_execution_dispatches_available_stages() {
+  const auto calibration_path = write_valid_calibration_file();
   std::ostringstream out;
   std::ostringstream err;
   const auto help_status = run_command(HelpCommand{}, out, err);
@@ -270,7 +303,8 @@ void command_execution_dispatches_available_stages() {
   out.clear();
   err.str("");
   err.clear();
-  StitchCommand stitch{.left = "left.mp4", .right = "right.mp4", .calibration = "match.json"};
+  StitchCommand stitch{
+      .left = "left.mp4", .right = "right.mp4", .calibration = calibration_path.string()};
   const auto stitch_status = run_command(Command{stitch}, out, err);
   expect_eq(stitch_status, 2, "stitch exits blocked");
   expect_true(out.str().find("C++ reco stitch runtime plan") != std::string::npos,
@@ -310,7 +344,8 @@ void command_execution_dispatches_available_stages() {
   out.clear();
   err.str("");
   err.clear();
-  PreviewCommand preview{.left = "left.mp4", .right = "right.mp4", .calibration = "match.json"};
+  PreviewCommand preview{
+      .left = "left.mp4", .right = "right.mp4", .calibration = calibration_path.string()};
   const auto preview_status = run_command(Command{preview}, out, err);
   expect_eq(preview_status, 2, "preview exits blocked");
   expect_true(out.str().find("C++ reco preview runtime plan") != std::string::npos,
@@ -322,7 +357,8 @@ void command_execution_dispatches_available_stages() {
   out.clear();
   err.str("");
   err.clear();
-  PreviewCommand hevc_preview{.left = "left.hevc", .right = "right.h265", .calibration = "match.json"};
+  PreviewCommand hevc_preview{
+      .left = "left.hevc", .right = "right.h265", .calibration = calibration_path.string()};
   const auto hevc_preview_status = run_command(Command{hevc_preview}, out, err);
   expect_eq(hevc_preview_status, 2, "HEVC preview exits blocked");
   expect_true(out.str().find("h265parse ! nvv4l2decoder") != std::string::npos,
@@ -334,8 +370,9 @@ void command_execution_dispatches_available_stages() {
   out.clear();
   err.str("");
   err.clear();
-  PreviewCommand invalid_preview{
-      .left = "left.mp4 ! fakesink", .right = "right.mp4", .calibration = "match.json"};
+  PreviewCommand invalid_preview{.left = "left.mp4 ! fakesink",
+                                 .right = "right.mp4",
+                                 .calibration = calibration_path.string()};
   const auto invalid_preview_status = run_command(Command{invalid_preview}, out, err);
   expect_eq(invalid_preview_status, 2, "invalid preview decode path exits blocked");
   expect_true(err.str().find("metacharacters") != std::string::npos,
@@ -345,11 +382,24 @@ void command_execution_dispatches_available_stages() {
   out.clear();
   err.str("");
   err.clear();
-  PreviewCommand unsupported_preview{.left = "left.avi", .right = "right.mp4", .calibration = "match.json"};
+  PreviewCommand unsupported_preview{
+      .left = "left.avi", .right = "right.mp4", .calibration = calibration_path.string()};
   const auto unsupported_preview_status = run_command(Command{unsupported_preview}, out, err);
   expect_eq(unsupported_preview_status, 2, "unsupported preview container exits blocked");
   expect_true(err.str().find("container is unsupported") != std::string::npos,
               "unsupported preview container is reported");
+
+  out.str("");
+  out.clear();
+  err.str("");
+  err.clear();
+  PreviewCommand missing_calibration_preview{
+      .left = "left.mp4", .right = "right.mp4", .calibration = "missing-match.json"};
+  const auto missing_calibration_status =
+      run_command(Command{missing_calibration_preview}, out, err);
+  expect_eq(missing_calibration_status, 2, "missing preview calibration exits blocked");
+  expect_true(err.str().find("cannot read calibration file") != std::string::npos,
+              "missing preview calibration is reported");
 
   out.str("");
   out.clear();
@@ -367,7 +417,7 @@ void command_execution_dispatches_available_stages() {
   err.clear();
   CameraCommand camera{.left_device = "/dev/video0",
                        .right_device = "/dev/video1",
-                       .calibration = "match.json",
+                       .calibration = calibration_path.string(),
                        .output = "out.mp4",
                        .v4l2_direct = true};
   const auto camera_status = run_command(Command{camera}, out, err);
@@ -383,13 +433,38 @@ void command_execution_dispatches_available_stages() {
   out.clear();
   err.str("");
   err.clear();
-  LibcameraCommand libcamera{.calibration = "match.json", .output = "out.mp4"};
+  CameraCommand missing_calibration_camera{.left_device = "/dev/video0",
+                                           .right_device = "/dev/video1",
+                                           .calibration = "missing-match.json",
+                                           .output = "out.mp4",
+                                           .v4l2_direct = true};
+  const auto missing_camera_status = run_command(Command{missing_calibration_camera}, out, err);
+  expect_eq(missing_camera_status, 2, "missing camera calibration exits blocked");
+  expect_true(err.str().find("cannot read calibration file") != std::string::npos,
+              "missing camera calibration is reported");
+
+  out.str("");
+  out.clear();
+  err.str("");
+  err.clear();
+  LibcameraCommand libcamera{.calibration = calibration_path.string(), .output = "out.mp4"};
   const auto libcamera_status = run_command(Command{libcamera}, out, err);
   expect_eq(libcamera_status, 2, "libcamera exits blocked");
-  expect_true(out.str().find("rpicam-vid") != std::string::npos,
-              "libcamera writes rpicam plan");
+  expect_true(out.str().find("rpicam-vid") != std::string::npos, "libcamera writes rpicam plan");
   expect_true(err.str().find("CPU YUV420P") != std::string::npos,
               "libcamera refuses CPU-resident path");
+
+  out.str("");
+  out.clear();
+  err.str("");
+  err.clear();
+  LibcameraCommand missing_calibration_libcamera{.calibration = "missing-match.json",
+                                                 .output = "out.mp4"};
+  const auto missing_libcamera_status =
+      run_command(Command{missing_calibration_libcamera}, out, err);
+  expect_eq(missing_libcamera_status, 2, "missing libcamera calibration exits blocked");
+  expect_true(err.str().find("cannot read calibration file") != std::string::npos,
+              "missing libcamera calibration is reported");
 }
 
 } // namespace
