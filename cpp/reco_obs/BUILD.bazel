@@ -1,0 +1,9 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+cc_library(
+    name = "reco_obs",
+    srcs = ["src/metadata.cpp"],
+    hdrs = ["include/reco/obs/metadata.hpp"],
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+)

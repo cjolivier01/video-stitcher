@@ -1,4 +1,4 @@
-load("@rules_cc//cc:defs.bzl", "cc_test")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_test")
 
 cc_test(
     name = "reco_control_tests",
@@ -7,5 +7,228 @@ cc_test(
     data = ["fixtures/reco_control_golden.json"],
     deps = [
         "//cpp/reco_control",
+    ],
+)
+
+cc_test(
+    name = "reco_core_data_tests",
+    size = "small",
+    srcs = ["reco_core_data_tests.cpp"],
+    deps = [
+        "//cpp/reco_core",
+    ],
+)
+
+cc_test(
+    name = "reco_core_math_events_tests",
+    size = "small",
+    srcs = ["reco_core_math_events_tests.cpp"],
+    deps = [
+        "//cpp/reco_core",
+    ],
+)
+
+cc_test(
+    name = "reco_core_shader_asset_tests",
+    size = "small",
+    srcs = ["reco_core_shader_asset_tests.cpp"],
+    deps = [
+        "//cpp/reco_core",
+    ],
+)
+
+cc_test(
+    name = "reco_core_render_layout_tests",
+    size = "small",
+    srcs = ["reco_core_render_layout_tests.cpp"],
+    deps = [
+        "//cpp/reco_core",
+    ],
+)
+
+cc_test(
+    name = "reco_core_cuda_backend_tests",
+    size = "small",
+    srcs = ["reco_core_cuda_backend_tests.cpp"],
+    deps = [
+        "//cpp/reco_core",
+    ],
+)
+
+cc_test(
+    name = "reco_io_config_tests",
+    size = "small",
+    srcs = ["reco_io_config_tests.cpp"],
+    deps = [
+        "//cpp/reco_core",
+        "//cpp/reco_io",
+        "@nlohmann_json//:json",
+    ],
+)
+
+cc_test(
+    name = "reco_autocam_policy_tests",
+    size = "small",
+    srcs = ["reco_autocam_policy_tests.cpp"],
+    deps = [
+        "//cpp/reco_autocam",
+        "//cpp/reco_core",
+    ],
+)
+
+cc_test(
+    name = "reco_calibrate_data_tests",
+    size = "small",
+    srcs = ["reco_calibrate_data_tests.cpp"],
+    deps = [
+        "//cpp/reco_calibrate",
+        "//cpp/reco_core",
+    ],
+)
+
+cc_test(
+    name = "reco_calibrate_feature_tests",
+    size = "small",
+    srcs = ["reco_calibrate_feature_tests.cpp"],
+    deps = [
+        "//cpp/reco_calibrate",
+    ],
+)
+
+cc_test(
+    name = "reco_calibrate_sampling_tests",
+    size = "small",
+    srcs = ["reco_calibrate_sampling_tests.cpp"],
+    deps = [
+        "//cpp/reco_calibrate",
+    ],
+)
+
+cc_test(
+    name = "reco_calibrate_ransac_tests",
+    size = "small",
+    srcs = ["reco_calibrate_ransac_tests.cpp"],
+    deps = [
+        "//cpp/reco_calibrate",
+    ],
+)
+
+cc_test(
+    name = "reco_calibrate_default_policy_tests",
+    size = "small",
+    srcs = ["reco_calibrate_default_policy_tests.cpp"],
+    deps = [
+        "//cpp/reco_calibrate",
+    ],
+)
+
+cc_test(
+    name = "reco_calibrate_optimizer_tests",
+    size = "small",
+    srcs = ["reco_calibrate_optimizer_tests.cpp"],
+    deps = [
+        "//cpp/reco_calibrate",
+    ],
+)
+
+cc_test(
+    name = "reco_calibrate_lens_database_tests",
+    size = "small",
+    srcs = ["reco_calibrate_lens_database_tests.cpp"],
+    deps = [
+        "//cpp/reco_calibrate",
+    ],
+)
+
+cc_test(
+    name = "reco_calibrate_telemetry_tests",
+    size = "small",
+    srcs = ["reco_calibrate_telemetry_tests.cpp"],
+    deps = [
+        "//cpp/reco_calibrate",
+    ],
+)
+
+cc_test(
+    name = "reco_detect_postprocess_tests",
+    size = "small",
+    srcs = ["reco_detect_postprocess_tests.cpp"],
+    deps = [
+        "//cpp/reco_detect",
+    ],
+)
+
+cc_test(
+    name = "reco_detect_cuda_preprocess_tests",
+    size = "small",
+    srcs = ["reco_detect_cuda_preprocess_tests.cpp"],
+    deps = [
+        "//cpp/reco_core",
+        "//cpp/reco_detect",
+    ],
+)
+
+cc_test(
+    name = "reco_detect_npp_interop_tests",
+    size = "small",
+    srcs = ["reco_detect_npp_interop_tests.cpp"],
+    deps = [
+        "//cpp/reco_core",
+        "//cpp/reco_detect",
+    ],
+)
+
+cc_binary(
+    name = "libfake_onnxruntime.so",
+    testonly = True,
+    srcs = ["fake_onnxruntime.cpp"],
+    linkshared = True,
+)
+
+cc_test(
+    name = "reco_detect_ort_session_fake_runtime_tests",
+    size = "small",
+    srcs = ["reco_detect_ort_session_fake_runtime_tests.cpp"],
+    data = [":libfake_onnxruntime.so"],
+    deps = [
+        "//cpp/reco_detect",
+    ],
+)
+
+cc_test(
+    name = "reco_cli_tests",
+    size = "small",
+    srcs = ["reco_cli_tests.cpp"],
+    deps = [
+        "//cpp/apps/reco_cli:reco_cli_lib",
+    ],
+)
+
+cc_test(
+    name = "reco_gui_state_tests",
+    size = "small",
+    srcs = ["reco_gui_state_tests.cpp"],
+    deps = [
+        "//cpp/reco_gui",
+        "@nlohmann_json//:json",
+    ],
+)
+
+cc_test(
+    name = "reco_gui_telemetry_tests",
+    size = "small",
+    srcs = ["reco_gui_telemetry_tests.cpp"],
+    deps = [
+        "//cpp/reco_gui",
+        "@nlohmann_json//:json",
+    ],
+)
+
+cc_test(
+    name = "reco_obs_metadata_tests",
+    size = "small",
+    srcs = ["reco_obs_metadata_tests.cpp"],
+    deps = [
+        "//cpp/reco_obs",
     ],
 )

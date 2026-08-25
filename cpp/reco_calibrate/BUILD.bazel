@@ -1,0 +1,36 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+cc_library(
+    name = "reco_calibrate",
+    srcs = [
+        "src/defaults.cpp",
+        "src/features.cpp",
+        "src/filter.cpp",
+        "src/geometry.cpp",
+        "src/lens_database.cpp",
+        "src/optimizer.cpp",
+        "src/ransac.cpp",
+        "src/sampling.cpp",
+        "src/telemetry.cpp",
+        "src/types.cpp",
+    ],
+    hdrs = [
+        "include/reco/calibrate/defaults.hpp",
+        "include/reco/calibrate/features.hpp",
+        "include/reco/calibrate/filter.hpp",
+        "include/reco/calibrate/geometry.hpp",
+        "include/reco/calibrate/lens_database.hpp",
+        "include/reco/calibrate/optimizer.hpp",
+        "include/reco/calibrate/ransac.hpp",
+        "include/reco/calibrate/sampling.hpp",
+        "include/reco/calibrate/telemetry.hpp",
+        "include/reco/calibrate/traits.hpp",
+        "include/reco/calibrate/types.hpp",
+    ],
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//cpp/reco_core",
+        "@nlohmann_json//:json",
+    ],
+)

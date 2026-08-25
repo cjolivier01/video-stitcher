@@ -16,7 +16,7 @@ struct PoseControlConfig {
   float hotkey_yaw_step_rad = 0.0872664626F;
   float hotkey_pitch_step_rad = 0.0872664626F;
   float hotkey_fov_step_deg = 5.0F;
-  reco::core::ViewportPosition rest_pose{};
+  reco::core::ViewportPosition rest_pose{0.0F, 0.0F, 75.0F};
 };
 
 class PoseControl {
@@ -52,4 +52,3 @@ private:
 };
 
 } // namespace reco::control
-

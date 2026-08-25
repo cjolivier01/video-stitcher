@@ -1,0 +1,31 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+
+cc_library(
+    name = "reco_detect",
+    srcs = [
+        "src/cuda_preprocess.cpp",
+        "src/detectors.cpp",
+        "src/npp_interop.cpp",
+        "src/ort_session.cpp",
+        "src/probe.cpp",
+    ],
+    hdrs = [
+        "include/reco/detect/cuda_preprocess.hpp",
+        "include/reco/detect/detectors.hpp",
+        "include/reco/detect/npp_interop.hpp",
+        "include/reco/detect/ort_session.hpp",
+        "include/reco/detect/probe.hpp",
+    ],
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//cpp/reco_core",
+    ],
+)
+
+cc_binary(
+    name = "onnx_names_fuzz",
+    testonly = True,
+    srcs = ["fuzz/onnx_names_fuzz.cpp"],
+    deps = [":reco_detect"],
+)
