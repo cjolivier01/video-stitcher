@@ -1,3 +1,4 @@
+#include "reco/detect/detectors.hpp"
 #include "reco/detect/ort_session.hpp"
 
 #include <cstdlib>
@@ -144,9 +145,84 @@ void fake_runtime_session_contract() {
   unset_env("RECO_FAKE_ORT_METADATA_FAIL");
 }
 
+void fake_runtime_cpu_detector_contract() {
+  const auto model = write_marker_model();
+  CpuYoloDetector detector(model, 0.10F, {});
+  expect_eq(std::string_view(detector.name()), std::string_view("ort-cpu"), "cpu detector name");
+  expect_eq(detector.input_size(), 8U, "cpu detector input size");
+  const auto labels = detector.class_names();
+  expect_true(labels.has_value(), "cpu detector labels available");
+  expect_eq((*labels)[2], std::string("player"), "cpu detector metadata labels");
+
+  const std::vector<std::uint8_t> y{80, 90, 100, 110};
+  const std::vector<std::uint8_t> uv{128, 128};
+  const DetectorFrame raw_frame(RawFrame{
+      .y = y,
+      .chroma = Nv12Chroma{.uv = uv},
+      .width = 2,
+      .height = 2,
+  });
+  set_env("RECO_FAKE_ORT_VALIDATE_NV12_2X2", "1");
+  const auto raw_detections = detector.detect(CameraId::Left, raw_frame);
+  unset_env("RECO_FAKE_ORT_VALIDATE_NV12_2X2");
+  expect_eq(raw_detections.size(), 2U, "cpu detector raw detections");
+  expect_eq(raw_detections[0].class_id, 0U, "cpu detector first class");
+  expect_eq(raw_detections[1].class_id, 2U, "cpu detector second class");
+  expect_true(raw_detections[0].camera == CameraId::Left, "cpu detector raw camera");
+
+  const std::vector<float> chw(1 * 3 * 8 * 8, 0.5F);
+  const DetectorFrame preprocessed_frame(PreprocessedChwFrame{
+      .data = chw,
+      .input_size = 8,
+      .src_width = 2,
+      .src_height = 2,
+  });
+  const auto preprocessed_detections = detector.detect(CameraId::Right, preprocessed_frame);
+  expect_eq(preprocessed_detections.size(), 2U, "cpu detector preprocessed detections");
+  expect_true(preprocessed_detections[0].camera == CameraId::Right,
+              "cpu detector preprocessed camera");
+
+  const std::vector<std::uint8_t> y_4x2{10, 20, 30, 40, 50, 60, 70, 80};
+  const std::vector<std::uint8_t> u_4x2{128, 128};
+  const std::vector<std::uint8_t> v_4x2{128, 128};
+  const DetectorFrame yuv420p_frame(RawFrame{
+      .y = y_4x2,
+      .chroma = Yuv420pChroma{.u = u_4x2, .v = v_4x2},
+      .width = 4,
+      .height = 2,
+  });
+  set_env("RECO_FAKE_ORT_VALIDATE_YUV420P_4X2", "1");
+  const auto yuv420p_detections = detector.detect(CameraId::Left, yuv420p_frame);
+  unset_env("RECO_FAKE_ORT_VALIDATE_YUV420P_4X2");
+  expect_eq(yuv420p_detections.size(), 1U, "cpu detector letterboxed yuv420p detections");
+
+  set_env("RECO_FAKE_ORT_EMPTY_OUTPUT", "1");
+  expect_runtime_error([&] { (void)detector.detect(CameraId::Left, preprocessed_frame); },
+                       "cpu detector rejects malformed ORT output shape");
+  unset_env("RECO_FAKE_ORT_EMPTY_OUTPUT");
+
+  try {
+    (void)detector.detect(CameraId::Left,
+                          DetectorFrame(GpuNv12Frame{
+                              .y_ptr = 1,
+                              .uv_ptr = 2,
+                              .y_pitch = 2,
+                              .uv_pitch = 2,
+                              .width = 2,
+                              .height = 2,
+                          }));
+    std::cerr << "FAIL: cpu detector accepted CUDA frame\n";
+    ++failures;
+  } catch (const DetectorError& error) {
+    expect_true(error.kind() == DetectorErrorKind::UnsupportedFrameKind,
+                "cpu detector rejects CUDA frames");
+  }
+}
+
 } // namespace
 
 int main() {
   fake_runtime_session_contract();
+  fake_runtime_cpu_detector_contract();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -2,14 +2,17 @@
 
 #include "reco/core/cuda_backend.hpp"
 #include "reco/core/pipeline_event.hpp"
+#include "reco/detect/ort_session.hpp"
 
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -156,6 +159,29 @@ public:
   [[nodiscard]] virtual std::optional<std::span<const std::string>> class_names() const {
     return std::nullopt;
   }
+};
+
+class CpuYoloDetector final : public UnifiedDetector {
+public:
+  explicit CpuYoloDetector(std::filesystem::path model_path);
+  CpuYoloDetector(std::filesystem::path model_path, float confidence_threshold,
+                  std::vector<std::string> labels);
+
+  [[nodiscard]] const char* name() const override;
+  [[nodiscard]] std::vector<Detection> detect(CameraId camera, const DetectorFrame& frame) override;
+  [[nodiscard]] std::optional<std::span<const std::string>> class_names() const override;
+  [[nodiscard]] std::uint32_t input_size() const;
+
+private:
+  [[nodiscard]] std::vector<Detection> detect_raw(CameraId camera, const RawFrame& frame);
+  [[nodiscard]] std::vector<Detection>
+  detect_preprocessed(CameraId camera, std::span<const float> data, std::uint32_t input_size,
+                      std::uint32_t src_width, std::uint32_t src_height);
+  [[nodiscard]] std::tuple<float, float, float> preprocess(const RawFrame& frame);
+
+  OrtSession session_;
+  float confidence_threshold_ = 0.10F;
+  std::vector<float> rgb_chw_buf_;
 };
 
 [[nodiscard]] std::vector<Detection> postprocess(const std::vector<float>& data, std::size_t n,
