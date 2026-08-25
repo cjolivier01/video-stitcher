@@ -3,6 +3,7 @@ load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 cc_library(
     name = "reco_detect",
     srcs = [
+        "src/coreml_session.cpp",
         "src/cuda_preprocess.cpp",
         "src/detectors.cpp",
         "src/ncnn_session.cpp",
@@ -12,6 +13,7 @@ cc_library(
         "src/trt_engine.cpp",
     ],
     hdrs = [
+        "include/reco/detect/coreml_session.hpp",
         "include/reco/detect/cuda_preprocess.hpp",
         "include/reco/detect/detectors.hpp",
         "include/reco/detect/ncnn_session.hpp",

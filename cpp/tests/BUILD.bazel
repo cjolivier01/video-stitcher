@@ -178,6 +178,15 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "reco_detect_coreml_session_tests",
+    size = "small",
+    srcs = ["reco_detect_coreml_session_tests.cpp"],
+    deps = [
+        "//cpp/reco_detect",
+    ],
+)
+
 cc_binary(
     name = "libfake_onnxruntime.so",
     testonly = True,
