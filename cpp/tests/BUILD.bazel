@@ -159,3 +159,12 @@ cc_test(
         "@nlohmann_json//:json",
     ],
 )
+
+cc_test(
+    name = "reco_obs_metadata_tests",
+    size = "small",
+    srcs = ["reco_obs_metadata_tests.cpp"],
+    deps = [
+        "//cpp/reco_obs",
+    ],
+)
