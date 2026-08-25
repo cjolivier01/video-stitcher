@@ -329,6 +329,301 @@ std::variant<PreviewCommand, ParseError> parse_preview(Cursor& cursor) {
   return command;
 }
 
+std::variant<CameraCommand, ParseError> parse_camera(Cursor& cursor) {
+  CameraCommand command;
+  std::optional<ParseError> err;
+  while (!cursor.empty()) {
+    const std::string arg = cursor.take();
+    auto next = [&](std::string_view option) { return cursor.value(option); };
+    if (arg == "--left-device") {
+      if (!assign_or_error(next(arg), command.left_device, err))
+        return *err;
+    } else if (arg == "--right-device") {
+      if (!assign_or_error(next(arg), command.right_device, err))
+        return *err;
+    } else if (arg == "-c" || arg == "--calibration") {
+      if (!assign_or_error(next(arg), command.calibration, err))
+        return *err;
+    } else if (arg == "-o" || arg == "--output") {
+      if (!assign_or_error(next(arg), command.output, err))
+        return *err;
+    } else if (arg == "--capture-width") {
+      if (!assign_next_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint32_t>(v, arg); },
+              command.capture_width, err))
+        return *err;
+    } else if (arg == "--capture-height") {
+      if (!assign_next_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint32_t>(v, arg); },
+              command.capture_height, err))
+        return *err;
+    } else if (arg == "--capture-fps") {
+      if (!assign_next_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint32_t>(v, arg); },
+              command.capture_fps, err))
+        return *err;
+    } else if (arg == "--width") {
+      if (!assign_next_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint32_t>(v, arg); },
+              command.width, err))
+        return *err;
+    } else if (arg == "--height") {
+      if (!assign_next_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint32_t>(v, arg); },
+              command.height, err))
+        return *err;
+    } else if (arg == "--encoder") {
+      if (!assign_optional_or_error(next(arg), command.encoder, err))
+        return *err;
+    } else if (arg == "--codec") {
+      if (!assign_or_error(next(arg), command.codec, err))
+        return *err;
+    } else if (arg == "--quality") {
+      if (!assign_or_error(next(arg), command.quality, err))
+        return *err;
+    } else if (arg == "--blend") {
+      if (!assign_next_or_error(cursor, arg, parse_blend, command.blend, err)) {
+        return *err;
+      }
+    } else if (arg == "--max-frames") {
+      if (!assign_next_optional_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint64_t>(v, arg); },
+              command.max_frames, err))
+        return *err;
+    } else if (arg == "--end-time") {
+      if (!assign_next_optional_or_error(
+              cursor, arg, [&](std::string_view v) { return parse_double(v, arg); },
+              command.end_time, err))
+        return *err;
+    } else if (arg == "--model") {
+      if (!assign_optional_or_error(next(arg), command.model, err))
+        return *err;
+    } else if (arg == "--detection-interval") {
+      if (!assign_next_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint64_t>(v, arg); },
+              command.detection_interval, err))
+        return *err;
+    } else if (arg == "--quality-value") {
+      std::uint32_t value = 0;
+      if (!assign_next_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint32_t>(v, arg); }, value,
+              err))
+        return *err;
+      if (value > std::numeric_limits<std::uint8_t>::max()) {
+        return ParseError{"invalid --quality-value " + std::to_string(value)};
+      }
+      command.quality_value = static_cast<std::uint8_t>(value);
+    } else if (arg == "--preset") {
+      if (!assign_optional_or_error(next(arg), command.preset, err))
+        return *err;
+    } else if (arg == "--container") {
+      if (!assign_optional_or_error(next(arg), command.container, err))
+        return *err;
+    } else if (arg == "--stream-url") {
+      if (!assign_optional_or_error(next(arg), command.stream_url, err))
+        return *err;
+    } else if (arg == "--tracking") {
+      if (!assign_or_error(next(arg), command.tracking, err))
+        return *err;
+    } else if (arg == "--unconstrained") {
+      command.unconstrained = true;
+    } else if (arg == "--replay") {
+      if (!assign_optional_or_error(next(arg), command.replay, err))
+        return *err;
+    } else if (arg == "--replay-scale") {
+      if (!assign_next_optional_or_error(cursor, arg, parse_wxh, command.replay_scale, err)) {
+        return *err;
+      }
+    } else if (arg == "--v4l2-direct") {
+      command.v4l2_direct = true;
+    } else if (arg == "--exposure") {
+      if (!assign_next_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint32_t>(v, arg); },
+              command.exposure, err))
+        return *err;
+    } else if (arg == "--sensor-gain") {
+      if (!assign_next_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint32_t>(v, arg); },
+              command.sensor_gain, err))
+        return *err;
+    } else if (arg == "--live-calibrate") {
+      command.live_calibrate = true;
+    } else if (arg == "--calibrate-frames") {
+      if (!assign_next_or_error(
+              cursor, arg, [&](std::string_view v) { return parse_integral<std::size_t>(v, arg); },
+              command.calibrate_frames, err))
+        return *err;
+    } else if (arg == "--left-lens-profile") {
+      if (!assign_optional_or_error(next(arg), command.left_lens_profile, err))
+        return *err;
+    } else {
+      return ParseError{"unknown camera option " + arg};
+    }
+  }
+  if (command.left_device.empty()) {
+    return ParseError{"camera requires --left-device"};
+  }
+  if (command.right_device.empty()) {
+    return ParseError{"camera requires --right-device"};
+  }
+  if (command.calibration.empty()) {
+    return ParseError{"camera requires -c/--calibration"};
+  }
+  if (command.output.empty()) {
+    return ParseError{"camera requires -o/--output"};
+  }
+  return command;
+}
+
+std::variant<LibcameraCommand, ParseError> parse_libcamera(Cursor& cursor) {
+  LibcameraCommand command;
+  std::optional<ParseError> err;
+  while (!cursor.empty()) {
+    const std::string arg = cursor.take();
+    auto next = [&](std::string_view option) { return cursor.value(option); };
+    if (arg == "--left-camera") {
+      if (!assign_next_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint32_t>(v, arg); },
+              command.left_camera, err))
+        return *err;
+    } else if (arg == "--right-camera") {
+      if (!assign_next_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint32_t>(v, arg); },
+              command.right_camera, err))
+        return *err;
+    } else if (arg == "-c" || arg == "--calibration") {
+      if (!assign_or_error(next(arg), command.calibration, err))
+        return *err;
+    } else if (arg == "-o" || arg == "--output") {
+      if (!assign_or_error(next(arg), command.output, err))
+        return *err;
+    } else if (arg == "--capture-width") {
+      if (!assign_next_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint32_t>(v, arg); },
+              command.capture_width, err))
+        return *err;
+    } else if (arg == "--capture-height") {
+      if (!assign_next_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint32_t>(v, arg); },
+              command.capture_height, err))
+        return *err;
+    } else if (arg == "--capture-fps") {
+      if (!assign_next_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint32_t>(v, arg); },
+              command.capture_fps, err))
+        return *err;
+    } else if (arg == "--width") {
+      if (!assign_next_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint32_t>(v, arg); },
+              command.width, err))
+        return *err;
+    } else if (arg == "--height") {
+      if (!assign_next_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint32_t>(v, arg); },
+              command.height, err))
+        return *err;
+    } else if (arg == "--encoder") {
+      if (!assign_optional_or_error(next(arg), command.encoder, err))
+        return *err;
+    } else if (arg == "--codec") {
+      if (!assign_or_error(next(arg), command.codec, err))
+        return *err;
+    } else if (arg == "--quality") {
+      if (!assign_or_error(next(arg), command.quality, err))
+        return *err;
+    } else if (arg == "--blend") {
+      if (!assign_next_or_error(cursor, arg, parse_blend, command.blend, err)) {
+        return *err;
+      }
+    } else if (arg == "--max-frames") {
+      if (!assign_next_optional_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint64_t>(v, arg); },
+              command.max_frames, err))
+        return *err;
+    } else if (arg == "--end-time") {
+      if (!assign_next_optional_or_error(
+              cursor, arg, [&](std::string_view v) { return parse_double(v, arg); },
+              command.end_time, err))
+        return *err;
+    } else if (arg == "--model") {
+      if (!assign_optional_or_error(next(arg), command.model, err))
+        return *err;
+    } else if (arg == "--detection-interval") {
+      if (!assign_next_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint64_t>(v, arg); },
+              command.detection_interval, err))
+        return *err;
+    } else if (arg == "--quality-value") {
+      std::uint32_t value = 0;
+      if (!assign_next_or_error(
+              cursor, arg,
+              [&](std::string_view v) { return parse_integral<std::uint32_t>(v, arg); }, value,
+              err))
+        return *err;
+      if (value > std::numeric_limits<std::uint8_t>::max()) {
+        return ParseError{"invalid --quality-value " + std::to_string(value)};
+      }
+      command.quality_value = static_cast<std::uint8_t>(value);
+    } else if (arg == "--preset") {
+      if (!assign_optional_or_error(next(arg), command.preset, err))
+        return *err;
+    } else {
+      return ParseError{"unknown libcamera option " + arg};
+    }
+  }
+  if (command.calibration.empty()) {
+    return ParseError{"libcamera requires -c/--calibration"};
+  }
+  if (command.output.empty()) {
+    return ParseError{"libcamera requires -o/--output"};
+  }
+  return command;
+}
+
+std::variant<GoproCommand, ParseError> parse_gopro(Cursor& cursor) {
+  GoproCommand command;
+  std::optional<ParseError> err;
+  while (!cursor.empty()) {
+    const std::string arg = cursor.take();
+    auto next = [&](std::string_view option) { return cursor.value(option); };
+    if (arg == "--serial") {
+      if (!assign_optional_or_error(next(arg), command.serial, err))
+        return *err;
+    } else if (arg == "--url") {
+      if (!assign_optional_or_error(next(arg), command.url, err))
+        return *err;
+    } else if (arg == "--start") {
+      command.start = true;
+    } else if (arg == "--stop") {
+      command.stop = true;
+    } else if (arg == "--sports-preset") {
+      command.sports_preset = true;
+    } else {
+      return ParseError{"unknown gopro option " + arg};
+    }
+  }
+  return command;
+}
+
 std::variant<CalibrateCommand, ParseError> parse_calibrate(Cursor& cursor) {
   CalibrateCommand command;
   std::vector<std::string> positionals;
@@ -490,7 +785,8 @@ std::variant<Command, ParseError> parse_args(const std::vector<std::string>& arg
   }
   Cursor cursor(args);
   const std::string subcommand = cursor.take();
-  if (subcommand == "stitch" || subcommand == "preview" || subcommand == "calibrate" ||
+  if (subcommand == "stitch" || subcommand == "preview" || subcommand == "camera" ||
+      subcommand == "libcamera" || subcommand == "calibrate" || subcommand == "gopro" ||
       subcommand == "info") {
     if (std::find(args.begin() + 1, args.end(), "--help") != args.end() ||
         std::find(args.begin() + 1, args.end(), "-h") != args.end()) {
@@ -509,11 +805,29 @@ std::variant<Command, ParseError> parse_args(const std::vector<std::string>& arg
       return *error;
     return Command{std::get<PreviewCommand>(std::move(parsed))};
   }
+  if (subcommand == "camera") {
+    auto parsed = parse_camera(cursor);
+    if (const auto* error = std::get_if<ParseError>(&parsed))
+      return *error;
+    return Command{std::get<CameraCommand>(std::move(parsed))};
+  }
+  if (subcommand == "libcamera") {
+    auto parsed = parse_libcamera(cursor);
+    if (const auto* error = std::get_if<ParseError>(&parsed))
+      return *error;
+    return Command{std::get<LibcameraCommand>(std::move(parsed))};
+  }
   if (subcommand == "calibrate") {
     auto parsed = parse_calibrate(cursor);
     if (const auto* error = std::get_if<ParseError>(&parsed))
       return *error;
     return Command{std::get<CalibrateCommand>(std::move(parsed))};
+  }
+  if (subcommand == "gopro") {
+    auto parsed = parse_gopro(cursor);
+    if (const auto* error = std::get_if<ParseError>(&parsed))
+      return *error;
+    return Command{std::get<GoproCommand>(std::move(parsed))};
   }
   if (subcommand == "info") {
     if (!cursor.empty()) {
@@ -534,6 +848,12 @@ std::string_view command_name(const Command& command) {
           return "preview";
         if constexpr (std::is_same_v<T, CalibrateCommand>)
           return "calibrate";
+        if constexpr (std::is_same_v<T, CameraCommand>)
+          return "camera";
+        if constexpr (std::is_same_v<T, LibcameraCommand>)
+          return "libcamera";
+        if constexpr (std::is_same_v<T, GoproCommand>)
+          return "gopro";
         if constexpr (std::is_same_v<T, InfoCommand>)
           return "info";
         return "help";
@@ -546,7 +866,10 @@ std::string help_text() {
          "Usage:\n"
          "  reco stitch LEFT RIGHT -c CALIBRATION [options]\n"
          "  reco preview LEFT RIGHT -c CALIBRATION [options]\n"
+         "  reco camera --left-device DEV --right-device DEV -c CALIBRATION -o OUTPUT [options]\n"
+         "  reco libcamera -c CALIBRATION -o OUTPUT [options]\n"
          "  reco calibrate LEFT RIGHT [options]\n"
+         "  reco gopro [options]\n"
          "  reco info\n\n"
          "Runtime command execution is staged behind the remaining GPU/backend ports.";
 }
