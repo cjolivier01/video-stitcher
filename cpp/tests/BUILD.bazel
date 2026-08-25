@@ -78,7 +78,10 @@ cc_test(
 cc_test(
     name = "reco_io_gstreamer_tests",
     size = "small",
-    srcs = ["reco_io_gstreamer_tests.cpp"],
+    srcs = [
+        "fixture_gpu_decode_source.hpp",
+        "reco_io_gstreamer_tests.cpp",
+    ],
     deps = [
         "//cpp/reco_io",
     ],
