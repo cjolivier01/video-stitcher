@@ -1,5 +1,7 @@
 #pragma once
 
+#include "reco/core/cuda_backend.hpp"
+
 #include <filesystem>
 #include <cstdint>
 #include <memory>
@@ -61,6 +63,9 @@ public:
   [[nodiscard]] const OrtSessionMetadata& metadata() const;
   [[nodiscard]] std::vector<OrtTensorOutput> run_cpu_f32(std::span<const float> input,
                                                          std::span<const std::int64_t> shape);
+  [[nodiscard]] std::vector<OrtTensorOutput> run_cuda_f32(core::CudaDevicePtr input,
+                                                          std::size_t byte_count,
+                                                          std::span<const std::int64_t> shape);
 
 private:
   struct Impl;

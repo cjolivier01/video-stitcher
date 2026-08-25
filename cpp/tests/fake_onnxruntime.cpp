@@ -17,8 +17,13 @@
 namespace {
 
 struct OrtCEnv {};
-struct OrtCSessionOptions {};
-struct OrtCMemoryInfo {};
+struct OrtCSessionOptions {
+  bool cuda_provider = false;
+  bool disable_cpu_fallback = false;
+};
+struct OrtCMemoryInfo {
+  bool cuda = false;
+};
 struct OrtCModelMetadata {};
 struct OrtCTypeInfo {};
 
@@ -40,6 +45,8 @@ struct OrtCValue {
   std::vector<float> f32;
   std::vector<std::int32_t> i32;
   int element_type = 1;
+  bool cuda_input = false;
+  std::uintptr_t device_ptr = 0;
 };
 
 struct OrtCAllocator {};
@@ -139,7 +146,7 @@ struct OrtApi {
                                                      OrtCTensorTypeAndShapeInfo**);
   void* GetTypeInfo;
   void* GetValueType;
-  void* CreateMemoryInfo;
+  OrtStatusPtr(RECO_ORT_CALL* CreateMemoryInfo)(const char*, int, int, int, OrtCMemoryInfo**);
   OrtStatusPtr(RECO_ORT_CALL* CreateCpuMemoryInfo)(int, int, OrtCMemoryInfo**);
   void* CompareMemoryInfo;
   void* MemoryInfoGetName;
@@ -192,6 +199,18 @@ struct OrtApi {
                                                                     char**);
   void* ModelMetadataGetVersion;
   void(RECO_ORT_CALL* ReleaseModelMetadata)(OrtCModelMetadata*);
+  void* CreateEnvWithGlobalThreadPools;
+  void* DisablePerSessionThreads;
+  void* CreateThreadingOptions;
+  void* ReleaseThreadingOptions;
+  void* ModelMetadataGetCustomMetadataMapKeys;
+  void* AddFreeDimensionOverrideByName;
+  void* GetAvailableProviders;
+  void* ReleaseAvailableProviders;
+  void* GetStringTensorElementLength;
+  void* GetStringTensorElement;
+  void* FillStringTensorElement;
+  OrtStatusPtr(RECO_ORT_CALL* AddSessionConfigEntry)(OrtCSessionOptions*, const char*, const char*);
 };
 
 OrtCStatus* ok() { return nullptr; }
@@ -277,9 +296,13 @@ OrtStatusPtr RECO_ORT_CALL create_session_options(OrtCSessionOptions** out) {
 }
 
 OrtStatusPtr RECO_ORT_CALL create_session(const OrtCEnv*, const OrtPathChar* model_path,
-                                          const OrtCSessionOptions*, OrtCSession** out) {
+                                          const OrtCSessionOptions* options, OrtCSession** out) {
   if (model_path == nullptr || !std::filesystem::exists(model_path)) {
     return fail("model not found");
+  }
+  if (env_set("RECO_FAKE_ORT_REQUIRE_CUDA_NO_CPU_FALLBACK") &&
+      (options == nullptr || !options->cuda_provider || !options->disable_cpu_fallback)) {
+    return fail("CUDA session did not disable CPU EP fallback");
   }
   *out = new OrtCSession{std::filesystem::path(model_path).string()};
   return ok();
@@ -287,8 +310,36 @@ OrtStatusPtr RECO_ORT_CALL create_session(const OrtCEnv*, const OrtPathChar* mod
 
 OrtStatusPtr RECO_ORT_CALL set_session_int(OrtCSessionOptions*, int) { return ok(); }
 
+OrtStatusPtr RECO_ORT_CALL add_session_config_entry(OrtCSessionOptions* options,
+                                                    const char* key, const char* value) {
+  if (options == nullptr || key == nullptr || value == nullptr) {
+    return fail("session config entry received null argument");
+  }
+  if (std::strcmp(key, "session.disable_cpu_ep_fallback") == 0) {
+    options->disable_cpu_fallback = std::strcmp(value, "1") == 0;
+  }
+  return ok();
+}
+
 OrtStatusPtr RECO_ORT_CALL create_cpu_memory_info(int, int, OrtCMemoryInfo** out) {
-  *out = new OrtCMemoryInfo;
+  *out = new OrtCMemoryInfo{false};
+  return ok();
+}
+
+OrtStatusPtr RECO_ORT_CALL create_memory_info(const char* name, int, int, int,
+                                              OrtCMemoryInfo** out) {
+  *out = new OrtCMemoryInfo{name != nullptr && std::strcmp(name, "Cuda") == 0};
+  return ok();
+}
+
+RECO_ORT_EXPORT OrtStatusPtr RECO_ORT_CALL
+OrtSessionOptionsAppendExecutionProvider_CUDA(OrtCSessionOptions* options, int) {
+  if (env_set("RECO_FAKE_ORT_CUDA_PROVIDER_FAIL")) {
+    return fail("CUDA provider unavailable");
+  }
+  if (options != nullptr) {
+    options->cuda_provider = true;
+  }
   return ok();
 }
 
@@ -388,14 +439,16 @@ OrtStatusPtr RECO_ORT_CALL metadata_lookup(const OrtCModelMetadata*, OrtCAllocat
   return ok();
 }
 
-OrtStatusPtr RECO_ORT_CALL create_tensor_with_data(const OrtCMemoryInfo*, void* data,
+OrtStatusPtr RECO_ORT_CALL create_tensor_with_data(const OrtCMemoryInfo* memory_info, void* data,
                                                    std::size_t byte_count,
                                                    const std::int64_t* shape, std::size_t rank,
                                                    int element_type, OrtCValue** out) {
   *out = new OrtCValue;
   (*out)->shape.assign(shape, shape + rank);
   (*out)->element_type = element_type;
-  if (element_type == 1) {
+  (*out)->cuda_input = memory_info != nullptr && memory_info->cuda;
+  (*out)->device_ptr = reinterpret_cast<std::uintptr_t>(data);
+  if (element_type == 1 && !(*out)->cuda_input) {
     const auto count = element_count((*out)->shape);
     if (count > 0 && byte_count == count * sizeof(float) && data != nullptr) {
       const auto* floats = static_cast<const float*>(data);
@@ -420,6 +473,18 @@ OrtStatusPtr RECO_ORT_CALL run(OrtCSession*, const OrtCRunOptions*, const char* 
   if (env_set("RECO_FAKE_ORT_VALIDATE_YUV420P_4X2")) {
     if (auto* status = validate_yuv420p_4x2_letterbox(inputs[0]); status != nullptr) {
       return status;
+    }
+  }
+  if (env_set("RECO_FAKE_ORT_VALIDATE_CUDA_INPUT")) {
+    if (inputs[0] == nullptr || !inputs[0]->cuda_input || inputs[0]->device_ptr != 0x12340000U ||
+        inputs[0]->shape != std::vector<std::int64_t>({1, 3, 8, 8})) {
+      return fail("CUDA input tensor was not wrapped as expected");
+    }
+  }
+  if (env_set("RECO_FAKE_ORT_VALIDATE_CUDA_INPUT_ANY")) {
+    if (inputs[0] == nullptr || !inputs[0]->cuda_input || inputs[0]->device_ptr == 0 ||
+        inputs[0]->shape != std::vector<std::int64_t>({1, 3, 8, 8})) {
+      return fail("CUDA detector input tensor was not wrapped as expected");
     }
   }
   for (std::size_t i = 0; i < output_count; ++i) {
@@ -493,6 +558,7 @@ OrtApi make_api() {
   api.GetDimensionsCount = dimensions_count;
   api.GetDimensions = dimensions;
   api.GetTensorTypeAndShape = tensor_type_and_shape;
+  api.CreateMemoryInfo = create_memory_info;
   api.CreateCpuMemoryInfo = create_cpu_memory_info;
   api.AllocatorFree = allocator_free;
   api.GetAllocatorWithDefaultOptions = get_default_allocator;
@@ -507,6 +573,7 @@ OrtApi make_api() {
   api.SessionGetModelMetadata = model_metadata;
   api.ModelMetadataLookupCustomMetadataMap = metadata_lookup;
   api.ReleaseModelMetadata = release_metadata;
+  api.AddSessionConfigEntry = add_session_config_entry;
   return api;
 }
 

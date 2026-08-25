@@ -191,6 +191,7 @@ cc_test(
     srcs = ["reco_detect_ort_session_fake_runtime_tests.cpp"],
     data = [":libfake_onnxruntime.so"],
     deps = [
+        "//cpp/reco_core",
         "//cpp/reco_detect",
     ],
 )
