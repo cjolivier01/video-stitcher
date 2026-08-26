@@ -145,8 +145,9 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_eq(result.fps_denominator, 1'001U, "parser FPS denominator");
   expect_true(std::abs(result.fps - 30'000.0 / 1'001.0) < 1e-12, "rational FPS");
   expect_eq(result.duration_ns, 10'000'000'000ULL, "queried duration");
-  expect_eq(result.total_frames, 300ULL, "bounded seeks preserve the exact access-unit count");
+  expect_eq(result.total_frames, 300ULL, "EOS scan preserves the exact access-unit count");
   expect_true(!result.duration_is_estimated, "known duration is not estimated");
+  expect_true(!result.total_frames_is_estimated, "EOS-proven frame count is exact");
 
   const auto events = read_events(event_path);
   expect_true(has_event(events, "parse-probe"), "probe constructs parser-only pipeline");
@@ -176,6 +177,8 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_eq(unknown_duration.total_frames, 1'798ULL,
             "fallback frame count uses exact rational arithmetic");
   expect_true(unknown_duration.duration_is_estimated, "unknown duration is marked estimated");
+  expect_true(unknown_duration.total_frames_is_estimated,
+              "unknown long-stream frame count is marked estimated");
 
   set_scenario("probe-duration-zero");
   expect_true(probe_gpu_video(container_config(video_path), timeout_ns).duration_is_estimated,
@@ -261,6 +264,8 @@ void probe_contracts(const std::filesystem::path& video_path,
             "unknown-PTS stream scanning continues beyond the timing window");
   expect_true(long_unknown_pts.duration_is_estimated,
               "long unknown-PTS duration remains explicitly estimated");
+  expect_true(!long_unknown_pts.total_frames_is_estimated,
+              "unknown-PTS EOS scan still proves the AU count");
 
   set_scenario("probe-mixed-prefix-pts");
   const auto mixed_prefix = probe_gpu_video(container_config(video_path), timeout_ns);
@@ -292,6 +297,34 @@ void probe_contracts(const std::filesystem::path& video_path,
             "VFR stream preserves its exact compressed access-unit count");
   expect_eq(vfr_fallback.duration_ns, 4'720'000'000ULL,
             "VFR EOS scan preserves observed presentation duration");
+  expect_true(!vfr_fallback.total_frames_is_estimated,
+              "VFR EOS scan proves its compressed AU count");
+
+  set_scenario("probe-vfr-late-transition");
+  const auto late_vfr = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(late_vfr.fps_numerator, 45U,
+            "late VFR transition retains the plausible average caps rate");
+  expect_eq(late_vfr.total_frames, 270ULL,
+            "late VFR transition is counted by access units instead of timestamp slots");
+  expect_true(!late_vfr.total_frames_is_estimated, "late VFR EOS scan reports an exact count");
+
+  set_scenario("probe-dropped-frame-after-prefix");
+  const auto dropped_frame = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(dropped_frame.total_frames, 179ULL,
+            "dropped AU after the timing prefix is not reconstructed as a timestamp slot");
+  expect_true(!dropped_frame.total_frames_is_estimated,
+              "dropped-frame EOS scan reports an exact count");
+
+  set_scenario("probe-reduced-cadence-after-prefix");
+  const auto reduced_cadence = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(reduced_cadence.fps_numerator, 45U,
+            "reduced cadence retains the plausible average caps numerator");
+  expect_eq(reduced_cadence.fps_denominator, 2U,
+            "reduced cadence retains the plausible average caps denominator");
+  expect_eq(reduced_cadence.total_frames, 135ULL,
+            "reduced cadence after the prefix is counted through EOS");
+  expect_true(!reduced_cadence.total_frames_is_estimated,
+              "reduced-cadence EOS scan reports an exact count");
 
   set_scenario("probe-bframe-cutoff");
   const auto reordered_cutoff = probe_gpu_video(container_config(video_path), timeout_ns);
@@ -309,7 +342,9 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_eq(quantized.duration_ns, 4'170'833'334ULL,
             "quantized duration is clamped to the proven frame-count boundary");
   expect_true(!quantized.duration_is_estimated,
-              "seek-correlated quantized duration remains authoritative");
+              "EOS-correlated quantized duration remains authoritative");
+  expect_true(!quantized.total_frames_is_estimated,
+              "quantized EOS scan proves its compressed AU count");
 
   set_scenario("probe-bad-fps");
   const auto invalid_caps_fps = probe_gpu_video(container_config(video_path), timeout_ns);
@@ -324,10 +359,15 @@ void probe_contracts(const std::filesystem::path& video_path,
             "unseekable parser retains bounded container-duration fallback");
   expect_true(unseekable.duration_is_estimated,
               "uncorrelated container duration is explicitly marked estimated");
+  expect_true(unseekable.total_frames_is_estimated,
+              "unseekable long-stream frame count is explicitly estimated");
 
   set_scenario("probe-seek-preroll");
-  expect_eq(probe_gpu_video(container_config(video_path), timeout_ns).total_frames, 300ULL,
+  const auto seek_preroll = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(seek_preroll.total_frames, 5'995ULL,
             "seek preroll outside the active segment is ignored");
+  expect_true(seek_preroll.total_frames_is_estimated,
+              "bounded-seek count remains explicitly estimated");
 
   set_scenario("probe-ok");
   expect_eq(probe_gpu_video(container_config(video_path), 1'000'000'000ULL).width, 3840U,

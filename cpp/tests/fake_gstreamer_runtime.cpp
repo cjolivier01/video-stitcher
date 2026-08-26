@@ -211,6 +211,15 @@ FakeCaps parser_sample_caps() {
   } else if (scenario() == "probe-unset-fps-inferred" || scenario() == "probe-vfr-unset-fps") {
     caps.fps_numerator = 0;
     caps.fps_denominator = 1;
+  } else if (scenario() == "probe-vfr-late-transition") {
+    caps.fps_numerator = 45;
+    caps.fps_denominator = 1;
+  } else if (scenario() == "probe-dropped-frame-after-prefix") {
+    caps.fps_numerator = 30;
+    caps.fps_denominator = 1;
+  } else if (scenario() == "probe-reduced-cadence-after-prefix") {
+    caps.fps_numerator = 45;
+    caps.fps_denominator = 2;
   } else if (scenario() == "probe-caps-runahead") {
     caps.width = 854;
     caps.height = 480;
@@ -231,6 +240,18 @@ std::uint64_t parser_frame_offset(std::uint64_t frame_index, const FakeCaps& cap
 std::uint64_t parser_timing_offset(std::uint64_t frame_index, const FakeCaps& caps) {
   if (scenario() == "probe-vfr-unset-fps") {
     return (frame_index / 2U) * 70'000'000ULL + (frame_index % 2U) * 30'000'000ULL;
+  }
+  if (scenario() == "probe-vfr-late-transition") {
+    return frame_index <= 90U ? frame_index * 1'000'000'000ULL / 30U
+                              : 3'000'000'000ULL + (frame_index - 90U) * 1'000'000'000ULL / 60U;
+  }
+  if (scenario() == "probe-dropped-frame-after-prefix") {
+    const auto presentation_index = frame_index < 100U ? frame_index : frame_index + 1U;
+    return presentation_index * 1'000'000'000ULL / 30U;
+  }
+  if (scenario() == "probe-reduced-cadence-after-prefix") {
+    return frame_index <= 90U ? frame_index * 1'000'000'000ULL / 30U
+                              : 3'000'000'000ULL + (frame_index - 90U) * 1'000'000'000ULL / 15U;
   }
   return parser_frame_offset(frame_index, caps);
 }
@@ -565,6 +586,10 @@ RECO_FAKE_EXPORT int gst_element_query_duration(void*, int format, std::int64_t*
     *duration = 1'000'000'000;
     return 1;
   }
+  if (scenario() == "probe-seek-preroll") {
+    *duration = 200'000'000'000;
+    return 1;
+  }
   if (scenario() == "probe-unset-fps-inferred" || scenario() == "probe-bframe-cutoff" ||
       scenario() == "probe-mixed-prefix-pts") {
     *duration = 4'000'000'000;
@@ -572,6 +597,12 @@ RECO_FAKE_EXPORT int gst_element_query_duration(void*, int format, std::int64_t*
   }
   if (scenario() == "probe-quantized-timestamps") {
     *duration = 4'170'833'333;
+    return 1;
+  }
+  if (scenario() == "probe-vfr-late-transition" ||
+      scenario() == "probe-dropped-frame-after-prefix" ||
+      scenario() == "probe-reduced-cadence-after-prefix") {
+    *duration = 6'000'000'000;
     return 1;
   }
   *duration = 10'000'000'000LL;
@@ -742,21 +773,28 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
         : current_scenario == "probe-nonzero-origin" ? 766'666'666ULL
                                                      : 0;
     const std::uint64_t selected_duration_ns =
-        current_scenario == "probe-delayed-stream"         ? 5'000'000'000ULL
-        : current_scenario == "probe-nonzero-origin"       ? 2'766'666'666ULL
-        : current_scenario == "probe-duration-mismatch"    ? 1'000'000'000ULL
-        : current_scenario == "probe-decode-order-origin"  ? 1'000'000'000ULL
-        : current_scenario == "probe-unknown-pts"          ? 1'000'000'000ULL
-        : current_scenario == "probe-long-unknown-pts"     ? 3'000'000'000ULL
-        : current_scenario == "probe-mixed-prefix-pts"     ? 4'000'000'000ULL
-        : current_scenario == "probe-one-frame-rounding"   ? 33'333'333ULL
-        : current_scenario == "probe-inexact-caps-fps"     ? 2'000'000'000ULL
-        : current_scenario == "probe-unset-fps-inferred"   ? 4'000'000'000ULL
-        : current_scenario == "probe-vfr-unset-fps"        ? 4'720'000'000ULL
-        : current_scenario == "probe-bframe-cutoff"        ? 4'000'000'000ULL
-        : current_scenario == "probe-quantized-timestamps" ? 4'170'833'333ULL
-        : current_scenario == "probe-exact-frame-count"    ? 100'100'000ULL
-        : current_scenario == "probe-integral-frame-count" ? 1'001'000'000'000ULL
+        current_scenario == "probe-duration-unknown" || current_scenario == "probe-duration-zero" ||
+                current_scenario == "probe-seek-unsupported" ||
+                current_scenario == "probe-pull-timeout" || current_scenario == "probe-seek-preroll"
+            ? 200'000'000'000ULL
+        : current_scenario == "probe-delayed-stream"               ? 5'000'000'000ULL
+        : current_scenario == "probe-nonzero-origin"               ? 2'766'666'666ULL
+        : current_scenario == "probe-duration-mismatch"            ? 1'000'000'000ULL
+        : current_scenario == "probe-decode-order-origin"          ? 1'000'000'000ULL
+        : current_scenario == "probe-unknown-pts"                  ? 1'000'000'000ULL
+        : current_scenario == "probe-long-unknown-pts"             ? 3'000'000'000ULL
+        : current_scenario == "probe-mixed-prefix-pts"             ? 4'000'000'000ULL
+        : current_scenario == "probe-one-frame-rounding"           ? 33'333'333ULL
+        : current_scenario == "probe-inexact-caps-fps"             ? 2'000'000'000ULL
+        : current_scenario == "probe-unset-fps-inferred"           ? 4'000'000'000ULL
+        : current_scenario == "probe-vfr-unset-fps"                ? 4'720'000'000ULL
+        : current_scenario == "probe-vfr-late-transition"          ? 6'000'000'000ULL
+        : current_scenario == "probe-dropped-frame-after-prefix"   ? 6'000'000'000ULL
+        : current_scenario == "probe-reduced-cadence-after-prefix" ? 6'000'000'000ULL
+        : current_scenario == "probe-bframe-cutoff"                ? 4'000'000'000ULL
+        : current_scenario == "probe-quantized-timestamps"         ? 4'170'833'333ULL
+        : current_scenario == "probe-exact-frame-count"            ? 100'100'000ULL
+        : current_scenario == "probe-integral-frame-count"         ? 1'001'000'000'000ULL
         : current_scenario == "probe-frame-count-overflow"
             ? static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())
             : 10'000'000'000ULL;
