@@ -410,6 +410,25 @@ void unknown_timestamps_are_not_fabricated() {
   expect_true(!result.frame->duration_ns.has_value(), "unknown duration remains absent");
 }
 
+void unknown_output_retires_only_unknown_observations() {
+  set_scenario("mixed-unknown-reorder");
+  auto source =
+      open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+
+  const auto unknown = source->read();
+  expect_true(unknown.frame.has_value(), "mixed-PTS unknown frame returned");
+  if (unknown.frame.has_value()) {
+    expect_true(!unknown.frame->pts_ns.has_value(), "mixed-PTS unknown frame stays unknown");
+  }
+  const auto known = source->read();
+  expect_true(known.frame.has_value(), "mixed-PTS reordered known frame returned");
+  if (known.frame.has_value()) {
+    expect_eq(known.frame->pts_ns.value_or(0), 1'000'000'000ULL,
+              "mixed-PTS known observation remains correlated");
+    expect_eq(known.frame->visible_width, 1280U, "mixed-PTS known geometry remains correlated");
+  }
+}
+
 void concurrent_reads_serialize_appsink_access() {
   set_scenario("frame-eos");
   const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
@@ -570,6 +589,7 @@ int main() {
   dropped_samples_do_not_accumulate_geometry_records();
   first_frame_rejects_grossly_stale_geometry();
   unknown_timestamps_are_not_fabricated();
+  unknown_output_retires_only_unknown_observations();
   concurrent_reads_serialize_appsink_access();
   fatal_pipeline_errors_are_latched();
   geometry_probe_errors_are_latched_before_further_pulls();

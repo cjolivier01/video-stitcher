@@ -80,10 +80,7 @@ struct GstBufferAbi {
 
 struct GstPadProbeInfoAbi {
   std::int32_t type = 0;
-#if INTPTR_MAX == INT64_MAX
-  std::int32_t padding = 0;
-#endif
-  std::uintptr_t id = 0;
+  unsigned long id = 0;
   void* data = nullptr;
 };
 
@@ -95,7 +92,8 @@ static_assert(sizeof(GstBufferAbi) == (sizeof(void*) == 8 ? 112 : 80));
 static_assert(offsetof(GstMapInfoAbi, data) == (sizeof(void*) == 8 ? 16 : 8));
 static_assert(offsetof(GstMapInfoAbi, size) == (sizeof(void*) == 8 ? 24 : 12));
 static_assert(sizeof(GstMapInfoAbi) == (sizeof(void*) == 8 ? 104 : 52));
-static_assert(offsetof(GstPadProbeInfoAbi, data) == (sizeof(void*) == 8 ? 16 : 8));
+static_assert(offsetof(GstPadProbeInfoAbi, data) ==
+              (sizeof(void*) == 8 && sizeof(unsigned long) == 8 ? 16 : 8));
 
 class DynamicLibrary {
 public:
@@ -392,6 +390,7 @@ enum class GeometryMetadataFailure {
   None,
   MissingCorrelation,
   UnknownTimestampAcrossChange,
+  AmbiguousTimestamp,
 };
 
 struct GeometryMetadata {
@@ -406,7 +405,6 @@ struct GeometryObservation {
 
 struct GeometryAmbiguityGroup {
   std::uint64_t pts_ns = 0;
-  std::vector<GeometryDimensions> candidates;
 };
 
 class GeometryProbeState {
@@ -470,6 +468,9 @@ public:
     case GeometryMetadataFailure::UnknownTimestampAcrossChange:
       throw GpuDecodeError(
           "GStreamer decoded frame timestamp cannot be correlated across a geometry change");
+    case GeometryMetadataFailure::AmbiguousTimestamp:
+      throw GpuDecodeError(
+          "GStreamer decoded frame timestamp is ambiguous at a geometry transition");
     }
     if (metadata->candidates.empty()) {
       throw GpuDecodeError("GStreamer decoded frame has no correlated pre-decoder geometry");
@@ -550,20 +551,26 @@ private:
       std::lock_guard lock(mutex_);
       if (pts == kGstClockTimeNone) {
         for (const auto& observation : observations_) {
-          add_candidate(metadata->candidates, observation.dimensions);
+          if (!observation.pts_ns.has_value()) {
+            add_candidate(metadata->candidates, observation.dimensions);
+          }
         }
-        if (metadata->candidates.size() > 1) {
-          metadata->failure = GeometryMetadataFailure::UnknownTimestampAcrossChange;
-        } else if (!observations_.empty()) {
-          observations_.pop_front();
-        } else {
+        const auto observation =
+            std::find_if(observations_.begin(), observations_.end(),
+                         [](const auto& value) { return !value.pts_ns.has_value(); });
+        if (observation == observations_.end()) {
           metadata->failure = GeometryMetadataFailure::MissingCorrelation;
+        } else {
+          if (metadata->candidates.size() > 1) {
+            metadata->failure = GeometryMetadataFailure::UnknownTimestampAcrossChange;
+          }
+          observations_.erase(observation);
         }
       } else {
         auto group = std::find_if(ambiguity_groups_.begin(), ambiguity_groups_.end(),
                                   [&](const auto& value) { return value.pts_ns == pts; });
         if (group != ambiguity_groups_.end()) {
-          metadata->candidates = group->candidates;
+          metadata->failure = GeometryMetadataFailure::AmbiguousTimestamp;
         }
         for (const auto& observation : observations_) {
           if (observation.pts_ns == pts) {
@@ -575,6 +582,9 @@ private:
                          [&](const auto& value) { return value.pts_ns == pts; });
         if (observation == observations_.end()) {
           metadata->failure = GeometryMetadataFailure::MissingCorrelation;
+          if (group != ambiguity_groups_.end()) {
+            ambiguity_groups_.erase(group);
+          }
         } else {
           observations_.erase(observation);
           const bool same_pts_remain =
@@ -582,9 +592,7 @@ private:
                           [&](const auto& value) { return value.pts_ns == pts; });
           if (metadata->candidates.size() > 1 && same_pts_remain) {
             if (group == ambiguity_groups_.end()) {
-              ambiguity_groups_.push_back({.pts_ns = pts, .candidates = metadata->candidates});
-            } else {
-              group->candidates = metadata->candidates;
+              ambiguity_groups_.push_back({.pts_ns = pts});
             }
           } else if (group != ambiguity_groups_.end() && !same_pts_remain) {
             ambiguity_groups_.erase(group);

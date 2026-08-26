@@ -132,10 +132,7 @@ struct FakeMessage {};
 
 struct FakePadProbeInfo {
   std::int32_t type = 0;
-#if INTPTR_MAX == INT64_MAX
-  std::int32_t padding = 0;
-#endif
-  std::uintptr_t id = 0;
+  unsigned long id = 0;
   void* data = nullptr;
 };
 
@@ -197,6 +194,9 @@ FakeSample* make_sample(std::uint32_t sample_index = 0) {
     sample->buffer.pts = 2'000'000'000ULL;
   } else if (scenario() == "retired-pts-reuse") {
     sample->buffer.pts = sample_index == 1 ? 2'000'000'000ULL : 1'000'000'000ULL;
+  } else if (scenario() == "mixed-unknown-reorder") {
+    sample->buffer.pts =
+        sample_index == 0 ? std::numeric_limits<std::uint64_t>::max() : 1'000'000'000ULL;
   }
 
   sample->params.width =
@@ -552,6 +552,16 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     auto* sample = make_sample(current);
     push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, predecoder_width(current),
                            predecoder_height());
+    return deliver_output(sink, sample);
+  }
+  if (current_scenario == "mixed-unknown-reorder" && current < 2) {
+    auto* sample = make_sample(current);
+    if (current == 0) {
+      GstBufferAbi known_buffer;
+      known_buffer.pts = 1'000'000'000ULL;
+      push_predecoder_buffer(sink->pipeline->display_pad, known_buffer, 1280, 720);
+      push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, 1280, 720);
+    }
     return deliver_output(sink, sample);
   }
   const bool caps_runahead = current_scenario == "caps-runahead" ||
