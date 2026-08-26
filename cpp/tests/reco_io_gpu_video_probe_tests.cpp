@@ -303,6 +303,13 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_true(long_mixed_prefix.total_frames_is_estimated,
               "bounded long untimed-prefix count remains explicitly estimated");
 
+  set_scenario("probe-reordered-untimed-prefix");
+  const auto reordered_untimed_prefix = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(reordered_untimed_prefix.duration_ns, 20'000'000'000ULL,
+            "reordered untimed prefix is counted once in correlated duration");
+  expect_eq(reordered_untimed_prefix.total_frames, 600ULL,
+            "reordered untimed prefix is counted once in correlated frame count");
+
   set_scenario("probe-unset-fps-inferred");
   const auto unset_fps = probe_gpu_video(container_config(video_path), timeout_ns);
   expect_eq(unset_fps.fps_numerator, 30U, "unset caps frame rate is inferred from timestamps");
@@ -372,6 +379,17 @@ void probe_contracts(const std::filesystem::path& video_path,
             "duplicate PTS transition preserves the observed AU lower bound");
   expect_true(duplicate_transition.total_frames_is_estimated,
               "bounded duplicate PTS transition count remains explicitly estimated");
+
+  set_scenario("probe-duplicate-pts-reorder-cutoff");
+  const auto duplicate_reorder_cutoff = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(duplicate_reorder_cutoff.fps_numerator, 50U,
+            "reordered cutoff group does not invalidate uniform duplicate PTS timing");
+  expect_eq(duplicate_reorder_cutoff.fps_denominator, 1U,
+            "reordered duplicate PTS timing retains its inferred denominator");
+  expect_true(duplicate_reorder_cutoff.total_frames >= 513ULL,
+              "reordered duplicate PTS estimate preserves the observed AU lower bound");
+  expect_true(duplicate_reorder_cutoff.total_frames_is_estimated,
+              "bounded reordered duplicate PTS count remains explicitly estimated");
 
   set_scenario("probe-paired-au-missing-pts");
   const auto paired_missing_pts = probe_gpu_video(container_config(video_path), timeout_ns);

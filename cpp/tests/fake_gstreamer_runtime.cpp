@@ -198,6 +198,7 @@ FakeCaps parser_sample_caps() {
              scenario() == "probe-unknown-pts" || scenario() == "probe-long-unknown-pts" ||
              scenario() == "probe-mixed-prefix-pts" ||
              scenario() == "probe-long-mixed-prefix-pts" ||
+             scenario() == "probe-reordered-untimed-prefix" ||
              scenario() == "probe-one-frame-rounding") {
     caps.fps_numerator = 30;
     caps.fps_denominator = 1;
@@ -205,6 +206,9 @@ FakeCaps parser_sample_caps() {
     caps.fps_numerator = 59;
     caps.fps_denominator = 2;
   } else if (scenario() == "probe-duplicate-pts-transition") {
+    caps.fps_numerator = 25;
+    caps.fps_denominator = 1;
+  } else if (scenario() == "probe-duplicate-pts-reorder-cutoff") {
     caps.fps_numerator = 25;
     caps.fps_denominator = 1;
   } else if (scenario() == "probe-short-quantized-exact-30") {
@@ -277,6 +281,12 @@ std::uint64_t parser_timing_offset(std::uint64_t frame_index, const FakeCaps& ca
   if (scenario() == "probe-duplicate-pts-transition") {
     return frame_index < 64U ? (frame_index / 2U) * 40'000'000ULL
                              : (frame_index - 32U) * 40'000'000ULL;
+  }
+  if (scenario() == "probe-duplicate-pts-reorder-cutoff") {
+    const auto presentation_index = frame_index == 511U   ? 512U
+                                    : frame_index == 513U ? 510U
+                                                          : frame_index;
+    return (presentation_index / 2U) * 40'000'000ULL;
   }
   if (scenario() == "probe-short-quantized-exact-30") {
     constexpr std::array<std::uint64_t, 4> kOffsets{0, 33'000'000ULL, 67'000'000ULL,
@@ -657,7 +667,9 @@ RECO_FAKE_EXPORT int gst_element_query_duration(void*, int format, std::int64_t*
     return 1;
   }
   if (scenario() == "probe-long-mixed-prefix-pts" ||
-      scenario() == "probe-duplicate-pts-transition") {
+      scenario() == "probe-reordered-untimed-prefix" ||
+      scenario() == "probe-duplicate-pts-transition" ||
+      scenario() == "probe-duplicate-pts-reorder-cutoff") {
     *duration = 20'000'000'000;
     return 1;
   }
@@ -883,6 +895,7 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
         : current_scenario == "probe-long-unknown-pts"             ? 3'000'000'000ULL
         : current_scenario == "probe-mixed-prefix-pts"             ? 4'000'000'000ULL
         : current_scenario == "probe-long-mixed-prefix-pts"        ? 20'000'000'000ULL
+        : current_scenario == "probe-reordered-untimed-prefix"     ? 20'000'000'000ULL
         : current_scenario == "probe-one-frame-rounding"           ? 33'333'333ULL
         : current_scenario == "probe-inexact-caps-fps"             ? 2'000'000'000ULL
         : current_scenario == "probe-short-quantized-exact-30"     ? 100'000'000ULL
@@ -898,6 +911,7 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
         : current_scenario == "probe-long-untimed-elementary"      ? 600'000'000'000ULL
         : current_scenario == "probe-duplicate-pts-pairs"          ? 4'000'000'000ULL
         : current_scenario == "probe-duplicate-pts-transition"     ? 20'000'000'000ULL
+        : current_scenario == "probe-duplicate-pts-reorder-cutoff" ? 20'000'000'000ULL
         : current_scenario == "probe-paired-au-missing-pts"        ? 4'000'000'000ULL
         : current_scenario == "probe-clustered-missing-pts"        ? 4'000'000'000ULL
         : current_scenario == "probe-exact-5997-fps"               ? 4'000'000'000ULL
@@ -955,6 +969,12 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     } else if (current_scenario == "probe-long-mixed-prefix-pts" && !sink->pipeline->has_seek &&
                sequential_index < 30U) {
       sample->buffer.pts = std::numeric_limits<std::uint64_t>::max();
+    } else if (current_scenario == "probe-reordered-untimed-prefix" && !sink->pipeline->has_seek &&
+               sequential_index < 2U) {
+      sample->buffer.pts = std::numeric_limits<std::uint64_t>::max();
+    } else if (current_scenario == "probe-reordered-untimed-prefix" && !sink->pipeline->has_seek &&
+               (sequential_index == 2U || sequential_index == 3U)) {
+      sample->buffer.pts = (sequential_index - 1U) * 1'000'000'000ULL / 30U;
     } else if (current_scenario == "probe-decode-order-origin" && !sink->pipeline->has_seek) {
       const auto presentation_index = sequential_index == 0   ? 2ULL
                                       : sequential_index == 1 ? 0ULL

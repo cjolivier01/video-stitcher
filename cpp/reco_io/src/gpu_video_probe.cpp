@@ -477,11 +477,11 @@ void* pull_compressed_sample(const std::shared_ptr<ProbeApi>& api, void* probe_s
     const auto poll_timeout =
         std::min(remaining_timeout_ns(deadline, timeout_message), kSamplePollTimeoutNs);
     if (void* sample = api->app_sink_try_pull_sample(probe_sink, poll_timeout); sample != nullptr) {
+      std::unique_ptr<void, ProbeApi::SampleUnref> sample_owner(sample, api->sample_unref);
       if (const auto error = pop_pipeline_error(api, bus); !error.empty()) {
-        api->sample_unref(sample);
         throw GpuVideoProbeError(error);
       }
-      return sample;
+      return sample_owner.release();
     }
     if (const auto error = pop_pipeline_error(api, bus); !error.empty()) {
       throw GpuVideoProbeError(error);
@@ -598,8 +598,8 @@ std::optional<InferredFrameRate> infer_constant_frame_rate(const TimingScan& sca
     if (duplicate_timestamp_multiplicity == 0) {
       duplicate_timestamp_multiplicity = group_size;
     } else if (group_size != duplicate_timestamp_multiplicity &&
-               (complete_stream || group_end != stored_end ||
-                group_size > duplicate_timestamp_multiplicity)) {
+               (complete_stream ||
+                static_cast<std::size_t>(stored_end - group_begin) > kTimingReorderLookahead)) {
       return std::nullopt;
     }
     group_begin = group_end;
@@ -675,6 +675,44 @@ std::optional<InferredFrameRate> infer_constant_frame_rate(const TimingScan& sca
                            .timestamp_multiplicity = timestamp_multiplicity,
                            .observed_fps = observed_fps,
                            .finite_span_fps_uncertainty = finite_span_fps_uncertainty};
+}
+
+struct UntimedPresentationPrefix {
+  std::uint64_t frame_count = 0;
+  std::uint64_t duration_ns = 0;
+};
+
+UntimedPresentationPrefix infer_untimed_presentation_prefix(const TimingScan& scan,
+                                                            std::uint32_t fps_numerator,
+                                                            std::uint32_t fps_denominator) {
+  if (scan.stored_timing_count == 0 || scan.timed_sample_indices[0] == 0 ||
+      !scan.first_stream_time.has_value()) {
+    return {};
+  }
+  std::array<std::uint64_t, kTimingAnalysisSamples> origin_candidates{};
+  const auto candidate_count = std::min(scan.stored_timing_count, origin_candidates.size());
+  for (std::size_t index = 0; index < candidate_count; ++index) {
+    const auto nominal_offset =
+        frame_timestamp_ns(scan.timed_sample_indices[index], fps_numerator, fps_denominator);
+    origin_candidates[index] =
+        scan.stream_times[index] > nominal_offset ? scan.stream_times[index] - nominal_offset : 0;
+  }
+  const auto candidate_end =
+      origin_candidates.begin() + static_cast<std::ptrdiff_t>(candidate_count);
+  std::sort(origin_candidates.begin(), candidate_end);
+  const auto estimated_origin = origin_candidates[candidate_count / 2U];
+  if (*scan.first_stream_time <= estimated_origin) {
+    return {};
+  }
+  const auto available_prefix_duration = *scan.first_stream_time - estimated_origin;
+  const auto available_prefix_frames =
+      frame_count_ceiling_for_duration(available_prefix_duration, fps_numerator, fps_denominator);
+  const auto frame_count = std::min(scan.timed_sample_indices[0], available_prefix_frames);
+  return {.frame_count = frame_count,
+          .duration_ns =
+              frame_count == available_prefix_frames
+                  ? available_prefix_duration
+                  : minimum_duration_for_frame_count(frame_count, fps_numerator, fps_denominator)};
 }
 
 bool frame_rates_are_close(std::uint32_t first_numerator, std::uint32_t first_denominator,
@@ -1071,12 +1109,11 @@ GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config, std::uint64_t t
           selected_stream_duration(api, pipeline, probe_sink, bus, duration_ns,
                                    *timing_scan.first_stream_time, fps_num, fps_den, deadline);
       if (selected_duration.has_value()) {
-        const auto untimed_prefix_frames = timing_scan.timed_sample_indices[0];
-        const auto untimed_prefix_duration =
-            minimum_duration_for_frame_count(untimed_prefix_frames, fps_num, fps_den);
-        duration_ns = add_saturating(selected_duration->duration_ns, untimed_prefix_duration);
+        const auto untimed_prefix =
+            infer_untimed_presentation_prefix(timing_scan, fps_num, fps_den);
+        duration_ns = add_saturating(selected_duration->duration_ns, untimed_prefix.duration_ns);
         correlated_frame_count =
-            add_saturating(selected_duration->frame_count, untimed_prefix_frames);
+            add_saturating(selected_duration->frame_count, untimed_prefix.frame_count);
         duration_is_estimated = true;
       } else {
         duration_is_estimated = true;
