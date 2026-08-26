@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -138,6 +139,27 @@ DeviceFrame make_blank_frame(CudaBackend& backend, std::uint32_t width, std::uin
   return {.pixels = std::move(device), .pitch = pitch, .width = width, .height = height};
 }
 
+DeviceFrame make_frame_from_pixels(CudaBackend& backend, std::vector<std::uint8_t> pixels,
+                                   std::uint32_t width, std::uint32_t height) {
+  const auto bytes = static_cast<std::size_t>(width) * height;
+  expect_eq(pixels.size(), bytes, "host frame fixture size");
+  auto device = backend.allocate(bytes);
+  upload(backend, pixels.data(), bytes, device);
+  return {.pixels = std::move(device), .pitch = width, .width = width, .height = height};
+}
+
+std::vector<std::uint8_t> rotate_clockwise(const std::vector<std::uint8_t>& source,
+                                           std::uint32_t size) {
+  std::vector<std::uint8_t> result(source.size());
+  for (std::uint32_t y = 0; y < size; ++y) {
+    for (std::uint32_t x = 0; x < size; ++x) {
+      result[static_cast<std::size_t>(x) * size + (size - 1U - y)] =
+          source[static_cast<std::size_t>(y) * size + x];
+    }
+  }
+  return result;
+}
+
 std::uint32_t feature_count(CudaBackend& backend, const GpuFeatureSet& features) {
   const auto view = features.view();
   std::uint32_t count = std::numeric_limits<std::uint32_t>::max();
@@ -149,6 +171,31 @@ std::uint32_t feature_count(CudaBackend& backend, const GpuFeatureSet& features)
                                   .width_bytes = sizeof(count),
                                   .height = 1});
   return count;
+}
+
+std::vector<Descriptor> feature_descriptors(CudaBackend& backend, const GpuFeatureSet& features) {
+  const auto count = feature_count(backend, features);
+  std::vector<Descriptor> descriptors(count);
+  if (count == 0U) {
+    return descriptors;
+  }
+  const auto bytes = descriptors.size() * sizeof(Descriptor);
+  backend.copy_device_to_host_2d({.dst = descriptors.data(),
+                                  .dst_pitch = bytes,
+                                  .src = features.view().descriptors,
+                                  .src_pitch = bytes,
+                                  .width_bytes = bytes,
+                                  .height = 1});
+  return descriptors;
+}
+
+std::uint64_t descriptor_hash(const Descriptor& descriptor) {
+  std::uint64_t hash = 1469598103934665603ULL;
+  for (const auto byte : descriptor) {
+    hash ^= byte;
+    hash *= 1099511628211ULL;
+  }
+  return hash;
 }
 
 GpuAkazeConfig detector_config(std::uint32_t max_keypoints = 32) {
@@ -261,6 +308,23 @@ void api_validation(CudaBackend& backend, const GpuAkazePipeline& pipeline,
         (void)pipeline.detect(frame, config);
       },
       "detector narrow pitch");
+  if constexpr (sizeof(std::size_t) == sizeof(std::uint64_t)) {
+    expect_invalid_argument(
+        [&] {
+          auto frame = valid_frame.view();
+          frame.pitch = std::numeric_limits<std::size_t>::max();
+          frame.height = std::numeric_limits<std::uint32_t>::max();
+          (void)pipeline.detect(frame, config);
+        },
+        "detector visible span overflow");
+  }
+  expect_invalid_argument(
+      [&] {
+        auto frame = valid_frame.view();
+        frame.ptr = std::numeric_limits<CudaDevicePtr>::max() - 8U;
+        (void)pipeline.detect(frame, config);
+      },
+      "detector pointer range overflow");
   expect_invalid_argument(
       [&] {
         auto frame = valid_frame.view();
@@ -312,6 +376,19 @@ void api_validation(CudaBackend& backend, const GpuAkazePipeline& pipeline,
   expect_invalid_argument([&] { (void)pipeline.detect(valid_frame.view(), invalid_config); },
                           "detector non-finite ROI");
   invalid_config = config;
+  invalid_config.use_region = true;
+  invalid_config.region = {.x_min = 0.0F, .x_max = 1.0F, .y_min = 0.0F, .y_max = 1.0F};
+  invalid_config.max_detection_width = std::numeric_limits<std::uint32_t>::max();
+  expect_invalid_argument(
+      [&] {
+        (void)pipeline.detect({.ptr = 1U,
+                               .pitch = std::numeric_limits<std::uint32_t>::max(),
+                               .width = std::numeric_limits<std::uint32_t>::max(),
+                               .height = 1U},
+                              invalid_config);
+      },
+      "unit ROI endpoint at maximum uint32 dimension remains defined");
+  invalid_config = config;
   invalid_config.lowe_ratio = 0.0F;
   expect_invalid_argument(
       [&] {
@@ -339,9 +416,20 @@ void api_validation(CudaBackend& backend, const GpuAkazePipeline& pipeline,
   expect_invalid_argument(
       [&] {
         (void)pipeline.match(fixture.view(), fixture.view(),
-                             std::numeric_limits<float>::quiet_NaN());
+                             std::numeric_limits<double>::quiet_NaN());
       },
       "matcher non-finite Lowe ratio");
+}
+
+void pipeline_owns_backend_lifetime(CudaBackend& allocation_backend, const DeviceFrame& frame) {
+  const auto make_pipeline = [] {
+    auto short_lived_backend = CudaBackend::create();
+    return std::make_unique<GpuAkazePipeline>(short_lived_backend);
+  };
+  const auto pipeline = make_pipeline();
+  const auto features = pipeline->detect(frame.view(), detector_config(8));
+  expect_true(feature_count(allocation_backend, features) > 0U,
+              "pipeline remains usable after constructor backend is destroyed");
 }
 
 void blank_image_has_no_features(CudaBackend& backend, const GpuAkazePipeline& pipeline) {
@@ -448,6 +536,45 @@ void roi_boundaries_are_enforced(CudaBackend& backend, const GpuAkazePipeline& p
   expect_true(feature_count(backend, full_roi) > 0U, "unit ROI boundaries accepted");
 }
 
+void rotated_descriptors_match_known_vectors(CudaBackend& backend,
+                                             const GpuAkazePipeline& pipeline) {
+  constexpr std::uint32_t size = 192;
+  auto pixels = texture(size, size, size, 7, 241, 0);
+  const auto config = detector_config(8);
+  constexpr std::array<std::uint64_t, 4> expected_hashes{
+      17885243628983993127ULL,
+      14984369198410826671ULL,
+      15870047116826553049ULL,
+      6089946918998727710ULL,
+  };
+  std::array<std::uint64_t, 4> hashes{};
+  for (std::size_t rotation = 0; rotation < hashes.size(); ++rotation) {
+    const auto frame = make_frame_from_pixels(backend, pixels, size, size);
+    const auto features = pipeline.detect(frame.view(), config);
+    const auto descriptors = feature_descriptors(backend, features);
+    expect_eq(descriptors.size(), static_cast<std::size_t>(config.max_keypoints),
+              "rotated golden descriptor count");
+    if (!descriptors.empty()) {
+      hashes[rotation] = descriptor_hash(descriptors.front());
+    }
+    for (const auto& descriptor : descriptors) {
+      expect_eq(static_cast<unsigned int>(descriptor[60] & 0xC0U), 0U,
+                "M-LDB bits above populated bit 485 are zero");
+      expect_eq(static_cast<unsigned int>(descriptor[61]), 0U,
+                "M-LDB byte 61 is outside the 486 populated bits");
+      expect_eq(static_cast<unsigned int>(descriptor[62]), 0U,
+                "M-LDB byte 62 is outside the 486 populated bits");
+      expect_eq(static_cast<unsigned int>(descriptor[63]), 0U,
+                "M-LDB byte 63 is outside the 486 populated bits");
+    }
+    pixels = rotate_clockwise(pixels, size);
+  }
+
+  for (std::size_t rotation = 0; rotation < hashes.size(); ++rotation) {
+    expect_eq(hashes[rotation], expected_hashes[rotation], "rotated M-LDB descriptor known vector");
+  }
+}
+
 void matcher_ties_lowe_and_crosscheck(CudaBackend& backend, const GpuAkazePipeline& pipeline) {
   Descriptor one_bit_a{};
   Descriptor one_bit_b{};
@@ -536,6 +663,34 @@ void matcher_order_is_stable(CudaBackend& backend, const GpuAkazePipeline& pipel
   }
 }
 
+void matcher_preserves_double_ratio_boundaries(CudaBackend& backend,
+                                               const GpuAkazePipeline& pipeline) {
+  Descriptor right_best{};
+  Descriptor right_second{};
+  flip_bit(right_best, 0);
+  for (std::size_t bit = 0; bit < 3; ++bit) {
+    flip_bit(right_second, bit);
+  }
+  const std::array left_points{point(1.0F), point(2.0F)};
+  const std::array left_descriptors{Descriptor{}, filled_descriptor(255)};
+  const std::array right_points{point(3.0F), point(4.0F)};
+  const std::array right_descriptors{right_best, right_second};
+  const auto left = make_features(backend, left_points, left_descriptors);
+  const auto right = make_features(backend, right_points, right_descriptors);
+  constexpr double boundary = 1.0 / 3.0;
+  const auto below = std::nextafter(boundary, 0.0);
+  const auto above = std::nextafter(std::nextafter(boundary, 1.0), 1.0);
+  expect_true(pipeline.match(left.view(), right.view(), below).empty(),
+              "Lowe ratio immediately below an integer distance boundary rejects");
+  const auto accepted = pipeline.match(left.view(), right.view(), above);
+  expect_eq(accepted.size(), 1U,
+            "Lowe ratio immediately above an integer distance boundary accepts");
+  if (accepted.size() == 1U) {
+    expect_eq(accepted.front().distance, 1U, "double-boundary accepted match distance");
+    expect_near(accepted.front().left.x, 1.0F, 0.0F, "double-boundary accepted match identity");
+  }
+}
+
 } // namespace
 
 int main() {
@@ -561,13 +716,16 @@ int main() {
     GpuAkazePipeline pipeline(backend);
     const auto validation_frame = make_frame(backend, 160, 96, 176);
     api_validation(backend, pipeline, validation_frame);
+    pipeline_owns_backend_lifetime(backend, validation_frame);
     blank_image_has_no_features(backend, pipeline);
     detector_is_bounded_and_deterministic(backend, pipeline);
     luma_range_boundaries_are_equivalent(backend, pipeline);
     resize_boundary_maps_to_source_coordinates(backend, pipeline);
     roi_boundaries_are_enforced(backend, pipeline);
+    rotated_descriptors_match_known_vectors(backend, pipeline);
     matcher_ties_lowe_and_crosscheck(backend, pipeline);
     matcher_order_is_stable(backend, pipeline);
+    matcher_preserves_double_ratio_boundaries(backend, pipeline);
   } catch (const std::exception& error) {
     std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';
     return EXIT_FAILURE;

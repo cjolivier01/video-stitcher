@@ -136,7 +136,7 @@ void launch(const reco::core::CudaKernel& kernel, const reco::core::CudaLaunchCo
   kernel.launch(config, std::span<void*>(pointers));
 }
 
-[[nodiscard]] DeviceImage allocate_float_image(reco::core::CudaBackend& backend,
+[[nodiscard]] DeviceImage allocate_float_image(const reco::core::CudaBackend& backend,
                                                std::uint32_t width, std::uint32_t height) {
   if (width == 0 || height == 0) {
     throw std::invalid_argument("GPU AKAZE image dimensions must be non-zero");
@@ -198,6 +198,17 @@ void validate_frame(const GpuGrayFrame& frame) {
   if (frame.pitch < frame.width) {
     throw std::invalid_argument("GPU AKAZE frame pitch is smaller than its visible width");
   }
+  const auto pitch = static_cast<std::uint64_t>(frame.pitch);
+  const auto rows_before_last = static_cast<std::uint64_t>(frame.height - 1U);
+  const auto width = static_cast<std::uint64_t>(frame.width);
+  const auto maximum = std::numeric_limits<std::uint64_t>::max();
+  if (rows_before_last != 0U && pitch > (maximum - width) / rows_before_last) {
+    throw std::invalid_argument("GPU AKAZE frame visible byte span overflows");
+  }
+  const auto visible_span = rows_before_last * pitch + width;
+  if (frame.ptr > maximum - visible_span) {
+    throw std::invalid_argument("GPU AKAZE frame device pointer range overflows");
+  }
   switch (frame.color_range) {
   case reco::core::YuvColorRange::Limited:
   case reco::core::YuvColorRange::Full:
@@ -226,8 +237,7 @@ void validate_config(const GpuAkazeConfig& config) {
   if (!std::isfinite(config.threshold) || !(config.threshold > 0.0F)) {
     throw std::invalid_argument("GPU AKAZE threshold must be finite and positive");
   }
-  if (!std::isfinite(config.lowe_ratio) || !(config.lowe_ratio > 0.0F) ||
-      config.lowe_ratio > 1.0F) {
+  if (!std::isfinite(config.lowe_ratio) || !(config.lowe_ratio > 0.0) || config.lowe_ratio > 1.0) {
     throw std::invalid_argument("GPU AKAZE Lowe ratio must be finite and in (0, 1]");
   }
   if (config.num_sublevels == 0 || config.num_sublevels > 8) {
@@ -245,12 +255,18 @@ void validate_config(const GpuAkazeConfig& config) {
                                                    const GpuAkazeConfig& config) {
   DetectionGeometry result{.crop_width = frame.width, .crop_height = frame.height};
   if (config.use_region) {
-    const auto x_low = static_cast<std::uint32_t>(config.region.x_min * frame.width);
-    const auto y_low = static_cast<std::uint32_t>(config.region.y_min * frame.height);
-    const auto x_high = std::min(
-        frame.width, static_cast<std::uint32_t>(std::ceil(config.region.x_max * frame.width)));
-    const auto y_high = std::min(
-        frame.height, static_cast<std::uint32_t>(std::ceil(config.region.y_max * frame.height)));
+    const auto endpoint = [](float normalized, std::uint32_t dimension, bool upper) {
+      const double scaled = static_cast<double>(normalized) * static_cast<double>(dimension);
+      const double rounded = upper ? std::ceil(scaled) : std::floor(scaled);
+      if (!(rounded >= 0.0) || rounded > static_cast<double>(dimension)) {
+        throw std::invalid_argument("GPU AKAZE region endpoint exceeds frame dimensions");
+      }
+      return static_cast<std::uint32_t>(rounded);
+    };
+    const auto x_low = endpoint(config.region.x_min, frame.width, false);
+    const auto y_low = endpoint(config.region.y_min, frame.height, false);
+    const auto x_high = endpoint(config.region.x_max, frame.width, true);
+    const auto y_high = endpoint(config.region.y_max, frame.height, true);
     const auto crop_x = x_low > kCropMargin ? x_low - kCropMargin : 0U;
     const auto crop_y = y_low > kCropMargin ? y_low - kCropMargin : 0U;
     const auto crop_right = x_high > frame.width - std::min(frame.width, kCropMargin)
@@ -404,40 +420,40 @@ struct GpuFeatureSet::Impl {
 };
 
 struct GpuAkazePipeline::Impl {
-  explicit Impl(reco::core::CudaBackend& backend_in) : backend(&backend_in) {
-    backend->ensure_primary_context();
+  explicit Impl(reco::core::CudaBackend& backend_in) : backend(backend_in) {
+    backend.ensure_primary_context();
     detail::NvrtcCompiler compiler;
     const auto akaze_ptx = compiler.compile(kGpuAkazeKernelSource, "reco_calibrate_gpu_akaze.cu");
-    y_to_float = backend->load_kernel_from_ptx(akaze_ptx, "akaze_y_to_float");
-    gaussian_x = backend->load_kernel_from_ptx(akaze_ptx, "akaze_gaussian_x");
-    gaussian_y = backend->load_kernel_from_ptx(akaze_ptx, "akaze_gaussian_y");
-    half_size = backend->load_kernel_from_ptx(akaze_ptx, "akaze_half_size");
-    scharr = backend->load_kernel_from_ptx(akaze_ptx, "akaze_scharr");
-    clear_histogram = backend->load_kernel_from_ptx(akaze_ptx, "akaze_clear_histogram");
-    gradient_histogram = backend->load_kernel_from_ptx(akaze_ptx, "akaze_gradient_histogram");
-    histogram_percentile = backend->load_kernel_from_ptx(akaze_ptx, "akaze_histogram_percentile");
-    conductivity = backend->load_kernel_from_ptx(akaze_ptx, "akaze_conductivity");
-    diffusion_step = backend->load_kernel_from_ptx(akaze_ptx, "akaze_diffusion_step");
-    hessian_response = backend->load_kernel_from_ptx(akaze_ptx, "akaze_hessian_response");
-    nms_flags = backend->load_kernel_from_ptx(akaze_ptx, "akaze_nms_flags");
-    akaze_scan_block = backend->load_kernel_from_ptx(akaze_ptx, "akaze_scan_block");
-    akaze_scan_add = backend->load_kernel_from_ptx(akaze_ptx, "akaze_scan_add");
-    scatter_candidates = backend->load_kernel_from_ptx(akaze_ptx, "akaze_scatter_candidates");
-    select_features = backend->load_kernel_from_ptx(akaze_ptx, "akaze_select_features");
-    describe_features = backend->load_kernel_from_ptx(akaze_ptx, "akaze_describe_features");
+    y_to_float = backend.load_kernel_from_ptx(akaze_ptx, "akaze_y_to_float");
+    gaussian_x = backend.load_kernel_from_ptx(akaze_ptx, "akaze_gaussian_x");
+    gaussian_y = backend.load_kernel_from_ptx(akaze_ptx, "akaze_gaussian_y");
+    half_size = backend.load_kernel_from_ptx(akaze_ptx, "akaze_half_size");
+    scharr = backend.load_kernel_from_ptx(akaze_ptx, "akaze_scharr");
+    clear_histogram = backend.load_kernel_from_ptx(akaze_ptx, "akaze_clear_histogram");
+    gradient_histogram = backend.load_kernel_from_ptx(akaze_ptx, "akaze_gradient_histogram");
+    histogram_percentile = backend.load_kernel_from_ptx(akaze_ptx, "akaze_histogram_percentile");
+    conductivity = backend.load_kernel_from_ptx(akaze_ptx, "akaze_conductivity");
+    diffusion_step = backend.load_kernel_from_ptx(akaze_ptx, "akaze_diffusion_step");
+    hessian_response = backend.load_kernel_from_ptx(akaze_ptx, "akaze_hessian_response");
+    nms_flags = backend.load_kernel_from_ptx(akaze_ptx, "akaze_nms_flags");
+    akaze_scan_block = backend.load_kernel_from_ptx(akaze_ptx, "akaze_scan_block");
+    akaze_scan_add = backend.load_kernel_from_ptx(akaze_ptx, "akaze_scan_add");
+    scatter_candidates = backend.load_kernel_from_ptx(akaze_ptx, "akaze_scatter_candidates");
+    select_features = backend.load_kernel_from_ptx(akaze_ptx, "akaze_select_features");
+    describe_features = backend.load_kernel_from_ptx(akaze_ptx, "akaze_describe_features");
 
     const auto match_ptx = compiler.compile(kGpuMatchKernelSource, "reco_calibrate_gpu_match.cu");
-    match_one_way = backend->load_kernel_from_ptx(match_ptx, "match_one_way");
-    match_crosscheck = backend->load_kernel_from_ptx(match_ptx, "match_crosscheck_flags");
-    match_scan_block = backend->load_kernel_from_ptx(match_ptx, "match_scan_block");
-    match_scan_add = backend->load_kernel_from_ptx(match_ptx, "match_scan_add");
-    match_scatter = backend->load_kernel_from_ptx(match_ptx, "match_scatter");
-    match_sort = backend->load_kernel_from_ptx(match_ptx, "match_stable_sort");
+    match_one_way = backend.load_kernel_from_ptx(match_ptx, "match_one_way");
+    match_crosscheck = backend.load_kernel_from_ptx(match_ptx, "match_crosscheck_flags");
+    match_scan_block = backend.load_kernel_from_ptx(match_ptx, "match_scan_block");
+    match_scan_add = backend.load_kernel_from_ptx(match_ptx, "match_scan_add");
+    match_scatter = backend.load_kernel_from_ptx(match_ptx, "match_scatter");
+    match_sort = backend.load_kernel_from_ptx(match_ptx, "match_stable_sort");
   }
 
   [[nodiscard]] DeviceImage gaussian(const DeviceImage& source, float sigma) const {
-    auto temporary = allocate_float_image(*backend, source.width, source.height);
-    auto output = allocate_float_image(*backend, source.width, source.height);
+    auto temporary = allocate_float_image(backend, source.width, source.height);
+    auto output = allocate_float_image(backend, source.width, source.height);
     auto src = source.buffer.ptr();
     auto src_pitch = static_cast<std::uint64_t>(source.pitch);
     auto temp = temporary.buffer.ptr();
@@ -527,7 +543,7 @@ struct GpuAkazePipeline::Impl {
                       std::vector<reco::core::CudaDeviceBuffer>& scratch) const {
     const auto blocks = divide_round_up(count, kLinearBlockSize);
     auto sums =
-        backend->allocate(checked_multiply(blocks, sizeof(std::uint32_t), "GPU scan block sums"));
+        backend.allocate(checked_multiply(blocks, sizeof(std::uint32_t), "GPU scan block sums"));
     auto sums_ptr = sums.ptr();
     auto count_arg = count;
     reco::core::CudaLaunchConfig config{
@@ -540,7 +556,7 @@ struct GpuAkazePipeline::Impl {
     launch(scan_block_kernel, config, input, output, sums_ptr, count_arg);
 
     if (blocks > 1U) {
-      auto offsets = backend->allocate(
+      auto offsets = backend.allocate(
           checked_multiply(blocks, sizeof(std::uint32_t), "GPU scan block offsets"));
       auto offsets_ptr = offsets.ptr();
       exclusive_scan(scan_block_kernel, scan_add_kernel, sums_ptr, offsets_ptr, blocks,
@@ -558,7 +574,7 @@ struct GpuAkazePipeline::Impl {
     scratch.push_back(std::move(sums));
   }
 
-  reco::core::CudaBackend* backend;
+  reco::core::CudaBackend backend;
   reco::core::CudaKernel y_to_float;
   reco::core::CudaKernel gaussian_x;
   reco::core::CudaKernel gaussian_y;
@@ -615,7 +631,7 @@ GpuFeatureSet GpuAkazePipeline::detect(const GpuGrayFrame& frame,
   }
   validate_frame(frame);
   validate_config(config);
-  auto& backend = *impl_->backend;
+  auto& backend = impl_->backend;
   backend.ensure_primary_context();
 
   const auto geometry = detection_geometry(frame, config);
@@ -889,20 +905,20 @@ GpuFeatureSet GpuAkazePipeline::detect(const GpuGrayFrame& frame,
 
 std::vector<GpuMatchedPoint> GpuAkazePipeline::match(const GpuFeatureView& left,
                                                      const GpuFeatureView& right,
-                                                     float lowe_ratio) const {
+                                                     double lowe_ratio) const {
   if (impl_ == nullptr) {
     throw std::logic_error("cannot use a moved-from GPU AKAZE pipeline");
   }
   validate_feature_view(left, "left");
   validate_feature_view(right, "right");
-  if (!std::isfinite(lowe_ratio) || !(lowe_ratio > 0.0F) || lowe_ratio > 1.0F) {
+  if (!std::isfinite(lowe_ratio) || !(lowe_ratio > 0.0) || lowe_ratio > 1.0) {
     throw std::invalid_argument("GPU matcher Lowe ratio must be finite and in (0, 1]");
   }
   if (left.capacity == 0 || right.capacity == 0) {
     return {};
   }
 
-  auto& backend = *impl_->backend;
+  auto& backend = impl_->backend;
   backend.ensure_primary_context();
   struct DirectionBuffers {
     reco::core::CudaDeviceBuffer best;

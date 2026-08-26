@@ -67,7 +67,7 @@ extern "C" __global__ void match_one_way(
     const unsigned char* train_descriptors,
     const unsigned int* train_count,
     unsigned int train_capacity,
-    float lowe_ratio,
+    double lowe_ratio,
     unsigned int* best_indices,
     unsigned int* best_distances,
     unsigned int* second_distances,
@@ -109,10 +109,10 @@ extern "C" __global__ void match_one_way(
   }
 
   unsigned int passes = 0U;
-  if (lowe_ratio < 1.0F) {
+  if (lowe_ratio < 1.0) {
     passes = second_distance > 0U &&
-                     static_cast<float>(best_distance) <
-                         lowe_ratio * static_cast<float>(second_distance)
+                     static_cast<double>(best_distance) <
+                         lowe_ratio * static_cast<double>(second_distance)
                  ? 1U
                  : 0U;
   } else {

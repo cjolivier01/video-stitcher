@@ -133,16 +133,26 @@ void validate_frame(const GpuGrayFrame& frame, std::string_view label) {
     throw std::invalid_argument(std::string("GPU undistort ") + std::string(label) +
                                 " pitch is smaller than width");
   }
+  switch (frame.color_range) {
+  case reco::core::YuvColorRange::Limited:
+  case reco::core::YuvColorRange::Full:
+    break;
+  default:
+    throw std::invalid_argument(std::string("GPU undistort ") + std::string(label) +
+                                " frame has an invalid color range");
+  }
 }
 
 std::uint64_t frame_span_bytes(const GpuGrayFrame& frame, std::string_view label) {
   const auto pitch = static_cast<std::uint64_t>(frame.pitch);
-  const auto height = static_cast<std::uint64_t>(frame.height);
-  if (pitch != 0 && height > std::numeric_limits<std::uint64_t>::max() / pitch) {
+  const auto rows_before_last = static_cast<std::uint64_t>(frame.height - 1U);
+  const auto width = static_cast<std::uint64_t>(frame.width);
+  const auto maximum = std::numeric_limits<std::uint64_t>::max();
+  if (rows_before_last != 0U && pitch > (maximum - width) / rows_before_last) {
     throw std::overflow_error(std::string("GPU undistort ") + std::string(label) +
                               " frame byte span overflow");
   }
-  return pitch * height;
+  return rows_before_last * pitch + width;
 }
 
 bool ranges_overlap(CudaDevicePtr lhs, std::uint64_t lhs_size, CudaDevicePtr rhs,
@@ -161,16 +171,16 @@ bool ranges_overlap(CudaDevicePtr lhs, std::uint64_t lhs_size, CudaDevicePtr rhs
 
 struct GpuCalibrationUndistorter::Impl {
   Impl(reco::core::CudaBackend& backend_in, GpuUndistortConfig config_in)
-      : backend(&backend_in), config(std::move(config_in)) {
+      : backend(backend_in), config(std::move(config_in)) {
     validate_config(config);
-    backend->ensure_primary_context();
+    backend.ensure_primary_context();
     detail::NvrtcCompiler compiler;
     const std::string ptx =
         compiler.compile(kUndistortKernelSource, "reco_calibrate_gpu_undistort.cu");
-    kernel = backend->load_kernel_from_ptx(ptx, "undistort_y_plane");
+    kernel = backend.load_kernel_from_ptx(ptx, "undistort_y_plane");
   }
 
-  reco::core::CudaBackend* backend = nullptr;
+  reco::core::CudaBackend backend;
   GpuUndistortConfig config;
   reco::core::CudaKernel kernel;
 };
@@ -193,6 +203,9 @@ void GpuCalibrationUndistorter::undistort_y(const GpuGrayFrame& src,
                                             const GpuGrayFrame& dst) const {
   validate_frame(src, "source");
   validate_frame(dst, "destination");
+  if (src.color_range != dst.color_range) {
+    throw std::invalid_argument("GPU undistort source and destination color ranges must match");
+  }
   const auto& config = impl_->config;
   if (dst.width != config.output_width || dst.height != config.output_height) {
     throw std::invalid_argument(

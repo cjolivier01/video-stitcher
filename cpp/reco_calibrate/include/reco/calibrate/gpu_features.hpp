@@ -58,7 +58,7 @@ struct GpuAkazeConfig {
   /// Positive Hessian response threshold.
   float threshold = 0.001F;
   /// Bidirectional Lowe ratio in `(0, 1]`; one disables the ratio test.
-  float lowe_ratio = 0.75F;
+  double lowe_ratio = 0.75;
   /// Normalized source-image region used when `use_region` is true.
   DetectRegion region;
   /// Enables region cropping and final point filtering.
@@ -105,7 +105,7 @@ public:
   [[nodiscard]] GpuFeatureSet detect(const GpuGrayFrame& frame, const GpuAkazeConfig& config) const;
   /// Runs bidirectional Hamming/Lowe matching and reads back only accepted point pairs.
   [[nodiscard]] std::vector<GpuMatchedPoint>
-  match(const GpuFeatureView& left, const GpuFeatureView& right, float lowe_ratio) const;
+  match(const GpuFeatureView& left, const GpuFeatureView& right, double lowe_ratio) const;
   [[nodiscard]] std::vector<GpuMatchedPoint> detect_and_match(const GpuGrayFrame& left,
                                                               const GpuGrayFrame& right,
                                                               const GpuAkazeConfig& config) const;

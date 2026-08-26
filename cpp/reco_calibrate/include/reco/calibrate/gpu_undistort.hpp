@@ -35,7 +35,7 @@ public:
   GpuCalibrationUndistorter& operator=(GpuCalibrationUndistorter&&) noexcept;
 
   [[nodiscard]] const GpuUndistortConfig& config() const;
-  // Source and destination device ranges must not overlap.
+  // Source and destination device ranges must not overlap and must carry the same color range.
   void undistort_y(const GpuGrayFrame& src, const GpuGrayFrame& dst) const;
 
 private:

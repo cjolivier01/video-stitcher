@@ -838,6 +838,7 @@ __device__ float akaze_orientation(
   float responses_x[109];
   float responses_y[109];
   float angles[109];
+  const float pi = 3.14159265358979323846f;
   const int gaussian_index[13] = {6, 5, 4, 3, 2, 1, 0, 1, 2, 3, 4, 5, 6};
   const float ratio = akaze_octave_ratio(point.octave);
   const float scale = roundf(0.5f * point.size / ratio);
@@ -857,13 +858,13 @@ __device__ float akaze_orientation(
             level.lx, level.lx_pitch, level.width, level.height, ix, iy);
         responses_y[index] = weight * akaze_level_sample(
             level.ly, level.ly_pitch, level.width, level.height, ix, iy);
-        angles[index] = atan2f(responses_y[index], responses_x[index]);
+        const float angle = atan2f(responses_y[index], responses_x[index]);
+        angles[index] = angle < 0.0f ? angle + 2.0f * pi : angle;
         ++index;
       }
     }
   }
 
-  const float pi = 3.14159265358979323846f;
   float angle1 = 0.0f;
   float maximum = 0.0f;
   float orientation = 0.0f;
@@ -873,7 +874,6 @@ __device__ float akaze_orientation(
     const float angle2 = angle1 + pi / 3.0f > 2.0f * pi
         ? angle1 - 5.0f * pi / 3.0f
         : angle1 + pi / 3.0f;
-    angle1 += 0.15f;
     for (unsigned int k = 0U; k < 109U; ++k) {
       const float angle = angles[k];
       if ((angle1 < angle2 && angle1 < angle && angle < angle2) ||
@@ -889,6 +889,7 @@ __device__ float akaze_orientation(
       maximum = magnitude;
       orientation = atan2f(sum_y, sum_x);
     }
+    angle1 += 0.15f;
   }
   return orientation;
 }
