@@ -200,6 +200,15 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_true(!selected_duration.duration_is_estimated,
               "timestamp-correlated selected duration is not estimated");
 
+  set_scenario("probe-delayed-stream");
+  const auto delayed_stream = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(delayed_stream.duration_ns, 1'000'000'000ULL,
+            "selected stream duration excludes its delayed container start");
+  expect_eq(delayed_stream.total_frames, 30ULL,
+            "delayed selected stream reports only its own frame count");
+  expect_true(!delayed_stream.duration_is_estimated,
+              "delayed selected stream duration remains timestamp-correlated");
+
   set_scenario("probe-seek-unsupported");
   const auto unseekable = probe_gpu_video(container_config(video_path), timeout_ns);
   expect_eq(unseekable.duration_ns, 10'000'000'000ULL,
@@ -254,9 +263,10 @@ void invalid_inputs_fail(const std::filesystem::path& video_path,
             {"probe-missing-info", "metadata identity"},
             {"probe-missing-pad", "metadata pad"},
             {"probe-missing-sink", "compressed-stream sink"},
+            {"probe-missing-bus", "message bus"},
             {"probe-state-error", "playing state"},
             {"probe-stream-error", "playing state"},
-            {"probe-timeout", "timed out"},
+            {"probe-async-error", "fake parser failure"},
             {"probe-no-supported-video", "H.264 or HEVC"},
             {"probe-missing-current-caps", "H.264 or HEVC"},
             {"probe-missing-caps-structure", "no structure"},
@@ -264,11 +274,17 @@ void invalid_inputs_fail(const std::filesystem::path& video_path,
             {"probe-unparsed-caps", "decoder-compatible"},
             {"probe-avc-caps", "decoder-compatible"},
             {"probe-nal-caps", "decoder-compatible"},
-            {"probe-bad-dimensions", "invalid visible"},
-            {"probe-pull-timeout", "timed out while seeking"}}}) {
+            {"probe-bad-dimensions", "invalid visible"}}}) {
     set_scenario(scenario_name);
     expect_probe_error([&] { (void)probe_gpu_video(container_config(video_path), timeout_ns); },
                        fragment, scenario_name);
+  }
+
+  for (const auto scenario_name : {"probe-timeout", "probe-pull-timeout"}) {
+    set_scenario(scenario_name);
+    expect_probe_error(
+        [&] { (void)probe_gpu_video(container_config(video_path), 1'000'000'000ULL); }, "timed out",
+        scenario_name);
   }
 
   set_scenario("probe-odd-dimensions");

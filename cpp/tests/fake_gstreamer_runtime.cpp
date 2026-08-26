@@ -1,6 +1,8 @@
 #include "reco/io/detail/nvbufsurface_9_1.hpp"
 
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -9,6 +11,7 @@
 #include <limits>
 #include <mutex>
 #include <string>
+#include <thread>
 
 #if defined(_WIN32)
 #define RECO_FAKE_EXPORT extern "C" __declspec(dllexport)
@@ -130,6 +133,7 @@ struct FakePipeline : FakeObject {
   FakePad* display_pad = nullptr;
   FakePad* output_pad = nullptr;
   bool parser_probe = false;
+  bool elementary_probe = false;
   std::int64_t seek_target_ns = 0;
   bool has_seek = false;
   std::uint64_t seek_generation = 0;
@@ -160,6 +164,7 @@ struct FakeSample {
   FakePipeline* pipeline = nullptr;
   bool post_pull_runahead_emitted = false;
   bool segment_outside = false;
+  bool non_time_segment = false;
 };
 
 std::mutex event_mutex;
@@ -364,6 +369,7 @@ RECO_FAKE_EXPORT void* gst_parse_launch(const char* description, GErrorAbi** err
   }
   auto* pipeline = new FakePipeline;
   pipeline->parser_probe = parser_probe;
+  pipeline->elementary_probe = parser_probe && std::strstr(description, "parsebin") == nullptr;
   if (scenario() == "probe-parse-partial-error") {
     *error = make_error("fake partial parse failure");
   }
@@ -473,7 +479,7 @@ RECO_FAKE_EXPORT int gst_element_query_duration(void*, int format, std::int64_t*
     *duration = std::numeric_limits<std::int64_t>::max();
     return 1;
   }
-  if (scenario() == "probe-duration-mismatch") {
+  if (scenario() == "probe-duration-mismatch" || scenario() == "probe-delayed-stream") {
     *duration = 5'000'000'000;
     return 1;
   }
@@ -495,7 +501,7 @@ RECO_FAKE_EXPORT int gst_element_seek_simple(void* pipeline_pointer, int format,
 
 RECO_FAKE_EXPORT void* gst_element_get_bus(void*) {
   record("get-bus");
-  if (scenario() == "missing-bus") {
+  if (scenario() == "missing-bus" || scenario() == "probe-missing-bus") {
     return nullptr;
   }
   return new FakeBus;
@@ -557,7 +563,8 @@ RECO_FAKE_EXPORT void* gst_pad_get_current_caps(void* pad_pointer) {
   } else if (pad->probe && scenario() == "probe-high-fps") {
     caps->fps_numerator = 90'000;
     caps->fps_denominator = 1;
-  } else if (pad->probe && scenario() == "probe-duration-mismatch") {
+  } else if (pad->probe &&
+             (scenario() == "probe-duration-mismatch" || scenario() == "probe-delayed-stream")) {
     caps->fps_numerator = 30;
     caps->fps_denominator = 1;
   }
@@ -616,7 +623,7 @@ RECO_FAKE_EXPORT void gst_caps_unref(void* caps) {
   delete static_cast<FakeCaps*>(caps);
 }
 
-RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uint64_t) {
+RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uint64_t timeout_ns) {
   auto* sink = static_cast<FakeSink*>(sink_pointer);
   if (sink->pipeline->parser_probe) {
     record("pull-probe");
@@ -629,26 +636,37 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
       sink->probe_eos = true;
       return nullptr;
     }
-    if (scenario() == "probe-timeout" ||
-        (scenario() == "probe-pull-timeout" && sink->pipeline->has_seek)) {
+    if (scenario() == "probe-async-error") {
       return nullptr;
     }
+    if (scenario() == "probe-timeout" ||
+        (scenario() == "probe-pull-timeout" && sink->pipeline->has_seek)) {
+      std::this_thread::sleep_for(std::chrono::nanoseconds(timeout_ns));
+      return nullptr;
+    }
+    const std::uint64_t selected_stream_start_ns =
+        scenario() == "probe-delayed-stream" ? 4'000'000'000ULL : 0;
     const std::uint64_t selected_duration_ns =
-        scenario() == "probe-duration-mismatch"      ? 1'000'000'000ULL
+        scenario() == "probe-delayed-stream"         ? 5'000'000'000ULL
+        : scenario() == "probe-duration-mismatch"    ? 1'000'000'000ULL
         : scenario() == "probe-exact-frame-count"    ? 100'100'000ULL
         : scenario() == "probe-integral-frame-count" ? 1'001'000'000'000ULL
         : scenario() == "probe-frame-count-overflow"
             ? static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())
             : 10'000'000'000ULL;
     const std::uint64_t frame_duration_ns =
-        scenario() == "probe-duration-mismatch" ? 33'333'333ULL : 33'366'666ULL;
-    const auto target_ns = static_cast<std::uint64_t>(sink->pipeline->seek_target_ns);
+        scenario() == "probe-duration-mismatch" || scenario() == "probe-delayed-stream"
+            ? 33'333'333ULL
+            : 33'366'666ULL;
+    const auto requested_target_ns = static_cast<std::uint64_t>(sink->pipeline->seek_target_ns);
+    const auto target_ns = std::max(requested_target_ns, selected_stream_start_ns);
     if (target_ns >= selected_duration_ns) {
       sink->probe_eos = true;
       return nullptr;
     }
     auto* sample = new FakeSample;
     sample->pipeline = sink->pipeline;
+    sample->non_time_segment = sink->pipeline->elementary_probe;
     sample->segment_outside = scenario() == "probe-seek-preroll" && sink->pipeline->has_seek &&
                               sink->probe_pulls_since_seek++ == 0;
     sample->buffer.pts = target_ns;
@@ -834,7 +852,8 @@ RECO_FAKE_EXPORT const void* gst_sample_get_segment(void* sample) { return sampl
 
 RECO_FAKE_EXPORT std::uint64_t gst_segment_to_stream_time(const void* segment, int format,
                                                           std::uint64_t position) {
-  return format == 3 && !static_cast<const FakeSample*>(segment)->segment_outside
+  return format == 3 && !static_cast<const FakeSample*>(segment)->segment_outside &&
+                 !static_cast<const FakeSample*>(segment)->non_time_segment
              ? position
              : std::numeric_limits<std::uint64_t>::max();
 }
@@ -938,7 +957,7 @@ RECO_FAKE_EXPORT void* gst_bus_timed_pop_filtered(void* bus_pointer, std::uint64
                                                   std::uint32_t types) {
   auto* bus = static_cast<FakeBus*>(bus_pointer);
   ++bus->poll_count;
-  const bool ready = scenario() == "stream-error" ||
+  const bool ready = scenario() == "stream-error" || scenario() == "probe-async-error" ||
                      (scenario() == "delayed-stream-error" && bus->poll_count >= 2);
   if (!ready || bus->emitted_error || (types & (1U << 1U)) == 0) {
     return nullptr;
@@ -948,7 +967,8 @@ RECO_FAKE_EXPORT void* gst_bus_timed_pop_filtered(void* bus_pointer, std::uint64
 }
 
 RECO_FAKE_EXPORT void gst_message_parse_error(void*, GErrorAbi** error, char** debug) {
-  *error = make_error("fake decoder failure");
+  *error = make_error(scenario() == "probe-async-error" ? "fake parser failure"
+                                                        : "fake decoder failure");
   *debug = duplicate("fake debug detail");
 }
 

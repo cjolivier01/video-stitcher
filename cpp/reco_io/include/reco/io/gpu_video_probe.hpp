@@ -25,7 +25,7 @@ struct GpuVideoProbe {
   std::uint64_t duration_ns = 0;
   /// Truncated `duration * fps` frame-count estimate.
   std::uint64_t total_frames = 0;
-  /// Whether `duration_ns` uses the Rust-compatible 60-second fallback.
+  /// Whether `duration_ns` is a fallback or an uncorrelated container estimate.
   bool duration_is_estimated = false;
 };
 
