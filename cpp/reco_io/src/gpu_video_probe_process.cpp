@@ -8,7 +8,10 @@
 #include <cstdint>
 #include <exception>
 #include <filesystem>
+#include <future>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -29,6 +32,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#if defined(__linux__)
+#include <dlfcn.h>
+#endif
+
 extern char** environ;
 #endif
 
@@ -41,6 +48,36 @@ constexpr std::uint64_t kMaximumProbeTimeoutNs = 3'600ULL * kNanosecondsPerSecon
 constexpr auto kProcessPollInterval = std::chrono::milliseconds(2);
 constexpr auto kMinimumTerminationReserve = std::chrono::milliseconds(50);
 constexpr auto kMaximumTerminationReserve = std::chrono::milliseconds(250);
+constexpr std::size_t kMaximumConcurrentProbeWorkers = 32;
+
+struct SupervisorSlots {
+  std::mutex mutex;
+  std::size_t active = 0;
+};
+
+SupervisorSlots& supervisor_slots() {
+  static auto* slots = new SupervisorSlots;
+  return *slots;
+}
+
+class SupervisorSlot {
+public:
+  SupervisorSlot() {
+    auto& slots = supervisor_slots();
+    std::lock_guard lock(slots.mutex);
+    if (slots.active >= kMaximumConcurrentProbeWorkers) {
+      throw GpuVideoProbeError("all video probe worker supervisor slots are occupied");
+    }
+    ++slots.active;
+  }
+  SupervisorSlot(const SupervisorSlot&) = delete;
+  SupervisorSlot& operator=(const SupervisorSlot&) = delete;
+  ~SupervisorSlot() {
+    auto& slots = supervisor_slots();
+    std::lock_guard lock(slots.mutex);
+    --slots.active;
+  }
+};
 
 [[noreturn]] void throw_worker_timeout() {
   throw GpuVideoProbeError("video probe worker timed out after exceeding the configured timeout");
@@ -325,8 +362,7 @@ public:
   int release() { return std::exchange(value_, -1); }
   void reset(int value = -1) {
     if (value_ >= 0) {
-      while (::close(value_) != 0 && errno == EINTR) {
-      }
+      (void)::close(value_);
     }
     value_ = value;
   }
@@ -484,16 +520,12 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
                              std::chrono::steady_clock::time_point deadline) {
   int request_socket[2] = {-1, -1};
   int response_socket[2] = {-1, -1};
-  int liveness_socket[2] = {-1, -1};
   create_socket_pair(request_socket, "input");
   UniqueFd child_input(request_socket[0]);
   UniqueFd parent_input(request_socket[1]);
   create_socket_pair(response_socket, "output");
   UniqueFd parent_output(response_socket[0]);
   UniqueFd child_output(response_socket[1]);
-  create_socket_pair(liveness_socket, "liveness");
-  UniqueFd child_liveness(liveness_socket[0]);
-  UniqueFd parent_liveness(liveness_socket[1]);
   make_nonblocking(parent_input.get());
   make_nonblocking(parent_output.get());
 #if defined(SO_NOSIGPIPE) && !defined(MSG_NOSIGNAL)
@@ -516,16 +548,22 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   if (action_error == 0) {
     action_error = posix_spawn_file_actions_adddup2(&actions, child_output.get(), STDOUT_FILENO);
   }
-  const int liveness_descriptor = child_liveness.get() == 3 ? 4 : 3;
-  if (action_error == 0) {
-    action_error =
-        posix_spawn_file_actions_adddup2(&actions, child_liveness.get(), liveness_descriptor);
+  bool closes_all_unrelated_descriptors = false;
+#if defined(__linux__)
+  using AddCloseFrom = int (*)(posix_spawn_file_actions_t*, int);
+  const auto add_close_from = reinterpret_cast<AddCloseFrom>(
+      ::dlsym(RTLD_DEFAULT, "posix_spawn_file_actions_addclosefrom_np"));
+  if (action_error == 0 && add_close_from != nullptr) {
+    action_error = add_close_from(&actions, STDERR_FILENO + 1);
+    closes_all_unrelated_descriptors = action_error == 0;
   }
-  for (const int descriptor : {child_input.get(), parent_input.get(), parent_output.get(),
-                               child_output.get(), child_liveness.get(), parent_liveness.get()}) {
-    if (action_error == 0 && descriptor != STDIN_FILENO && descriptor != STDOUT_FILENO &&
-        descriptor != liveness_descriptor) {
-      action_error = posix_spawn_file_actions_addclose(&actions, descriptor);
+#endif
+  if (!closes_all_unrelated_descriptors) {
+    for (const int descriptor :
+         {child_input.get(), parent_input.get(), parent_output.get(), child_output.get()}) {
+      if (action_error == 0 && descriptor != STDIN_FILENO && descriptor != STDOUT_FILENO) {
+        action_error = posix_spawn_file_actions_addclose(&actions, descriptor);
+      }
     }
   }
   if (action_error != 0) {
@@ -542,9 +580,14 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
                              std::string(std::strerror(attributes_result)));
   }
   const auto destroy_attributes = [&attributes] { posix_spawnattr_destroy(&attributes); };
+  short spawn_flags = POSIX_SPAWN_SETPGROUP;
+#if defined(POSIX_SPAWN_CLOEXEC_DEFAULT)
+  spawn_flags = static_cast<short>(spawn_flags | POSIX_SPAWN_CLOEXEC_DEFAULT);
+  closes_all_unrelated_descriptors = true;
+#endif
   auto attribute_error = posix_spawnattr_setpgroup(&attributes, 0);
   if (attribute_error == 0) {
-    attribute_error = posix_spawnattr_setflags(&attributes, POSIX_SPAWN_SETPGROUP);
+    attribute_error = posix_spawnattr_setflags(&attributes, spawn_flags);
   }
   if (attribute_error != 0) {
     destroy_attributes();
@@ -554,10 +597,11 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   }
 
   const auto executable = worker_path.string();
-  const auto liveness_argument = std::to_string(liveness_descriptor);
+  const auto parent_pid_argument = std::to_string(static_cast<std::uint64_t>(::getpid())) +
+                                   (closes_all_unrelated_descriptors ? ":1" : ":0");
   char* const arguments[] = {const_cast<char*>(executable.c_str()),
                              const_cast<char*>("--reco-video-probe-worker"),
-                             const_cast<char*>(liveness_argument.c_str()), nullptr};
+                             const_cast<char*>(parent_pid_argument.c_str()), nullptr};
   pid_t pid = -1;
   const auto spawn_result =
       ::posix_spawn(&pid, executable.c_str(), &actions, &attributes, arguments, environ);
@@ -570,7 +614,6 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   ChildProcess child(pid);
   child_input.reset();
   child_output.reset();
-  child_liveness.reset();
   write_request(parent_input.get(), request, deadline);
   parent_input.reset();
 
@@ -603,6 +646,29 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
 
 #endif
 
+std::string run_probe_worker_bounded(std::filesystem::path worker_path, std::string request,
+                                     std::chrono::steady_clock::time_point worker_deadline,
+                                     std::chrono::steady_clock::time_point public_deadline) {
+  auto supervisor_slot = std::make_shared<SupervisorSlot>();
+  std::promise<std::string> result;
+  auto future = result.get_future();
+  std::thread supervisor([supervisor_slot = std::move(supervisor_slot),
+                          worker_path = std::move(worker_path), request = std::move(request),
+                          result = std::move(result), worker_deadline]() mutable {
+    try {
+      result.set_value(run_probe_worker(worker_path, request, worker_deadline));
+    } catch (...) {
+      result.set_exception(std::current_exception());
+    }
+  });
+  if (future.wait_until(public_deadline) != std::future_status::ready) {
+    supervisor.detach();
+    throw_worker_timeout();
+  }
+  supervisor.join();
+  return future.get();
+}
+
 } // namespace
 
 GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config,
@@ -624,10 +690,11 @@ GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config,
       std::clamp(timeout / 10,
                  std::chrono::duration_cast<std::chrono::nanoseconds>(kMinimumTerminationReserve),
                  std::chrono::duration_cast<std::chrono::nanoseconds>(kMaximumTerminationReserve));
-  const auto worker_budget = timeout - termination_reserve;
-  const auto deadline = std::chrono::steady_clock::now() + worker_budget;
+  const auto public_deadline = std::chrono::steady_clock::now() + timeout;
+  const auto worker_deadline = public_deadline - termination_reserve;
   const auto request = detail::encode_probe_request(config, timeout_ns);
-  return detail::decode_probe_response(run_probe_worker(worker_path, request, deadline));
+  return detail::decode_probe_response(
+      run_probe_worker_bounded(worker_path, request, worker_deadline, public_deadline));
 }
 
 } // namespace reco::io

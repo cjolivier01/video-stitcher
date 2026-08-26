@@ -54,7 +54,8 @@ constexpr std::uint64_t kMaximumDecodeReorderFrames = 32;
 // Exact AU counting remains bounded for long recordings. Results beyond this
 // prefix are explicitly marked estimated after duration correlation.
 constexpr std::uint64_t kMaximumExactCountSamples = 512;
-constexpr std::size_t kStoredTimingSamples = kMaximumExactCountSamples + 1;
+constexpr std::uint64_t kMaximumConflictingMetadataCountSamples = 4096;
+constexpr std::size_t kStoredTimingSamples = kMaximumConflictingMetadataCountSamples + 1;
 static_assert(kStoredTimingSamples >= kTimingAnalysisSamples + kTimingReorderLookahead);
 constexpr std::uint32_t kMaximumFrameRateDenominator = 1001;
 constexpr long double kFrameRatePreferenceTolerance = 0.05L;
@@ -374,6 +375,15 @@ std::string path_for_gstreamer(const std::filesystem::path& path) {
 #endif
 }
 
+std::filesystem::path path_from_utf8(std::string_view value) {
+#if defined(_WIN32)
+  const auto* begin = reinterpret_cast<const char8_t*>(value.data());
+  return std::filesystem::path(std::u8string(begin, begin + value.size()));
+#else
+  return std::filesystem::path(std::string(value));
+#endif
+}
+
 std::string build_probe_pipeline(const GpuFileDecodeConfig& config,
                                  const std::filesystem::path& absolute_path) {
   std::ostringstream pipeline;
@@ -620,6 +630,106 @@ std::size_t positional_timestamp_multiplicity(
   return static_cast<std::size_t>(access_unit_stride / duplicate_timestamp_multiplicity);
 }
 
+std::optional<InferredFrameRate> infer_sparse_reordered_frame_rate(
+    const TimingScan& scan,
+    const std::array<std::uint64_t, kStoredTimingSamples>& sorted_unique_times,
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, kStoredTimingSamples>& timing_points,
+    std::size_t unique_count) {
+  if (scan.stored_timing_count != scan.timed_sample_count || unique_count < 3 ||
+      scan.sample_count <= 2 * kTimingReorderLookahead + 1) {
+    return std::nullopt;
+  }
+
+  const auto point_end =
+      timing_points.begin() + static_cast<std::ptrdiff_t>(scan.stored_timing_count);
+  const auto first_group_end = std::find_if(
+      timing_points.begin(), point_end, [first_time = sorted_unique_times[0]](const auto& point) {
+        return point.first != first_time;
+      });
+  const auto last_group_begin =
+      std::lower_bound(timing_points.begin(), point_end,
+                       std::pair(sorted_unique_times[unique_count - 1], std::uint64_t{0}));
+  if (first_group_end == timing_points.begin() || last_group_begin == point_end) {
+    return std::nullopt;
+  }
+  const auto first_decode_index = std::min_element(timing_points.begin(), first_group_end,
+                                                   [](const auto& left, const auto& right) {
+                                                     return left.second < right.second;
+                                                   })
+                                      ->second;
+  const auto last_decode_index =
+      std::max_element(last_group_begin, point_end, [](const auto& left, const auto& right) {
+        return left.second < right.second;
+      })->second;
+  if (first_decode_index > kTimingReorderLookahead || last_decode_index >= scan.sample_count ||
+      scan.sample_count - 1 - last_decode_index > kTimingReorderLookahead) {
+    return std::nullopt;
+  }
+
+  const auto span_ns = sorted_unique_times[unique_count - 1] - sorted_unique_times[0];
+  if (span_ns == 0) {
+    return std::nullopt;
+  }
+  const auto sample_intervals = static_cast<long double>(scan.sample_count - 1);
+  const auto observed_fps = sample_intervals * kNanosecondsPerSecond / span_ns;
+  constexpr long double kTimestampGridToleranceFrames = 0.01L;
+  const auto maximum_reorder_interval_error =
+      static_cast<long double>(2 * kTimingReorderLookahead + 1);
+
+  std::optional<std::pair<std::uint32_t, std::uint32_t>> best_rate;
+  auto best_error = std::numeric_limits<long double>::infinity();
+  long double best_interval_count = 0.0L;
+  for (const auto& [numerator, denominator] : kCanonicalFrameRates) {
+    const auto candidate_fps = static_cast<long double>(numerator) / denominator;
+    const auto candidate_intervals =
+        static_cast<long double>(span_ns) * candidate_fps / kNanosecondsPerSecond;
+    if (std::abs(candidate_intervals - sample_intervals) > maximum_reorder_interval_error) {
+      continue;
+    }
+    bool fits_timestamp_grid = true;
+    std::size_t unit_interval_count = 0;
+    for (std::size_t index = 1; index < unique_count; ++index) {
+      const auto delta_ns = sorted_unique_times[index] - sorted_unique_times[index - 1];
+      const auto frame_steps =
+          static_cast<long double>(delta_ns) * candidate_fps / kNanosecondsPerSecond;
+      const auto rounded_steps = std::round(frame_steps);
+      if (rounded_steps < 1.0L ||
+          std::abs(frame_steps - rounded_steps) > kTimestampGridToleranceFrames) {
+        fits_timestamp_grid = false;
+        break;
+      }
+      if (rounded_steps == 1.0L) {
+        ++unit_interval_count;
+      }
+    }
+    if (scan.timed_sample_count == scan.sample_count &&
+        unit_interval_count * 10 < (unique_count - 1) * 9) {
+      fits_timestamp_grid = false;
+    }
+    const auto error = std::abs(candidate_fps - observed_fps);
+    if (fits_timestamp_grid && error < best_error) {
+      best_rate = std::pair(numerator, denominator);
+      best_error = error;
+      best_interval_count = candidate_intervals;
+    }
+  }
+  if (!best_rate.has_value()) {
+    return std::nullopt;
+  }
+
+  const auto average_multiplicity =
+      best_interval_count / static_cast<long double>(unique_count - 1);
+  const auto rounded_multiplicity = std::max<long long>(std::llround(average_multiplicity), 1);
+  const auto timestamp_multiplicity =
+      static_cast<std::size_t>(std::min<long long>(rounded_multiplicity, kTimingReorderLookahead));
+  return InferredFrameRate{.numerator = best_rate->first,
+                           .denominator = best_rate->second,
+                           .timestamp_multiplicity = timestamp_multiplicity,
+                           .observed_fps = observed_fps,
+                           .finite_span_fps_uncertainty =
+                               observed_fps * maximum_reorder_interval_error / sample_intervals};
+}
+
 std::optional<InferredFrameRate> infer_constant_frame_rate(const TimingScan& scan,
                                                            bool complete_stream) {
   if (scan.stored_timing_count < 3) {
@@ -688,7 +798,7 @@ std::optional<InferredFrameRate> infer_constant_frame_rate(const TimingScan& sca
   if (minimum_delta == 0 || (maximum_delta - minimum_delta > 2 &&
                              static_cast<long double>(maximum_delta - minimum_delta) >
                                  minimum_delta * kMaximumTimingDeltaVariation)) {
-    return std::nullopt;
+    return infer_sparse_reordered_frame_rate(scan, times, timing_points, stored_unique_count);
   }
 
   const auto span_ns = times[unique_count - 1] - times[0];
@@ -985,13 +1095,13 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeout_ns);
 
   std::error_code path_error;
-  const auto absolute_path = std::filesystem::absolute(config.path, path_error);
+  const auto absolute_path = std::filesystem::absolute(path_from_utf8(config.path), path_error);
   if (path_error) {
     throw GpuVideoProbeError("failed to resolve video path: " + path_error.message());
   }
   if (!std::filesystem::is_regular_file(absolute_path, path_error) || path_error) {
     throw GpuVideoProbeError("video probe path is not a readable regular file: " +
-                             absolute_path.string());
+                             path_for_gstreamer(absolute_path));
   }
 
   auto api = std::make_shared<ProbeApi>();
@@ -1123,6 +1233,33 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
     }
     observe_timing_sample(api, sample, timing_scan);
   }
+  std::optional<std::uint64_t> queried_container_duration;
+  if (!timing_scan.reached_eos) {
+    std::int64_t queried_duration = 0;
+    if (api->element_query_duration(pipeline, kGstFormatTime, &queried_duration) != 0 &&
+        queried_duration > 0) {
+      queried_container_duration = static_cast<std::uint64_t>(queried_duration);
+    }
+  }
+  const bool caps_rate_cannot_cover_observed_samples =
+      queried_container_duration.has_value() && caps_frame_rate_is_plausible &&
+      add_saturating(frame_count_ceiling_for_duration(*queried_container_duration,
+                                                      static_cast<std::uint32_t>(fps_numerator),
+                                                      static_cast<std::uint32_t>(fps_denominator)),
+                     kTimingReorderLookahead) < timing_scan.sample_count;
+  if (!timing_scan.reached_eos && caps_rate_cannot_cover_observed_samples) {
+    while (timing_scan.sample_count <= kMaximumConflictingMetadataCountSamples) {
+      void* sample = pull_compressed_sample(
+          api, probe_sink, bus, deadline,
+          "GStreamer parser-only probe timed out while resolving conflicting metadata");
+      initial_sample_owner.reset(sample);
+      if (sample == nullptr) {
+        timing_scan.reached_eos = true;
+        break;
+      }
+      observe_timing_sample(api, sample, timing_scan);
+    }
+  }
   const auto inferred_frame_rate = infer_constant_frame_rate(timing_scan, timing_scan.reached_eos);
   const bool inferred_frame_rate_is_no_worse_than_caps =
       inferred_frame_rate.has_value() &&
@@ -1136,7 +1273,7 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
   const bool prefer_inferred_frame_rate =
       inferred_frame_rate_is_no_worse_than_caps &&
       (timing_scan.reached_eos || inferred_frame_rate->timestamp_multiplicity > 1 ||
-       !caps_frame_rate_is_plausible ||
+       !caps_frame_rate_is_plausible || caps_rate_cannot_cover_observed_samples ||
        frame_rates_are_close(inferred_frame_rate->numerator, inferred_frame_rate->denominator,
                              static_cast<std::uint32_t>(fps_numerator),
                              static_cast<std::uint32_t>(fps_denominator),
@@ -1197,12 +1334,9 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
     }
   } else {
     total_frames_is_estimated = true;
-    std::int64_t queried_duration = 0;
-    duration_is_estimated =
-        api->element_query_duration(pipeline, kGstFormatTime, &queried_duration) == 0 ||
-        queried_duration <= 0;
+    duration_is_estimated = !queried_container_duration.has_value();
     duration_ns = duration_is_estimated ? kFallbackDurationSeconds * kNanosecondsPerSecond
-                                        : static_cast<std::uint64_t>(queried_duration);
+                                        : *queried_container_duration;
     if (!config.elementary_stream && !duration_is_estimated &&
         timing_scan.first_stream_time.has_value()) {
       const auto selected_duration = selected_stream_duration(

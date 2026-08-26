@@ -1,4 +1,4 @@
-load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
 
 cc_library(
     name = "reco_io",
@@ -47,6 +47,16 @@ cc_binary(
     ],
     visibility = ["//visibility:public"],
     deps = [":reco_io"],
+)
+
+cc_test(
+    name = "gpu_video_probe_protocol_tests",
+    size = "small",
+    srcs = ["src/gpu_video_probe_protocol_tests.cpp"],
+    deps = [
+        ":reco_io",
+        "@nlohmann_json//:json",
+    ],
 )
 
 filegroup(

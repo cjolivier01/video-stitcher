@@ -208,6 +208,11 @@ FakeCaps parser_sample_caps() {
   } else if (scenario() == "probe-inexact-caps-fps") {
     caps.fps_numerator = 59;
     caps.fps_denominator = 2;
+  } else if (scenario() == "probe-reordered-periodic-missing-pts" ||
+             scenario() == "probe-bounded-caps-underestimate" ||
+             scenario() == "probe-long-reordered-periodic-missing-pts") {
+    caps.fps_numerator = 15;
+    caps.fps_denominator = 1;
   } else if (scenario() == "probe-duplicate-pts-transition") {
     caps.fps_numerator = 25;
     caps.fps_denominator = 1;
@@ -289,6 +294,11 @@ std::uint64_t parser_frame_offset(std::uint64_t frame_index, const FakeCaps& cap
 }
 
 std::uint64_t parser_timing_offset(std::uint64_t frame_index, const FakeCaps& caps) {
+  if (scenario() == "probe-reordered-periodic-missing-pts" ||
+      scenario() == "probe-bounded-caps-underestimate" ||
+      scenario() == "probe-long-reordered-periodic-missing-pts") {
+    return frame_index * 1'000'000'000ULL / 30U;
+  }
   if (scenario() == "probe-duplicate-pts-transition") {
     return frame_index < 64U ? (frame_index / 2U) * 40'000'000ULL
                              : (frame_index - 32U) * 40'000'000ULL;
@@ -710,6 +720,15 @@ RECO_FAKE_EXPORT int gst_element_query_duration(void*, int format, std::int64_t*
     *duration = 4'000'000'000;
     return 1;
   }
+  if (scenario() == "probe-reordered-periodic-missing-pts") {
+    *duration = 6'666'666'666;
+    return 1;
+  }
+  if (scenario() == "probe-long-reordered-periodic-missing-pts" ||
+      scenario() == "probe-bounded-caps-underestimate") {
+    *duration = 20'000'000'000;
+    return 1;
+  }
   if (scenario() == "probe-reordered-untimed-prefix") {
     *duration = 24'000'000'000;
     return 1;
@@ -777,7 +796,9 @@ RECO_FAKE_EXPORT int gst_element_seek_simple(void* pipeline_pointer, int format,
     return 1;
   }
   if (format != 3 || target < 0 || scenario() == "probe-seek-unsupported" ||
-      scenario() == "probe-long-duplicate-pts-pairs") {
+      scenario() == "probe-long-duplicate-pts-pairs" ||
+      scenario() == "probe-bounded-caps-underestimate" ||
+      scenario() == "probe-long-reordered-periodic-missing-pts") {
     return 0;
   }
   static_cast<FakePipeline*>(pipeline_pointer)->seek_target_ns = target;
@@ -935,9 +956,6 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
                current_scenario == "probe-bframe-cutoff") {
       timing_caps.fps_numerator = 30;
       timing_caps.fps_denominator = 1;
-    } else if (current_scenario == "probe-estimated-count-lower-bound") {
-      timing_caps.fps_numerator = 60;
-      timing_caps.fps_denominator = 1;
     } else if (current_scenario == "probe-retimed-constant-pts") {
       timing_caps.fps_numerator = 30;
       timing_caps.fps_denominator = 1;
@@ -979,7 +997,7 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
         : current_scenario == "probe-dropped-frame-after-prefix"            ? 6'000'000'000ULL
         : current_scenario == "probe-reduced-cadence-after-prefix"          ? 6'000'000'000ULL
         : current_scenario == "probe-vfr-missing-durations"                 ? 6'000'000'000ULL
-        : current_scenario == "probe-estimated-count-lower-bound"           ? 10'000'000'000ULL
+        : current_scenario == "probe-estimated-count-lower-bound"           ? 6'000'000'000'000ULL
         : current_scenario == "probe-retimed-constant-pts"                  ? 5'000'000'000ULL
         : current_scenario == "probe-long-untimed-elementary"               ? 600'000'000'000ULL
         : current_scenario == "probe-duplicate-pts-pairs"                   ? 4'000'000'000ULL
@@ -993,6 +1011,9 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
         : current_scenario == "probe-clustered-missing-pts"                 ? 4'000'000'000ULL
         : current_scenario == "probe-exact-5997-fps"                        ? 4'000'000'000ULL
         : current_scenario == "probe-quantized-no-vui-5994"                 ? 4'004'000'000ULL
+        : current_scenario == "probe-reordered-periodic-missing-pts"        ? 6'666'666'666ULL
+        : current_scenario == "probe-long-reordered-periodic-missing-pts"   ? 20'000'000'000ULL
+        : current_scenario == "probe-bounded-caps-underestimate"            ? 20'000'000'000ULL
         : current_scenario == "probe-bframe-cutoff"                         ? 4'000'000'000ULL
         : current_scenario == "probe-seek-untimestamped-tail"               ? 20'000'000'000ULL
         : current_scenario == "probe-seek-dts-reorder-tail"                 ? 20'000'000'000ULL
@@ -1055,6 +1076,10 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     } else if (current_scenario == "probe-paired-au-missing-pts" && !sink->pipeline->has_seek &&
                (sequential_index % 2U) != 0) {
       sample->buffer.pts = std::numeric_limits<std::uint64_t>::max();
+    } else if ((current_scenario == "probe-reordered-periodic-missing-pts" ||
+                current_scenario == "probe-long-reordered-periodic-missing-pts") &&
+               !sink->pipeline->has_seek && (sequential_index % 2U) != 0U) {
+      sample->buffer.pts = std::numeric_limits<std::uint64_t>::max();
     } else if (current_scenario == "probe-clustered-missing-pts" && !sink->pipeline->has_seek &&
                sequential_index >= 60U) {
       sample->buffer.pts = std::numeric_limits<std::uint64_t>::max();
@@ -1088,6 +1113,14 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
                                                                : sequential_index;
       sample->buffer.pts =
           selected_stream_start_ns + parser_frame_offset(presentation_index, timing_caps);
+    } else if ((current_scenario == "probe-reordered-periodic-missing-pts" ||
+                current_scenario == "probe-long-reordered-periodic-missing-pts") &&
+               !sink->pipeline->has_seek) {
+      constexpr std::array<std::uint64_t, 6> kPresentationOrder{2, 0, 1, 5, 3, 4};
+      const auto presentation_index =
+          sequential_index / kPresentationOrder.size() * kPresentationOrder.size() +
+          kPresentationOrder[sequential_index % kPresentationOrder.size()];
+      sample->buffer.pts = selected_stream_start_ns + presentation_index * 1'000'000'000ULL / 30U;
     } else if (current_scenario == "probe-quantized-timestamps") {
       sample->buffer.pts = target_ns / 1'000'000ULL * 1'000'000ULL;
     } else {

@@ -3,7 +3,9 @@
 
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <csignal>
+#include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <iostream>
@@ -39,19 +41,17 @@ std::string read_request() {
   return request;
 }
 
-void start_parent_liveness_watch(int descriptor) {
+void start_parent_liveness_watch(std::uint64_t expected_parent_pid) {
 #if defined(_WIN32)
-  (void)descriptor;
+  (void)expected_parent_pid;
 #else
-  std::thread([descriptor] {
-    std::array<char, 1> ignored{};
+  std::thread([expected_parent_pid] {
     while (true) {
-      const auto result = ::read(descriptor, ignored.data(), ignored.size());
-      if (result > 0 || (result < 0 && errno == EINTR)) {
-        continue;
+      if (static_cast<std::uint64_t>(::getppid()) != expected_parent_pid) {
+        (void)::kill(0, SIGKILL);
+        std::_Exit(3);
       }
-      (void)::kill(0, SIGKILL);
-      std::_Exit(3);
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
   }).detach();
 #endif
@@ -59,11 +59,11 @@ void start_parent_liveness_watch(int descriptor) {
 
 } // namespace
 
-int run_gpu_video_probe_worker(int parent_liveness_descriptor) {
+int run_gpu_video_probe_worker(std::uint64_t expected_parent_pid) {
   std::string response;
   try {
+    start_parent_liveness_watch(expected_parent_pid);
     const auto payload = read_request();
-    start_parent_liveness_watch(parent_liveness_descriptor);
     const auto request = decode_probe_request(payload);
     response = encode_probe_success(probe_gpu_video_in_process(request.config, request.timeout_ns));
   } catch (const std::invalid_argument& error) {

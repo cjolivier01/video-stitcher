@@ -4,6 +4,7 @@
 #include <cstring>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <thread>
@@ -14,6 +15,7 @@
 #include <io.h>
 #include <windows.h>
 #else
+#include <filesystem>
 #include <unistd.h>
 #endif
 
@@ -32,6 +34,22 @@ int main(int argc, char** argv) {
   }
 #endif
   const char* scenario = std::getenv("RECO_FAKE_PROBE_WORKER_SCENARIO");
+#if defined(__linux__)
+  if (scenario != nullptr && std::strcmp(scenario, "descriptor-isolation") == 0) {
+    const char* forbidden_path = std::getenv("RECO_FAKE_PROBE_FORBIDDEN_PATH");
+    if (forbidden_path == nullptr || forbidden_path[0] == '\0') {
+      return EXIT_FAILURE;
+    }
+    std::error_code directory_error;
+    for (const auto& descriptor :
+         std::filesystem::directory_iterator("/proc/self/fd", directory_error)) {
+      std::error_code link_error;
+      if (std::filesystem::read_symlink(descriptor.path(), link_error) == forbidden_path) {
+        return 4;
+      }
+    }
+  }
+#endif
   if (scenario != nullptr && std::strcmp(scenario, "close-input") == 0) {
 #if defined(_WIN32)
     CloseHandle(GetStdHandle(STD_INPUT_HANDLE));
@@ -54,16 +72,35 @@ int main(int argc, char** argv) {
     nlohmann::json response;
     if (std::strcmp(scenario, "wrong-version") == 0) {
       response = {{"protocol_version", 2}, {"ok", false}};
+    } else if (std::strcmp(scenario, "wrapped-version") == 0) {
+      response = {{"protocol_version", std::numeric_limits<std::uint64_t>::max()}, {"ok", false}};
     } else if (std::strcmp(scenario, "valid-metadata") == 0 ||
-               std::strcmp(scenario, "invalid-metadata") == 0) {
+#if defined(__linux__)
+               std::strcmp(scenario, "descriptor-isolation") == 0 ||
+#endif
+               std::strcmp(scenario, "invalid-metadata") == 0 ||
+               std::strcmp(scenario, "negative-metadata") == 0 ||
+               std::strcmp(scenario, "oversized-metadata") == 0) {
+      const bool negative = std::strcmp(scenario, "negative-metadata") == 0;
+      const bool oversized = std::strcmp(scenario, "oversized-metadata") == 0;
       response = {{"protocol_version", 1},
                   {"ok", true},
-                  {"width", std::strcmp(scenario, "valid-metadata") == 0 ? 854 : 853},
+                  {"width", negative ? nlohmann::json(-2)
+                            : oversized
+                                ? nlohmann::json(std::numeric_limits<std::uint64_t>::max())
+                                : nlohmann::json(
+                                      std::strcmp(scenario, "valid-metadata") == 0 ||
+#if defined(__linux__)
+                                              std::strcmp(scenario, "descriptor-isolation") == 0 ||
+#endif
+                                              false
+                                          ? 854
+                                          : 853)},
                   {"height", 480},
                   {"fps_numerator", 30},
                   {"fps_denominator", 1},
-                  {"duration_ns", 1'000'000'000},
-                  {"total_frames", 30},
+                  {"duration_ns", negative ? nlohmann::json(-1) : nlohmann::json(1'000'000'000)},
+                  {"total_frames", negative ? nlohmann::json(-1) : nlohmann::json(30)},
                   {"duration_is_estimated", false},
                   {"total_frames_is_estimated", false}};
     }

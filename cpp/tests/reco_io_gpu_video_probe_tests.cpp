@@ -24,6 +24,7 @@
 #endif
 #if defined(__linux__)
 #include <csignal>
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
@@ -84,30 +85,7 @@ void expect_invalid_argument(Function&& function, std::string_view fragment,
   }
 }
 
-bool ends_with(std::string_view value, std::string_view suffix) {
-  return value.size() >= suffix.size() && value.substr(value.size() - suffix.size()) == suffix;
-}
-
-std::filesystem::path find_fake_runtime_runfile() {
-  const char* runfiles = std::getenv("TEST_SRCDIR");
-  if (runfiles == nullptr || runfiles[0] == '\0') {
-    throw std::runtime_error("TEST_SRCDIR is not set");
-  }
-  for (const auto& entry : std::filesystem::recursive_directory_iterator(runfiles)) {
-    const auto filename = entry.path().filename().string();
-    if (filename.find("fake_gstreamer_runtime") != std::string::npos &&
-        (ends_with(filename, ".so") || ends_with(filename, ".dylib") ||
-         ends_with(filename, ".dll"))) {
-      return entry.path();
-    }
-  }
-  throw std::runtime_error("fake GStreamer runtime runfile not found");
-}
-
-std::filesystem::path executable_runfile(std::string path) {
-#if defined(_WIN32)
-  path += ".exe";
-#endif
+std::filesystem::path resolve_runfile(std::string path) {
   const char* workspace = std::getenv("TEST_WORKSPACE");
   if (workspace == nullptr || workspace[0] == '\0') {
     throw std::runtime_error("TEST_WORKSPACE is not set");
@@ -126,6 +104,13 @@ std::filesystem::path executable_runfile(std::string path) {
   return resolved;
 }
 
+std::filesystem::path executable_runfile(std::string path) {
+#if defined(_WIN32)
+  path += ".exe";
+#endif
+  return resolve_runfile(std::move(path));
+}
+
 void set_environment(const char* name, const std::string& value) {
 #if defined(_WIN32)
   _putenv_s(name, value.c_str());
@@ -139,7 +124,13 @@ void set_scenario(std::string_view value) {
 }
 
 GpuFileDecodeConfig container_config(const std::filesystem::path& path) {
-  return {.path = path.string(),
+#if defined(_WIN32)
+  const auto encoded = path.u8string();
+  const std::string path_string(reinterpret_cast<const char*>(encoded.data()), encoded.size());
+#else
+  const auto path_string = path.string();
+#endif
+  return {.path = path_string,
           .codec = GpuDecodeCodec::H264,
           .elementary_stream = false,
           .container = GpuDecodeContainer::QuickTime,
@@ -148,7 +139,13 @@ GpuFileDecodeConfig container_config(const std::filesystem::path& path) {
 }
 
 GpuFileDecodeConfig elementary_config(const std::filesystem::path& path, GpuDecodeCodec codec) {
-  return {.path = path.string(),
+#if defined(_WIN32)
+  const auto encoded = path.u8string();
+  const std::string path_string(reinterpret_cast<const char*>(encoded.data()), encoded.size());
+#else
+  const auto path_string = path.string();
+#endif
+  return {.path = path_string,
           .codec = codec,
           .elementary_stream = true,
           .container = std::nullopt,
@@ -477,6 +474,35 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_eq(paired_missing_pts.total_frames, 200ULL,
             "uniformly missing paired-AU PTS values retain the exact AU count");
 
+  set_scenario("probe-reordered-periodic-missing-pts");
+  const auto reordered_periodic_missing = probe_video(container_config(video_path), timeout_ns);
+  expect_eq(reordered_periodic_missing.fps_numerator, 30U,
+            "periodic missing PTS survives B-frame presentation reordering");
+  expect_eq(reordered_periodic_missing.fps_denominator, 1U,
+            "reordered sparse timing retains the inferred denominator");
+  expect_eq(reordered_periodic_missing.total_frames, 200ULL,
+            "reordered sparse timing retains the EOS-proven AU count");
+  expect_true(reordered_periodic_missing.duration_ns >= 6'666'666'666ULL &&
+                  reordered_periodic_missing.duration_ns <= 6'666'666'667ULL,
+              "reordered sparse timing derives duration from the corrected frame rate");
+
+  set_scenario("probe-long-reordered-periodic-missing-pts");
+  const auto long_reordered_periodic_missing =
+      probe_video(container_config(video_path), timeout_ns);
+  expect_eq(long_reordered_periodic_missing.fps_numerator, 30U,
+            "bounded reordered sparse timing corrects misleading caps");
+  expect_eq(long_reordered_periodic_missing.total_frames, 600ULL,
+            "conflicting reordered sparse timing extends to an exact AU count");
+  expect_true(!long_reordered_periodic_missing.total_frames_is_estimated,
+              "adaptive conflicting-metadata scan reaches EOS when bounded");
+
+  set_scenario("probe-bounded-caps-underestimate");
+  const auto bounded_caps_underestimate = probe_video(container_config(video_path), timeout_ns);
+  expect_eq(bounded_caps_underestimate.fps_numerator, 30U,
+            "bounded timing overrides caps that cannot cover observed access units");
+  expect_eq(bounded_caps_underestimate.total_frames, 600ULL,
+            "bounded timing and container duration recover the complete frame estimate");
+
   set_scenario("probe-clustered-missing-pts");
   const auto clustered_missing_pts = probe_video(container_config(video_path), timeout_ns);
   expect_eq(clustered_missing_pts.fps_numerator, 30U,
@@ -560,8 +586,8 @@ void probe_contracts(const std::filesystem::path& video_path,
 
   set_scenario("probe-estimated-count-lower-bound");
   const auto lower_bound = probe_video(container_config(video_path), timeout_ns);
-  expect_eq(lower_bound.total_frames, 513ULL,
-            "estimated count cannot fall below observed compressed AUs");
+  expect_eq(lower_bound.total_frames, 4'097ULL,
+            "adaptive estimated count cannot fall below observed compressed AUs");
   expect_true(lower_bound.total_frames_is_estimated,
               "bounded lower-bound count remains explicitly estimated");
 
@@ -782,11 +808,14 @@ void worker_ipc_failures_are_bounded(const std::filesystem::path& video_path) {
       },
       "video probe worker", "closed worker input is an exception rather than process SIGPIPE");
 
-  const std::array<std::pair<std::string_view, std::string_view>, 4> invalid_workers{{
+  const std::array<std::pair<std::string_view, std::string_view>, 7> invalid_workers{{
       {"crash", "exited abnormally"},
       {"malformed-response", "not valid CBOR"},
       {"wrong-version", "unsupported protocol version"},
+      {"wrapped-version", "out-of-range protocol_version"},
       {"invalid-metadata", "invalid metadata"},
+      {"negative-metadata", "out-of-range width"},
+      {"oversized-metadata", "out-of-range width"},
   }};
   for (const auto& [scenario, fragment] : invalid_workers) {
     set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", std::string(scenario));
@@ -799,8 +828,33 @@ void worker_ipc_failures_are_bounded(const std::filesystem::path& video_path) {
   }
 }
 
+void unrelated_descriptors_are_not_inherited(const std::filesystem::path& video_path) {
+#if defined(__linux__)
+  const auto marker_path =
+      video_path.parent_path() / (video_path.filename().string() + ".forbidden-descriptor");
+  {
+    std::ofstream marker(marker_path);
+    marker << "descriptor marker";
+  }
+  const auto marker_descriptor = ::open(marker_path.c_str(), O_RDONLY);
+  expect_true(marker_descriptor >= 0, "descriptor-isolation marker opens");
+  if (marker_descriptor >= 0) {
+    set_environment("RECO_FAKE_PROBE_FORBIDDEN_PATH", marker_path.string());
+    set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "descriptor-isolation");
+    expect_eq(reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
+                                        5'000'000'000ULL)
+                  .width,
+              854U, "probe worker closes unrelated inherited descriptors");
+    (void)::close(marker_descriptor);
+  }
+  std::filesystem::remove(marker_path);
+#else
+  (void)video_path;
+#endif
+}
+
 void non_utf8_path_round_trips() {
-#if !defined(_WIN32)
+#if defined(__linux__)
   auto filename = std::string("reco_gpu_probe_non_utf8_");
   filename.push_back(static_cast<char>(0xFF));
   filename += ".mp4";
@@ -812,6 +866,21 @@ void non_utf8_path_round_trips() {
   set_scenario("probe-ok");
   expect_eq(probe_video(container_config(path), 5'000'000'000ULL).width, 3840U,
             "non-UTF-8 POSIX path survives probe worker IPC");
+  std::filesystem::remove(path);
+#endif
+}
+
+void windows_unicode_path_round_trips() {
+#if defined(_WIN32)
+  const auto filename = std::u8string(u8"reco_gpu_probe_\u5f55\u50cf.mp4");
+  const auto path = std::filesystem::temp_directory_path() / std::filesystem::path(filename);
+  {
+    std::ofstream video(path, std::ios::binary);
+    video << "fake video container";
+  }
+  set_scenario("probe-ok");
+  expect_eq(probe_video(container_config(path), 5'000'000'000ULL).width, 3840U,
+            "UTF-8 Windows path survives probe worker validation and pipeline construction");
   std::filesystem::remove(path);
 #endif
 }
@@ -834,14 +903,16 @@ void parent_death_reclaims_worker(const std::filesystem::path& video_path) {
 
   std::optional<pid_t> worker;
   const auto discovery_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-  const auto children_path = std::filesystem::path("/proc") / std::to_string(caller) / "task" /
-                             std::to_string(caller) / "children";
+  const auto task_path = std::filesystem::path("/proc") / std::to_string(caller) / "task";
   while (std::chrono::steady_clock::now() < discovery_deadline && !worker.has_value()) {
-    std::ifstream children(children_path);
-    pid_t child = -1;
-    if (children >> child && child > 0) {
-      worker = child;
-      break;
+    std::error_code directory_error;
+    for (const auto& task : std::filesystem::directory_iterator(task_path, directory_error)) {
+      std::ifstream children(task.path() / "children");
+      pid_t child = -1;
+      if (children >> child && child > 0) {
+        worker = child;
+        break;
+      }
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
@@ -879,7 +950,7 @@ void expect_no_unreaped_children() {
 
 int main() {
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
-  const auto runtime = find_fake_runtime_runfile();
+  const auto runtime = resolve_runfile("cpp/tests/libfake_gstreamer_runtime.so");
   probe_worker_path = executable_runfile("cpp/reco_io/reco_video_probe_worker");
   fake_probe_worker_path = executable_runfile("cpp/tests/fake_video_probe_worker");
   set_environment("RECO_GSTREAMER_DYLIB_PATH", runtime.string());
@@ -900,7 +971,9 @@ int main() {
   probe_contracts(video_path, event_path);
   invalid_inputs_fail(video_path, event_path);
   non_utf8_path_round_trips();
+  windows_unicode_path_round_trips();
   worker_ipc_failures_are_bounded(video_path);
+  unrelated_descriptors_are_not_inherited(video_path);
   parent_death_reclaims_worker(video_path);
   expect_no_unreaped_children();
 

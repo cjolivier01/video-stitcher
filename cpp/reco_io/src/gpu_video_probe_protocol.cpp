@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace reco::io::detail {
@@ -15,6 +17,7 @@ namespace {
 constexpr std::size_t kMaximumErrorMessageBytes = 1024;
 constexpr std::uint32_t kProbeProtocolVersion = 1;
 constexpr double kMaximumSaneFps = 1000.0;
+constexpr std::uint32_t kMaximumGpuVideoDimension = 65'536;
 
 int encode_container(const std::optional<GpuDecodeContainer>& container) {
   return container.has_value() ? static_cast<int>(*container) : -1;
@@ -78,7 +81,45 @@ template <typename Value>
 Value required_value(const nlohmann::json& json, std::string_view key,
                      std::string_view description) {
   try {
-    return json.at(std::string(key)).get<Value>();
+    const auto& value = json.at(std::string(key));
+    if constexpr (std::is_same_v<Value, bool>) {
+      if (!value.is_boolean()) {
+        throw GpuVideoProbeError(std::string(description) + " has an invalid " + std::string(key));
+      }
+      return value.get<bool>();
+    } else if constexpr (std::is_same_v<Value, std::string>) {
+      if (!value.is_string()) {
+        throw GpuVideoProbeError(std::string(description) + " has an invalid " + std::string(key));
+      }
+      return value.get<std::string>();
+    } else if constexpr (std::is_integral_v<Value>) {
+      if (value.is_number_unsigned()) {
+        const auto raw = value.get<std::uint64_t>();
+        if (raw > static_cast<std::uint64_t>(std::numeric_limits<Value>::max())) {
+          throw GpuVideoProbeError(std::string(description) + " has an out-of-range " +
+                                   std::string(key));
+        }
+        return static_cast<Value>(raw);
+      }
+      if (value.is_number_integer()) {
+        const auto raw = value.get<std::int64_t>();
+        if constexpr (std::is_unsigned_v<Value>) {
+          if (raw < 0 || static_cast<std::uint64_t>(raw) >
+                             static_cast<std::uint64_t>(std::numeric_limits<Value>::max())) {
+            throw GpuVideoProbeError(std::string(description) + " has an out-of-range " +
+                                     std::string(key));
+          }
+        } else if (raw < static_cast<std::int64_t>(std::numeric_limits<Value>::min()) ||
+                   raw > static_cast<std::int64_t>(std::numeric_limits<Value>::max())) {
+          throw GpuVideoProbeError(std::string(description) + " has an out-of-range " +
+                                   std::string(key));
+        }
+        return static_cast<Value>(raw);
+      }
+      throw GpuVideoProbeError(std::string(description) + " has an invalid " + std::string(key));
+    } else {
+      static_assert(!sizeof(Value), "required_value does not support this type");
+    }
   } catch (const nlohmann::json::exception& error) {
     throw GpuVideoProbeError(std::string(description) + " has an invalid " + std::string(key) +
                              ": " + error.what());
@@ -185,13 +226,19 @@ GpuVideoProbe decode_probe_response(std::string_view payload) {
       required_value<bool>(response, "duration_is_estimated", "video probe worker response");
   probe.total_frames_is_estimated =
       required_value<bool>(response, "total_frames_is_estimated", "video probe worker response");
-  if (probe.width == 0 || probe.height == 0 || (probe.width % 2U) != 0 ||
+  if (probe.width == 0 || probe.width > kMaximumGpuVideoDimension || probe.height == 0 ||
+      probe.height > kMaximumGpuVideoDimension || (probe.width % 2U) != 0 ||
       (probe.height % 2U) != 0 || probe.fps_numerator == 0 || probe.fps_denominator == 0 ||
       probe.duration_ns == 0 || probe.total_frames == 0) {
     throw GpuVideoProbeError("video probe worker returned invalid metadata");
   }
   probe.fps = static_cast<double>(probe.fps_numerator) / probe.fps_denominator;
   if (!std::isfinite(probe.fps) || probe.fps <= 0.0 || probe.fps > kMaximumSaneFps) {
+    throw GpuVideoProbeError("video probe worker returned invalid metadata");
+  }
+  const auto average_fps = static_cast<long double>(probe.total_frames) * 1'000'000'000.0L /
+                           static_cast<long double>(probe.duration_ns);
+  if (!std::isfinite(average_fps) || average_fps > kMaximumSaneFps * 1.01L) {
     throw GpuVideoProbeError("video probe worker returned invalid metadata");
   }
   return probe;
