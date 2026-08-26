@@ -125,6 +125,15 @@ std::optional<std::string> validate_gpu_decoded_frame(const GpuDecodedFrame& fra
   if (const auto error = validate_nvmm_frame_info(frame.nvmm); error.has_value()) {
     return "GPU decoded frame is invalid: " + *error;
   }
+  if (frame.visible_width == 0 || frame.visible_height == 0) {
+    return "GPU decoded frame visible dimensions must be non-zero";
+  }
+  if ((frame.visible_width % 2U) != 0 || (frame.visible_height % 2U) != 0) {
+    return "GPU decoded frame visible NV12 dimensions must be even";
+  }
+  if (frame.visible_width > frame.nvmm.width || frame.visible_height > frame.nvmm.height) {
+    return "GPU decoded frame visible dimensions exceed the NVMM allocation";
+  }
   return std::nullopt;
 }
 
@@ -132,7 +141,10 @@ NvmmCudaFrame map_gpu_decoded_frame_to_cuda(const GpuDecodedFrame& frame) {
   if (const auto error = validate_gpu_decoded_frame(frame); error.has_value()) {
     throw std::invalid_argument(*error);
   }
-  return map_nvmm_frame_to_cuda(frame.nvmm, frame.owner);
+  auto mapped = map_nvmm_frame_to_cuda(frame.nvmm, frame.owner);
+  mapped.width = frame.visible_width;
+  mapped.height = frame.visible_height;
+  return mapped;
 }
 
 std::string build_gstreamer_gpu_file_decode_pipeline(const GpuFileDecodeConfig& config) {
@@ -147,9 +159,11 @@ std::string build_gstreamer_gpu_file_decode_pipeline(const GpuFileDecodeConfig& 
     pipeline << gpu_decode_container_demuxer(*config.container)
              << " ! capsfilter caps=\"video/x-h264;video/x-h265\" ! parsebin";
   }
-  pipeline << " ! nvv4l2decoder"
+  pipeline << " ! identity name=display_info silent=true"
+           << " ! nvv4l2decoder"
            << " ! nvvideoconvert compute-hw=1 bl-output=false disable-passthrough=true"
            << " ! video/x-raw(memory:NVMM),format=NV12"
+           << " ! identity name=output_info silent=true"
            << " ! appsink name=sink emit-signals=false sync=false max-buffers="
            << config.max_buffers << " drop=" << (config.drop ? "true" : "false");
   return pipeline.str();

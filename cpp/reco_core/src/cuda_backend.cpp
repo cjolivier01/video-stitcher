@@ -239,6 +239,7 @@ struct CudaBackend::Impl {
     cu_ctx_set_current = driver.symbol<decltype(cu_ctx_set_current)>("cuCtxSetCurrent");
     cu_ctx_synchronize = driver.symbol<decltype(cu_ctx_synchronize)>("cuCtxSynchronize");
     cu_mem_alloc = driver.symbol<decltype(cu_mem_alloc)>("cuMemAlloc_v2");
+    cu_mem_alloc_pitch = driver.symbol<decltype(cu_mem_alloc_pitch)>("cuMemAllocPitch_v2");
     cu_mem_free = driver.symbol<decltype(cu_mem_free)>("cuMemFree_v2");
     cu_memset_d8 = driver.symbol<decltype(cu_memset_d8)>("cuMemsetD8_v2");
     cu_memcpy_2d = driver.symbol<decltype(cu_memcpy_2d)>("cuMemcpy2D_v2");
@@ -330,6 +331,8 @@ struct CudaBackend::Impl {
   CUresult (*cu_ctx_set_current)(CUcontext) = nullptr;
   CUresult (*cu_ctx_synchronize)() = nullptr;
   CUresult (*cu_mem_alloc)(CUdeviceptr*, std::size_t) = nullptr;
+  CUresult (*cu_mem_alloc_pitch)(CUdeviceptr*, std::size_t*, std::size_t, std::size_t,
+                                 unsigned int) = nullptr;
   CUresult (*cu_mem_free)(CUdeviceptr) = nullptr;
   CUresult (*cu_memset_d8)(CUdeviceptr, unsigned char, std::size_t) = nullptr;
   CUresult (*cu_memcpy_2d)(const CudaMemcpy2D*) = nullptr;
@@ -569,7 +572,16 @@ CudaBackend CudaBackend::create() {
   return CudaBackend(impl);
 }
 
-CudaBackend::CudaBackend(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {}
+CudaBackend::CudaBackend(std::shared_ptr<Impl> impl,
+                         std::shared_ptr<CudaBackendTraceSink> trace_sink)
+    : impl_(std::move(impl)), trace_sink_(std::move(trace_sink)) {}
+
+CudaBackend CudaBackend::with_trace_sink(std::shared_ptr<CudaBackendTraceSink> trace_sink) const {
+  if (!trace_sink) {
+    throw std::invalid_argument("CUDA trace sink must be non-null");
+  }
+  return CudaBackend(impl_, std::move(trace_sink));
+}
 
 int CudaBackend::device_count() const {
   int count = 0;
@@ -608,14 +620,47 @@ CudaDeviceBuffer CudaBackend::allocate(std::size_t bytes) const {
   if (bytes == 0) {
     throw std::invalid_argument("CUDA allocation size must be non-zero");
   }
+  auto impl = impl_;
+  std::function<void(CudaDevicePtr)> deleter = [impl](CudaDevicePtr ptr) {
+    impl->ensure_primary_context(0);
+    check_cuda("cuMemFree_v2", impl->cu_mem_free(ptr));
+  };
   impl_->ensure_primary_context(0);
   CUdeviceptr ptr = 0;
   check_cuda("cuMemAlloc_v2", impl_->cu_mem_alloc(&ptr, bytes));
+  return CudaDeviceBuffer(ptr, bytes, std::move(deleter));
+}
+
+CudaPitchedAllocation CudaBackend::allocate_pitched(std::size_t width_bytes, std::size_t height,
+                                                    unsigned int element_size_bytes) const {
+  if (width_bytes == 0 || height == 0) {
+    throw std::invalid_argument("CUDA pitched allocation dimensions must be non-zero");
+  }
+  if (element_size_bytes != 4 && element_size_bytes != 8 && element_size_bytes != 16) {
+    throw std::invalid_argument("CUDA pitched allocation element size must be 4, 8, or 16");
+  }
+  if (width_bytes > std::numeric_limits<std::size_t>::max() / height) {
+    throw std::overflow_error("CUDA pitched allocation size overflow");
+  }
+
   auto impl = impl_;
-  return CudaDeviceBuffer(ptr, bytes, [impl](CudaDevicePtr ptr) {
+  std::function<void(CudaDevicePtr)> deleter = [impl](CudaDevicePtr allocation) {
     impl->ensure_primary_context(0);
-    check_cuda("cuMemFree_v2", impl->cu_mem_free(ptr));
-  });
+    check_cuda("cuMemFree_v2", impl->cu_mem_free(allocation));
+  };
+  impl_->ensure_primary_context(0);
+  CUdeviceptr ptr = 0;
+  std::size_t pitch = 0;
+  check_cuda("cuMemAllocPitch_v2",
+             impl_->cu_mem_alloc_pitch(&ptr, &pitch, width_bytes, height, element_size_bytes));
+  if (pitch < width_bytes || pitch > std::numeric_limits<std::size_t>::max() / height) {
+    const auto free_result = impl_->cu_mem_free(ptr);
+    (void)free_result;
+    throw std::runtime_error("CUDA pitched allocation returned an invalid pitch");
+  }
+
+  const std::size_t size = pitch * height;
+  return {.buffer = CudaDeviceBuffer(ptr, size, std::move(deleter)), .pitch = pitch};
 }
 
 CudaSharedMemory CudaBackend::allocate_shared_memory(std::size_t bytes) const {
@@ -738,6 +783,9 @@ void CudaBackend::copy_device_to_device_2d(const Cuda2DCopy& copy) const {
       .height = copy.height,
   };
   check_cuda("cuMemcpy2D_v2 (DtoD)", impl_->cu_memcpy_2d(&desc));
+  if (trace_sink_) {
+    trace_sink_->device_to_device_copy_submitted();
+  }
 }
 
 void CudaBackend::copy_device_to_host_2d(const CudaDeviceToHost2DCopy& copy) const {
@@ -792,6 +840,9 @@ CudaKernel CudaBackend::load_kernel_from_ptx(std::string_view ptx,
 void CudaBackend::synchronize() const {
   impl_->ensure_current_context_for_copy();
   check_cuda("cuCtxSynchronize", impl_->cu_ctx_synchronize());
+  if (trace_sink_) {
+    trace_sink_->context_synchronized();
+  }
 }
 
 } // namespace reco::core

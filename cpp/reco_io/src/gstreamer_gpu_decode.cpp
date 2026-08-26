@@ -1,16 +1,22 @@
 #include "reco/io/gpu_decode.hpp"
 
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+#include <deque>
 #include <initializer_list>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <utility>
+#include <vector>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -26,8 +32,13 @@ constexpr int kGstStateNull = 1;
 constexpr int kGstStatePlaying = 4;
 constexpr int kGstStateChangeFailure = 0;
 constexpr std::uint32_t kGstMessageError = 1U << 1U;
+constexpr int kGstPadProbeTypeBuffer = 1 << 4;
+constexpr int kGstPadProbeOk = 1;
 constexpr std::uint64_t kGstClockTimeNone = std::numeric_limits<std::uint64_t>::max();
 constexpr std::uint64_t kSamplePollTimeoutNs = 100'000'000;
+constexpr std::size_t kMaximumGeometryObservations = 4096;
+// Codec block alignment can pad a surface, but not by an entire 256-pixel block.
+constexpr std::uint32_t kMaximumVisibleAllocationPadding = 255;
 
 struct GErrorAbi {
   std::uint32_t domain = 0;
@@ -67,6 +78,12 @@ struct GstBufferAbi {
   std::uint64_t offset_end = 0;
 };
 
+struct GstPadProbeInfoAbi {
+  std::int32_t type = 0;
+  unsigned long id = 0;
+  void* data = nullptr;
+};
+
 // GstBuffer and GstMapInfo are public GStreamer 1.x ABI structs. The runtime
 // major-version check below prevents these layouts from being used with a
 // future incompatible ABI.
@@ -75,6 +92,8 @@ static_assert(sizeof(GstBufferAbi) == (sizeof(void*) == 8 ? 112 : 80));
 static_assert(offsetof(GstMapInfoAbi, data) == (sizeof(void*) == 8 ? 16 : 8));
 static_assert(offsetof(GstMapInfoAbi, size) == (sizeof(void*) == 8 ? 24 : 12));
 static_assert(sizeof(GstMapInfoAbi) == (sizeof(void*) == 8 ? 104 : 52));
+static_assert(offsetof(GstPadProbeInfoAbi, data) ==
+              (sizeof(void*) == 8 && sizeof(unsigned long) == 8 ? 16 : 8));
 
 class DynamicLibrary {
 public:
@@ -160,13 +179,24 @@ public:
   using Version = void (*)(std::uint32_t*, std::uint32_t*, std::uint32_t*, std::uint32_t*);
   using ParseLaunch = void* (*)(const char*, GErrorAbi**);
   using BinGetByName = void* (*)(void*, const char*);
+  using ElementGetStaticPad = void* (*)(void*, const char*);
   using ElementSetState = int (*)(void*, int);
   using ElementGetBus = void* (*)(void*);
   using ObjectUnref = void (*)(void*);
+  using PadGetCurrentCaps = void* (*)(void*);
+  using PadProbeCallback = int (*)(void*, void*, void*);
+  using DestroyNotify = void (*)(void*);
+  using PadAddProbe = unsigned long (*)(void*, int, PadProbeCallback, void*, DestroyNotify);
+  using PadRemoveProbe = void (*)(void*, unsigned long);
+  using MiniObjectSetQdata = void (*)(void*, std::uint32_t, void*, DestroyNotify);
+  using MiniObjectGetQdata = void* (*)(void*, std::uint32_t);
+  using CapsUnref = void (*)(void*);
   using AppSinkTryPullSample = void* (*)(void*, std::uint64_t);
   using AppSinkIsEos = int (*)(void*);
   using SampleGetBuffer = void* (*)(void*);
   using SampleUnref = void (*)(void*);
+  using CapsGetStructure = void* (*)(const void*, std::uint32_t);
+  using StructureGetInt = int (*)(const void*, const char*, int*);
   using BufferMap = int (*)(void*, GstMapInfoAbi*, std::uint32_t);
   using BufferUnmap = void (*)(void*, GstMapInfoAbi*);
   using BusTimedPopFiltered = void* (*)(void*, std::uint64_t, std::uint32_t);
@@ -174,6 +204,7 @@ public:
   using MessageUnref = void (*)(void*);
   using ErrorFree = void (*)(GErrorAbi*);
   using Free = void (*)(void*);
+  using QuarkFromStaticString = std::uint32_t (*)(const char*);
 
   GstreamerApi() {
 #if defined(_WIN32)
@@ -203,11 +234,21 @@ public:
     version = core_library->symbol<Version>("gst_version");
     parse_launch = core_library->symbol<ParseLaunch>("gst_parse_launch");
     bin_get_by_name = core_library->symbol<BinGetByName>("gst_bin_get_by_name");
+    element_get_static_pad =
+        core_library->symbol<ElementGetStaticPad>("gst_element_get_static_pad");
     element_set_state = core_library->symbol<ElementSetState>("gst_element_set_state");
     element_get_bus = core_library->symbol<ElementGetBus>("gst_element_get_bus");
     object_unref = core_library->symbol<ObjectUnref>("gst_object_unref");
+    pad_get_current_caps = core_library->symbol<PadGetCurrentCaps>("gst_pad_get_current_caps");
+    pad_add_probe = core_library->symbol<PadAddProbe>("gst_pad_add_probe");
+    pad_remove_probe = core_library->symbol<PadRemoveProbe>("gst_pad_remove_probe");
+    mini_object_set_qdata = core_library->symbol<MiniObjectSetQdata>("gst_mini_object_set_qdata");
+    mini_object_get_qdata = core_library->symbol<MiniObjectGetQdata>("gst_mini_object_get_qdata");
+    caps_unref = core_library->symbol<CapsUnref>("gst_caps_unref");
     sample_get_buffer = core_library->symbol<SampleGetBuffer>("gst_sample_get_buffer");
     sample_unref = core_library->symbol<SampleUnref>("gst_sample_unref");
+    caps_get_structure = core_library->symbol<CapsGetStructure>("gst_caps_get_structure");
+    structure_get_int = core_library->symbol<StructureGetInt>("gst_structure_get_int");
     buffer_map = core_library->symbol<BufferMap>("gst_buffer_map");
     buffer_unmap = core_library->symbol<BufferUnmap>("gst_buffer_unmap");
     bus_timed_pop_filtered =
@@ -219,6 +260,12 @@ public:
     app_sink_is_eos = app_library->symbol<AppSinkIsEos>("gst_app_sink_is_eos");
     error_free = glib_library->symbol<ErrorFree>("g_error_free");
     free = glib_library->symbol<Free>("g_free");
+    quark_from_static_string =
+        glib_library->symbol<QuarkFromStaticString>("g_quark_from_static_string");
+    geometry_metadata_quark = quark_from_static_string("reco-gpu-visible-geometry");
+    if (geometry_metadata_quark == 0) {
+      throw GpuDecodeError("failed to create GStreamer geometry metadata key");
+    }
   }
 
   std::shared_ptr<DynamicLibrary> core_library;
@@ -228,13 +275,22 @@ public:
   Version version = nullptr;
   ParseLaunch parse_launch = nullptr;
   BinGetByName bin_get_by_name = nullptr;
+  ElementGetStaticPad element_get_static_pad = nullptr;
   ElementSetState element_set_state = nullptr;
   ElementGetBus element_get_bus = nullptr;
   ObjectUnref object_unref = nullptr;
+  PadGetCurrentCaps pad_get_current_caps = nullptr;
+  PadAddProbe pad_add_probe = nullptr;
+  PadRemoveProbe pad_remove_probe = nullptr;
+  MiniObjectSetQdata mini_object_set_qdata = nullptr;
+  MiniObjectGetQdata mini_object_get_qdata = nullptr;
+  CapsUnref caps_unref = nullptr;
   AppSinkTryPullSample app_sink_try_pull_sample = nullptr;
   AppSinkIsEos app_sink_is_eos = nullptr;
   SampleGetBuffer sample_get_buffer = nullptr;
   SampleUnref sample_unref = nullptr;
+  CapsGetStructure caps_get_structure = nullptr;
+  StructureGetInt structure_get_int = nullptr;
   BufferMap buffer_map = nullptr;
   BufferUnmap buffer_unmap = nullptr;
   BusTimedPopFiltered bus_timed_pop_filtered = nullptr;
@@ -242,6 +298,8 @@ public:
   MessageUnref message_unref = nullptr;
   ErrorFree error_free = nullptr;
   Free free = nullptr;
+  QuarkFromStaticString quark_from_static_string = nullptr;
+  std::uint32_t geometry_metadata_quark = 0;
 };
 
 std::string take_error(const std::shared_ptr<GstreamerApi>& api, GErrorAbi*& error,
@@ -255,6 +313,26 @@ std::string take_error(const std::shared_ptr<GstreamerApi>& api, GErrorAbi*& err
     error = nullptr;
   }
   return message;
+}
+
+std::pair<std::uint32_t, std::uint32_t> visible_dimensions(const std::shared_ptr<GstreamerApi>& api,
+                                                           void* predecoder_pad) {
+  void* caps = api->pad_get_current_caps(predecoder_pad);
+  if (caps == nullptr) {
+    throw GpuDecodeError("GStreamer pre-decoder pad does not contain negotiated caps");
+  }
+  const std::unique_ptr<void, GstreamerApi::CapsUnref> caps_owner(caps, api->caps_unref);
+  void* structure = api->caps_get_structure(caps, 0);
+  if (structure == nullptr) {
+    throw GpuDecodeError("GStreamer pre-decoder caps do not contain a structure");
+  }
+  int width = 0;
+  int height = 0;
+  if (api->structure_get_int(structure, "width", &width) == 0 ||
+      api->structure_get_int(structure, "height", &height) == 0 || width <= 0 || height <= 0) {
+    throw GpuDecodeError("GStreamer pre-decoder caps do not contain valid visible dimensions");
+  }
+  return {static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height)};
 }
 
 class GstSampleOwner {
@@ -294,6 +372,293 @@ private:
   void* buffer_ = nullptr;
   GstMapInfoAbi map_{};
   bool mapped_ = false;
+};
+
+enum class GeometryProbeFailure {
+  None,
+  MissingBuffer,
+  MissingCaps,
+  MissingCapsStructure,
+  InvalidDimensions,
+  QueueLimit,
+  Unknown,
+};
+
+using GeometryDimensions = std::pair<std::uint32_t, std::uint32_t>;
+
+enum class GeometryMetadataFailure {
+  None,
+  MissingCorrelation,
+  UnknownTimestampAcrossChange,
+  AmbiguousTimestamp,
+};
+
+struct GeometryMetadata {
+  std::vector<GeometryDimensions> candidates;
+  GeometryMetadataFailure failure = GeometryMetadataFailure::None;
+};
+
+struct GeometryObservation {
+  std::optional<std::uint64_t> pts_ns;
+  GeometryDimensions dimensions;
+};
+
+struct GeometryAmbiguityGroup {
+  std::uint64_t pts_ns = 0;
+};
+
+class GeometryProbeState {
+public:
+  explicit GeometryProbeState(std::shared_ptr<GstreamerApi> api) : api_(std::move(api)) {}
+
+  static int on_predecoder_buffer(void* pad, void* probe_info, void* user_data) noexcept {
+    auto state = *static_cast<std::shared_ptr<GeometryProbeState>*>(user_data);
+    try {
+      state->record_predecoder_geometry(pad, probe_info);
+    } catch (const std::exception& error) {
+      state->record_error(error.what());
+    } catch (...) {
+      state->record_error(nullptr);
+    }
+    return kGstPadProbeOk;
+  }
+
+  static int on_output_buffer(void*, void* probe_info, void* user_data) noexcept {
+    auto state = *static_cast<std::shared_ptr<GeometryProbeState>*>(user_data);
+    try {
+      state->attach_output_geometry(probe_info);
+    } catch (const std::exception& error) {
+      state->record_error(error.what());
+    } catch (...) {
+      state->record_error(nullptr);
+    }
+    return kGstPadProbeOk;
+  }
+
+  static void destroy_callback_data(void* user_data) noexcept {
+    delete static_cast<std::shared_ptr<GeometryProbeState>*>(user_data);
+  }
+
+  static void destroy_metadata(void* metadata) noexcept {
+    delete static_cast<GeometryMetadata*>(metadata);
+  }
+
+  void check_failure() const { throw_if_failed(); }
+
+  [[nodiscard]] bool failed() const noexcept {
+    return failure_.load(std::memory_order_acquire) != GeometryProbeFailure::None;
+  }
+
+  [[nodiscard]] GeometryDimensions
+  take_dimensions(void* buffer, const GeometryDimensions& allocation_dimensions,
+                  const std::optional<GeometryDimensions>& previous_allocation_dimensions,
+                  const std::optional<GeometryDimensions>& previous_visible_dimensions) const {
+    throw_if_failed();
+    const auto* metadata = static_cast<const GeometryMetadata*>(
+        api_->mini_object_get_qdata(buffer, api_->geometry_metadata_quark));
+    if (metadata == nullptr) {
+      throw GpuDecodeError("GStreamer decoded frame has no attached pre-decoder geometry");
+    }
+    switch (metadata->failure) {
+    case GeometryMetadataFailure::None:
+      break;
+    case GeometryMetadataFailure::MissingCorrelation:
+      throw GpuDecodeError(
+          "GStreamer decoded frame timestamp has no correlated pre-decoder geometry");
+    case GeometryMetadataFailure::UnknownTimestampAcrossChange:
+      throw GpuDecodeError(
+          "GStreamer decoded frame timestamp cannot be correlated across a geometry change");
+    case GeometryMetadataFailure::AmbiguousTimestamp:
+      throw GpuDecodeError(
+          "GStreamer decoded frame timestamp is ambiguous at a geometry transition");
+    }
+    if (metadata->candidates.empty()) {
+      throw GpuDecodeError("GStreamer decoded frame has no correlated pre-decoder geometry");
+    }
+    if (metadata->candidates.size() == 1) {
+      return metadata->candidates.front();
+    }
+
+    const auto allocation_compatible = [&](const auto& dimensions) {
+      return dimensions.first <= allocation_dimensions.first &&
+             dimensions.second <= allocation_dimensions.second &&
+             allocation_dimensions.first - dimensions.first <= kMaximumVisibleAllocationPadding &&
+             allocation_dimensions.second - dimensions.second <= kMaximumVisibleAllocationPadding;
+    };
+    std::vector<GeometryDimensions> compatible_candidates;
+    std::copy_if(metadata->candidates.begin(), metadata->candidates.end(),
+                 std::back_inserter(compatible_candidates), allocation_compatible);
+    if (compatible_candidates.size() == 1) {
+      return compatible_candidates.front();
+    }
+    if (compatible_candidates.empty()) {
+      throw GpuDecodeError(
+          "GStreamer decoded frame allocation does not match timestamped pre-decoder geometry");
+    }
+
+    if (previous_allocation_dimensions.has_value() && previous_visible_dimensions.has_value() &&
+        *previous_allocation_dimensions != allocation_dimensions) {
+      std::optional<GeometryDimensions> changed_candidate;
+      for (const auto& candidate : compatible_candidates) {
+        if (candidate == *previous_visible_dimensions) {
+          continue;
+        }
+        if (changed_candidate.has_value()) {
+          changed_candidate.reset();
+          break;
+        }
+        changed_candidate = candidate;
+      }
+      if (changed_candidate.has_value()) {
+        return *changed_candidate;
+      }
+    }
+    throw GpuDecodeError("GStreamer decoded frame timestamp is ambiguous at a geometry transition");
+  }
+
+private:
+  static void add_candidate(std::vector<GeometryDimensions>& candidates,
+                            const GeometryDimensions& dimensions) {
+    if (std::find(candidates.begin(), candidates.end(), dimensions) == candidates.end()) {
+      candidates.push_back(dimensions);
+    }
+  }
+
+  void record_predecoder_geometry(void* pad, void* probe_info) {
+    void* buffer = static_cast<GstPadProbeInfoAbi*>(probe_info)->data;
+    if (buffer == nullptr) {
+      throw GpuDecodeError("GStreamer pre-decoder probe did not contain a buffer");
+    }
+    const auto dimensions = visible_dimensions(api_, pad);
+    const auto pts = static_cast<const GstBufferAbi*>(buffer)->pts;
+    std::lock_guard lock(mutex_);
+    if (observations_.size() >= kMaximumGeometryObservations) {
+      throw GpuDecodeError("GStreamer pre-decoder geometry history exceeded its safety limit");
+    }
+    observations_.push_back(
+        {.pts_ns = pts == kGstClockTimeNone ? std::nullopt : std::optional<std::uint64_t>(pts),
+         .dimensions = dimensions});
+  }
+
+  void attach_output_geometry(void* probe_info) {
+    void* buffer = static_cast<GstPadProbeInfoAbi*>(probe_info)->data;
+    if (buffer == nullptr) {
+      throw GpuDecodeError("GStreamer output probe did not contain a buffer");
+    }
+    const auto pts = static_cast<const GstBufferAbi*>(buffer)->pts;
+    auto metadata = std::make_unique<GeometryMetadata>();
+    {
+      std::lock_guard lock(mutex_);
+      if (pts == kGstClockTimeNone) {
+        if (unknown_ambiguity_active_) {
+          metadata->failure = GeometryMetadataFailure::UnknownTimestampAcrossChange;
+        }
+        for (const auto& observation : observations_) {
+          if (!observation.pts_ns.has_value()) {
+            add_candidate(metadata->candidates, observation.dimensions);
+          }
+        }
+        const auto observation =
+            std::find_if(observations_.begin(), observations_.end(),
+                         [](const auto& value) { return !value.pts_ns.has_value(); });
+        if (observation == observations_.end()) {
+          metadata->failure = GeometryMetadataFailure::MissingCorrelation;
+          unknown_ambiguity_active_ = false;
+        } else {
+          if (metadata->candidates.size() > 1) {
+            metadata->failure = GeometryMetadataFailure::UnknownTimestampAcrossChange;
+            unknown_ambiguity_active_ = true;
+          }
+          observations_.erase(observation);
+          if (std::none_of(observations_.begin(), observations_.end(),
+                           [](const auto& value) { return !value.pts_ns.has_value(); })) {
+            unknown_ambiguity_active_ = false;
+          }
+        }
+      } else {
+        auto group = std::find_if(ambiguity_groups_.begin(), ambiguity_groups_.end(),
+                                  [&](const auto& value) { return value.pts_ns == pts; });
+        if (group != ambiguity_groups_.end()) {
+          metadata->failure = GeometryMetadataFailure::AmbiguousTimestamp;
+        }
+        for (const auto& observation : observations_) {
+          if (observation.pts_ns == pts) {
+            add_candidate(metadata->candidates, observation.dimensions);
+          }
+        }
+        const auto observation =
+            std::find_if(observations_.begin(), observations_.end(),
+                         [&](const auto& value) { return value.pts_ns == pts; });
+        if (observation == observations_.end()) {
+          metadata->failure = GeometryMetadataFailure::MissingCorrelation;
+          if (group != ambiguity_groups_.end()) {
+            ambiguity_groups_.erase(group);
+          }
+        } else {
+          observations_.erase(observation);
+          const bool same_pts_remain =
+              std::any_of(observations_.begin(), observations_.end(),
+                          [&](const auto& value) { return value.pts_ns == pts; });
+          if (metadata->candidates.size() > 1 && same_pts_remain) {
+            if (group == ambiguity_groups_.end()) {
+              ambiguity_groups_.push_back({.pts_ns = pts});
+            }
+          } else if (group != ambiguity_groups_.end() && !same_pts_remain) {
+            ambiguity_groups_.erase(group);
+          }
+        }
+      }
+    }
+    api_->mini_object_set_qdata(buffer, api_->geometry_metadata_quark, metadata.release(),
+                                &GeometryProbeState::destroy_metadata);
+  }
+
+  void throw_if_failed() const {
+    switch (failure_.load(std::memory_order_acquire)) {
+    case GeometryProbeFailure::None:
+      return;
+    case GeometryProbeFailure::MissingBuffer:
+      throw GpuDecodeError("GStreamer geometry probe did not contain a buffer");
+    case GeometryProbeFailure::MissingCaps:
+      throw GpuDecodeError("GStreamer pre-decoder pad does not contain negotiated caps");
+    case GeometryProbeFailure::MissingCapsStructure:
+      throw GpuDecodeError("GStreamer pre-decoder caps do not contain a structure");
+    case GeometryProbeFailure::InvalidDimensions:
+      throw GpuDecodeError("GStreamer pre-decoder caps do not contain valid visible dimensions");
+    case GeometryProbeFailure::QueueLimit:
+      throw GpuDecodeError("GStreamer pre-decoder geometry history exceeded its safety limit");
+    case GeometryProbeFailure::Unknown:
+      throw GpuDecodeError("GStreamer geometry probe failed");
+    }
+    throw GpuDecodeError("GStreamer geometry probe failed");
+  }
+
+  void record_error(const char* message) noexcept {
+    auto failure = GeometryProbeFailure::Unknown;
+    if (message != nullptr && std::strstr(message, "did not contain a buffer") != nullptr) {
+      failure = GeometryProbeFailure::MissingBuffer;
+    } else if (message != nullptr &&
+               std::strstr(message, "does not contain negotiated caps") != nullptr) {
+      failure = GeometryProbeFailure::MissingCaps;
+    } else if (message != nullptr &&
+               std::strstr(message, "do not contain a structure") != nullptr) {
+      failure = GeometryProbeFailure::MissingCapsStructure;
+    } else if (message != nullptr && std::strstr(message, "valid visible dimensions") != nullptr) {
+      failure = GeometryProbeFailure::InvalidDimensions;
+    } else if (message != nullptr && std::strstr(message, "safety limit") != nullptr) {
+      failure = GeometryProbeFailure::QueueLimit;
+    }
+    GeometryProbeFailure expected = GeometryProbeFailure::None;
+    (void)failure_.compare_exchange_strong(expected, failure, std::memory_order_release,
+                                           std::memory_order_relaxed);
+  }
+
+  std::shared_ptr<GstreamerApi> api_;
+  std::mutex mutex_;
+  std::deque<GeometryObservation> observations_;
+  std::deque<GeometryAmbiguityGroup> ambiguity_groups_;
+  bool unknown_ambiguity_active_ = false;
+  std::atomic<GeometryProbeFailure> failure_{GeometryProbeFailure::None};
 };
 
 class GstreamerGpuFileDecodeSource final : public GpuFileDecodeSource {
@@ -339,6 +704,43 @@ public:
     if (sink_ == nullptr) {
       throw GpuDecodeError("GStreamer pipeline does not contain appsink 'sink'");
     }
+    display_info_ = api_->bin_get_by_name(pipeline_, "display_info");
+    if (display_info_ == nullptr) {
+      throw GpuDecodeError(
+          "GStreamer pipeline does not contain pre-decoder identity 'display_info'");
+    }
+    display_info_pad_ = api_->element_get_static_pad(display_info_, "src");
+    if (display_info_pad_ == nullptr) {
+      throw GpuDecodeError("GStreamer pre-decoder identity does not provide a source pad");
+    }
+    geometry_probe_state_ = std::make_shared<GeometryProbeState>(api_);
+    auto predecoder_callback_data =
+        std::make_unique<std::shared_ptr<GeometryProbeState>>(geometry_probe_state_);
+    display_info_probe_id_ = api_->pad_add_probe(
+        display_info_pad_, kGstPadProbeTypeBuffer, &GeometryProbeState::on_predecoder_buffer,
+        predecoder_callback_data.get(), &GeometryProbeState::destroy_callback_data);
+    if (display_info_probe_id_ == 0) {
+      geometry_probe_state_.reset();
+      throw GpuDecodeError("failed to install GStreamer pre-decoder geometry probe");
+    }
+    (void)predecoder_callback_data.release();
+    output_info_ = api_->bin_get_by_name(pipeline_, "output_info");
+    if (output_info_ == nullptr) {
+      throw GpuDecodeError("GStreamer pipeline does not contain output identity 'output_info'");
+    }
+    output_info_pad_ = api_->element_get_static_pad(output_info_, "src");
+    if (output_info_pad_ == nullptr) {
+      throw GpuDecodeError("GStreamer output identity does not provide a source pad");
+    }
+    auto output_callback_data =
+        std::make_unique<std::shared_ptr<GeometryProbeState>>(geometry_probe_state_);
+    output_info_probe_id_ = api_->pad_add_probe(
+        output_info_pad_, kGstPadProbeTypeBuffer, &GeometryProbeState::on_output_buffer,
+        output_callback_data.get(), &GeometryProbeState::destroy_callback_data);
+    if (output_info_probe_id_ == 0) {
+      throw GpuDecodeError("failed to install GStreamer output geometry probe");
+    }
+    (void)output_callback_data.release();
     bus_ = api_->element_get_bus(pipeline_);
     if (bus_ == nullptr) {
       throw GpuDecodeError("GStreamer pipeline does not provide a message bus");
@@ -357,6 +759,7 @@ public:
     if (terminal_error_.has_value()) {
       throw GpuDecodeError(*terminal_error_);
     }
+    throw_if_geometry_probe_failed();
     if (ended_) {
       return make_gpu_decode_eos();
     }
@@ -367,6 +770,7 @@ public:
       if (sample != nullptr) {
         break;
       }
+      throw_if_geometry_probe_failed();
       if (const auto error = pop_pipeline_error(); !error.empty()) {
         terminal_error_ = error;
         throw GpuDecodeError(*terminal_error_);
@@ -378,6 +782,7 @@ public:
     }
 
     auto owner = std::make_shared<GstSampleOwner>(api_, sample);
+    throw_if_geometry_probe_failed();
     void* buffer = api_->sample_get_buffer(sample);
     if (buffer == nullptr) {
       throw GpuDecodeError("GStreamer sample does not contain a buffer");
@@ -392,22 +797,67 @@ public:
     }
 
     const auto& gst_buffer = *static_cast<const GstBufferAbi*>(buffer);
+    const auto pts_ns = gst_buffer.pts == kGstClockTimeNone
+                            ? std::nullopt
+                            : std::optional<std::uint64_t>(gst_buffer.pts);
+    const auto allocation_dimensions = std::pair(nvmm.width, nvmm.height);
+    GeometryDimensions visible_dimensions;
+    try {
+      visible_dimensions = geometry_probe_state_->take_dimensions(buffer, allocation_dimensions,
+                                                                  previous_allocation_dimensions_,
+                                                                  previous_visible_dimensions_);
+    } catch (const GpuDecodeError& error) {
+      if (geometry_probe_state_->failed()) {
+        terminal_error_ = error.what();
+      }
+      throw;
+    }
+    const auto [visible_width, visible_height] = visible_dimensions;
     GpuDecodedFrame frame{
         .nvmm = nvmm,
+        .visible_width = visible_width,
+        .visible_height = visible_height,
         .owner = owner,
         .frame_index = next_frame_index_,
-        .pts_ns = gst_buffer.pts == kGstClockTimeNone
-                      ? std::nullopt
-                      : std::optional<std::uint64_t>(gst_buffer.pts),
+        .pts_ns = pts_ns,
         .duration_ns = gst_buffer.duration == kGstClockTimeNone
                            ? std::nullopt
                            : std::optional<std::uint64_t>(gst_buffer.duration),
     };
+    if (const auto validation_error = validate_gpu_decoded_frame(frame);
+        validation_error.has_value()) {
+      throw GpuDecodeError("invalid GStreamer GPU frame: " + *validation_error);
+    }
+    if (nvmm.width - visible_width > kMaximumVisibleAllocationPadding ||
+        nvmm.height - visible_height > kMaximumVisibleAllocationPadding) {
+      throw GpuDecodeError(
+          "GStreamer NVMM allocation dimensions are inconsistent with visible geometry");
+    }
+    const auto current_visible_dimensions = std::pair(visible_width, visible_height);
+    if (previous_allocation_dimensions_.has_value() &&
+        *previous_allocation_dimensions_ != allocation_dimensions &&
+        previous_visible_dimensions_.has_value() &&
+        *previous_visible_dimensions_ == current_visible_dimensions) {
+      throw GpuDecodeError(
+          "GStreamer NVMM allocation dimensions changed without a confirmed visible geometry "
+          "change");
+    }
+    previous_allocation_dimensions_ = allocation_dimensions;
+    previous_visible_dimensions_ = current_visible_dimensions;
     ++next_frame_index_;
     return make_gpu_decode_frame(std::move(frame));
   }
 
 private:
+  void throw_if_geometry_probe_failed() {
+    try {
+      geometry_probe_state_->check_failure();
+    } catch (const GpuDecodeError& error) {
+      terminal_error_ = error.what();
+      throw GpuDecodeError(*terminal_error_);
+    }
+  }
+
   [[nodiscard]] std::string pop_pipeline_error() {
     void* message = api_->bus_timed_pop_filtered(bus_, 0, kGstMessageError);
     if (message == nullptr) {
@@ -437,6 +887,31 @@ private:
       api_->object_unref(bus_);
       bus_ = nullptr;
     }
+    if (output_info_pad_ != nullptr) {
+      if (output_info_probe_id_ != 0) {
+        api_->pad_remove_probe(output_info_pad_, output_info_probe_id_);
+        output_info_probe_id_ = 0;
+      }
+      api_->object_unref(output_info_pad_);
+      output_info_pad_ = nullptr;
+    }
+    if (output_info_ != nullptr) {
+      api_->object_unref(output_info_);
+      output_info_ = nullptr;
+    }
+    if (display_info_pad_ != nullptr) {
+      if (display_info_probe_id_ != 0) {
+        api_->pad_remove_probe(display_info_pad_, display_info_probe_id_);
+        display_info_probe_id_ = 0;
+      }
+      api_->object_unref(display_info_pad_);
+      display_info_pad_ = nullptr;
+    }
+    if (display_info_ != nullptr) {
+      api_->object_unref(display_info_);
+      display_info_ = nullptr;
+    }
+    geometry_probe_state_.reset();
     if (sink_ != nullptr) {
       api_->object_unref(sink_);
       sink_ = nullptr;
@@ -453,8 +928,17 @@ private:
   std::shared_ptr<GstreamerApi> api_;
   void* pipeline_ = nullptr;
   void* sink_ = nullptr;
+  void* display_info_ = nullptr;
+  void* display_info_pad_ = nullptr;
+  unsigned long display_info_probe_id_ = 0;
+  void* output_info_ = nullptr;
+  void* output_info_pad_ = nullptr;
+  unsigned long output_info_probe_id_ = 0;
   void* bus_ = nullptr;
   std::mutex read_mutex_;
+  std::shared_ptr<GeometryProbeState> geometry_probe_state_;
+  std::optional<std::pair<std::uint32_t, std::uint32_t>> previous_allocation_dimensions_;
+  std::optional<std::pair<std::uint32_t, std::uint32_t>> previous_visible_dimensions_;
   std::uint64_t next_frame_index_ = 0;
   std::optional<std::string> terminal_error_;
   bool ended_ = false;

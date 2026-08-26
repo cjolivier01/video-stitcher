@@ -41,6 +41,8 @@ enum class GpuDecodeFrameStatus {
 
 struct GpuDecodedFrame {
   NvmmFrameInfo nvmm;
+  std::uint32_t visible_width = 0;
+  std::uint32_t visible_height = 0;
   std::shared_ptr<void> owner;
   std::uint64_t frame_index = 0;
   std::optional<std::uint64_t> pts_ns;

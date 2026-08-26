@@ -136,6 +136,8 @@ void production_source_retains_mapped_sample() {
               "selected DeepStream ABI preserved");
   expect_true(first.frame->nvmm.memory_type == NvmmMemoryType::CudaDevice,
               "dGPU CUDA-device memory preserved");
+  expect_eq(first.frame->visible_width, 1280U, "pre-decoder visible width preserved");
+  expect_eq(first.frame->visible_height, 720U, "pre-decoder visible height preserved");
   expect_true(first.frame->nvmm.color_matrix == Nv12ColorMatrix::Bt709,
               "NV12 matrix metadata preserved");
 
@@ -147,6 +149,16 @@ void production_source_retains_mapped_sample() {
   source.reset();
   events = read_events(event_path);
   expect_eq(count_event(events, "state-null"), 1U, "source shutdown stops pipeline");
+  expect_eq(count_event(events, "remove-display-probe"), 1U,
+            "source shutdown removes the geometry callback");
+  expect_eq(count_event(events, "destroy-display-probe-data"), 1U,
+            "GStreamer owns and destroys the geometry callback state");
+  expect_eq(count_event(events, "remove-output-probe"), 1U,
+            "source shutdown removes the output metadata callback");
+  expect_eq(count_event(events, "destroy-output-probe-data"), 1U,
+            "GStreamer owns and destroys the output callback state");
+  expect_eq(count_event(events, "probe-leaked"), 0U,
+            "geometry callback does not outlive its source");
   expect_eq(count_event(events, "unmap"), 0U,
             "source shutdown does not invalidate an outstanding frame");
 
@@ -171,6 +183,220 @@ void production_source_retains_mapped_sample() {
             "idempotent EOS does not perform a third pull on either source");
 }
 
+void padded_sink_caps_preserve_predecoder_dimensions() {
+  set_scenario("visible-crop");
+  const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
+  std::filesystem::remove(event_path);
+  auto source =
+      open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+  const auto result = source->read();
+  expect_true(result.frame.has_value(), "visible-crop scenario returns a frame");
+  if (!result.frame.has_value()) {
+    return;
+  }
+  expect_eq(result.frame->nvmm.width, 864U, "aligned NVMM allocation width preserved");
+  expect_eq(result.frame->nvmm.y_pitch, 1024U, "aligned NVMM allocation pitch preserved");
+  expect_eq(result.frame->visible_width, 854U, "pre-decoder width preserved separately");
+  expect_eq(result.frame->visible_height, 720U, "pre-decoder height preserved separately");
+  const auto events = read_events(event_path);
+  expect_eq(count_event(events, "pad-current-caps"), 1U,
+            "display dimensions come from pre-decoder caps");
+  expect_eq(count_event(events, "sample-caps"), 0U,
+            "padded appsink caps are not treated as display dimensions");
+}
+
+void runahead_caps_are_correlated_by_timestamp() {
+  set_scenario("caps-runahead");
+  const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
+  std::filesystem::remove(event_path);
+  auto source =
+      open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+
+  const auto first = source->read();
+  expect_true(first.frame.has_value(), "caps-runahead first frame returned");
+  if (!first.frame.has_value()) {
+    return;
+  }
+  expect_eq(first.frame->nvmm.width, 864U, "first runahead allocation remains padded");
+  expect_eq(first.frame->visible_width, 854U,
+            "first runahead frame uses its timestamped pre-decoder geometry");
+  auto events = read_events(event_path);
+  expect_eq(count_event(events, "pad-current-caps"), 2U,
+            "upstream advances to the second geometry before the first pull returns");
+
+  const auto second = source->read();
+  expect_true(second.frame.has_value(), "caps-runahead second frame returned");
+  if (second.frame.has_value()) {
+    expect_eq(second.frame->nvmm.width, 1280U, "second runahead allocation width");
+    expect_eq(second.frame->visible_width, 1280U,
+              "second runahead frame uses its own timestamped geometry");
+  }
+}
+
+void duplicate_pts_at_geometry_transition_is_ambiguous() {
+  set_scenario("duplicate-transition-pts");
+  auto source =
+      open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+
+  const auto first = source->read();
+  expect_true(first.frame.has_value(), "duplicate-transition first old-geometry frame returned");
+  expect_gpu_decode_error([&] { (void)source->read(); },
+                          "timestamp is ambiguous at a geometry transition",
+                          "duplicate PTS cannot relabel an old allocation with new geometry");
+}
+
+void valid_transition_with_unchanged_allocation_is_correlated() {
+  set_scenario("same-allocation-runahead");
+  auto source =
+      open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+
+  const auto first = source->read();
+  expect_true(first.frame.has_value(), "same-allocation first frame returned");
+  if (first.frame.has_value()) {
+    expect_eq(first.frame->nvmm.width, 1280U, "same-allocation first padded width");
+    expect_eq(first.frame->visible_width, 1100U, "same-allocation first visible width");
+  }
+
+  const auto second = source->read();
+  expect_true(second.frame.has_value(), "same-allocation transition frame returned");
+  if (second.frame.has_value()) {
+    expect_eq(second.frame->nvmm.width, 1280U, "same-allocation second padded width");
+    expect_eq(second.frame->visible_width, 1200U, "same-allocation second visible width");
+  }
+}
+
+void dropped_first_frame_can_land_on_exact_transition() {
+  set_scenario("drop-transition-first");
+  auto config = valid_config();
+  config.drop = true;
+  auto source =
+      open_gstreamer_gpu_file_decode_source(std::move(config), NvbufSurfaceAbi::DeepStream9_1);
+
+  const auto result = source->read();
+  expect_true(result.frame.has_value(), "dropped exact-transition frame returned");
+  if (result.frame.has_value()) {
+    expect_eq(result.frame->pts_ns.value_or(0), 2'000'000'000ULL,
+              "dropped exact-transition PTS preserved");
+    expect_eq(result.frame->visible_width, 1200U,
+              "dropped exact-transition frame uses current geometry");
+  }
+}
+
+void dropped_first_duplicate_pts_at_transition_is_ambiguous() {
+  set_scenario("drop-duplicate-transition-first");
+  auto config = valid_config();
+  config.drop = true;
+  auto source =
+      open_gstreamer_gpu_file_decode_source(std::move(config), NvbufSurfaceAbi::DeepStream9_1);
+
+  expect_gpu_decode_error([&] { (void)source->read(); },
+                          "timestamp is ambiguous at a geometry transition",
+                          "first retained duplicate-PTS boundary frame remains ambiguous");
+}
+
+void nonmonotonic_parser_pts_preserve_duplicate_boundary_evidence() {
+  set_scenario("nonmonotonic-duplicate-transition");
+  auto config = valid_config();
+  config.drop = true;
+  auto source =
+      open_gstreamer_gpu_file_decode_source(std::move(config), NvbufSurfaceAbi::DeepStream9_1);
+
+  expect_gpu_decode_error([&] { (void)source->read(); },
+                          "timestamp is ambiguous at a geometry transition",
+                          "reordered parser PTS cannot hide duplicate-boundary ambiguity");
+}
+
+void nonmonotonic_parser_pts_correlate_unique_geometry() {
+  set_scenario("nonmonotonic-unique-transition");
+  auto source =
+      open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+
+  const auto result = source->read();
+  expect_true(result.frame.has_value(), "nonmonotonic unique transition frame returned");
+  if (result.frame.has_value()) {
+    expect_eq(result.frame->pts_ns.value_or(0), 2'000'000'000ULL,
+              "nonmonotonic unique transition PTS preserved");
+    expect_eq(result.frame->visible_width, 1200U,
+              "nonmonotonic PTS uses its exact pre-decoder geometry");
+  }
+}
+
+void retired_pts_do_not_pollute_later_geometry_epochs() {
+  set_scenario("retired-pts-reuse");
+  auto source =
+      open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+
+  constexpr std::array<std::uint32_t, 3> expected_widths{1100, 1200, 1160};
+  for (const auto expected_width : expected_widths) {
+    const auto result = source->read();
+    expect_true(result.frame.has_value(), "retired-PTS geometry frame returned");
+    if (result.frame.has_value()) {
+      expect_eq(result.frame->visible_width, expected_width,
+                "retired PTS does not create a stale geometry candidate");
+    }
+  }
+}
+
+void pulled_sample_metadata_survives_post_pull_runahead() {
+  set_scenario("post-pull-runahead");
+  auto config = valid_config();
+  config.drop = true;
+  auto source =
+      open_gstreamer_gpu_file_decode_source(std::move(config), NvbufSurfaceAbi::DeepStream9_1);
+
+  const auto result = source->read();
+  expect_true(result.frame.has_value(), "post-pull runahead frame returned");
+  if (result.frame.has_value()) {
+    expect_eq(result.frame->visible_width, 1280U,
+              "attached geometry survives 5000 post-pull decoded frames");
+  }
+}
+
+void stale_parser_caps_reject_allocation_changes() {
+  set_scenario("caps-runahead-stale-caps");
+  auto source =
+      open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+
+  const auto first = source->read();
+  expect_true(first.frame.has_value(), "stale-caps first frame returned");
+  if (!first.frame.has_value()) {
+    return;
+  }
+  expect_eq(first.frame->nvmm.width, 864U, "stale-caps initial padded allocation width");
+  expect_eq(first.frame->nvmm.height, 480U, "stale-caps initial allocation height");
+  expect_eq(first.frame->visible_width, 854U, "stale-caps initial visible width");
+  expect_eq(first.frame->visible_height, 480U, "stale-caps initial visible height");
+
+  expect_gpu_decode_error([&] { (void)source->read(); }, "visible geometry",
+                          "stale parser caps cannot silently crop a resized NVMM frame");
+}
+
+void dropped_samples_do_not_accumulate_geometry_records() {
+  set_scenario("drop-runahead");
+  auto config = valid_config();
+  config.drop = true;
+  auto source =
+      open_gstreamer_gpu_file_decode_source(std::move(config), NvbufSurfaceAbi::DeepStream9_1);
+
+  const auto result = source->read();
+  expect_true(result.frame.has_value(), "drop-runahead frame returned after 5000 discarded inputs");
+  if (result.frame.has_value()) {
+    expect_eq(result.frame->visible_width, 1280U,
+              "drop-runahead static geometry remains correlated");
+  }
+}
+
+void first_frame_rejects_grossly_stale_geometry() {
+  set_scenario("drop-stale-caps-first");
+  auto config = valid_config();
+  config.drop = true;
+  auto source =
+      open_gstreamer_gpu_file_decode_source(std::move(config), NvbufSurfaceAbi::DeepStream9_1);
+  expect_gpu_decode_error([&] { (void)source->read(); },
+                          "allocation dimensions are inconsistent with visible geometry",
+                          "first retained frame cannot use grossly stale parser caps");
+}
+
 void unknown_timestamps_are_not_fabricated() {
   set_scenario("unknown-time");
   auto source =
@@ -182,6 +408,37 @@ void unknown_timestamps_are_not_fabricated() {
   }
   expect_true(!result.frame->pts_ns.has_value(), "unknown PTS remains absent");
   expect_true(!result.frame->duration_ns.has_value(), "unknown duration remains absent");
+}
+
+void unknown_output_retires_only_unknown_observations() {
+  set_scenario("mixed-unknown-reorder");
+  auto source =
+      open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+
+  const auto unknown = source->read();
+  expect_true(unknown.frame.has_value(), "mixed-PTS unknown frame returned");
+  if (unknown.frame.has_value()) {
+    expect_true(!unknown.frame->pts_ns.has_value(), "mixed-PTS unknown frame stays unknown");
+  }
+  const auto known = source->read();
+  expect_true(known.frame.has_value(), "mixed-PTS reordered known frame returned");
+  if (known.frame.has_value()) {
+    expect_eq(known.frame->pts_ns.value_or(0), 1'000'000'000ULL,
+              "mixed-PTS known observation remains correlated");
+    expect_eq(known.frame->visible_width, 1280U, "mixed-PTS known geometry remains correlated");
+  }
+}
+
+void dropped_ambiguous_unknown_output_keeps_batch_ambiguous() {
+  set_scenario("dropped-unknown-transition");
+  auto config = valid_config();
+  config.drop = true;
+  auto source =
+      open_gstreamer_gpu_file_decode_source(std::move(config), NvbufSurfaceAbi::DeepStream9_1);
+
+  expect_gpu_decode_error([&] { (void)source->read(); },
+                          "timestamp cannot be correlated across a geometry change",
+                          "dropped ambiguous unknown frame keeps remaining batch fail-closed");
 }
 
 void concurrent_reads_serialize_appsink_access() {
@@ -257,13 +514,35 @@ void fatal_pipeline_errors_are_latched() {
   expect_eq(count_event(events, "pull"), 1U, "latched bus error prevents later appsink pulls");
 }
 
+void geometry_probe_errors_are_latched_before_further_pulls() {
+  set_scenario("missing-caps");
+  const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
+  std::filesystem::remove(event_path);
+  auto source =
+      open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+
+  expect_gpu_decode_error([&] { (void)source->read(); }, "does not contain negotiated caps",
+                          "first geometry probe failure");
+  expect_gpu_decode_error([&] { (void)source->read(); }, "does not contain negotiated caps",
+                          "latched geometry probe failure");
+  const auto events = read_events(event_path);
+  expect_eq(count_event(events, "pull"), 1U,
+            "latched geometry probe failure prevents further sample pulls");
+}
+
 void runtime_failures_are_reported() {
   for (const auto& [scenario_name, fragment] :
-       std::array<std::pair<std::string_view, std::string_view>, 6>{
+       std::array<std::pair<std::string_view, std::string_view>, 12>{
            {{"old-version", "1.10 or newer"},
             {"init-error", "fake initialization failure"},
             {"parse-error", "fake parse failure"},
             {"missing-sink", "does not contain appsink"},
+            {"missing-display-info", "does not contain pre-decoder identity"},
+            {"missing-display-pad", "does not provide a source pad"},
+            {"probe-install-error", "failed to install"},
+            {"missing-output-info", "does not contain output identity"},
+            {"missing-output-pad", "output identity does not provide a source pad"},
+            {"output-probe-install-error", "failed to install GStreamer output"},
             {"missing-bus", "does not provide a message bus"},
             {"state-error", "rejected the PLAYING state"}}}) {
     set_scenario(scenario_name);
@@ -276,12 +555,17 @@ void runtime_failures_are_reported() {
   }
 
   for (const auto& [scenario_name, fragment] :
-       std::array<std::pair<std::string_view, std::string_view>, 5>{
+       std::array<std::pair<std::string_view, std::string_view>, 10>{
            {{"stream-error", "fake decoder failure"},
             {"delayed-stream-error", "fake decoder failure"},
             {"missing-buffer", "does not contain a buffer"},
             {"map-error", "failed to map"},
-            {"invalid-surface", "filled-buffer count"}}}) {
+            {"invalid-surface", "filled-buffer count"},
+            {"missing-caps", "does not contain negotiated caps"},
+            {"missing-caps-structure", "do not contain a structure"},
+            {"invalid-caps", "valid visible dimensions"},
+            {"oversized-caps", "exceed the NVMM allocation"},
+            {"caps-runahead-unknown-time", "cannot be correlated"}}}) {
     set_scenario(scenario_name);
     auto source =
         open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
@@ -303,9 +587,25 @@ int main() {
   set_environment("RECO_FAKE_GST_EVENT_PATH", event_path.string());
 
   production_source_retains_mapped_sample();
+  padded_sink_caps_preserve_predecoder_dimensions();
+  runahead_caps_are_correlated_by_timestamp();
+  duplicate_pts_at_geometry_transition_is_ambiguous();
+  valid_transition_with_unchanged_allocation_is_correlated();
+  dropped_first_frame_can_land_on_exact_transition();
+  dropped_first_duplicate_pts_at_transition_is_ambiguous();
+  nonmonotonic_parser_pts_preserve_duplicate_boundary_evidence();
+  nonmonotonic_parser_pts_correlate_unique_geometry();
+  retired_pts_do_not_pollute_later_geometry_epochs();
+  pulled_sample_metadata_survives_post_pull_runahead();
+  stale_parser_caps_reject_allocation_changes();
+  dropped_samples_do_not_accumulate_geometry_records();
+  first_frame_rejects_grossly_stale_geometry();
   unknown_timestamps_are_not_fabricated();
+  unknown_output_retires_only_unknown_observations();
+  dropped_ambiguous_unknown_output_keeps_batch_ambiguous();
   concurrent_reads_serialize_appsink_access();
   fatal_pipeline_errors_are_latched();
+  geometry_probe_errors_are_latched_before_further_pulls();
   runtime_failures_are_reported();
   std::filesystem::remove(event_path);
 #endif
