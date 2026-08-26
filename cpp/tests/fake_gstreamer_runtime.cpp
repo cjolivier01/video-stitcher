@@ -26,12 +26,6 @@ struct GErrorAbi {
   char* message = nullptr;
 };
 
-struct GListAbi {
-  void* data = nullptr;
-  GListAbi* next = nullptr;
-  GListAbi* previous = nullptr;
-};
-
 struct GstMapInfoAbi {
   void* memory = nullptr;
   std::uint32_t flags = 0;
@@ -72,6 +66,7 @@ enum class ObjectKind {
   Bus,
   DisplayInfo,
   OutputInfo,
+  ProbeInfo,
   Pad,
 };
 
@@ -109,6 +104,12 @@ struct FakeOutputInfo : FakeObject {
   FakePipeline* pipeline = nullptr;
 };
 
+struct FakeProbeInfo : FakeObject {
+  explicit FakeProbeInfo(FakePipeline* owner)
+      : FakeObject(ObjectKind::ProbeInfo), pipeline(owner) {}
+  FakePipeline* pipeline = nullptr;
+};
+
 struct FakePad : FakeObject {
   FakePad() : FakeObject(ObjectKind::Pad) {}
   FakePadProbeCallback callback = nullptr;
@@ -118,12 +119,14 @@ struct FakePad : FakeObject {
   std::uint32_t current_width = 1280;
   std::uint32_t current_height = 720;
   bool output = false;
+  bool probe = false;
 };
 
 struct FakePipeline : FakeObject {
   FakePipeline() : FakeObject(ObjectKind::Pipeline) {}
   FakePad* display_pad = nullptr;
   FakePad* output_pad = nullptr;
+  bool parser_probe = false;
 };
 
 constexpr std::uint64_t kFakeCapsMagic = 0x5245434f43415053ULL;
@@ -132,6 +135,8 @@ struct FakeCaps {
   std::uint64_t magic = kFakeCapsMagic;
   std::uint32_t width = 1280;
   std::uint32_t height = 720;
+  std::int32_t fps_numerator = 30'000;
+  std::int32_t fps_denominator = 1'001;
 };
 
 struct FakeMessage {};
@@ -140,32 +145,6 @@ struct FakePadProbeInfo {
   std::int32_t type = 0;
   unsigned long id = 0;
   void* data = nullptr;
-};
-
-enum class GObjectKind {
-  Discoverer,
-  DiscovererInfo,
-};
-
-struct FakeGObject {
-  explicit FakeGObject(GObjectKind object_kind) : kind(object_kind) {}
-  GObjectKind kind;
-};
-
-struct FakeDiscoverer : FakeGObject {
-  FakeDiscoverer() : FakeGObject(GObjectKind::Discoverer) {}
-};
-
-struct FakeDiscovererInfo : FakeGObject {
-  FakeDiscovererInfo() : FakeGObject(GObjectKind::DiscovererInfo) {}
-};
-
-struct FakeVideoInfo {
-  std::uint32_t width = 3840;
-  std::uint32_t height = 2160;
-  std::uint32_t fps_numerator = 30'000;
-  std::uint32_t fps_denominator = 1'001;
-  bool image = false;
 };
 
 struct FakeSample {
@@ -346,13 +325,38 @@ RECO_FAKE_EXPORT int gst_init_check(int*, char***, GErrorAbi** error) {
   return 0;
 }
 
-RECO_FAKE_EXPORT void* gst_parse_launch(const char*, GErrorAbi** error) {
-  record("parse");
-  if (scenario() == "parse-error") {
+RECO_FAKE_EXPORT void* gst_parse_launch(const char* description, GErrorAbi** error) {
+  const bool parser_probe =
+      description != nullptr && std::strstr(description, "probe_info") != nullptr;
+  record(parser_probe ? "parse-probe" : "parse-decoder");
+  if (parser_probe && std::strstr(description, "video/x-h264;video/x-h265") != nullptr) {
+    record("probe-codec-filter");
+  }
+  if (parser_probe && std::strstr(description, "parsebin") != nullptr) {
+    record("probe-parsebin");
+  }
+  if (parser_probe && std::strstr(description, "h264parse") != nullptr) {
+    record("probe-h264-parser");
+  }
+  if (parser_probe && std::strstr(description, "h265parse") != nullptr) {
+    record("probe-h265-parser");
+  }
+  if (parser_probe && std::strstr(description, "video/x-raw") != nullptr) {
+    record("raw-video-caps");
+  }
+  if (description != nullptr && std::strstr(description, "nvv4l2decoder") != nullptr) {
+    record("decoder-element");
+  }
+  if (scenario() == "parse-error" || scenario() == "probe-parse-error") {
     *error = make_error("fake parse failure");
     return nullptr;
   }
-  return new FakePipeline;
+  auto* pipeline = new FakePipeline;
+  pipeline->parser_probe = parser_probe;
+  if (scenario() == "probe-parse-partial-error") {
+    *error = make_error("fake partial parse failure");
+  }
+  return pipeline;
 }
 
 RECO_FAKE_EXPORT void* gst_bin_get_by_name(void* pipeline_pointer, const char* name) {
@@ -369,33 +373,90 @@ RECO_FAKE_EXPORT void* gst_bin_get_by_name(void* pipeline_pointer, const char* n
     record("get-output-info");
     return scenario() == "missing-output-info" ? nullptr : new FakeOutputInfo(pipeline);
   }
+  if (name != nullptr && std::strcmp(name, "probe_info") == 0) {
+    record("get-probe-info");
+    return scenario() == "probe-missing-info" ? nullptr : new FakeProbeInfo(pipeline);
+  }
   return nullptr;
 }
 
 RECO_FAKE_EXPORT void* gst_element_get_static_pad(void* element_pointer, const char* name) {
   const auto* element = static_cast<FakeObject*>(element_pointer);
   const bool output = element->kind == ObjectKind::OutputInfo;
-  record(output ? "get-output-pad" : "get-display-pad");
+  const bool probe = element->kind == ObjectKind::ProbeInfo;
+  record(output ? "get-output-pad" : probe ? "get-probe-pad" : "get-display-pad");
   if (name == nullptr || std::strcmp(name, "src") != 0 ||
       (!output && scenario() == "missing-display-pad") ||
-      (output && scenario() == "missing-output-pad")) {
+      (output && scenario() == "missing-output-pad") ||
+      (probe && scenario() == "probe-missing-pad")) {
     return nullptr;
   }
   auto* pad = new FakePad;
   pad->output = output;
+  pad->probe = probe;
+  if (probe) {
+    pad->current_width = 3840;
+    pad->current_height = 2160;
+  }
   if (output) {
     static_cast<FakeOutputInfo*>(element_pointer)->pipeline->output_pad = pad;
-  } else {
+  } else if (!probe) {
     static_cast<FakeDisplayInfo*>(element_pointer)->pipeline->display_pad = pad;
   }
   return pad;
 }
 
 RECO_FAKE_EXPORT int gst_element_set_state(void*, int state) {
-  record(state == 4 ? "state-playing" : "state-null");
-  if (state == 4 && scenario() == "state-error") {
+  record(state == 4 ? "state-playing" : state == 3 ? "state-paused" : "state-null");
+  if ((state == 4 && scenario() == "state-error") ||
+      (state == 3 && scenario() == "probe-state-error")) {
     return 0;
   }
+  return 1;
+}
+
+RECO_FAKE_EXPORT int gst_element_get_state(void*, int* state, int* pending, std::uint64_t) {
+  record("get-state");
+  if (pending != nullptr) {
+    *pending = 0;
+  }
+  if (scenario() == "probe-stream-error" || scenario() == "probe-no-supported-video") {
+    return 0;
+  }
+  if (scenario() == "probe-timeout") {
+    if (state != nullptr) {
+      *state = 2;
+    }
+    return 2;
+  }
+  if (state != nullptr) {
+    *state = 3;
+  }
+  return 1;
+}
+
+RECO_FAKE_EXPORT int gst_element_query_duration(void*, int format, std::int64_t* duration) {
+  record("query-duration");
+  if (format != 3 || duration == nullptr || scenario() == "probe-duration-unknown") {
+    return 0;
+  }
+  if (scenario() == "probe-duration-zero") {
+    *duration = 0;
+    return 1;
+  }
+  if (scenario() == "probe-exact-frame-count") {
+    *duration = 100'100'000;
+    return 1;
+  }
+  if (scenario() == "probe-integral-frame-count") {
+    *duration = 1'001'000'000'000;
+    return 1;
+  }
+  if (scenario() == "probe-frame-count-overflow") {
+    *duration = std::numeric_limits<std::int64_t>::max();
+    return 1;
+  }
+  *duration = 10'000'000'000LL;
   return 1;
 }
 
@@ -433,6 +494,10 @@ RECO_FAKE_EXPORT void gst_object_unref(void* object) {
     record("unref-output-info");
     delete static_cast<FakeOutputInfo*>(object);
     break;
+  case ObjectKind::ProbeInfo:
+    record("unref-probe-info");
+    delete static_cast<FakeProbeInfo*>(object);
+    break;
   case ObjectKind::Pad:
     record("unref-display-pad");
     if (static_cast<FakePad*>(object)->probe_id != 0) {
@@ -445,11 +510,22 @@ RECO_FAKE_EXPORT void gst_object_unref(void* object) {
 
 RECO_FAKE_EXPORT void* gst_pad_get_current_caps(void* pad_pointer) {
   record("pad-current-caps");
-  if (scenario() == "missing-caps") {
+  const auto* pad = static_cast<FakePad*>(pad_pointer);
+  if (scenario() == "missing-caps" || (pad->probe && scenario() == "probe-missing-current-caps")) {
     return nullptr;
   }
-  const auto* pad = static_cast<FakePad*>(pad_pointer);
-  return new FakeCaps{.width = pad->current_width, .height = pad->current_height};
+  auto* caps = new FakeCaps{.width = pad->current_width, .height = pad->current_height};
+  if (pad->probe && scenario() == "probe-bad-dimensions") {
+    caps->width = 0;
+  } else if (pad->probe && scenario() == "probe-odd-dimensions") {
+    caps->width = 853;
+  } else if (pad->probe && scenario() == "probe-bad-fps") {
+    caps->fps_denominator = 0;
+  } else if (pad->probe && scenario() == "probe-high-fps") {
+    caps->fps_numerator = 90'000;
+    caps->fps_denominator = 1;
+  }
+  return caps;
 }
 
 RECO_FAKE_EXPORT unsigned long gst_pad_add_probe(void* pad_pointer, int,
@@ -681,7 +757,10 @@ RECO_FAKE_EXPORT void* gst_sample_get_caps(void* sample) {
 }
 
 RECO_FAKE_EXPORT void* gst_caps_get_structure(const void* caps, std::uint32_t index) {
-  return index == 0 && scenario() != "missing-caps-structure" ? const_cast<void*>(caps) : nullptr;
+  return index == 0 && scenario() != "missing-caps-structure" &&
+                 scenario() != "probe-missing-caps-structure"
+             ? const_cast<void*>(caps)
+             : nullptr;
 }
 
 RECO_FAKE_EXPORT int gst_structure_get_int(const void* structure, const char* field, int* value) {
@@ -704,6 +783,21 @@ RECO_FAKE_EXPORT int gst_structure_get_int(const void* structure, const char* fi
     return 1;
   }
   return 0;
+}
+
+RECO_FAKE_EXPORT int gst_structure_get_fraction(const void* structure, const char* field,
+                                                int* numerator, int* denominator) {
+  if (structure == nullptr || field == nullptr || numerator == nullptr || denominator == nullptr ||
+      std::strcmp(field, "framerate") != 0) {
+    return 0;
+  }
+  const auto* caps = static_cast<const FakeCaps*>(structure);
+  if (caps->magic != kFakeCapsMagic) {
+    return 0;
+  }
+  *numerator = caps->fps_numerator;
+  *denominator = caps->fps_denominator;
+  return 1;
 }
 
 RECO_FAKE_EXPORT void gst_sample_unref(void* sample) {
@@ -757,128 +851,3 @@ RECO_FAKE_EXPORT void g_error_free(GErrorAbi* error) {
 }
 
 RECO_FAKE_EXPORT void g_free(void* pointer) { std::free(pointer); }
-
-RECO_FAKE_EXPORT char* gst_filename_to_uri(const char* filename, GErrorAbi** error) {
-  record("filename-to-uri");
-  if (scenario() == "probe-uri-error") {
-    *error = make_error("fake URI conversion failure");
-    return nullptr;
-  }
-  const std::string uri = "file://" + std::string(filename);
-  return duplicate(uri.c_str());
-}
-
-RECO_FAKE_EXPORT void* gst_discoverer_new(std::uint64_t, GErrorAbi** error) {
-  record("discoverer-new");
-  if (scenario() == "probe-new-error") {
-    *error = make_error("fake discoverer construction failure");
-    return nullptr;
-  }
-  return new FakeDiscoverer;
-}
-
-RECO_FAKE_EXPORT void* gst_discoverer_discover_uri(void*, const char*, GErrorAbi** error) {
-  record("discover-uri");
-  if (scenario() == "probe-discover-error") {
-    *error = make_error("fake discovery failure");
-    return nullptr;
-  }
-  return new FakeDiscovererInfo;
-}
-
-RECO_FAKE_EXPORT int gst_discoverer_info_get_result(const void*) {
-  if (scenario() == "probe-timeout") {
-    return 3;
-  }
-  if (scenario() == "probe-missing-plugins") {
-    return 5;
-  }
-  return 0;
-}
-
-RECO_FAKE_EXPORT std::uint64_t gst_discoverer_info_get_duration(const void*) {
-  if (scenario() == "probe-duration-unknown") {
-    return std::numeric_limits<std::uint64_t>::max();
-  }
-  if (scenario() == "probe-duration-zero") {
-    return 0;
-  }
-  return 10'000'000'000ULL;
-}
-
-RECO_FAKE_EXPORT GListAbi* gst_discoverer_info_get_video_streams(void*) {
-  if (scenario() == "probe-no-video") {
-    return nullptr;
-  }
-
-  auto* first = new GListAbi;
-  first->data = new FakeVideoInfo;
-  auto* first_info = static_cast<FakeVideoInfo*>(first->data);
-  if (scenario() == "probe-image-only" || scenario() == "probe-image-then-video") {
-    first_info->image = true;
-  } else if (scenario() == "probe-bad-fps") {
-    first_info->fps_denominator = 0;
-  } else if (scenario() == "probe-bad-dimensions") {
-    first_info->width = 0;
-  } else if (scenario() == "probe-odd-dimensions") {
-    first_info->width = 853;
-  } else if (scenario() == "probe-high-fps") {
-    first_info->fps_numerator = 90'000;
-    first_info->fps_denominator = 1;
-  }
-
-  if (scenario() == "probe-multiple" || scenario() == "probe-image-then-video") {
-    auto* second = new GListAbi;
-    second->data = new FakeVideoInfo;
-    second->previous = first;
-    first->next = second;
-  }
-  return first;
-}
-
-RECO_FAKE_EXPORT std::uint32_t gst_discoverer_video_info_get_width(const void* info) {
-  return static_cast<const FakeVideoInfo*>(info)->width;
-}
-
-RECO_FAKE_EXPORT std::uint32_t gst_discoverer_video_info_get_height(const void* info) {
-  return static_cast<const FakeVideoInfo*>(info)->height;
-}
-
-RECO_FAKE_EXPORT std::uint32_t gst_discoverer_video_info_get_framerate_num(const void* info) {
-  return static_cast<const FakeVideoInfo*>(info)->fps_numerator;
-}
-
-RECO_FAKE_EXPORT std::uint32_t gst_discoverer_video_info_get_framerate_denom(const void* info) {
-  return static_cast<const FakeVideoInfo*>(info)->fps_denominator;
-}
-
-RECO_FAKE_EXPORT int gst_discoverer_video_info_is_image(const void* info) {
-  return static_cast<const FakeVideoInfo*>(info)->image ? 1 : 0;
-}
-
-RECO_FAKE_EXPORT void gst_discoverer_stream_info_list_free(GListAbi* list) {
-  record("stream-list-free");
-  while (list != nullptr) {
-    auto* next = list->next;
-    delete static_cast<FakeVideoInfo*>(list->data);
-    delete list;
-    list = next;
-  }
-}
-
-RECO_FAKE_EXPORT void g_object_unref(void* object) {
-  if (object == nullptr) {
-    return;
-  }
-  auto* base = static_cast<FakeGObject*>(object);
-  switch (base->kind) {
-  case GObjectKind::Discoverer:
-    record("unref-discoverer");
-    delete static_cast<FakeDiscoverer*>(object);
-    break;
-  case GObjectKind::DiscovererInfo:
-    record("unref-discoverer-info");
-    delete static_cast<FakeDiscovererInfo*>(object);
-    break;
-  }
-}

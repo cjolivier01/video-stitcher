@@ -2,7 +2,6 @@
 
 #include "reco/io/gpu_decode.hpp"
 
-#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -26,12 +25,8 @@ struct GpuVideoProbe {
   std::uint64_t duration_ns = 0;
   /// Truncated `duration * fps` frame-count estimate.
   std::uint64_t total_frames = 0;
-  /// Number of non-image video streams discovered in the container.
-  std::size_t video_stream_count = 0;
   /// Whether `duration_ns` uses the Rust-compatible 60-second fallback.
   bool duration_is_estimated = false;
-  /// False when usable metadata was returned with missing-plugin warnings.
-  bool discovery_complete = false;
 };
 
 /// Failure while probing a GPU-decodable video without materializing frames.
@@ -40,7 +35,10 @@ public:
   explicit GpuVideoProbeError(std::string message) : std::runtime_error(std::move(message)) {}
 };
 
-/// Uses GStreamer Discoverer to probe a local GPU-decodable input.
+/// Uses the production GStreamer demux/parser topology to probe a local input.
+///
+/// The pipeline stops before NVDEC and never produces a decoded frame. The
+/// timeout must be between one second and one hour, inclusive.
 [[nodiscard]] GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config,
                                             std::uint64_t timeout_ns);
 
