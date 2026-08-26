@@ -391,6 +391,25 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_true(duplicate_reorder_cutoff.total_frames_is_estimated,
               "bounded reordered duplicate PTS count remains explicitly estimated");
 
+  set_scenario("probe-duplicate-pts-transition-untimed-tail");
+  const auto duplicate_transition_untimed_tail =
+      probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(duplicate_transition_untimed_tail.fps_numerator, 25U,
+            "untimed tail does not hide an earlier duplicate PTS cadence transition");
+  expect_eq(duplicate_transition_untimed_tail.fps_denominator, 1U,
+            "duplicate transition before an untimed tail preserves the caps denominator");
+  expect_eq(duplicate_transition_untimed_tail.total_frames, 513ULL,
+            "duplicate transition before an untimed tail preserves the AU lower bound");
+
+  set_scenario("probe-duplicate-pts-larger-reorder-suffix");
+  const auto larger_reorder_suffix = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(larger_reorder_suffix.fps_numerator, 25U,
+            "larger duplicate groups in the reorder suffix invalidate multiplicity");
+  expect_eq(larger_reorder_suffix.fps_denominator, 1U,
+            "larger reorder-suffix groups preserve the caps denominator");
+  expect_eq(larger_reorder_suffix.total_frames, 513ULL,
+            "larger reorder-suffix groups preserve the AU lower bound");
+
   set_scenario("probe-paired-au-missing-pts");
   const auto paired_missing_pts = probe_gpu_video(container_config(video_path), timeout_ns);
   expect_eq(paired_missing_pts.fps_numerator, 50U,
@@ -503,6 +522,15 @@ void probe_contracts(const std::filesystem::path& video_path,
               "bounded-seek count remains explicitly estimated");
   expect_true(seek_preroll.duration_is_estimated,
               "bounded terminal seek duration remains explicitly estimated");
+
+  set_scenario("probe-seek-unknown-pts-preroll");
+  const auto unknown_pts_preroll = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(unknown_pts_preroll.total_frames, 5'995ULL,
+            "PTS-less seek preroll is skipped before duration correlation");
+  expect_true(unknown_pts_preroll.total_frames_is_estimated,
+              "PTS-less seek-preroll count remains explicitly estimated");
+  expect_true(unknown_pts_preroll.duration_is_estimated,
+              "PTS-less seek-preroll duration remains explicitly estimated");
 
   set_scenario("probe-ok");
   expect_eq(probe_gpu_video(container_config(video_path), 1'000'000'000ULL).width, 3840U,

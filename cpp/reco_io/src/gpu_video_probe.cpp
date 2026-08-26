@@ -590,17 +590,35 @@ std::optional<InferredFrameRate> infer_constant_frame_rate(const TimingScan& sca
   auto times = scan.stream_times;
   const auto stored_end = times.begin() + static_cast<std::ptrdiff_t>(scan.stored_timing_count);
   std::sort(times.begin(), stored_end);
+  std::array<std::pair<std::uint64_t, std::uint64_t>, kStoredTimingSamples> timing_points{};
+  for (std::size_t index = 0; index < scan.stored_timing_count; ++index) {
+    timing_points[index] = {scan.stream_times[index], scan.timed_sample_indices[index]};
+  }
+  const auto point_end =
+      timing_points.begin() + static_cast<std::ptrdiff_t>(scan.stored_timing_count);
+  std::sort(timing_points.begin(), point_end);
+  const auto reorder_suffix_start =
+      scan.sample_count > kTimingReorderLookahead ? scan.sample_count - kTimingReorderLookahead : 0;
   std::size_t duplicate_timestamp_multiplicity = 0;
-  for (auto group_begin = times.begin(); group_begin != stored_end;) {
-    const auto group_end = std::find_if(
-        group_begin, stored_end, [value = *group_begin](auto item) { return item != value; });
+  for (auto group_begin = timing_points.begin(); group_begin != point_end;) {
+    const auto group_end =
+        std::find_if(group_begin, point_end, [value = group_begin->first](const auto& item) {
+          return item.first != value;
+        });
     const auto group_size = static_cast<std::size_t>(group_end - group_begin);
     if (duplicate_timestamp_multiplicity == 0) {
       duplicate_timestamp_multiplicity = group_size;
-    } else if (group_size != duplicate_timestamp_multiplicity &&
-               (complete_stream ||
-                static_cast<std::size_t>(stored_end - group_begin) > kTimingReorderLookahead)) {
-      return std::nullopt;
+    } else if (group_size != duplicate_timestamp_multiplicity) {
+      const bool partial_group_is_in_reorder_suffix =
+          !complete_stream && group_size < duplicate_timestamp_multiplicity &&
+          std::all_of(
+              group_begin, group_end,
+              [reorder_suffix_start](const auto& item) {
+                return item.second >= reorder_suffix_start;
+              });
+      if (!partial_group_is_in_reorder_suffix) {
+        return std::nullopt;
+      }
     }
     group_begin = group_end;
   }
@@ -689,24 +707,31 @@ UntimedPresentationPrefix infer_untimed_presentation_prefix(const TimingScan& sc
       !scan.first_stream_time.has_value()) {
     return {};
   }
-  std::array<std::uint64_t, kTimingAnalysisSamples> origin_candidates{};
-  const auto candidate_count = std::min(scan.stored_timing_count, origin_candidates.size());
+  constexpr auto kOriginCandidateCount = kTimingAnalysisSamples + kTimingReorderLookahead;
+  const auto candidate_count = std::min(scan.stored_timing_count, kOriginCandidateCount);
+  // A signed mean over the analysis window plus reorder lookahead cancels
+  // complete decode-order permutations without biasing the timeline origin.
+  long double origin_sum = 0.0L;
   for (std::size_t index = 0; index < candidate_count; ++index) {
     const auto nominal_offset =
         frame_timestamp_ns(scan.timed_sample_indices[index], fps_numerator, fps_denominator);
-    origin_candidates[index] =
-        scan.stream_times[index] > nominal_offset ? scan.stream_times[index] - nominal_offset : 0;
+    origin_sum += static_cast<long double>(scan.stream_times[index]) - nominal_offset;
   }
-  const auto candidate_end =
-      origin_candidates.begin() + static_cast<std::ptrdiff_t>(candidate_count);
-  std::sort(origin_candidates.begin(), candidate_end);
-  const auto estimated_origin = origin_candidates[candidate_count / 2U];
+  const auto estimated_origin_value = origin_sum / static_cast<long double>(candidate_count);
+  const auto estimated_origin =
+      estimated_origin_value <= 0.0L ? 0
+      : estimated_origin_value >=
+              static_cast<long double>(std::numeric_limits<std::uint64_t>::max())
+          ? std::numeric_limits<std::uint64_t>::max()
+          : static_cast<std::uint64_t>(estimated_origin_value);
   if (*scan.first_stream_time <= estimated_origin) {
     return {};
   }
   const auto available_prefix_duration = *scan.first_stream_time - estimated_origin;
+  const auto half_frame_duration = kNanosecondsPerSecond * fps_denominator / (2ULL * fps_numerator);
   const auto available_prefix_frames =
-      frame_count_ceiling_for_duration(available_prefix_duration, fps_numerator, fps_denominator);
+      frame_count_for_duration(add_saturating(available_prefix_duration, half_frame_duration),
+                               fps_numerator, fps_denominator);
   const auto frame_count = std::min(scan.timed_sample_indices[0], available_prefix_frames);
   return {.frame_count = frame_count,
           .duration_ns =
@@ -790,23 +815,25 @@ FrameSeekResult seek_compressed_frame(const std::shared_ptr<ProbeApi>& api, void
     if (buffer == nullptr) {
       throw GpuVideoProbeError("GStreamer parser-only probe returned a sample without a buffer");
     }
-    if (buffer->pts == kGstClockTimeNone) {
-      return {.usable = false};
+    const bool has_presentation_time = buffer->pts != kGstClockTimeNone;
+    const auto timestamp = has_presentation_time ? buffer->pts : buffer->dts;
+    if (timestamp == kGstClockTimeNone) {
+      continue;
     }
     const void* segment = api->sample_get_segment(sample);
     if (segment == nullptr) {
       return {.usable = false};
     }
-    const auto stream_pts = api->segment_to_stream_time(segment, kGstFormatTime, buffer->pts);
-    if (stream_pts == kGstClockTimeNone) {
+    const auto stream_time = api->segment_to_stream_time(segment, kGstFormatTime, timestamp);
+    if (stream_time == kGstClockTimeNone) {
       continue;
     }
-    if (stream_pts < earliest_matching_pts) {
+    if (stream_time < earliest_matching_pts) {
       continue;
     }
     return {.usable = true,
             .available = true,
-            .pts_ns = stream_pts,
+            .pts_ns = has_presentation_time ? stream_time : target_ns,
             .duration_ns = buffer->duration == 0 || buffer->duration == kGstClockTimeNone
                                ? nominal_duration_ns
                                : buffer->duration};
