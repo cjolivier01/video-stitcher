@@ -34,6 +34,9 @@ struct GpuVideoProbe {
   /// Whether `total_frames` comes from bounded duration/timestamp correlation
   /// instead of an EOS-proven compressed access-unit count.
   bool total_frames_is_estimated = false;
+  /// True only when every selected-stream access unit was observed through EOS
+  /// with unchanged codec, geometry, and timing caps.
+  bool selected_stream_caps_verified = false;
   /// True only when every selected-stream presentation timestamp was checked
   /// against one constant cadence. Callers must require this before converting
   /// calibration timestamps to frame indices.
@@ -50,9 +53,11 @@ public:
 ///
 /// The pipeline stops before NVDEC and never produces a decoded frame. The
 /// selected stream's duration is correlated with bounded seeks over compressed
-/// access-unit timestamps. Dense timestamp streams are scanned to EOS and
-/// report an exact AU count. Sparse or incomplete timing keeps counting
-/// bounded and exposes an explicitly estimated count for longer streams.
+/// access-unit timestamps. Short dense timestamp streams are scanned to EOS and
+/// report an exact AU count. Longer, sparse, or incomplete timing stays bounded
+/// and exposes explicit count, caps, and cadence verification state.
+/// Matroska compressed-buffer durations preserve the exact selected-track
+/// rational when GStreamer normalizes negotiated caps.
 /// Dense timestamp evidence that proves variable frame rate is rejected
 /// because indexed calibration sampling requires a constant cadence.
 /// Sparse or incomplete timestamp evidence is returned with

@@ -435,7 +435,7 @@ int main(int argc, char** argv) {
                std::strcmp(scenario, "oversized-metadata") == 0) {
       const bool negative = std::strcmp(scenario, "negative-metadata") == 0;
       const bool oversized = std::strcmp(scenario, "oversized-metadata") == 0;
-      response = {{"protocol_version", 2},
+      response = {{"protocol_version", 3},
                   {"ok", true},
                   {"width",
                    negative ? nlohmann::json(-2)
@@ -457,6 +457,7 @@ int main(int argc, char** argv) {
                   {"total_frames", negative ? nlohmann::json(-1) : nlohmann::json(30)},
                   {"duration_is_estimated", false},
                   {"total_frames_is_estimated", false},
+                  {"selected_stream_caps_verified", true},
                   {"indexed_sampling_cadence_verified", true}};
     }
     const auto encoded = nlohmann::json::to_cbor(response);

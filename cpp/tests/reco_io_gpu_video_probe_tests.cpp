@@ -141,6 +141,25 @@ wait_for_process_marker(const std::filesystem::path& path,
   return std::nullopt;
 }
 
+#if defined(__linux__)
+std::optional<pid_t> wait_for_direct_child(pid_t parent,
+                                           std::chrono::steady_clock::time_point deadline) {
+  const auto task_path = std::filesystem::path("/proc") / std::to_string(parent) / "task";
+  while (std::chrono::steady_clock::now() < deadline) {
+    std::error_code directory_error;
+    for (const auto& task : std::filesystem::directory_iterator(task_path, directory_error)) {
+      std::ifstream children(task.path() / "children");
+      pid_t child = -1;
+      if (children >> child && child > 0) {
+        return child;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return std::nullopt;
+}
+#endif
+
 #if defined(_WIN32)
 class WindowsHandle {
 public:
@@ -210,7 +229,13 @@ GpuFileDecodeConfig elementary_config(const std::filesystem::path& path, GpuDeco
 }
 
 GpuVideoProbe probe_video(const GpuFileDecodeConfig& config, std::uint64_t timeout_ns) {
-  return reco::io::probe_gpu_video(config, probe_worker_path, timeout_ns);
+  try {
+    return reco::io::probe_gpu_video(config, probe_worker_path, timeout_ns);
+  } catch (const GpuVideoProbeError& error) {
+    const char* scenario = std::getenv("RECO_FAKE_GST_SCENARIO");
+    throw GpuVideoProbeError(std::string(scenario == nullptr ? "unknown" : scenario) + ": " +
+                             error.what());
+  }
 }
 
 #if defined(_WIN32)
@@ -244,6 +269,10 @@ bool has_event(const std::vector<std::string>& events, std::string_view value) {
   return std::find(events.begin(), events.end(), value) != events.end();
 }
 
+std::size_t count_event(const std::vector<std::string>& events, std::string_view value) {
+  return static_cast<std::size_t>(std::count(events.begin(), events.end(), value));
+}
+
 void probe_contracts(const std::filesystem::path& video_path,
                      const std::filesystem::path& event_path) {
   constexpr std::uint64_t timeout_ns = 60'000'000'000ULL;
@@ -261,6 +290,8 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_true(!result.total_frames_is_estimated, "EOS-proven frame count is exact");
   expect_true(result.indexed_sampling_cadence_verified,
               "dense full-stream timing is safe for indexed calibration sampling");
+  expect_true(result.selected_stream_caps_verified,
+              "EOS scan verifies codec, geometry, and timing caps for every access unit");
 
   const auto events = read_events(event_path);
   expect_true(has_event(events, "parse-probe"), "probe constructs parser-only pipeline");
@@ -268,6 +299,8 @@ void probe_contracts(const std::filesystem::path& video_path,
               "container probe filters out attached images and unsupported codecs");
   expect_true(has_event(events, "probe-parsebin"),
               "container probe uses the production parser selection topology");
+  expect_true(has_event(events, "probe-container-info"),
+              "container probe retains the pre-parser rational metadata caps");
   expect_true(has_event(events, "probe-decoder-caps"),
               "probe constrains parser output to the NVDEC sink contract");
   expect_true(has_event(events, "state-playing"),
@@ -279,23 +312,25 @@ void probe_contracts(const std::filesystem::path& video_path,
               "probe seeks only compressed access-unit timestamps");
   expect_true(has_event(events, "sample-caps"),
               "probe reads caps from the retained compressed sample");
-  expect_true(!has_event(events, "pad-current-caps"), "probe does not race mutable live-pad caps");
+  expect_true(has_event(events, "pad-current-caps"),
+              "probe reads negotiated pre-parser caps after compressed-sample preroll");
   expect_true(!has_event(events, "map"), "probe does not map frame memory");
   expect_true(!has_event(events, "raw-video-caps"), "probe never negotiates raw video caps");
 
   set_scenario("probe-duration-unknown");
   const auto unknown_duration = probe_video(container_config(video_path), timeout_ns);
-  expect_eq(unknown_duration.duration_ns, 200'033'166'667ULL,
+  expect_eq(unknown_duration.duration_ns, 200'000'000'000ULL,
             "unknown duration covers the EOS-proven compressed AU count");
   expect_eq(unknown_duration.total_frames, 5'995ULL,
             "unknown container duration retains the full-stream exact count");
-  expect_true(unknown_duration.duration_is_estimated, "unknown duration is marked estimated");
+  expect_true(!unknown_duration.duration_is_estimated,
+              "EOS timing supersedes missing container duration metadata");
   expect_true(!unknown_duration.total_frames_is_estimated,
               "dense EOS-proven frame count is exact despite unknown duration metadata");
 
   set_scenario("probe-duration-zero");
-  expect_true(probe_video(container_config(video_path), timeout_ns).duration_is_estimated,
-              "zero duration uses explicit estimate");
+  expect_true(!probe_video(container_config(video_path), timeout_ns).duration_is_estimated,
+              "EOS timing supersedes a zero container duration");
 
   set_scenario("probe-exact-frame-count");
   expect_eq(probe_video(container_config(video_path), timeout_ns).total_frames, 3ULL,
@@ -306,9 +341,11 @@ void probe_contracts(const std::filesystem::path& video_path,
             "integral rational frame count is not rounded down");
 
   set_scenario("probe-frame-count-overflow");
-  expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
-                     "full cadence validation limit",
-                     "impractically large streams fail closed instead of skipping cadence proof");
+  const auto enormous_estimate = probe_video(container_config(video_path), timeout_ns);
+  expect_true(enormous_estimate.total_frames_is_estimated,
+              "impractically large streams retain explicitly estimated frame counts");
+  expect_true(!enormous_estimate.indexed_sampling_cadence_verified,
+              "impractically large streams do not claim an exhaustive cadence proof");
 
   set_scenario("probe-duration-mismatch");
   const auto selected_duration = probe_video(container_config(video_path), timeout_ns);
@@ -452,6 +489,8 @@ void probe_contracts(const std::filesystem::path& video_path,
               "bounded long untimed-prefix count remains explicitly estimated");
   expect_true(!long_mixed_prefix.indexed_sampling_cadence_verified,
               "incomplete PTS evidence is not exposed as an indexed-sampling cadence proof");
+  expect_true(!long_mixed_prefix.selected_stream_caps_verified,
+              "bounded untimed timing does not claim full-stream caps stability");
 
   set_scenario("probe-reordered-untimed-prefix");
   const auto reordered_untimed_prefix = probe_video(container_config(video_path), timeout_ns);
@@ -484,6 +523,8 @@ void probe_contracts(const std::filesystem::path& video_path,
               "long elementary AU count is explicitly estimated");
   expect_true(long_untimed_elementary.duration_is_estimated,
               "untimed elementary duration query is not treated as authoritative");
+  expect_true(!long_untimed_elementary.selected_stream_caps_verified,
+              "bounded elementary probing leaves full-stream caps stability unverified");
 
   set_scenario("probe-vfr-unset-fps");
   expect_probe_error(
@@ -526,6 +567,17 @@ void probe_contracts(const std::filesystem::path& video_path,
             "duplicate PTS pairs retain their EOS-proven AU count");
   expect_eq(duplicate_pts.duration_ns, 4'000'000'000ULL,
             "duplicate PTS pairs retain their observed terminal span");
+
+  set_scenario("probe-triplicate-pts");
+  const auto triplicate_pts = probe_video(container_config(video_path), timeout_ns);
+  expect_eq(triplicate_pts.fps_numerator, 75U,
+            "triplicate PTS groups retain their access-unit rate");
+  expect_eq(triplicate_pts.total_frames, 300ULL,
+            "triplicate PTS groups retain their exact access-unit count");
+  expect_eq(triplicate_pts.duration_ns, 4'000'000'000ULL,
+            "verified cadence closes the full triplicate terminal group");
+  expect_true(!triplicate_pts.duration_is_estimated,
+              "verified cadence and exact count provide an exact triplicate duration");
 
   set_scenario("probe-long-duplicate-pts-pairs");
   const auto long_duplicate_pts = probe_video(container_config(video_path), timeout_ns);
@@ -650,13 +702,20 @@ void probe_contracts(const std::filesystem::path& video_path,
             "exact near-canonical caps preserve their denominator");
 
   set_scenario("probe-container-exact-5997-parser-ntsc");
-  const auto container_exact_5997 = probe_video(container_config(video_path), timeout_ns);
+  auto exact_matroska_config = container_config(video_path);
+  exact_matroska_config.container = GpuDecodeContainer::Matroska;
+  const auto container_exact_5997 = probe_video(exact_matroska_config, timeout_ns);
   expect_eq(container_exact_5997.fps_numerator, 5'997U,
             "exact container cadence overrides normalized parser caps");
   expect_eq(container_exact_5997.fps_denominator, 100U,
             "exact container cadence preserves its noncanonical denominator");
   expect_eq(container_exact_5997.total_frames, 600ULL,
             "near-NTSC conflict extension retains the exact AU count");
+
+  set_scenario("probe-matroska-duration-transition");
+  expect_probe_error([&] { (void)probe_video(exact_matroska_config, timeout_ns); },
+                     "compressed-buffer durations disagree",
+                     "Matroska DefaultDuration changes cannot retain an exact indexed rate");
 
   set_scenario("probe-quantized-no-vui-5994");
   const auto quantized_no_vui = probe_video(container_config(video_path), timeout_ns);
@@ -698,6 +757,29 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_true(!bounded_unset_15.total_frames_is_estimated,
               "durationless dense full-stream frame count is exact");
 
+  std::filesystem::remove(event_path);
+  set_scenario("probe-million-au-no-duration");
+  const auto bounded_million = probe_video(container_config(video_path), timeout_ns);
+  expect_true(bounded_million.total_frames_is_estimated,
+              "million-AU durationless probe keeps its bounded count explicitly estimated");
+  expect_true(!bounded_million.selected_stream_caps_verified,
+              "bounded long probe does not claim complete selected-stream caps coverage");
+  expect_true(!bounded_million.indexed_sampling_cadence_verified,
+              "bounded long probe does not claim exhaustive cadence coverage");
+  const auto bounded_events = read_events(event_path);
+  expect_eq(count_event(bounded_events, "pull-probe"), 10'000U,
+            "durationless long probe reads exactly the eager 10,000-AU ceiling");
+  expect_eq(count_event(bounded_events, "seek-compressed"), 0U,
+            "durationless long probe does not add random-access work");
+
+  std::filesystem::remove(event_path);
+  set_scenario("probe-long-gop-seek-budget");
+  expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
+                     "frame-seek work limit",
+                     "long-GOP seek preroll fails closed at its compressed-AU budget");
+  expect_true(count_event(read_events(event_path), "pull-probe") <= 5'600U,
+              "long-GOP duration correlation cannot scan the recording from its first keyframe");
+
   set_scenario("probe-late-vfr-after-bounded-prefix");
   expect_probe_error(
       [&] { (void)probe_video(container_config(video_path), timeout_ns); }, "variable frame-rate",
@@ -721,7 +803,7 @@ void probe_contracts(const std::filesystem::path& video_path,
   set_scenario("probe-vfr-between-windows");
   expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
                      "variable frame-rate",
-                     "full-stream cadence validation covers regions between fixed seek windows");
+                     "bounded sequential cadence validation catches the interior transition");
 
   set_scenario("probe-interior-seek-gap");
   expect_probe_error(
@@ -737,6 +819,16 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_probe_error(
       [&] { (void)probe_video(container_config(video_path), timeout_ns); }, "variable frame-rate",
       "a dense gap immediately before the reorder suffix remains part of prefix analysis");
+
+  set_scenario("probe-descending-pts");
+  expect_probe_error(
+      [&] { (void)probe_video(container_config(video_path), timeout_ns); }, "reorder depth",
+      "descending PTS cannot grow unresolved cadence state beyond the reorder bound");
+
+  set_scenario("probe-oldest-pts-refresh");
+  expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
+                     "reorder depth",
+                     "refreshing the oldest pending PTS cannot grow cadence state without bound");
 
   std::filesystem::remove(event_path);
   set_scenario("probe-terminal-60-eos");
@@ -817,8 +909,8 @@ void probe_contracts(const std::filesystem::path& video_path,
   const auto seek_preroll = probe_video(container_config(video_path), timeout_ns);
   expect_eq(seek_preroll.total_frames, 5'995ULL,
             "seek preroll outside the active segment is ignored");
-  expect_true(!seek_preroll.total_frames_is_estimated,
-              "full sequential cadence scan proves the seek-preroll frame count");
+  expect_true(seek_preroll.total_frames_is_estimated,
+              "bounded seek-preroll frame count remains explicitly estimated");
   expect_true(seek_preroll.duration_is_estimated,
               "bounded terminal seek duration remains explicitly estimated");
 
@@ -826,8 +918,8 @@ void probe_contracts(const std::filesystem::path& video_path,
   const auto unknown_pts_preroll = probe_video(container_config(video_path), timeout_ns);
   expect_eq(unknown_pts_preroll.total_frames, 5'995ULL,
             "PTS-less seek preroll is skipped before duration correlation");
-  expect_true(!unknown_pts_preroll.total_frames_is_estimated,
-              "full sequential cadence scan proves the PTS-less seek-preroll frame count");
+  expect_true(unknown_pts_preroll.total_frames_is_estimated,
+              "bounded PTS-less seek-preroll frame count remains explicitly estimated");
   expect_true(unknown_pts_preroll.duration_is_estimated,
               "PTS-less seek-preroll duration remains explicitly estimated");
 
@@ -1071,6 +1163,59 @@ void launch_gate_prevents_post_timeout_process_start(const std::filesystem::path
   expect_true(!has_event(events, "request"), "expired launch sequence does not write a request");
   set_environment("RECO_FAKE_PROBE_LIFECYCLE_PATH", "");
   std::filesystem::remove(lifecycle_path);
+}
+
+void guardian_death_before_pid_report_reclaims_worker(const std::filesystem::path& video_path) {
+#if defined(__linux__)
+  const auto caller = ::fork();
+  if (caller == 0) {
+    try {
+      (void)reco::io::detail::probe_gpu_video_with_pre_worker_report_delay_for_test(
+          container_config(video_path), fake_probe_worker_path, 30'000'000'000ULL,
+          5'000'000'000ULL);
+      std::_Exit(2);
+    } catch (...) {
+      std::_Exit(0);
+    }
+  }
+  expect_true(caller > 0, "pre-report guardian-death caller starts");
+  if (caller <= 0) {
+    return;
+  }
+
+  const auto discovery_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  const auto guardian = wait_for_direct_child(caller, discovery_deadline);
+  const auto worker =
+      guardian.has_value() ? wait_for_direct_child(*guardian, discovery_deadline) : std::nullopt;
+  expect_true(guardian.has_value(), "guardian starts before the delayed PID report");
+  expect_true(worker.has_value(), "start-gated worker exists before its PID is reported");
+  if (guardian.has_value()) {
+    (void)::kill(*guardian, SIGKILL);
+  }
+
+  int caller_status = 0;
+  while (::waitpid(caller, &caller_status, 0) < 0 && errno == EINTR) {
+  }
+  expect_true(WIFEXITED(caller_status) && WEXITSTATUS(caller_status) == 0,
+              "guardian loss fails the blocked probe call");
+
+  bool worker_exited = false;
+  const auto exit_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (worker.has_value() && std::chrono::steady_clock::now() < exit_deadline) {
+    errno = 0;
+    if (::kill(*worker, 0) != 0 && errno == ESRCH) {
+      worker_exited = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  expect_true(worker_exited, "guardian death closes the unreleased worker start gate");
+  if (worker.has_value() && !worker_exited) {
+    (void)::kill(*worker, SIGKILL);
+  }
+#else
+  (void)video_path;
+#endif
 }
 
 void auto_reaped_workers_are_supported(const std::filesystem::path& video_path) {
@@ -1717,6 +1862,7 @@ int main(int argc, char** argv) {
   worker_ipc_failures_are_bounded(video_path);
   delayed_supervision_cannot_launch_worker(video_path);
   launch_gate_prevents_post_timeout_process_start(video_path);
+  guardian_death_before_pid_report_reclaims_worker(video_path);
   auto_reaped_workers_are_supported(video_path);
   windows_job_reclaims_worker_descendants(video_path);
   unrelated_descriptors_are_not_inherited(video_path);

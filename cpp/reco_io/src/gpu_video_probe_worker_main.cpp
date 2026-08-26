@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <string_view>
 #include <system_error>
 #include <vector>
@@ -103,7 +104,10 @@ int main(int argc, char** argv) {
   const auto [end, error] =
       std::from_chars(pid_value.data(), pid_value.data() + pid_value.size(), expected_parent_pid);
   if (error != std::errc{} || end != pid_value.data() + pid_value.size() ||
-      expected_parent_pid == 0 || (value[separator + 1] == '0' && !close_unrelated_descriptors())) {
+      expected_parent_pid == 0 ||
+      expected_parent_pid > static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max()) ||
+      static_cast<std::uint64_t>(::getppid()) != expected_parent_pid ||
+      (value[separator + 1] == '0' && !close_unrelated_descriptors())) {
     return 2;
   }
   return reco::io::detail::run_gpu_video_probe_worker();

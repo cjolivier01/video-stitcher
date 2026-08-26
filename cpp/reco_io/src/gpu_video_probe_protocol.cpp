@@ -16,7 +16,7 @@ namespace {
 
 constexpr std::size_t kMaximumErrorMessageBytes = 1024;
 constexpr std::size_t kMaximumCborNestingDepth = 32;
-constexpr std::uint32_t kProbeProtocolVersion = 2;
+constexpr std::uint32_t kProbeProtocolVersion = 3;
 constexpr double kMaximumSaneFps = 1000.0;
 constexpr std::uint32_t kMaximumGpuVideoDimension = 8'192;
 constexpr std::uint64_t kMaximumNv12FrameBytes = 8'192ULL * 8'192ULL * 3ULL / 2ULL;
@@ -408,6 +408,7 @@ std::string encode_probe_success(const GpuVideoProbe& probe) {
       {"total_frames", probe.total_frames},
       {"duration_is_estimated", probe.duration_is_estimated},
       {"total_frames_is_estimated", probe.total_frames_is_estimated},
+      {"selected_stream_caps_verified", probe.selected_stream_caps_verified},
       {"indexed_sampling_cadence_verified", probe.indexed_sampling_cadence_verified}});
 }
 
@@ -454,6 +455,8 @@ GpuVideoProbe decode_probe_response(std::string_view payload) {
       required_value<bool>(response, "duration_is_estimated", "video probe worker response");
   probe.total_frames_is_estimated =
       required_value<bool>(response, "total_frames_is_estimated", "video probe worker response");
+  probe.selected_stream_caps_verified = required_value<bool>(
+      response, "selected_stream_caps_verified", "video probe worker response");
   probe.indexed_sampling_cadence_verified = required_value<bool>(
       response, "indexed_sampling_cadence_verified", "video probe worker response");
   if (!gpu_geometry_is_valid(probe.width, probe.height) || probe.fps_numerator == 0 ||
@@ -476,6 +479,14 @@ GpuVideoProbe decode_probe_response(std::string_view payload) {
   if ((probe.duration_is_estimated || probe.total_frames_is_estimated) &&
       !estimated_frame_count_is_plausible(probe)) {
     throw GpuVideoProbeError("video probe worker returned implausible estimated metadata");
+  }
+  if (probe.indexed_sampling_cadence_verified &&
+      (probe.total_frames < 3 || probe.total_frames_is_estimated ||
+       !probe.selected_stream_caps_verified || !exact_frame_count_is_consistent(probe))) {
+    throw GpuVideoProbeError("video probe worker returned inconsistent cadence proof metadata");
+  }
+  if (probe.selected_stream_caps_verified && probe.total_frames_is_estimated) {
+    throw GpuVideoProbeError("video probe worker returned inconsistent caps proof metadata");
   }
   return probe;
 }

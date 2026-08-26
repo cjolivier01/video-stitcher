@@ -60,12 +60,15 @@ constexpr std::uint64_t kMaximumDecodeReorderFrames = 32;
 // prefix are explicitly marked estimated after duration correlation.
 constexpr std::uint64_t kMaximumExactCountSamples = 512;
 constexpr std::uint64_t kMaximumConflictingMetadataCountSamples = 4096;
-constexpr std::uint64_t kMaximumFullCadenceValidationSamples = 10'000'000;
+// Keep metadata probing bounded. Longer streams use sparse timing windows and
+// remain explicitly unverified for frame-index sampling.
+constexpr std::uint64_t kMaximumEagerCadenceValidationSamples = 10'000;
 constexpr std::uint64_t kTailTimingWindowNs = 5ULL * kNanosecondsPerSecond;
 constexpr std::uint64_t kTimingWindowSeekPrerollNs = kNanosecondsPerSecond;
 // Five seconds at the highest accepted frame rate plus a complete decoder
 // reorder suffix. This also remains larger than the bounded prefix scan.
 constexpr std::size_t kMaximumTimingWindowSamples = 5'000 + kTimingReorderLookahead + 1;
+constexpr std::uint64_t kMaximumCompressedSamplePulls = 50'000;
 constexpr std::size_t kStoredTimingSamples = kMaximumTimingWindowSamples;
 static_assert(kStoredTimingSamples >= kTimingAnalysisSamples + kTimingReorderLookahead);
 static_assert(kStoredTimingSamples > kMaximumConflictingMetadataCountSamples);
@@ -283,6 +286,7 @@ public:
   using ParseLaunch = void* (*)(const char*, GErrorAbi**);
   using BinGetByName = void* (*)(void*, const char*);
   using ElementGetStaticPad = void* (*)(void*, const char*);
+  using PadGetCurrentCaps = void* (*)(void*);
   using ElementSetState = int (*)(void*, int);
   using ElementGetBus = void* (*)(void*);
   using ElementQueryDuration = int (*)(void*, int, std::int64_t*);
@@ -304,6 +308,7 @@ public:
   using MessageParseError = void (*)(void*, GErrorAbi**, char**);
   using MessageUnref = void (*)(void*);
   using ObjectUnref = void (*)(void*);
+  using CapsUnref = void (*)(void*);
   using ErrorFree = void (*)(GErrorAbi*);
   using Free = void (*)(void*);
 
@@ -314,11 +319,26 @@ public:
     glib = load_library("RECO_GLIB_DYLIB_PATH", {"libglib-2.0-0.dll", "glib-2.0-0.dll"}, "GLib");
 #elif defined(__APPLE__)
     core = load_library("RECO_GSTREAMER_DYLIB_PATH",
-                        {"libgstreamer-1.0.0.dylib", "libgstreamer-1.0.dylib"}, "GStreamer");
-    app = load_library("RECO_GSTAPP_DYLIB_PATH", {"libgstapp-1.0.0.dylib", "libgstapp-1.0.dylib"},
+                        {"libgstreamer-1.0.0.dylib", "libgstreamer-1.0.dylib",
+                         "/opt/homebrew/lib/libgstreamer-1.0.0.dylib",
+                         "/usr/local/lib/libgstreamer-1.0.0.dylib",
+                         "/Library/Frameworks/GStreamer.framework/Versions/1.0/lib/"
+                         "libgstreamer-1.0.0.dylib"},
+                        "GStreamer");
+    app = load_library("RECO_GSTAPP_DYLIB_PATH",
+                       {"libgstapp-1.0.0.dylib", "libgstapp-1.0.dylib",
+                        "/opt/homebrew/lib/libgstapp-1.0.0.dylib",
+                        "/usr/local/lib/libgstapp-1.0.0.dylib",
+                        "/Library/Frameworks/GStreamer.framework/Versions/1.0/lib/"
+                        "libgstapp-1.0.0.dylib"},
                        "GstApp");
     glib =
-        load_library("RECO_GLIB_DYLIB_PATH", {"libglib-2.0.0.dylib", "libglib-2.0.dylib"}, "GLib");
+        load_library("RECO_GLIB_DYLIB_PATH",
+                     {"libglib-2.0.0.dylib", "libglib-2.0.dylib",
+                      "/opt/homebrew/lib/libglib-2.0.0.dylib", "/usr/local/lib/libglib-2.0.0.dylib",
+                      "/Library/Frameworks/GStreamer.framework/Versions/1.0/lib/"
+                      "libglib-2.0.0.dylib"},
+                     "GLib");
 #else
     core = load_library("RECO_GSTREAMER_DYLIB_PATH",
                         {"libgstreamer-1.0.so.0", "libgstreamer-1.0.so"}, "GStreamer");
@@ -332,6 +352,7 @@ public:
     parse_launch = core->symbol<ParseLaunch>("gst_parse_launch");
     bin_get_by_name = core->symbol<BinGetByName>("gst_bin_get_by_name");
     element_get_static_pad = core->symbol<ElementGetStaticPad>("gst_element_get_static_pad");
+    pad_get_current_caps = core->symbol<PadGetCurrentCaps>("gst_pad_get_current_caps");
     element_set_state = core->symbol<ElementSetState>("gst_element_set_state");
     element_get_bus = core->symbol<ElementGetBus>("gst_element_get_bus");
     element_query_duration = core->symbol<ElementQueryDuration>("gst_element_query_duration");
@@ -353,6 +374,7 @@ public:
     message_parse_error = core->symbol<MessageParseError>("gst_message_parse_error");
     message_unref = core->symbol<MessageUnref>("gst_mini_object_unref");
     object_unref = core->symbol<ObjectUnref>("gst_object_unref");
+    caps_unref = core->symbol<CapsUnref>("gst_caps_unref");
     error_free = glib->symbol<ErrorFree>("g_error_free");
     free = glib->symbol<Free>("g_free");
   }
@@ -365,6 +387,7 @@ public:
   ParseLaunch parse_launch = nullptr;
   BinGetByName bin_get_by_name = nullptr;
   ElementGetStaticPad element_get_static_pad = nullptr;
+  PadGetCurrentCaps pad_get_current_caps = nullptr;
   ElementSetState element_set_state = nullptr;
   ElementGetBus element_get_bus = nullptr;
   ElementQueryDuration element_query_duration = nullptr;
@@ -386,6 +409,7 @@ public:
   MessageParseError message_parse_error = nullptr;
   MessageUnref message_unref = nullptr;
   ObjectUnref object_unref = nullptr;
+  CapsUnref caps_unref = nullptr;
   ErrorFree error_free = nullptr;
   Free free = nullptr;
 };
@@ -453,7 +477,8 @@ std::string build_probe_pipeline(const GpuFileDecodeConfig& config,
     pipeline << parser_for_codec(config.codec);
   } else {
     pipeline << gpu_decode_container_demuxer(*config.container)
-             << " ! capsfilter caps=\"video/x-h264;video/x-h265\" ! parsebin";
+             << " ! capsfilter caps=\"video/x-h264;video/x-h265\""
+             << " ! identity name=container_info silent=true ! parsebin";
   }
   pipeline << " ! capsfilter caps=\"video/x-h264,stream-format=byte-stream,alignment=au;"
               "video/x-h265,stream-format=byte-stream,alignment=au\""
@@ -569,7 +594,87 @@ std::string pop_pipeline_error(const std::shared_ptr<ProbeApi>& api, void* bus) 
   return result;
 }
 
+class CompressedSampleBudget {
+public:
+  void consume() {
+    if (consumed_ == kMaximumCompressedSamplePulls) {
+      throw GpuVideoProbeError(
+          "video parser exceeded the compressed access-unit metadata work limit");
+    }
+    ++consumed_;
+  }
+
+private:
+  std::uint64_t consumed_ = 0;
+};
+
+std::optional<std::pair<std::uint32_t, std::uint32_t>>
+reduce_matroska_buffer_duration(std::uint64_t duration_ns) {
+  // libavformat derives Matroska stream rates from DefaultDuration with this
+  // bounded continued-fraction reduction.
+  constexpr std::uint64_t kMaximumDurationNs = 1'000'000'000'000ULL;
+  constexpr std::uint64_t kMaximumRationalComponent = 30'000;
+  if (duration_ns == 0 || duration_ns > kMaximumDurationNs) {
+    return std::nullopt;
+  }
+
+  std::uint64_t numerator = kNanosecondsPerSecond;
+  std::uint64_t denominator = duration_ns;
+  const auto divisor = std::gcd(numerator, denominator);
+  numerator /= divisor;
+  denominator /= divisor;
+
+  std::uint64_t previous_numerator = 0;
+  std::uint64_t previous_denominator = 1;
+  std::uint64_t current_numerator = 1;
+  std::uint64_t current_denominator = 0;
+  if (numerator <= kMaximumRationalComponent && denominator <= kMaximumRationalComponent) {
+    current_numerator = numerator;
+    current_denominator = denominator;
+    denominator = 0;
+  }
+  while (denominator != 0) {
+    auto coefficient = numerator / denominator;
+    const auto remainder = numerator - denominator * coefficient;
+    const auto next_numerator = coefficient * current_numerator + previous_numerator;
+    const auto next_denominator = coefficient * current_denominator + previous_denominator;
+    if (next_numerator > kMaximumRationalComponent ||
+        next_denominator > kMaximumRationalComponent) {
+      if (current_numerator != 0) {
+        coefficient = (kMaximumRationalComponent - previous_numerator) / current_numerator;
+      }
+      if (current_denominator != 0) {
+        coefficient = std::min(coefficient, (kMaximumRationalComponent - previous_denominator) /
+                                                current_denominator);
+      }
+      const auto candidate_denominator =
+          2 * coefficient * current_denominator + previous_denominator;
+      if (denominator * candidate_denominator > numerator * current_denominator) {
+        current_numerator = coefficient * current_numerator + previous_numerator;
+        current_denominator = coefficient * current_denominator + previous_denominator;
+      }
+      break;
+    }
+    previous_numerator = current_numerator;
+    previous_denominator = current_denominator;
+    current_numerator = next_numerator;
+    current_denominator = next_denominator;
+    numerator = denominator;
+    denominator = remainder;
+  }
+  if (current_numerator == 0 || current_denominator == 0) {
+    return std::nullopt;
+  }
+  const auto fps = static_cast<long double>(current_numerator) / current_denominator;
+  if (!std::isfinite(fps) || fps <= 0.0L || fps > kMaximumSaneFps) {
+    return std::nullopt;
+  }
+  return std::pair(static_cast<std::uint32_t>(current_numerator),
+                   static_cast<std::uint32_t>(current_denominator));
+}
+
 void* pull_compressed_sample(const std::shared_ptr<ProbeApi>& api, void* probe_sink, void* bus,
+                             CompressedSampleBudget& sample_budget,
                              std::chrono::steady_clock::time_point deadline,
                              std::string_view timeout_message) {
   while (true) {
@@ -580,6 +685,7 @@ void* pull_compressed_sample(const std::shared_ptr<ProbeApi>& api, void* probe_s
       if (const auto error = pop_pipeline_error(api, bus); !error.empty()) {
         throw GpuVideoProbeError(error);
       }
+      sample_budget.consume();
       return sample_owner.release();
     }
     if (const auto error = pop_pipeline_error(api, bus); !error.empty()) {
@@ -601,7 +707,10 @@ struct TimingScan {
   std::optional<std::uint64_t> last_stream_time;
   std::optional<std::uint64_t> final_frame_end;
   std::optional<std::uint64_t> final_frame_duration;
+  std::optional<std::pair<std::uint32_t, std::uint32_t>> buffer_duration_frame_rate;
   bool all_durations_known = true;
+  bool all_buffer_duration_rates_known = true;
+  bool buffer_duration_rates_consistent = true;
   bool reached_eos = false;
 };
 
@@ -658,6 +767,16 @@ void observe_timing_sample(const std::shared_ptr<ProbeApi>& api, void* sample, T
     throw GpuVideoProbeError("GStreamer parser-only probe returned a sample without a buffer");
   }
   ++scan.sample_count;
+  const auto duration_rate = buffer->duration == kGstClockTimeNone
+                                 ? std::nullopt
+                                 : reduce_matroska_buffer_duration(buffer->duration);
+  if (!duration_rate.has_value()) {
+    scan.all_buffer_duration_rates_known = false;
+  } else if (!scan.buffer_duration_frame_rate.has_value()) {
+    scan.buffer_duration_frame_rate = duration_rate;
+  } else if (*scan.buffer_duration_frame_rate != *duration_rate) {
+    scan.buffer_duration_rates_consistent = false;
+  }
   if (buffer->pts == kGstClockTimeNone) {
     scan.all_durations_known = false;
     return;
@@ -718,11 +837,17 @@ public:
       }
       finalize_first();
     }
+    if (pending_.size() > 2 * kTimingReorderLookahead + 1) {
+      fail("presentation timestamps exceed the supported decode reorder depth");
+    }
   }
 
   void finish() {
     while (!pending_.empty()) {
       finalize_first();
+    }
+    if (finalized_group_count_ < 3) {
+      fail("fewer than three distinct presentation timestamps were observed");
     }
     if (previous_group_count_.has_value() && previous_grid_step_.has_value() &&
         *previous_group_count_ != *previous_grid_step_) {
@@ -747,6 +872,7 @@ private:
     const auto stream_time = first->first;
     const auto group_count = first->second.count;
     pending_.erase(first);
+    ++finalized_group_count_;
 
     if (origin_time_.has_value()) {
       if (stream_time <= *previous_time_) {
@@ -783,6 +909,7 @@ private:
   std::uint32_t fps_numerator_ = 0;
   std::uint32_t fps_denominator_ = 0;
   std::map<std::uint64_t, PendingGroup> pending_;
+  std::size_t finalized_group_count_ = 0;
   std::optional<std::uint64_t> origin_time_;
   std::optional<std::uint64_t> previous_time_;
   std::optional<std::uint64_t> finalized_time_;
@@ -1262,11 +1389,13 @@ enum class TimingWindowStatus { Unavailable, Constant, Nonconstant };
 struct TimingWindowEvidence {
   TimingWindowStatus status = TimingWindowStatus::Unavailable;
   std::optional<InferredFrameRate> frame_rate;
+  std::optional<std::pair<std::uint32_t, std::uint32_t>> buffer_duration_frame_rate;
 };
 
 TimingWindowEvidence infer_timing_window(const std::shared_ptr<ProbeApi>& api, void* pipeline,
                                          void* probe_sink, void* bus, std::uint64_t start_ns,
                                          std::optional<std::uint64_t> end_ns, bool require_eos,
+                                         CompressedSampleBudget& sample_budget,
                                          std::chrono::steady_clock::time_point deadline,
                                          const ParserCapsIdentity& expected_caps) {
   const auto seek_ns =
@@ -1280,10 +1409,11 @@ TimingWindowEvidence infer_timing_window(const std::shared_ptr<ProbeApi>& api, v
   TimingScan window_scan;
   bool window_started = false;
   bool covered_end = !end_ns.has_value();
+  bool window_complete = false;
   std::size_t samples_after_end = 0;
-  while (true) {
+  for (std::size_t sample_index = 0; sample_index < kMaximumTimingWindowSamples; ++sample_index) {
     void* sample = pull_compressed_sample(
-        api, probe_sink, bus, deadline,
+        api, probe_sink, bus, sample_budget, deadline,
         require_eos
             ? "GStreamer parser-only probe timed out while sampling terminal stream timing"
             : "GStreamer parser-only probe timed out while sampling interior stream timing");
@@ -1308,13 +1438,22 @@ TimingWindowEvidence infer_timing_window(const std::shared_ptr<ProbeApi>& api, v
       continue;
     }
     if (covered_end && ++samples_after_end >= kMaximumDecodeReorderFrames) {
+      window_complete = true;
       break;
     }
+  }
+  if (!window_scan.reached_eos && !window_complete) {
+    throw GpuVideoProbeError(
+        "video parser exceeded the compressed access-unit timing-window work limit");
   }
   if (!window_started || (require_eos && !window_scan.reached_eos) ||
       (end_ns.has_value() && !covered_end)) {
     return {};
   }
+  const auto buffer_duration_frame_rate =
+      window_scan.all_buffer_duration_rates_known && window_scan.buffer_duration_rates_consistent
+          ? window_scan.buffer_duration_frame_rate
+          : std::nullopt;
   auto frame_rate = infer_constant_frame_rate(window_scan, require_eos, true, !require_eos);
   if (frame_rate.has_value()) {
     const auto maximum_start_delay =
@@ -1325,9 +1464,12 @@ TimingWindowEvidence infer_timing_window(const std::shared_ptr<ProbeApi>& api, v
                                 window_scan.timed_sample_count == window_scan.sample_count
                             ? TimingWindowStatus::Nonconstant
                             : TimingWindowStatus::Unavailable,
-              .frame_rate = std::nullopt};
+              .frame_rate = std::nullopt,
+              .buffer_duration_frame_rate = buffer_duration_frame_rate};
     }
-    return {.status = TimingWindowStatus::Constant, .frame_rate = std::move(frame_rate)};
+    return {.status = TimingWindowStatus::Constant,
+            .frame_rate = std::move(frame_rate),
+            .buffer_duration_frame_rate = buffer_duration_frame_rate};
   }
   return {
       .status = window_scan.sample_count >= kTimingAnalysisSamples &&
@@ -1335,6 +1477,7 @@ TimingWindowEvidence infer_timing_window(const std::shared_ptr<ProbeApi>& api, v
                     ? TimingWindowStatus::Nonconstant
                     : TimingWindowStatus::Unavailable,
       .frame_rate = std::nullopt,
+      .buffer_duration_frame_rate = buffer_duration_frame_rate,
   };
 }
 
@@ -1355,6 +1498,7 @@ FrameSeekResult seek_compressed_frame(const std::shared_ptr<ProbeApi>& api, void
                                       std::uint64_t frame_index, std::uint32_t fps_numerator,
                                       std::uint32_t fps_denominator,
                                       std::size_t timestamp_multiplicity,
+                                      CompressedSampleBudget& sample_budget,
                                       std::chrono::steady_clock::time_point deadline,
                                       const ParserCapsIdentity& expected_caps) {
   const auto relative_target_ns = frame_timestamp_ns(frame_index, fps_numerator, fps_denominator);
@@ -1384,9 +1528,9 @@ FrameSeekResult seek_compressed_frame(const std::shared_ptr<ProbeApi>& api, void
       nominal_duration_ns > std::numeric_limits<std::uint64_t>::max() / kMaximumDecodeReorderFrames
           ? std::numeric_limits<std::uint64_t>::max()
           : nominal_duration_ns * kMaximumDecodeReorderFrames;
-  while (true) {
+  for (std::size_t sample_index = 0; sample_index < kMaximumTimingWindowSamples; ++sample_index) {
     void* sample =
-        pull_compressed_sample(api, probe_sink, bus, deadline,
+        pull_compressed_sample(api, probe_sink, bus, sample_budget, deadline,
                                "GStreamer parser-only probe timed out while seeking stream end");
     std::unique_ptr<void, ProbeApi::SampleUnref> sample_owner(sample, api->sample_unref);
     if (sample == nullptr) {
@@ -1425,13 +1569,16 @@ FrameSeekResult seek_compressed_frame(const std::shared_ptr<ProbeApi>& api, void
                                ? nominal_duration_ns
                                : buffer->duration};
   }
+  throw GpuVideoProbeError(
+      "video parser exceeded the compressed access-unit frame-seek work limit");
 }
 
 std::optional<SelectedStreamProbe> selected_stream_duration(
     const std::shared_ptr<ProbeApi>& api, void* pipeline, void* probe_sink, void* bus,
     std::uint64_t container_duration_ns, std::uint64_t stream_origin_ns,
     std::uint32_t fps_numerator, std::uint32_t fps_denominator, std::size_t timestamp_multiplicity,
-    std::chrono::steady_clock::time_point deadline, const ParserCapsIdentity& expected_caps) {
+    CompressedSampleBudget& sample_budget, std::chrono::steady_clock::time_point deadline,
+    const ParserCapsIdentity& expected_caps) {
   const auto duration_frame_ceiling =
       frame_count_ceiling_for_duration(container_duration_ns, fps_numerator, fps_denominator);
   if (duration_frame_ceiling == std::numeric_limits<std::uint64_t>::max()) {
@@ -1446,9 +1593,9 @@ std::optional<SelectedStreamProbe> selected_stream_duration(
   std::uint64_t last = initial_search_frame_limit;
   std::optional<std::pair<std::uint64_t, FrameSeekResult>> final_available_frame;
   while (true) {
-    const auto result =
-        seek_compressed_frame(api, pipeline, probe_sink, bus, stream_origin_ns, last, fps_numerator,
-                              fps_denominator, timestamp_multiplicity, deadline, expected_caps);
+    const auto result = seek_compressed_frame(
+        api, pipeline, probe_sink, bus, stream_origin_ns, last, fps_numerator, fps_denominator,
+        timestamp_multiplicity, sample_budget, deadline, expected_caps);
     if (!result.usable) {
       return std::nullopt;
     }
@@ -1467,9 +1614,9 @@ std::optional<SelectedStreamProbe> selected_stream_duration(
   }
   while (first < last) {
     const auto candidate = first + (last - first) / 2;
-    const auto result = seek_compressed_frame(api, pipeline, probe_sink, bus, stream_origin_ns,
-                                              candidate, fps_numerator, fps_denominator,
-                                              timestamp_multiplicity, deadline, expected_caps);
+    const auto result = seek_compressed_frame(
+        api, pipeline, probe_sink, bus, stream_origin_ns, candidate, fps_numerator, fps_denominator,
+        timestamp_multiplicity, sample_budget, deadline, expected_caps);
     if (!result.usable) {
       return std::nullopt;
     }
@@ -1522,6 +1669,7 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
     throw std::invalid_argument("video probe timeout must be between one second and one hour");
   }
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeout_ns);
+  CompressedSampleBudget sample_budget;
 
   std::error_code path_error;
   const auto absolute_path = std::filesystem::absolute(path_from_utf8(config.path), path_error);
@@ -1572,6 +1720,20 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
   if (probe_pad == nullptr) {
     throw GpuVideoProbeError("GStreamer parser-only probe has no metadata pad");
   }
+  void* container_info =
+      config.elementary_stream ? nullptr : api->bin_get_by_name(pipeline, "container_info");
+  std::unique_ptr<void, ProbeApi::ObjectUnref> container_info_owner(container_info,
+                                                                    api->object_unref);
+  if (!config.elementary_stream && container_info == nullptr) {
+    throw GpuVideoProbeError("GStreamer parser-only probe has no container metadata identity");
+  }
+  void* container_pad =
+      container_info == nullptr ? nullptr : api->element_get_static_pad(container_info, "src");
+  std::unique_ptr<void, ProbeApi::ObjectUnref> container_pad_owner(container_pad,
+                                                                   api->object_unref);
+  if (container_info != nullptr && container_pad == nullptr) {
+    throw GpuVideoProbeError("GStreamer parser-only probe has no container metadata pad");
+  }
   void* probe_sink = api->bin_get_by_name(pipeline, "probe_sink");
   std::unique_ptr<void, ProbeApi::ObjectUnref> probe_sink_owner(probe_sink, api->object_unref);
   if (probe_sink == nullptr) {
@@ -1594,7 +1756,7 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
   void* initial_sample = nullptr;
   std::unique_ptr<void, ProbeApi::SampleUnref> initial_sample_owner(nullptr, api->sample_unref);
   initial_sample =
-      pull_compressed_sample(api, probe_sink, bus, deadline,
+      pull_compressed_sample(api, probe_sink, bus, sample_budget, deadline,
                              "GStreamer parser-only probe timed out while parsing stream metadata");
   initial_sample_owner.reset(initial_sample);
   if (initial_sample == nullptr) {
@@ -1603,6 +1765,24 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
   }
   if (api->sample_get_buffer(initial_sample) == nullptr) {
     throw GpuVideoProbeError("GStreamer parser-only probe returned a sample without a buffer");
+  }
+
+  std::optional<std::pair<int, int>> container_frame_rate;
+  if (container_pad != nullptr) {
+    void* container_caps = api->pad_get_current_caps(container_pad);
+    std::unique_ptr<void, ProbeApi::CapsUnref> container_caps_owner(container_caps,
+                                                                    api->caps_unref);
+    if (container_caps != nullptr) {
+      void* container_structure = api->caps_get_structure(container_caps, 0);
+      int container_fps_numerator = 0;
+      int container_fps_denominator = 0;
+      if (container_structure != nullptr &&
+          api->structure_get_fraction(container_structure, "framerate", &container_fps_numerator,
+                                      &container_fps_denominator) != 0 &&
+          container_fps_numerator > 0 && container_fps_denominator > 0) {
+        container_frame_rate = {container_fps_numerator, container_fps_denominator};
+      }
+    }
   }
 
   void* caps = api->sample_get_caps(initial_sample);
@@ -1645,8 +1825,13 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
       fps_numerator > 0 && fps_denominator > 0;
   const double caps_fps =
       has_caps_frame_rate ? static_cast<double>(fps_numerator) / fps_denominator : 0.0;
-  const bool caps_frame_rate_is_plausible =
+  const bool parser_caps_frame_rate_is_plausible =
       std::isfinite(caps_fps) && caps_fps > 0.0 && caps_fps <= kMaximumSaneFps;
+  const auto parser_caps_frame_rate =
+      parser_caps_frame_rate_is_plausible
+          ? std::optional(std::pair(static_cast<std::uint32_t>(fps_numerator),
+                                    static_cast<std::uint32_t>(fps_denominator)))
+          : std::nullopt;
   const ParserCapsIdentity expected_caps{
       .codec = codec_caps,
       .stream_format = stream_format,
@@ -1656,13 +1841,12 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
       .frame_rate = has_caps_frame_rate ? std::optional(std::pair(fps_numerator, fps_denominator))
                                         : std::nullopt,
   };
-
   TimingScan timing_scan;
   observe_timing_sample(api, initial_sample, timing_scan, &expected_caps);
   initial_sample_owner.reset();
   while (timing_scan.sample_count <= kMaximumExactCountSamples) {
     void* sample = pull_compressed_sample(
-        api, probe_sink, bus, deadline,
+        api, probe_sink, bus, sample_budget, deadline,
         "GStreamer parser-only probe timed out while counting compressed stream frames");
     initial_sample_owner.reset(sample);
     if (sample == nullptr) {
@@ -1671,6 +1855,29 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
     }
     observe_timing_sample(api, sample, timing_scan, &expected_caps);
   }
+  std::optional<std::pair<std::uint32_t, std::uint32_t>> matroska_duration_frame_rate;
+  if (!config.elementary_stream && config.container == GpuDecodeContainer::Matroska &&
+      timing_scan.all_buffer_duration_rates_known && timing_scan.buffer_duration_rates_consistent) {
+    matroska_duration_frame_rate = timing_scan.buffer_duration_frame_rate;
+    if (matroska_duration_frame_rate.has_value()) {
+      container_frame_rate = {
+          static_cast<int>(matroska_duration_frame_rate->first),
+          static_cast<int>(matroska_duration_frame_rate->second),
+      };
+    }
+  }
+  bool container_frame_rate_is_plausible = false;
+  if (container_frame_rate.has_value()) {
+    const auto container_fps = static_cast<double>(container_frame_rate->first) /
+                               static_cast<double>(container_frame_rate->second);
+    if (std::isfinite(container_fps) && container_fps > 0.0 && container_fps <= kMaximumSaneFps) {
+      container_frame_rate_is_plausible = true;
+      fps_numerator = container_frame_rate->first;
+      fps_denominator = container_frame_rate->second;
+    }
+  }
+  const bool caps_frame_rate_is_plausible =
+      container_frame_rate_is_plausible || parser_caps_frame_rate_is_plausible;
   std::optional<std::uint64_t> queried_container_duration;
   if (!timing_scan.reached_eos) {
     std::int64_t queried_duration = 0;
@@ -1699,7 +1906,7 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
        incomplete_noncanonical_rate_needs_more_evidence)) {
     while (timing_scan.sample_count <= kMaximumConflictingMetadataCountSamples) {
       void* sample = pull_compressed_sample(
-          api, probe_sink, bus, deadline,
+          api, probe_sink, bus, sample_budget, deadline,
           "GStreamer parser-only probe timed out while resolving conflicting metadata");
       initial_sample_owner.reset(sample);
       if (sample == nullptr) {
@@ -1708,6 +1915,14 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
       }
       observe_timing_sample(api, sample, timing_scan, &expected_caps);
     }
+  }
+  if (matroska_duration_frame_rate.has_value() &&
+      (!timing_scan.all_buffer_duration_rates_known ||
+       !timing_scan.buffer_duration_rates_consistent ||
+       timing_scan.buffer_duration_frame_rate != matroska_duration_frame_rate)) {
+    throw GpuVideoProbeError(
+        "variable frame-rate video is unsupported for indexed GPU calibration sampling "
+        "(Matroska compressed-buffer durations disagree)");
   }
   const auto inferred_frame_rate = infer_constant_frame_rate(
       timing_scan, timing_scan.reached_eos, timing_scan.reached_eos, !timing_scan.reached_eos);
@@ -1744,20 +1959,20 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
     add_cadence_candidate(static_cast<std::uint32_t>(fps_numerator),
                           static_cast<std::uint32_t>(fps_denominator));
   }
+  if (parser_caps_frame_rate.has_value()) {
+    add_cadence_candidate(parser_caps_frame_rate->first, parser_caps_frame_rate->second);
+  }
   std::vector<std::pair<std::uint32_t, std::uint32_t>> cadence_verified_rates;
   std::optional<std::uint64_t> full_cadence_sample_count;
-  if (!cadence_candidates.empty() && timing_scan.timed_sample_count == timing_scan.sample_count) {
-    if (queried_container_duration.has_value() &&
-        std::any_of(
-            cadence_candidates.begin(), cadence_candidates.end(), [&](const auto& candidate) {
-              return frame_count_ceiling_for_duration(*queried_container_duration,
-                                                      candidate.rate.first, candidate.rate.second) >
-                     kMaximumFullCadenceValidationSamples;
-            })) {
-      throw GpuVideoProbeError(
-          "video parser could not verify constant frame timing because the selected stream "
-          "exceeds the full cadence validation limit");
-    }
+  const bool eager_cadence_validation_is_bounded =
+      timing_scan.reached_eos || !queried_container_duration.has_value() ||
+      std::any_of(cadence_candidates.begin(), cadence_candidates.end(), [&](const auto& candidate) {
+        return frame_count_ceiling_for_duration(*queried_container_duration, candidate.rate.first,
+                                                candidate.rate.second) <=
+               kMaximumEagerCadenceValidationSamples;
+      });
+  if (!cadence_candidates.empty() && timing_scan.timed_sample_count == timing_scan.sample_count &&
+      eager_cadence_validation_is_bounded) {
     const auto validate_cadence_sample = [&](std::uint64_t stream_time,
                                              std::uint64_t sample_index) {
       for (auto& candidate : cadence_candidates) {
@@ -1783,30 +1998,34 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
     }
     auto validation_sample_count = timing_scan.sample_count;
     if (!timing_scan.reached_eos) {
-      while (true) {
+      while (validation_sample_count < kMaximumEagerCadenceValidationSamples) {
         void* sample = pull_compressed_sample(
-            api, probe_sink, bus, deadline,
+            api, probe_sink, bus, sample_budget, deadline,
             "GStreamer parser-only probe timed out while verifying full-stream frame cadence");
         initial_sample_owner.reset(sample);
         if (sample == nullptr) {
+          timing_scan.reached_eos = true;
           break;
         }
-        validate_parser_sample_caps(api, sample, expected_caps);
+        observe_timing_sample(api, sample, timing_scan, &expected_caps);
         const auto stream_time = sample_presentation_stream_time(api, sample);
         if (!stream_time.has_value()) {
           throw GpuVideoProbeError(
               "variable frame-rate video is unsupported for indexed GPU calibration sampling "
               "(full-stream cadence becomes untimed)");
         }
-        if (validation_sample_count >= kMaximumFullCadenceValidationSamples) {
-          throw GpuVideoProbeError(
-              "video parser could not verify constant frame timing because the selected stream "
-              "exceeds the full cadence validation limit");
-        }
         validate_cadence_sample(*stream_time, validation_sample_count++);
       }
     }
-    if (validation_sample_count >= 3) {
+    if (timing_scan.reached_eos && validation_sample_count >= 3) {
+      if (matroska_duration_frame_rate.has_value() &&
+          (!timing_scan.all_buffer_duration_rates_known ||
+           !timing_scan.buffer_duration_rates_consistent ||
+           timing_scan.buffer_duration_frame_rate != matroska_duration_frame_rate)) {
+        throw GpuVideoProbeError(
+            "variable frame-rate video is unsupported for indexed GPU calibration sampling "
+            "(Matroska compressed-buffer durations disagree)");
+      }
       for (auto& candidate : cadence_candidates) {
         if (!candidate.failure.has_value()) {
           try {
@@ -1871,7 +2090,7 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
       correlated_selected_stream = selected_stream_duration(
           api, pipeline, probe_sink, bus, *queried_container_duration,
           *timing_scan.first_stream_time, correlated_fps_numerator, correlated_fps_denominator,
-          correlated_timestamp_multiplicity, deadline, expected_caps);
+          correlated_timestamp_multiplicity, sample_budget, deadline, expected_caps);
       if (correlated_selected_stream.has_value()) {
         timing_range_start_ns = *timing_scan.first_stream_time;
         timing_range_end_ns =
@@ -1891,6 +2110,12 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
                   "(timing window starting at " +
                       std::to_string(window_start_ns) + " ns is nonconstant)"
                 : "video parser could not verify constant frame timing across the selected stream");
+      }
+      if (matroska_duration_frame_rate.has_value() &&
+          evidence.buffer_duration_frame_rate != matroska_duration_frame_rate) {
+        throw GpuVideoProbeError(
+            "variable frame-rate video is unsupported for indexed GPU calibration sampling "
+            "(Matroska compressed-buffer durations disagree)");
       }
       if (representative_rate.has_value() &&
           !frame_rates_are_close(representative_rate->first, representative_rate->second,
@@ -1921,7 +2146,7 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
       const auto end_ns =
           std::min(add_saturating(start_ns, kTailTimingWindowNs), timing_range_end_ns);
       validate_window(infer_timing_window(api, pipeline, probe_sink, bus, start_ns, end_ns, false,
-                                          deadline, expected_caps),
+                                          sample_budget, deadline, expected_caps),
                       start_ns);
     }
 
@@ -1929,7 +2154,7 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
                                    ? timing_range_end_ns - kTailTimingWindowNs
                                    : timing_range_start_ns;
     tail_timing = infer_timing_window(api, pipeline, probe_sink, bus, tail_start_ns, std::nullopt,
-                                      true, deadline, expected_caps);
+                                      true, sample_budget, deadline, expected_caps);
     validate_window(tail_timing, tail_start_ns);
   }
   const bool representative_tail_matches =
@@ -1989,6 +2214,7 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
 
   const auto fps_num = static_cast<std::uint32_t>(fps_numerator);
   const auto fps_den = static_cast<std::uint32_t>(fps_denominator);
+  const bool selected_stream_caps_verified = timing_scan.reached_eos;
   const bool indexed_sampling_cadence_verified = cadence_rate_is_verified(fps_num, fps_den);
   const auto timestamp_multiplicity =
       inferred_frame_rate.has_value() &&
@@ -2031,6 +2257,13 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
       duration_ns = minimum_duration_for_frame_count(total_frames, fps_num, fps_den);
       duration_is_estimated = true;
     }
+    const auto cadence_boundary_duration =
+        minimum_duration_for_frame_count(total_frames, fps_num, fps_den);
+    if (indexed_sampling_cadence_verified && cadence_boundary_duration > duration_ns &&
+        cadence_boundary_duration - duration_ns > nominal_frame_duration) {
+      duration_ns = cadence_boundary_duration;
+      duration_is_estimated = false;
+    }
   } else {
     total_frames_is_estimated = !full_cadence_sample_count.has_value();
     duration_is_estimated = !queried_container_duration.has_value();
@@ -2045,7 +2278,8 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
               ? correlated_selected_stream
               : selected_stream_duration(api, pipeline, probe_sink, bus, duration_ns,
                                          *timing_scan.first_stream_time, fps_num, fps_den,
-                                         timestamp_multiplicity, deadline, expected_caps);
+                                         timestamp_multiplicity, sample_budget, deadline,
+                                         expected_caps);
       if (selected_duration.has_value()) {
         const auto untimed_prefix =
             infer_untimed_presentation_prefix(timing_scan, fps_num, fps_den);
@@ -2084,6 +2318,7 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
           .total_frames = total_frames,
           .duration_is_estimated = duration_is_estimated,
           .total_frames_is_estimated = total_frames_is_estimated,
+          .selected_stream_caps_verified = selected_stream_caps_verified,
           .indexed_sampling_cadence_verified = indexed_sampling_cadence_verified};
 }
 
