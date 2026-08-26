@@ -105,13 +105,23 @@ struct CudaPitchedAllocation {
 class CudaSharedMemory;
 class CudaKernel;
 
+/// Optional non-throwing trace sink for explicit CUDA backend operations.
+class CudaBackendTraceSink {
+public:
+  virtual ~CudaBackendTraceSink() = default;
+  /// Called after a device-to-device copy has been accepted by the CUDA driver.
+  virtual void device_to_device_copy_submitted() noexcept {}
+  /// Called after an explicit CUDA context synchronization succeeds.
+  virtual void context_synchronized() noexcept {}
+};
+
 class CudaBackend {
 public:
   [[nodiscard]] static bool is_available();
   [[nodiscard]] static std::string availability_error();
   [[nodiscard]] static CudaBackend create();
-  /// Returns a backend view that invokes observer after each successful explicit synchronization.
-  [[nodiscard]] CudaBackend with_synchronization_observer(std::function<void()> observer) const;
+  /// Returns a backend view that reports explicit operations to `trace_sink`.
+  [[nodiscard]] CudaBackend with_trace_sink(std::shared_ptr<CudaBackendTraceSink> trace_sink) const;
 
   [[nodiscard]] int device_count() const;
   [[nodiscard]] CudaDeviceInfo device_info(int ordinal = 0) const;
@@ -139,9 +149,9 @@ private:
   struct Impl;
 
   explicit CudaBackend(std::shared_ptr<Impl> impl,
-                       std::function<void()> synchronization_observer = {});
+                       std::shared_ptr<CudaBackendTraceSink> trace_sink = {});
   std::shared_ptr<Impl> impl_;
-  std::function<void()> synchronization_observer_;
+  std::shared_ptr<CudaBackendTraceSink> trace_sink_;
 };
 
 class CudaSharedMemory {

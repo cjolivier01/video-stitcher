@@ -2,6 +2,7 @@
 #include "reco/io/detail/nvbufsurface_9_1.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -197,21 +198,56 @@ bool address_sanitizer_build() {
 
 #if defined(__linux__)
 
+enum class CopyTraceEvent {
+  CopySubmitted,
+  ContextSynchronized,
+  DecoderOwnerReleased,
+};
+
+struct CopyOrderTrace final : CudaBackendTraceSink {
+  void device_to_device_copy_submitted() noexcept override {
+    record(CopyTraceEvent::CopySubmitted);
+  }
+  void context_synchronized() noexcept override { record(CopyTraceEvent::ContextSynchronized); }
+  void decoder_owner_released() noexcept { record(CopyTraceEvent::DecoderOwnerReleased); }
+
+  void record(CopyTraceEvent event) noexcept {
+    if (event_count == events.size()) {
+      overflow = true;
+      return;
+    }
+    events[event_count++] = event;
+  }
+
+  std::array<CopyTraceEvent, 16> events{};
+  std::size_t event_count = 0;
+  bool overflow = false;
+};
+
 struct CudaNvmmOwner {
-  explicit CudaNvmmOwner(CudaDeviceBuffer allocation) : allocation(std::move(allocation)) {}
+  explicit CudaNvmmOwner(CudaDeviceBuffer allocation, std::shared_ptr<CopyOrderTrace> trace = {})
+      : allocation(std::move(allocation)), trace(std::move(trace)) {}
+  ~CudaNvmmOwner() {
+    if (trace) {
+      trace->decoder_owner_released();
+    }
+  }
 
   CudaDeviceBuffer allocation;
   abi::SurfaceParams params;
   abi::Surface surface;
+  std::shared_ptr<CopyOrderTrace> trace;
 };
 
 std::pair<GpuDecodedFrame, std::weak_ptr<CudaNvmmOwner>>
 make_cuda_frame(CudaBackend& backend, std::uint64_t frame_index, std::uint8_t y_value,
-                std::uint32_t width = 66, std::uint32_t height = 32) {
+                std::uint32_t width = 66, std::uint32_t height = 32,
+                std::shared_ptr<CopyOrderTrace> trace = {}) {
   auto source_allocation = backend.allocate_pitched(width, height + height / 2U, 16);
   const std::size_t pitch = source_allocation.pitch;
   const std::size_t total_size = pitch * (height + height / 2U);
-  auto owner = std::make_shared<CudaNvmmOwner>(std::move(source_allocation.buffer));
+  auto owner =
+      std::make_shared<CudaNvmmOwner>(std::move(source_allocation.buffer), std::move(trace));
   std::vector<std::uint8_t> pixels(total_size, 128);
   std::fill_n(pixels.begin(), pitch * height, y_value);
   backend.copy_host_to_device_2d({.src = pixels.data(),
@@ -258,13 +294,13 @@ make_cuda_frame(CudaBackend& backend, std::uint64_t frame_index, std::uint8_t y_
 }
 
 void selected_y_planes_are_copied_device_to_device(CudaBackend& backend) {
-  std::size_t completed_copy_synchronizations = 0;
-  auto extraction_backend = backend.with_synchronization_observer(
-      [&completed_copy_synchronizations] { ++completed_copy_synchronizations; });
+  auto trace = std::make_shared<CopyOrderTrace>();
+  auto extraction_backend = backend.with_trace_sink(trace);
   std::vector<GpuDecodedFrame> frames;
   std::vector<std::weak_ptr<CudaNvmmOwner>> lifetimes;
   for (std::uint64_t index = 0; index < 5; ++index) {
-    auto [frame, lifetime] = make_cuda_frame(backend, index, static_cast<std::uint8_t>(20 + index));
+    auto [frame, lifetime] =
+        make_cuda_frame(backend, index, static_cast<std::uint8_t>(20 + index), 66, 32, trace);
     frames.push_back(std::move(frame));
     lifetimes.push_back(std::move(lifetime));
   }
@@ -272,8 +308,17 @@ void selected_y_planes_are_copied_device_to_device(CudaBackend& backend) {
   const auto selected =
       extract_gpu_gray_frames(extraction_backend, source, std::vector<std::uint64_t>{1, 3});
   expect_eq(selected.size(), 2U, "two indexed GPU frames extracted");
-  expect_eq(completed_copy_synchronizations, 2U,
-            "each selected decoder surface is synchronized before release");
+  constexpr std::array expected_events{
+      CopyTraceEvent::DecoderOwnerReleased, CopyTraceEvent::CopySubmitted,
+      CopyTraceEvent::ContextSynchronized,  CopyTraceEvent::DecoderOwnerReleased,
+      CopyTraceEvent::DecoderOwnerReleased, CopyTraceEvent::CopySubmitted,
+      CopyTraceEvent::ContextSynchronized,  CopyTraceEvent::DecoderOwnerReleased};
+  expect_true(!trace->overflow, "CUDA copy ordering trace does not overflow");
+  expect_eq(trace->event_count, expected_events.size(), "CUDA copy ordering event count");
+  if (trace->event_count == expected_events.size()) {
+    expect_true(std::equal(expected_events.begin(), expected_events.end(), trace->events.begin()),
+                "D2D copies synchronize before decoder owners are released");
+  }
   if (selected.size() != 2) {
     return;
   }

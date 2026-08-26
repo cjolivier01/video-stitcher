@@ -572,14 +572,15 @@ CudaBackend CudaBackend::create() {
   return CudaBackend(impl);
 }
 
-CudaBackend::CudaBackend(std::shared_ptr<Impl> impl, std::function<void()> synchronization_observer)
-    : impl_(std::move(impl)), synchronization_observer_(std::move(synchronization_observer)) {}
+CudaBackend::CudaBackend(std::shared_ptr<Impl> impl,
+                         std::shared_ptr<CudaBackendTraceSink> trace_sink)
+    : impl_(std::move(impl)), trace_sink_(std::move(trace_sink)) {}
 
-CudaBackend CudaBackend::with_synchronization_observer(std::function<void()> observer) const {
-  if (!observer) {
-    throw std::invalid_argument("CUDA synchronization observer must be callable");
+CudaBackend CudaBackend::with_trace_sink(std::shared_ptr<CudaBackendTraceSink> trace_sink) const {
+  if (!trace_sink) {
+    throw std::invalid_argument("CUDA trace sink must be non-null");
   }
-  return CudaBackend(impl_, std::move(observer));
+  return CudaBackend(impl_, std::move(trace_sink));
 }
 
 int CudaBackend::device_count() const {
@@ -619,14 +620,15 @@ CudaDeviceBuffer CudaBackend::allocate(std::size_t bytes) const {
   if (bytes == 0) {
     throw std::invalid_argument("CUDA allocation size must be non-zero");
   }
+  auto impl = impl_;
+  std::function<void(CudaDevicePtr)> deleter = [impl](CudaDevicePtr ptr) {
+    impl->ensure_primary_context(0);
+    check_cuda("cuMemFree_v2", impl->cu_mem_free(ptr));
+  };
   impl_->ensure_primary_context(0);
   CUdeviceptr ptr = 0;
   check_cuda("cuMemAlloc_v2", impl_->cu_mem_alloc(&ptr, bytes));
-  auto impl = impl_;
-  return CudaDeviceBuffer(ptr, bytes, [impl](CudaDevicePtr ptr) {
-    impl->ensure_primary_context(0);
-    check_cuda("cuMemFree_v2", impl->cu_mem_free(ptr));
-  });
+  return CudaDeviceBuffer(ptr, bytes, std::move(deleter));
 }
 
 CudaPitchedAllocation CudaBackend::allocate_pitched(std::size_t width_bytes, std::size_t height,
@@ -641,6 +643,11 @@ CudaPitchedAllocation CudaBackend::allocate_pitched(std::size_t width_bytes, std
     throw std::overflow_error("CUDA pitched allocation size overflow");
   }
 
+  auto impl = impl_;
+  std::function<void(CudaDevicePtr)> deleter = [impl](CudaDevicePtr allocation) {
+    impl->ensure_primary_context(0);
+    check_cuda("cuMemFree_v2", impl->cu_mem_free(allocation));
+  };
   impl_->ensure_primary_context(0);
   CUdeviceptr ptr = 0;
   std::size_t pitch = 0;
@@ -653,13 +660,7 @@ CudaPitchedAllocation CudaBackend::allocate_pitched(std::size_t width_bytes, std
   }
 
   const std::size_t size = pitch * height;
-  auto impl = impl_;
-  return {.buffer = CudaDeviceBuffer(ptr, size,
-                                     [impl](CudaDevicePtr allocation) {
-                                       impl->ensure_primary_context(0);
-                                       check_cuda("cuMemFree_v2", impl->cu_mem_free(allocation));
-                                     }),
-          .pitch = pitch};
+  return {.buffer = CudaDeviceBuffer(ptr, size, std::move(deleter)), .pitch = pitch};
 }
 
 CudaSharedMemory CudaBackend::allocate_shared_memory(std::size_t bytes) const {
@@ -782,6 +783,9 @@ void CudaBackend::copy_device_to_device_2d(const Cuda2DCopy& copy) const {
       .height = copy.height,
   };
   check_cuda("cuMemcpy2D_v2 (DtoD)", impl_->cu_memcpy_2d(&desc));
+  if (trace_sink_) {
+    trace_sink_->device_to_device_copy_submitted();
+  }
 }
 
 void CudaBackend::copy_device_to_host_2d(const CudaDeviceToHost2DCopy& copy) const {
@@ -836,8 +840,8 @@ CudaKernel CudaBackend::load_kernel_from_ptx(std::string_view ptx,
 void CudaBackend::synchronize() const {
   impl_->ensure_current_context_for_copy();
   check_cuda("cuCtxSynchronize", impl_->cu_ctx_synchronize());
-  if (synchronization_observer_) {
-    synchronization_observer_();
+  if (trace_sink_) {
+    trace_sink_->context_synchronized();
   }
 }
 

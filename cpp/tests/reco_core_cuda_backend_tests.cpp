@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -128,6 +129,14 @@ DONE:
 }
 )ptx";
 
+struct CountingCudaTrace final : CudaBackendTraceSink {
+  void device_to_device_copy_submitted() noexcept override { ++copies; }
+  void context_synchronized() noexcept override { ++synchronizations; }
+
+  std::size_t copies = 0;
+  std::size_t synchronizations = 0;
+};
+
 } // namespace
 
 int main() {
@@ -193,15 +202,14 @@ int main() {
     backend.synchronize();
     expect_invalid_argument(
         [&] {
-          auto ignored = backend.with_synchronization_observer({});
+          auto ignored = backend.with_trace_sink({});
           (void)ignored;
         },
-        "empty CUDA synchronization observer validation");
-    std::size_t observed_synchronizations = 0;
-    auto observed_backend = backend.with_synchronization_observer(
-        [&observed_synchronizations] { ++observed_synchronizations; });
+        "null CUDA trace sink validation");
+    auto trace = std::make_shared<CountingCudaTrace>();
+    auto observed_backend = backend.with_trace_sink(trace);
     observed_backend.synchronize();
-    expect_eq(observed_synchronizations, 1U, "successful CUDA synchronization observed");
+    expect_eq(trace->synchronizations, 1U, "successful CUDA synchronization observed");
     const auto host = backend.copy_to_host(buffer);
     expect_eq(host.size(), 4096U, "host copy size");
     for (const auto byte : host) {
@@ -396,6 +404,13 @@ int main() {
                                       .dst_pitch = device_dst_pitch,
                                       .width_bytes = width,
                                       .height = height});
+    observed_backend.copy_device_to_device_2d({.src = src_device.ptr(),
+                                               .src_pitch = device_src_pitch,
+                                               .dst = dst_device.ptr(),
+                                               .dst_pitch = device_dst_pitch,
+                                               .width_bytes = width,
+                                               .height = height});
+    expect_eq(trace->copies, 1U, "successful CUDA D2D submission observed");
     std::vector<std::uint8_t> host_dst(dst_pitch * height, 0xCD);
     backend.copy_device_to_host_2d({.dst = host_dst.data(),
                                     .dst_pitch = dst_pitch,
