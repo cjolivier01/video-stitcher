@@ -95,9 +95,9 @@ void plan_keeps_calibration_gpu_resident() {
               "blocked plan does not claim verified device residency");
   expect_true(description.find("nvv4l2decoder") != std::string::npos,
               "plan describes hardware decode pipeline");
-  expect_true(description.find("qtdemux ! video/x-h264 ! h264parse ! nvv4l2decoder") !=
-                  std::string::npos,
-              "containerized inputs select the H264 video pad");
+  expect_true(description.find("qtdemux ! capsfilter caps=\"video/x-h264;video/x-h265\" ! "
+                               "parsebin ! nvv4l2decoder") != std::string::npos,
+              "containerized inputs select a supported video pad");
   expect_true(description.find("video/x-raw(memory:NVMM),format=NV12") != std::string::npos,
               "plan preserves NVMM decode caps");
   expect_true(description.find("Undistorting") != std::string::npos,

@@ -25,6 +25,8 @@ enum class GpuDecodeContainer {
 
 struct GpuFileDecodeConfig {
   std::string path;
+  // Elementary streams require an explicit parser. Supported containers
+  // select H264 or HEVC from their video pad at runtime.
   GpuDecodeCodec codec = GpuDecodeCodec::H264;
   bool elementary_stream = false;
   std::optional<GpuDecodeContainer> container;
