@@ -232,6 +232,17 @@ cc_test(
 )
 
 cc_test(
+    name = "reco_calibrate_gpu_sampling_tests",
+    size = "small",
+    srcs = ["reco_calibrate_gpu_sampling_tests.cpp"],
+    deps = [
+        "//cpp/reco_calibrate",
+        "//cpp/reco_core",
+        "//cpp/reco_io",
+    ],
+)
+
+cc_test(
     name = "reco_calibrate_pipeline_tests",
     size = "small",
     srcs = ["reco_calibrate_pipeline_tests.cpp"],
