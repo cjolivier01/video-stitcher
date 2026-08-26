@@ -227,6 +227,26 @@ void runahead_caps_are_correlated_by_timestamp() {
   }
 }
 
+void stale_parser_caps_reject_allocation_changes() {
+  set_scenario("caps-runahead-stale-caps");
+  auto source =
+      open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+
+  const auto first = source->read();
+  expect_true(first.frame.has_value(), "stale-caps first frame returned");
+  if (!first.frame.has_value()) {
+    return;
+  }
+  expect_eq(first.frame->nvmm.width, 864U, "stale-caps initial padded allocation width");
+  expect_eq(first.frame->nvmm.height, 480U, "stale-caps initial allocation height");
+  expect_eq(first.frame->visible_width, 854U, "stale-caps initial visible width");
+  expect_eq(first.frame->visible_height, 480U, "stale-caps initial visible height");
+
+  expect_gpu_decode_error([&] { (void)source->read(); },
+                          "allocation dimensions changed without a confirmed visible geometry",
+                          "stale parser caps cannot silently crop a resized NVMM frame");
+}
+
 void unknown_timestamps_are_not_fabricated() {
   set_scenario("unknown-time");
   auto source =
@@ -369,6 +389,7 @@ int main() {
   production_source_retains_mapped_sample();
   padded_sink_caps_preserve_predecoder_dimensions();
   runahead_caps_are_correlated_by_timestamp();
+  stale_parser_caps_reject_allocation_changes();
   unknown_timestamps_are_not_fabricated();
   concurrent_reads_serialize_appsink_access();
   fatal_pipeline_errors_are_latched();

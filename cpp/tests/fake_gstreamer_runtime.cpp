@@ -167,33 +167,34 @@ FakeSample* make_sample(std::uint32_t sample_index = 0) {
   if (scenario() == "unknown-time" || scenario() == "caps-runahead-unknown-time") {
     sample->buffer.pts = std::numeric_limits<std::uint64_t>::max();
     sample->buffer.duration = std::numeric_limits<std::uint64_t>::max();
-  } else if (scenario() == "caps-runahead") {
+  } else if (scenario() == "caps-runahead" || scenario() == "caps-runahead-stale-caps") {
     sample->buffer.pts = (static_cast<std::uint64_t>(sample_index) + 1U) * 1'000'000'000ULL;
   }
 
   sample->params.width =
       scenario() == "visible-crop" ||
-              ((scenario() == "caps-runahead" || scenario() == "caps-runahead-unknown-time") &&
+              ((scenario() == "caps-runahead" || scenario() == "caps-runahead-unknown-time" ||
+                scenario() == "caps-runahead-stale-caps") &&
                sample_index == 0)
           ? 864
           : 1280;
-  sample->params.height = 720;
+  sample->params.height = scenario() == "caps-runahead-stale-caps" && sample_index == 0 ? 480 : 720;
   sample->params.pitch = sample->params.width == 864 ? 1024 : 1280;
   sample->params.color_format = abi::kColorNv12_709;
   sample->params.layout = abi::kLayoutPitch;
-  sample->params.data_size = sample->params.pitch * 1080;
+  sample->params.data_size = sample->params.pitch * sample->params.height * 3U / 2U;
   sample->params.data_ptr = reinterpret_cast<void*>(0x10000000);
   sample->params.plane_params.num_planes = 2;
   sample->params.plane_params.width[0] = sample->params.width;
-  sample->params.plane_params.height[0] = 720;
+  sample->params.plane_params.height[0] = sample->params.height;
   sample->params.plane_params.pitch[0] = sample->params.pitch;
-  sample->params.plane_params.psize[0] = sample->params.pitch * 720;
+  sample->params.plane_params.psize[0] = sample->params.pitch * sample->params.height;
   sample->params.plane_params.bytes_per_pix[0] = 1;
   sample->params.plane_params.width[1] = sample->params.width / 2U;
-  sample->params.plane_params.height[1] = 360;
+  sample->params.plane_params.height[1] = sample->params.height / 2U;
   sample->params.plane_params.pitch[1] = sample->params.pitch;
-  sample->params.plane_params.offset[1] = sample->params.pitch * 720;
-  sample->params.plane_params.psize[1] = sample->params.pitch * 360;
+  sample->params.plane_params.offset[1] = sample->params.pitch * sample->params.height;
+  sample->params.plane_params.psize[1] = sample->params.pitch * sample->params.height / 2U;
   sample->params.plane_params.bytes_per_pix[1] = 2;
   sample->surface.gpu_id = 0;
   sample->surface.batch_size = 1;
@@ -204,7 +205,7 @@ FakeSample* make_sample(std::uint32_t sample_index = 0) {
 }
 
 std::uint32_t predecoder_width(std::uint32_t sample_index) {
-  if (scenario() == "visible-crop") {
+  if (scenario() == "visible-crop" || scenario() == "caps-runahead-stale-caps") {
     return 854;
   }
   if (scenario() == "oversized-caps") {
@@ -217,11 +218,20 @@ std::uint32_t predecoder_width(std::uint32_t sample_index) {
   return 1280;
 }
 
-void push_predecoder_buffer(FakePad* pad, GstBufferAbi& buffer, std::uint32_t width) {
+std::uint32_t predecoder_height() {
+  if (scenario() == "caps-runahead-stale-caps") {
+    return 480;
+  }
+  return 720;
+}
+
+void push_predecoder_buffer(FakePad* pad, GstBufferAbi& buffer, std::uint32_t width,
+                            std::uint32_t height) {
   if (pad == nullptr || pad->callback == nullptr) {
     return;
   }
   pad->current_width = width;
+  pad->current_height = height;
   FakePadProbeInfo info{.buffer = &buffer};
   (void)pad->callback(pad, &info, pad->callback_data);
 }
@@ -373,18 +383,20 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
   auto* sink = static_cast<FakeSink*>(sink_pointer);
   const auto current = sink->pull_count++;
   const auto current_scenario = scenario();
-  const bool caps_runahead =
-      current_scenario == "caps-runahead" || current_scenario == "caps-runahead-unknown-time";
+  const bool caps_runahead = current_scenario == "caps-runahead" ||
+                             current_scenario == "caps-runahead-unknown-time" ||
+                             current_scenario == "caps-runahead-stale-caps";
   if (caps_runahead && current < 2) {
     auto* sample = make_sample(current);
     if (current == 0) {
-      push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer,
-                             predecoder_width(current));
+      push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, predecoder_width(current),
+                             predecoder_height());
       GstBufferAbi next_buffer;
       next_buffer.pts = current_scenario == "caps-runahead-unknown-time"
                             ? std::numeric_limits<std::uint64_t>::max()
                             : 2'000'000'000ULL;
-      push_predecoder_buffer(sink->pipeline->display_pad, next_buffer, predecoder_width(1));
+      push_predecoder_buffer(sink->pipeline->display_pad, next_buffer, predecoder_width(1),
+                             predecoder_height());
     }
     return sample;
   }
@@ -395,7 +407,8 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
        current_scenario == "invalid-caps" || current_scenario == "oversized-caps") &&
       current == 0) {
     auto* sample = make_sample(current);
-    push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, predecoder_width(current));
+    push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, predecoder_width(current),
+                           predecoder_height());
     return sample;
   }
   return nullptr;
@@ -406,9 +419,11 @@ RECO_FAKE_EXPORT int gst_app_sink_is_eos(void* sink_pointer) {
   const auto* sink = static_cast<FakeSink*>(sink_pointer);
   return (current_scenario == "frame-eos" || current_scenario == "unknown-time" ||
           current_scenario == "visible-crop" || current_scenario == "caps-runahead" ||
-          current_scenario == "caps-runahead-unknown-time") &&
+          current_scenario == "caps-runahead-unknown-time" ||
+          current_scenario == "caps-runahead-stale-caps") &&
          sink->pull_count >= (current_scenario == "caps-runahead" ||
-                                      current_scenario == "caps-runahead-unknown-time"
+                                      current_scenario == "caps-runahead-unknown-time" ||
+                                      current_scenario == "caps-runahead-stale-caps"
                                   ? 3U
                                   : 2U);
 }

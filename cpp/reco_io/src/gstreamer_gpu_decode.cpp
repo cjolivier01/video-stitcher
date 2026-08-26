@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <initializer_list>
 #include <limits>
@@ -479,11 +481,33 @@ public:
         validation_error.has_value()) {
       throw GpuDecodeError("invalid GStreamer GPU frame: " + *validation_error);
     }
+    const auto allocation_dimensions = std::pair(nvmm.width, nvmm.height);
+    const auto current_visible_dimensions = std::pair(visible_width, visible_height);
+    if (previous_allocation_dimensions_.has_value() &&
+        *previous_allocation_dimensions_ != allocation_dimensions &&
+        previous_visible_dimensions_.has_value() &&
+        *previous_visible_dimensions_ == current_visible_dimensions) {
+      throw GpuDecodeError(
+          "GStreamer NVMM allocation dimensions changed without a confirmed visible geometry "
+          "change");
+    }
+    previous_allocation_dimensions_ = allocation_dimensions;
+    previous_visible_dimensions_ = current_visible_dimensions;
     ++next_frame_index_;
     return make_gpu_decode_frame(std::move(frame));
   }
 
 private:
+  enum class GeometryProbeFailure {
+    None,
+    MissingBuffer,
+    MissingCaps,
+    MissingCapsStructure,
+    InvalidDimensions,
+    QueueLimit,
+    Unknown,
+  };
+
   struct PendingGeometry {
     std::optional<std::uint64_t> pts_ns;
     std::uint32_t width = 0;
@@ -497,7 +521,7 @@ private:
     } catch (const std::exception& error) {
       source->record_probe_error(error.what());
     } catch (...) {
-      source->record_probe_error("unknown pre-decoder geometry probe failure");
+      source->record_probe_error(nullptr);
     }
     return kGstPadProbeOk;
   }
@@ -519,22 +543,44 @@ private:
          .height = height});
   }
 
-  void record_probe_error(std::string message) noexcept {
-    try {
-      std::lock_guard lock(geometry_mutex_);
-      if (!geometry_probe_error_.has_value()) {
-        geometry_probe_error_ = std::move(message);
-      }
-    } catch (...) {
+  void record_probe_error(const char* message) noexcept {
+    auto failure = GeometryProbeFailure::Unknown;
+    if (message != nullptr && std::strstr(message, "did not contain a buffer") != nullptr) {
+      failure = GeometryProbeFailure::MissingBuffer;
+    } else if (message != nullptr &&
+               std::strstr(message, "does not contain negotiated caps") != nullptr) {
+      failure = GeometryProbeFailure::MissingCaps;
+    } else if (message != nullptr &&
+               std::strstr(message, "do not contain a structure") != nullptr) {
+      failure = GeometryProbeFailure::MissingCapsStructure;
+    } else if (message != nullptr && std::strstr(message, "valid visible dimensions") != nullptr) {
+      failure = GeometryProbeFailure::InvalidDimensions;
+    } else if (message != nullptr && std::strstr(message, "safety limit") != nullptr) {
+      failure = GeometryProbeFailure::QueueLimit;
     }
+    GeometryProbeFailure expected = GeometryProbeFailure::None;
+    (void)geometry_probe_failure_.compare_exchange_strong(
+        expected, failure, std::memory_order_release, std::memory_order_relaxed);
   }
 
   [[nodiscard]] std::pair<std::uint32_t, std::uint32_t>
   take_visible_dimensions(std::optional<std::uint64_t> pts_ns) {
     std::lock_guard lock(geometry_mutex_);
-    if (geometry_probe_error_.has_value()) {
-      throw GpuDecodeError("GStreamer pre-decoder geometry probe failed: " +
-                           *geometry_probe_error_);
+    switch (geometry_probe_failure_.load(std::memory_order_acquire)) {
+    case GeometryProbeFailure::None:
+      break;
+    case GeometryProbeFailure::MissingBuffer:
+      throw GpuDecodeError("GStreamer pre-decoder probe did not contain a buffer");
+    case GeometryProbeFailure::MissingCaps:
+      throw GpuDecodeError("GStreamer pre-decoder pad does not contain negotiated caps");
+    case GeometryProbeFailure::MissingCapsStructure:
+      throw GpuDecodeError("GStreamer pre-decoder caps do not contain a structure");
+    case GeometryProbeFailure::InvalidDimensions:
+      throw GpuDecodeError("GStreamer pre-decoder caps do not contain valid visible dimensions");
+    case GeometryProbeFailure::QueueLimit:
+      throw GpuDecodeError("GStreamer pre-decoder geometry queue exceeded its safety limit");
+    case GeometryProbeFailure::Unknown:
+      throw GpuDecodeError("GStreamer pre-decoder geometry probe failed");
     }
     if (pending_geometry_.empty()) {
       throw GpuDecodeError("GStreamer decoded frame has no correlated pre-decoder geometry");
@@ -639,7 +685,9 @@ private:
   std::mutex read_mutex_;
   std::mutex geometry_mutex_;
   std::deque<PendingGeometry> pending_geometry_;
-  std::optional<std::string> geometry_probe_error_;
+  std::atomic<GeometryProbeFailure> geometry_probe_failure_{GeometryProbeFailure::None};
+  std::optional<std::pair<std::uint32_t, std::uint32_t>> previous_allocation_dimensions_;
+  std::optional<std::pair<std::uint32_t, std::uint32_t>> previous_visible_dimensions_;
   std::uint64_t next_frame_index_ = 0;
   std::optional<std::string> terminal_error_;
   bool ended_ = false;
