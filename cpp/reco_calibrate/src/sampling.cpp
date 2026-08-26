@@ -107,6 +107,10 @@ extract_gpu_gray_frames(reco::core::CudaBackend& backend, reco::io::GpuFileDecod
   if (!source.gpu_resident()) {
     throw std::invalid_argument("calibration frame extraction requires a GPU-resident source");
   }
+  if (source.config().drop) {
+    throw std::invalid_argument(
+        "calibration frame extraction requires decoder frame dropping to be disabled");
+  }
   for (std::size_t i = 1; i < frame_indices.size(); ++i) {
     if (frame_indices[i] <= frame_indices[i - 1]) {
       throw std::invalid_argument("calibration frame indices must be sorted and unique");
@@ -166,6 +170,9 @@ extract_gpu_gray_frames(reco::core::CudaBackend& backend, reco::io::GpuFileDecod
                                       .dst_pitch = pitch,
                                       .width_bytes = mapped.width,
                                       .height = mapped.height});
+    // The decoder may recycle its surface as soon as this iteration releases
+    // mapped. Confirm the D2D read is complete before returning that surface.
+    backend.synchronize();
     extracted.push_back({.y_plane = std::move(y_plane),
                          .pitch = pitch,
                          .width = mapped.width,
@@ -181,6 +188,10 @@ extract_gpu_gray_frames(reco::core::CudaBackend& backend, reco::io::GpuFileDecod
 std::vector<GpuCalibrationFrame> extract_gpu_gray_frames_from_file(
     reco::core::CudaBackend& backend, reco::io::GpuFileDecodeConfig config,
     reco::io::NvbufSurfaceAbi abi, std::span<const std::uint64_t> frame_indices) {
+  if (config.drop) {
+    throw std::invalid_argument(
+        "calibration frame extraction requires decoder frame dropping to be disabled");
+  }
   auto source = reco::io::open_gstreamer_gpu_file_decode_source(std::move(config), abi);
   return extract_gpu_gray_frames(backend, *source, frame_indices);
 }

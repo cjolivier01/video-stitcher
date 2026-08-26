@@ -53,8 +53,8 @@ void expect_error(Function&& function, std::string_view fragment, std::string_vi
   }
 }
 
-GpuFileDecodeConfig fixture_config() {
-  return {.path = "fixture.mp4", .container = GpuDecodeContainer::QuickTime};
+GpuFileDecodeConfig fixture_config(bool drop = false) {
+  return {.path = "fixture.mp4", .container = GpuDecodeContainer::QuickTime, .drop = drop};
 }
 
 GpuDecodedFrame metadata_frame(std::uint64_t frame_index) {
@@ -75,8 +75,9 @@ GpuDecodedFrame metadata_frame(std::uint64_t frame_index) {
 
 class VectorSource final : public GpuFileDecodeSource {
 public:
-  explicit VectorSource(std::vector<GpuDecodedFrame> frames, bool gpu_resident = true)
-      : config_(fixture_config()), pipeline_(build_gstreamer_gpu_file_decode_pipeline(config_)),
+  explicit VectorSource(std::vector<GpuDecodedFrame> frames, bool gpu_resident = true,
+                        bool drop = false)
+      : config_(fixture_config(drop)), pipeline_(build_gstreamer_gpu_file_decode_pipeline(config_)),
         frames_(std::move(frames)), gpu_resident_(gpu_resident) {}
 
   [[nodiscard]] const GpuFileDecodeConfig& config() const override { return config_; }
@@ -119,6 +120,20 @@ void extraction_contract_rejects_invalid_streams(CudaBackend& backend) {
   expect_error<std::invalid_argument>(
       [&] { (void)extract_gpu_gray_frames(backend, non_gpu, std::vector<std::uint64_t>{0}); },
       "GPU-resident", "CPU source rejected");
+
+  VectorSource dropping({}, true, true);
+  expect_error<std::invalid_argument>(
+      [&] { (void)extract_gpu_gray_frames(backend, dropping, std::vector<std::uint64_t>{0}); },
+      "dropping to be disabled", "drop-enabled source rejected");
+  expect_eq(dropping.read_count(), 0U, "drop-enabled source does not consume decoder frames");
+
+  expect_error<std::invalid_argument>(
+      [&] {
+        (void)extract_gpu_gray_frames_from_file(
+            backend, fixture_config(true), NvbufSurfaceAbi::DeepStream9_1,
+            std::vector<std::uint64_t>{0});
+      },
+      "dropping to be disabled", "drop-enabled file config rejected before decoder startup");
 
   VectorSource unsorted({});
   expect_error<std::invalid_argument>(
