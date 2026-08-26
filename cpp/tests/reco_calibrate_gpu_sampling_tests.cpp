@@ -195,6 +195,8 @@ bool address_sanitizer_build() {
 #endif
 }
 
+#if defined(__linux__)
+
 struct CudaNvmmOwner {
   explicit CudaNvmmOwner(CudaDeviceBuffer allocation) : allocation(std::move(allocation)) {}
 
@@ -205,10 +207,11 @@ struct CudaNvmmOwner {
 
 std::pair<GpuDecodedFrame, std::weak_ptr<CudaNvmmOwner>>
 make_cuda_frame(CudaBackend& backend, std::uint64_t frame_index, std::uint8_t y_value,
-                std::uint32_t width = 64, std::uint32_t height = 32) {
-  const std::size_t pitch = width;
+                std::uint32_t width = 66, std::uint32_t height = 32) {
+  auto source_allocation = backend.allocate_pitched(width, height + height / 2U, 16);
+  const std::size_t pitch = source_allocation.pitch;
   const std::size_t total_size = pitch * (height + height / 2U);
-  auto owner = std::make_shared<CudaNvmmOwner>(backend.allocate(total_size));
+  auto owner = std::make_shared<CudaNvmmOwner>(std::move(source_allocation.buffer));
   std::vector<std::uint8_t> pixels(total_size, 128);
   std::fill_n(pixels.begin(), pitch * height, y_value);
   backend.copy_host_to_device_2d({.src = pixels.data(),
@@ -255,6 +258,9 @@ make_cuda_frame(CudaBackend& backend, std::uint64_t frame_index, std::uint8_t y_
 }
 
 void selected_y_planes_are_copied_device_to_device(CudaBackend& backend) {
+  std::size_t completed_copy_synchronizations = 0;
+  auto extraction_backend = backend.with_synchronization_observer(
+      [&completed_copy_synchronizations] { ++completed_copy_synchronizations; });
   std::vector<GpuDecodedFrame> frames;
   std::vector<std::weak_ptr<CudaNvmmOwner>> lifetimes;
   for (std::uint64_t index = 0; index < 5; ++index) {
@@ -263,8 +269,11 @@ void selected_y_planes_are_copied_device_to_device(CudaBackend& backend) {
     lifetimes.push_back(std::move(lifetime));
   }
   VectorSource source(std::move(frames));
-  const auto selected = extract_gpu_gray_frames(backend, source, std::vector<std::uint64_t>{1, 3});
+  const auto selected =
+      extract_gpu_gray_frames(extraction_backend, source, std::vector<std::uint64_t>{1, 3});
   expect_eq(selected.size(), 2U, "two indexed GPU frames extracted");
+  expect_eq(completed_copy_synchronizations, 2U,
+            "each selected decoder surface is synchronized before release");
   if (selected.size() != 2) {
     return;
   }
@@ -273,11 +282,22 @@ void selected_y_planes_are_copied_device_to_device(CudaBackend& backend) {
   expect_eq(selected[1].frame_index, 3U, "second selected index preserved");
   expect_true(selected[0].pts_ns == 33'333'333U, "selected PTS preserved");
   expect_true(selected[1].duration_ns == 33'333'333U, "selected duration preserved");
-  expect_eq(selected[0].pitch, 64U, "calibration copy uses tight device pitch");
+  expect_eq(selected[0].width, 66U, "non-aligned calibration frame width preserved");
+  expect_true(selected[0].pitch >= selected[0].width,
+              "calibration copy uses a pitch covering the frame width");
+  expect_eq(selected[0].y_plane.size(), selected[0].pitch * selected[0].height,
+            "calibration allocation retains its full pitched extent");
   expect_eq(selected[0].view().ptr, selected[0].y_plane.ptr(), "gray view references device copy");
 
   for (std::size_t i = 0; i < selected.size(); ++i) {
-    const auto pixels = backend.copy_to_host(selected[i].y_plane);
+    std::vector<std::uint8_t> pixels(static_cast<std::size_t>(selected[i].width) *
+                                     selected[i].height);
+    backend.copy_device_to_host_2d({.dst = pixels.data(),
+                                    .dst_pitch = selected[i].width,
+                                    .src = selected[i].y_plane.ptr(),
+                                    .src_pitch = selected[i].pitch,
+                                    .width_bytes = selected[i].width,
+                                    .height = selected[i].height});
     const auto expected = static_cast<std::uint8_t>(selected[i].frame_index + 20);
     expect_true(std::all_of(pixels.begin(), pixels.end(),
                             [expected](std::uint8_t value) { return value == expected; }),
@@ -300,6 +320,8 @@ void selected_y_planes_are_copied_device_to_device(CudaBackend& backend) {
       "dimensions changed", "mid-stream dimension changes are rejected");
 }
 
+#endif
+
 } // namespace
 
 int main() {
@@ -317,6 +339,10 @@ int main() {
   }
   auto backend = CudaBackend::create();
   extraction_contract_rejects_invalid_streams(backend);
+#if defined(__linux__)
   selected_y_planes_are_copied_device_to_device(backend);
+#else
+  std::cerr << "SKIP: NvBufSurface CUDA mapping tests require Linux\n";
+#endif
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

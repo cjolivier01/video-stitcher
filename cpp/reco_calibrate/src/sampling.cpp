@@ -162,19 +162,18 @@ extract_gpu_gray_frames(reco::core::CudaBackend& backend, reco::io::GpuFileDecod
       throw GpuFrameExtractionError("GPU calibration frame allocation size overflows");
     }
 
-    const auto pitch = static_cast<std::size_t>(mapped.width);
-    auto y_plane = backend.allocate(pitch * mapped.height);
+    auto allocation = backend.allocate_pitched(mapped.width, mapped.height, 16);
     backend.copy_device_to_device_2d({.src = mapped.y_ptr,
                                       .src_pitch = mapped.y_pitch,
-                                      .dst = y_plane.ptr(),
-                                      .dst_pitch = pitch,
+                                      .dst = allocation.buffer.ptr(),
+                                      .dst_pitch = allocation.pitch,
                                       .width_bytes = mapped.width,
                                       .height = mapped.height});
     // The decoder may recycle its surface as soon as this iteration releases
     // mapped. Confirm the D2D read is complete before returning that surface.
     backend.synchronize();
-    extracted.push_back({.y_plane = std::move(y_plane),
-                         .pitch = pitch,
+    extracted.push_back({.y_plane = std::move(allocation.buffer),
+                         .pitch = allocation.pitch,
                          .width = mapped.width,
                          .height = mapped.height,
                          .frame_index = decoded.frame_index,

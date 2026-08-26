@@ -94,6 +94,14 @@ private:
   std::function<void(CudaDevicePtr)> free_;
 };
 
+/// CUDA device allocation whose row pitch is valid for two-dimensional copies.
+struct CudaPitchedAllocation {
+  /// Device storage spanning `pitch * height` bytes.
+  CudaDeviceBuffer buffer;
+  /// Driver-selected distance between adjacent rows, in bytes.
+  std::size_t pitch = 0;
+};
+
 class CudaSharedMemory;
 class CudaKernel;
 
@@ -102,12 +110,17 @@ public:
   [[nodiscard]] static bool is_available();
   [[nodiscard]] static std::string availability_error();
   [[nodiscard]] static CudaBackend create();
+  /// Returns a backend view that invokes observer after each successful explicit synchronization.
+  [[nodiscard]] CudaBackend with_synchronization_observer(std::function<void()> observer) const;
 
   [[nodiscard]] int device_count() const;
   [[nodiscard]] CudaDeviceInfo device_info(int ordinal = 0) const;
   void ensure_primary_context(int ordinal = 0) const;
   [[nodiscard]] CudaMemoryInfo memory_info() const;
   [[nodiscard]] CudaDeviceBuffer allocate(std::size_t bytes) const;
+  /// Allocates 2D storage with a driver-selected pitch valid for `cuMemcpy2D`.
+  [[nodiscard]] CudaPitchedAllocation allocate_pitched(std::size_t width_bytes, std::size_t height,
+                                                       unsigned int element_size_bytes) const;
   [[nodiscard]] CudaSharedMemory allocate_shared_memory(std::size_t bytes) const;
   void memset_d8(const CudaDeviceBuffer& buffer, std::uint8_t value) const;
   [[nodiscard]] std::vector<std::uint8_t> copy_to_host(const CudaDeviceBuffer& buffer) const;
@@ -125,8 +138,10 @@ private:
 
   struct Impl;
 
-  explicit CudaBackend(std::shared_ptr<Impl> impl);
+  explicit CudaBackend(std::shared_ptr<Impl> impl,
+                       std::function<void()> synchronization_observer = {});
   std::shared_ptr<Impl> impl_;
+  std::function<void()> synchronization_observer_;
 };
 
 class CudaSharedMemory {

@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -41,6 +42,18 @@ template <typename Fn> void expect_invalid_argument(Fn&& fn, std::string_view me
     std::cerr << "FAIL: " << message << " did not throw\n";
     ++failures;
   } catch (const std::invalid_argument&) {
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: " << message << " threw unexpected exception: " << error.what() << '\n';
+    ++failures;
+  }
+}
+
+template <typename Fn> void expect_overflow_error(Fn&& fn, std::string_view message) {
+  try {
+    fn();
+    std::cerr << "FAIL: " << message << " did not throw\n";
+    ++failures;
+  } catch (const std::overflow_error&) {
   } catch (const std::exception& error) {
     std::cerr << "FAIL: " << message << " threw unexpected exception: " << error.what() << '\n';
     ++failures;
@@ -178,6 +191,17 @@ int main() {
     expect_eq(buffer.size(), 4096U, "device buffer size");
     backend.memset_d8(buffer, 0xA5);
     backend.synchronize();
+    expect_invalid_argument(
+        [&] {
+          auto ignored = backend.with_synchronization_observer({});
+          (void)ignored;
+        },
+        "empty CUDA synchronization observer validation");
+    std::size_t observed_synchronizations = 0;
+    auto observed_backend = backend.with_synchronization_observer(
+        [&observed_synchronizations] { ++observed_synchronizations; });
+    observed_backend.synchronize();
+    expect_eq(observed_synchronizations, 1U, "successful CUDA synchronization observed");
     const auto host = backend.copy_to_host(buffer);
     expect_eq(host.size(), 4096U, "host copy size");
     for (const auto byte : host) {
@@ -246,8 +270,6 @@ int main() {
     constexpr std::size_t width = 17;
     constexpr std::size_t height = 5;
     constexpr std::size_t src_pitch = 23;
-    constexpr std::size_t device_src_pitch = 32;
-    constexpr std::size_t device_dst_pitch = 40;
     constexpr std::size_t dst_pitch = 29;
 
     std::vector<std::uint8_t> host_src(src_pitch * height, 0x11);
@@ -256,8 +278,40 @@ int main() {
         host_src[row * src_pitch + col] = static_cast<std::uint8_t>(row * 31 + col);
       }
     }
-    auto src_device = backend.allocate(device_src_pitch * height);
-    auto dst_device = backend.allocate(device_dst_pitch * height);
+    expect_invalid_argument(
+        [&] {
+          auto ignored = backend.allocate_pitched(0, height, 16);
+          (void)ignored;
+        },
+        "pitched allocation zero width validation");
+    expect_invalid_argument(
+        [&] {
+          auto ignored = backend.allocate_pitched(width, 0, 16);
+          (void)ignored;
+        },
+        "pitched allocation zero height validation");
+    expect_invalid_argument(
+        [&] {
+          auto ignored = backend.allocate_pitched(width, height, 1);
+          (void)ignored;
+        },
+        "pitched allocation element size validation");
+    expect_overflow_error(
+        [&] {
+          auto ignored = backend.allocate_pitched(std::numeric_limits<std::size_t>::max(), 2, 16);
+          (void)ignored;
+        },
+        "pitched allocation overflow validation");
+    auto src_allocation = backend.allocate_pitched(width, height, 16);
+    auto dst_allocation = backend.allocate_pitched(width, height, 16);
+    auto& src_device = src_allocation.buffer;
+    auto& dst_device = dst_allocation.buffer;
+    const auto device_src_pitch = src_allocation.pitch;
+    const auto device_dst_pitch = dst_allocation.pitch;
+    expect_true(device_src_pitch >= width, "pitched source covers requested width");
+    expect_true(device_dst_pitch >= width, "pitched destination covers requested width");
+    expect_eq(src_device.size(), device_src_pitch * height, "pitched source allocation size");
+    expect_eq(dst_device.size(), device_dst_pitch * height, "pitched destination allocation size");
     backend.memset_d8(src_device, 0);
     backend.memset_d8(dst_device, 0xEE);
     expect_invalid_argument(
