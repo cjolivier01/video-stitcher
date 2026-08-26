@@ -149,6 +149,10 @@ void production_source_retains_mapped_sample() {
   source.reset();
   events = read_events(event_path);
   expect_eq(count_event(events, "state-null"), 1U, "source shutdown stops pipeline");
+  expect_eq(count_event(events, "remove-display-probe"), 1U,
+            "source shutdown removes the geometry callback");
+  expect_eq(count_event(events, "probe-leaked"), 0U,
+            "geometry callback does not outlive its source");
   expect_eq(count_event(events, "unmap"), 0U,
             "source shutdown does not invalidate an outstanding frame");
 
@@ -193,6 +197,34 @@ void padded_sink_caps_preserve_predecoder_dimensions() {
             "display dimensions come from pre-decoder caps");
   expect_eq(count_event(events, "sample-caps"), 0U,
             "padded appsink caps are not treated as display dimensions");
+}
+
+void runahead_caps_are_correlated_by_timestamp() {
+  set_scenario("caps-runahead");
+  const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
+  std::filesystem::remove(event_path);
+  auto source =
+      open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+
+  const auto first = source->read();
+  expect_true(first.frame.has_value(), "caps-runahead first frame returned");
+  if (!first.frame.has_value()) {
+    return;
+  }
+  expect_eq(first.frame->nvmm.width, 864U, "first runahead allocation remains padded");
+  expect_eq(first.frame->visible_width, 854U,
+            "first runahead frame uses its timestamped pre-decoder geometry");
+  auto events = read_events(event_path);
+  expect_eq(count_event(events, "pad-current-caps"), 2U,
+            "upstream advances to the second geometry before the first pull returns");
+
+  const auto second = source->read();
+  expect_true(second.frame.has_value(), "caps-runahead second frame returned");
+  if (second.frame.has_value()) {
+    expect_eq(second.frame->nvmm.width, 1280U, "second runahead allocation width");
+    expect_eq(second.frame->visible_width, 1280U,
+              "second runahead frame uses its own timestamped geometry");
+  }
 }
 
 void unknown_timestamps_are_not_fabricated() {
@@ -283,13 +315,14 @@ void fatal_pipeline_errors_are_latched() {
 
 void runtime_failures_are_reported() {
   for (const auto& [scenario_name, fragment] :
-       std::array<std::pair<std::string_view, std::string_view>, 8>{
+       std::array<std::pair<std::string_view, std::string_view>, 9>{
            {{"old-version", "1.10 or newer"},
             {"init-error", "fake initialization failure"},
             {"parse-error", "fake parse failure"},
             {"missing-sink", "does not contain appsink"},
             {"missing-display-info", "does not contain pre-decoder identity"},
             {"missing-display-pad", "does not provide a source pad"},
+            {"probe-install-error", "failed to install"},
             {"missing-bus", "does not provide a message bus"},
             {"state-error", "rejected the PLAYING state"}}}) {
     set_scenario(scenario_name);
@@ -302,7 +335,7 @@ void runtime_failures_are_reported() {
   }
 
   for (const auto& [scenario_name, fragment] :
-       std::array<std::pair<std::string_view, std::string_view>, 9>{
+       std::array<std::pair<std::string_view, std::string_view>, 10>{
            {{"stream-error", "fake decoder failure"},
             {"delayed-stream-error", "fake decoder failure"},
             {"missing-buffer", "does not contain a buffer"},
@@ -311,7 +344,8 @@ void runtime_failures_are_reported() {
             {"missing-caps", "does not contain negotiated caps"},
             {"missing-caps-structure", "do not contain a structure"},
             {"invalid-caps", "valid visible dimensions"},
-            {"oversized-caps", "exceed the NVMM allocation"}}}) {
+            {"oversized-caps", "exceed the NVMM allocation"},
+            {"caps-runahead-unknown-time", "cannot be correlated"}}}) {
     set_scenario(scenario_name);
     auto source =
         open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
@@ -334,6 +368,7 @@ int main() {
 
   production_source_retains_mapped_sample();
   padded_sink_caps_preserve_predecoder_dimensions();
+  runahead_caps_are_correlated_by_timestamp();
   unknown_timestamps_are_not_fabricated();
   concurrent_reads_serialize_appsink_access();
   fatal_pipeline_errors_are_latched();

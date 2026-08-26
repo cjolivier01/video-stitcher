@@ -1,9 +1,11 @@
 #include "reco/io/gpu_decode.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <initializer_list>
 #include <limits>
 #include <memory>
@@ -26,8 +28,11 @@ constexpr int kGstStateNull = 1;
 constexpr int kGstStatePlaying = 4;
 constexpr int kGstStateChangeFailure = 0;
 constexpr std::uint32_t kGstMessageError = 1U << 1U;
+constexpr int kGstPadProbeTypeBuffer = 1 << 4;
+constexpr int kGstPadProbeOk = 1;
 constexpr std::uint64_t kGstClockTimeNone = std::numeric_limits<std::uint64_t>::max();
 constexpr std::uint64_t kSamplePollTimeoutNs = 100'000'000;
+constexpr std::size_t kMaximumPendingGeometry = 4096;
 
 struct GErrorAbi {
   std::uint32_t domain = 0;
@@ -165,6 +170,11 @@ public:
   using ElementGetBus = void* (*)(void*);
   using ObjectUnref = void (*)(void*);
   using PadGetCurrentCaps = void* (*)(void*);
+  using PadProbeCallback = int (*)(void*, void*, void*);
+  using DestroyNotify = void (*)(void*);
+  using PadAddProbe = unsigned long (*)(void*, int, PadProbeCallback, void*, DestroyNotify);
+  using PadRemoveProbe = void (*)(void*, unsigned long);
+  using PadProbeInfoGetBuffer = void* (*)(void*);
   using CapsUnref = void (*)(void*);
   using AppSinkTryPullSample = void* (*)(void*, std::uint64_t);
   using AppSinkIsEos = int (*)(void*);
@@ -214,6 +224,10 @@ public:
     element_get_bus = core_library->symbol<ElementGetBus>("gst_element_get_bus");
     object_unref = core_library->symbol<ObjectUnref>("gst_object_unref");
     pad_get_current_caps = core_library->symbol<PadGetCurrentCaps>("gst_pad_get_current_caps");
+    pad_add_probe = core_library->symbol<PadAddProbe>("gst_pad_add_probe");
+    pad_remove_probe = core_library->symbol<PadRemoveProbe>("gst_pad_remove_probe");
+    pad_probe_info_get_buffer =
+        core_library->symbol<PadProbeInfoGetBuffer>("gst_pad_probe_info_get_buffer");
     caps_unref = core_library->symbol<CapsUnref>("gst_caps_unref");
     sample_get_buffer = core_library->symbol<SampleGetBuffer>("gst_sample_get_buffer");
     sample_unref = core_library->symbol<SampleUnref>("gst_sample_unref");
@@ -244,6 +258,9 @@ public:
   ElementGetBus element_get_bus = nullptr;
   ObjectUnref object_unref = nullptr;
   PadGetCurrentCaps pad_get_current_caps = nullptr;
+  PadAddProbe pad_add_probe = nullptr;
+  PadRemoveProbe pad_remove_probe = nullptr;
+  PadProbeInfoGetBuffer pad_probe_info_get_buffer = nullptr;
   CapsUnref caps_unref = nullptr;
   AppSinkTryPullSample app_sink_try_pull_sample = nullptr;
   AppSinkIsEos app_sink_is_eos = nullptr;
@@ -384,6 +401,12 @@ public:
     if (display_info_pad_ == nullptr) {
       throw GpuDecodeError("GStreamer pre-decoder identity does not provide a source pad");
     }
+    display_info_probe_id_ =
+        api_->pad_add_probe(display_info_pad_, kGstPadProbeTypeBuffer,
+                            &GstreamerGpuFileDecodeSource::on_predecoder_buffer, this, nullptr);
+    if (display_info_probe_id_ == 0) {
+      throw GpuDecodeError("failed to install GStreamer pre-decoder geometry probe");
+    }
     bus_ = api_->element_get_bus(pipeline_);
     if (bus_ == nullptr) {
       throw GpuDecodeError("GStreamer pipeline does not provide a message bus");
@@ -428,7 +451,6 @@ public:
       throw GpuDecodeError("GStreamer sample does not contain a buffer");
     }
     owner->map_buffer(buffer);
-    const auto [visible_width, visible_height] = visible_dimensions(api_, display_info_pad_);
 
     NvmmFrameInfo nvmm;
     try {
@@ -438,15 +460,17 @@ public:
     }
 
     const auto& gst_buffer = *static_cast<const GstBufferAbi*>(buffer);
+    const auto pts_ns = gst_buffer.pts == kGstClockTimeNone
+                            ? std::nullopt
+                            : std::optional<std::uint64_t>(gst_buffer.pts);
+    const auto [visible_width, visible_height] = take_visible_dimensions(pts_ns);
     GpuDecodedFrame frame{
         .nvmm = nvmm,
         .visible_width = visible_width,
         .visible_height = visible_height,
         .owner = owner,
         .frame_index = next_frame_index_,
-        .pts_ns = gst_buffer.pts == kGstClockTimeNone
-                      ? std::nullopt
-                      : std::optional<std::uint64_t>(gst_buffer.pts),
+        .pts_ns = pts_ns,
         .duration_ns = gst_buffer.duration == kGstClockTimeNone
                            ? std::nullopt
                            : std::optional<std::uint64_t>(gst_buffer.duration),
@@ -460,6 +484,97 @@ public:
   }
 
 private:
+  struct PendingGeometry {
+    std::optional<std::uint64_t> pts_ns;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+  };
+
+  static int on_predecoder_buffer(void*, void* probe_info, void* user_data) noexcept {
+    auto* source = static_cast<GstreamerGpuFileDecodeSource*>(user_data);
+    try {
+      source->record_predecoder_geometry(probe_info);
+    } catch (const std::exception& error) {
+      source->record_probe_error(error.what());
+    } catch (...) {
+      source->record_probe_error("unknown pre-decoder geometry probe failure");
+    }
+    return kGstPadProbeOk;
+  }
+
+  void record_predecoder_geometry(void* probe_info) {
+    void* buffer = api_->pad_probe_info_get_buffer(probe_info);
+    if (buffer == nullptr) {
+      throw GpuDecodeError("GStreamer pre-decoder probe did not contain a buffer");
+    }
+    const auto [width, height] = visible_dimensions(api_, display_info_pad_);
+    const auto pts = static_cast<const GstBufferAbi*>(buffer)->pts;
+    std::lock_guard lock(geometry_mutex_);
+    if (pending_geometry_.size() >= kMaximumPendingGeometry) {
+      throw GpuDecodeError("GStreamer pre-decoder geometry queue exceeded its safety limit");
+    }
+    pending_geometry_.push_back(
+        {.pts_ns = pts == kGstClockTimeNone ? std::nullopt : std::optional<std::uint64_t>(pts),
+         .width = width,
+         .height = height});
+  }
+
+  void record_probe_error(std::string message) noexcept {
+    try {
+      std::lock_guard lock(geometry_mutex_);
+      if (!geometry_probe_error_.has_value()) {
+        geometry_probe_error_ = std::move(message);
+      }
+    } catch (...) {
+    }
+  }
+
+  [[nodiscard]] std::pair<std::uint32_t, std::uint32_t>
+  take_visible_dimensions(std::optional<std::uint64_t> pts_ns) {
+    std::lock_guard lock(geometry_mutex_);
+    if (geometry_probe_error_.has_value()) {
+      throw GpuDecodeError("GStreamer pre-decoder geometry probe failed: " +
+                           *geometry_probe_error_);
+    }
+    if (pending_geometry_.empty()) {
+      throw GpuDecodeError("GStreamer decoded frame has no correlated pre-decoder geometry");
+    }
+
+    auto selected = pending_geometry_.end();
+    if (pts_ns.has_value()) {
+      for (auto geometry = pending_geometry_.begin(); geometry != pending_geometry_.end();
+           ++geometry) {
+        if (geometry->pts_ns != pts_ns) {
+          continue;
+        }
+        if (selected != pending_geometry_.end() &&
+            (geometry->width != selected->width || geometry->height != selected->height)) {
+          throw GpuDecodeError(
+              "GStreamer decoded frame timestamp matches conflicting pre-decoder geometry");
+        }
+        if (selected == pending_geometry_.end()) {
+          selected = geometry;
+        }
+      }
+    }
+    if (selected == pending_geometry_.end()) {
+      const auto& first = pending_geometry_.front();
+      const bool dimensions_are_unambiguous = std::all_of(
+          pending_geometry_.begin(), pending_geometry_.end(), [&](const PendingGeometry& geometry) {
+            return geometry.width == first.width && geometry.height == first.height;
+          });
+      if (!dimensions_are_unambiguous) {
+        throw GpuDecodeError(
+            "GStreamer decoded frame timestamp cannot be correlated across a geometry change");
+      }
+      selected = pending_geometry_.begin();
+    }
+
+    const auto dimensions = std::pair{selected->width, selected->height};
+    pending_geometry_.erase(selected);
+    return dimensions;
+  }
+
   [[nodiscard]] std::string pop_pipeline_error() {
     void* message = api_->bus_timed_pop_filtered(bus_, 0, kGstMessageError);
     if (message == nullptr) {
@@ -490,6 +605,10 @@ private:
       bus_ = nullptr;
     }
     if (display_info_pad_ != nullptr) {
+      if (display_info_probe_id_ != 0) {
+        api_->pad_remove_probe(display_info_pad_, display_info_probe_id_);
+        display_info_probe_id_ = 0;
+      }
       api_->object_unref(display_info_pad_);
       display_info_pad_ = nullptr;
     }
@@ -515,8 +634,12 @@ private:
   void* sink_ = nullptr;
   void* display_info_ = nullptr;
   void* display_info_pad_ = nullptr;
+  unsigned long display_info_probe_id_ = 0;
   void* bus_ = nullptr;
   std::mutex read_mutex_;
+  std::mutex geometry_mutex_;
+  std::deque<PendingGeometry> pending_geometry_;
+  std::optional<std::string> geometry_probe_error_;
   std::uint64_t next_frame_index_ = 0;
   std::optional<std::string> terminal_error_;
   bool ended_ = false;
