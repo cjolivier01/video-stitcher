@@ -26,6 +26,12 @@ struct GErrorAbi {
   char* message = nullptr;
 };
 
+struct GListAbi {
+  void* data = nullptr;
+  GListAbi* next = nullptr;
+  GListAbi* previous = nullptr;
+};
+
 struct GstMapInfoAbi {
   void* memory = nullptr;
   std::uint32_t flags = 0;
@@ -134,6 +140,32 @@ struct FakePadProbeInfo {
   std::int32_t type = 0;
   unsigned long id = 0;
   void* data = nullptr;
+};
+
+enum class GObjectKind {
+  Discoverer,
+  DiscovererInfo,
+};
+
+struct FakeGObject {
+  explicit FakeGObject(GObjectKind object_kind) : kind(object_kind) {}
+  GObjectKind kind;
+};
+
+struct FakeDiscoverer : FakeGObject {
+  FakeDiscoverer() : FakeGObject(GObjectKind::Discoverer) {}
+};
+
+struct FakeDiscovererInfo : FakeGObject {
+  FakeDiscovererInfo() : FakeGObject(GObjectKind::DiscovererInfo) {}
+};
+
+struct FakeVideoInfo {
+  std::uint32_t width = 3840;
+  std::uint32_t height = 2160;
+  std::uint32_t fps_numerator = 30'000;
+  std::uint32_t fps_denominator = 1'001;
+  bool image = false;
 };
 
 struct FakeSample {
@@ -725,3 +757,123 @@ RECO_FAKE_EXPORT void g_error_free(GErrorAbi* error) {
 }
 
 RECO_FAKE_EXPORT void g_free(void* pointer) { std::free(pointer); }
+
+RECO_FAKE_EXPORT char* gst_filename_to_uri(const char* filename, GErrorAbi** error) {
+  record("filename-to-uri");
+  if (scenario() == "probe-uri-error") {
+    *error = make_error("fake URI conversion failure");
+    return nullptr;
+  }
+  const std::string uri = "file://" + std::string(filename);
+  return duplicate(uri.c_str());
+}
+
+RECO_FAKE_EXPORT void* gst_discoverer_new(std::uint64_t, GErrorAbi** error) {
+  record("discoverer-new");
+  if (scenario() == "probe-new-error") {
+    *error = make_error("fake discoverer construction failure");
+    return nullptr;
+  }
+  return new FakeDiscoverer;
+}
+
+RECO_FAKE_EXPORT void* gst_discoverer_discover_uri(void*, const char*, GErrorAbi** error) {
+  record("discover-uri");
+  if (scenario() == "probe-discover-error") {
+    *error = make_error("fake discovery failure");
+    return nullptr;
+  }
+  return new FakeDiscovererInfo;
+}
+
+RECO_FAKE_EXPORT int gst_discoverer_info_get_result(const void*) {
+  if (scenario() == "probe-timeout") {
+    return 3;
+  }
+  if (scenario() == "probe-missing-plugins") {
+    return 5;
+  }
+  return 0;
+}
+
+RECO_FAKE_EXPORT std::uint64_t gst_discoverer_info_get_duration(const void*) {
+  if (scenario() == "probe-duration-unknown") {
+    return std::numeric_limits<std::uint64_t>::max();
+  }
+  if (scenario() == "probe-duration-zero") {
+    return 0;
+  }
+  return 10'000'000'000ULL;
+}
+
+RECO_FAKE_EXPORT GListAbi* gst_discoverer_info_get_video_streams(void*) {
+  if (scenario() == "probe-no-video") {
+    return nullptr;
+  }
+
+  auto* first = new GListAbi;
+  first->data = new FakeVideoInfo;
+  auto* first_info = static_cast<FakeVideoInfo*>(first->data);
+  if (scenario() == "probe-image-only" || scenario() == "probe-image-then-video") {
+    first_info->image = true;
+  } else if (scenario() == "probe-bad-fps") {
+    first_info->fps_denominator = 0;
+  } else if (scenario() == "probe-bad-dimensions") {
+    first_info->width = 0;
+  }
+
+  if (scenario() == "probe-multiple" || scenario() == "probe-image-then-video") {
+    auto* second = new GListAbi;
+    second->data = new FakeVideoInfo;
+    second->previous = first;
+    first->next = second;
+  }
+  return first;
+}
+
+RECO_FAKE_EXPORT std::uint32_t gst_discoverer_video_info_get_width(const void* info) {
+  return static_cast<const FakeVideoInfo*>(info)->width;
+}
+
+RECO_FAKE_EXPORT std::uint32_t gst_discoverer_video_info_get_height(const void* info) {
+  return static_cast<const FakeVideoInfo*>(info)->height;
+}
+
+RECO_FAKE_EXPORT std::uint32_t gst_discoverer_video_info_get_framerate_num(const void* info) {
+  return static_cast<const FakeVideoInfo*>(info)->fps_numerator;
+}
+
+RECO_FAKE_EXPORT std::uint32_t gst_discoverer_video_info_get_framerate_denom(const void* info) {
+  return static_cast<const FakeVideoInfo*>(info)->fps_denominator;
+}
+
+RECO_FAKE_EXPORT int gst_discoverer_video_info_is_image(const void* info) {
+  return static_cast<const FakeVideoInfo*>(info)->image ? 1 : 0;
+}
+
+RECO_FAKE_EXPORT void gst_discoverer_stream_info_list_free(GListAbi* list) {
+  record("stream-list-free");
+  while (list != nullptr) {
+    auto* next = list->next;
+    delete static_cast<FakeVideoInfo*>(list->data);
+    delete list;
+    list = next;
+  }
+}
+
+RECO_FAKE_EXPORT void g_object_unref(void* object) {
+  if (object == nullptr) {
+    return;
+  }
+  auto* base = static_cast<FakeGObject*>(object);
+  switch (base->kind) {
+  case GObjectKind::Discoverer:
+    record("unref-discoverer");
+    delete static_cast<FakeDiscoverer*>(object);
+    break;
+  case GObjectKind::DiscovererInfo:
+    record("unref-discoverer-info");
+    delete static_cast<FakeDiscovererInfo*>(object);
+    break;
+  }
+}

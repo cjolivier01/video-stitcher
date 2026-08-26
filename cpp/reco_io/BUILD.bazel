@@ -6,6 +6,7 @@ cc_library(
         "src/gstreamer.cpp",
         "src/gstreamer_gpu_decode.cpp",
         "src/gpu_decode.cpp",
+        "src/gpu_video_probe.cpp",
         "src/jsonl_sink.cpp",
         "src/nvmm.cpp",
         "src/output.cpp",
@@ -15,6 +16,7 @@ cc_library(
     hdrs = [
         "include/reco/io/gstreamer.hpp",
         "include/reco/io/gpu_decode.hpp",
+        "include/reco/io/gpu_video_probe.hpp",
         "include/reco/io/detail/nvbufsurface_7_1.hpp",
         "include/reco/io/detail/nvbufsurface_9_1.hpp",
         "include/reco/io/jsonl_sink.hpp",
