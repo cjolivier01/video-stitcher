@@ -1752,7 +1752,16 @@ void lowered_file_limit_does_not_leak_high_descriptors(const std::filesystem::pa
 }
 
 void worker_address_space_is_limited(const std::filesystem::path& video_path) {
-#if !defined(_WIN32) && !defined(RECO_PROBE_WIDE_ADDRESS_SANITIZER)
+#if defined(__APPLE__) && !defined(RECO_PROBE_WIDE_ADDRESS_SANITIZER)
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "memory-over-limit");
+  expect_probe_error(
+      [&] {
+        (void)reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
+                                        5'000'000'000ULL);
+      },
+      "abnormally", "macOS guardian terminates a worker above its physical-memory ceiling");
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+#elif !defined(_WIN32) && !defined(RECO_PROBE_WIDE_ADDRESS_SANITIZER)
   set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "memory-limit");
   try {
     expect_eq(reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,

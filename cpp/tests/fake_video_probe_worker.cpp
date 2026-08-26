@@ -328,6 +328,7 @@ int main(int argc, char** argv) {
 #endif
   const char* scenario = std::getenv("RECO_FAKE_PROBE_WORKER_SCENARIO");
 #if !defined(_WIN32)
+#if !defined(__APPLE__)
   if (scenario != nullptr && std::strcmp(scenario, "memory-limit") == 0) {
     struct rlimit address_space{};
     constexpr rlim_t kExpectedMaximum = 512ULL * 1024ULL * 1024ULL;
@@ -336,6 +337,18 @@ int main(int argc, char** argv) {
       return 5;
     }
   }
+#else
+  if (scenario != nullptr && std::strcmp(scenario, "memory-over-limit") == 0) {
+    constexpr std::size_t kAllocationBytes = 640ULL * 1024ULL * 1024ULL;
+    std::vector<std::uint8_t> allocation(kAllocationBytes);
+    volatile auto* bytes = allocation.data();
+    for (std::size_t offset = 0; offset < allocation.size(); offset += 4'096U) {
+      bytes[offset] = static_cast<std::uint8_t>(offset);
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(30));
+    return 6;
+  }
+#endif
   if (scenario != nullptr && std::strcmp(scenario, "descriptor-isolation") == 0) {
     const char* forbidden_descriptor = std::getenv("RECO_FAKE_PROBE_FORBIDDEN_FD");
     if (forbidden_descriptor != nullptr && forbidden_descriptor[0] != '\0') {
@@ -456,7 +469,9 @@ int main(int argc, char** argv) {
                std::strcmp(scenario, "valid-metadata-with-descendant") == 0 ||
 #if !defined(_WIN32)
                std::strcmp(scenario, "descriptor-isolation") == 0 ||
+#if !defined(__APPLE__)
                std::strcmp(scenario, "memory-limit") == 0 ||
+#endif
 #endif
                std::strcmp(scenario, "invalid-metadata") == 0 ||
                std::strcmp(scenario, "negative-metadata") == 0 ||
@@ -475,7 +490,11 @@ int main(int argc, char** argv) {
 #if !defined(_WIN32)
                                      std::strcmp(scenario, "descriptor-isolation") == 0 ||
 #endif
+#if !defined(_WIN32) && !defined(__APPLE__)
                                      std::strcmp(scenario, "memory-limit") == 0 || false
+#else
+                                     false
+#endif
                                  ? 854
                                  : 853)},
                   {"height", 480},

@@ -40,6 +40,8 @@ constexpr DWORD_PTR kProcThreadAttributeJobList = ProcThreadAttributeValue(13, F
 #include <unistd.h>
 
 #if defined(__APPLE__)
+#include <dlfcn.h>
+#include <libproc.h>
 #include <sys/sysctl.h>
 #endif
 
@@ -819,7 +821,11 @@ long descriptor_scan_limit() {
 }
 
 bool guardian_limit_worker_address_space() {
-#if defined(RECO_PROBE_WIDE_ADDRESS_SANITIZER)
+#if defined(__APPLE__)
+  // Darwin aliases RLIMIT_AS to advisory RLIMIT_RSS. The guardian enforces
+  // physical footprint while it retains stable ownership of the child PID.
+  return true;
+#elif defined(RECO_PROBE_WIDE_ADDRESS_SANITIZER)
   // Wide-address sanitizers reserve terabytes of shadow virtual memory before main.
   return true;
 #else
@@ -837,6 +843,31 @@ bool guardian_limit_worker_address_space() {
   return ::setrlimit(RLIMIT_AS, &bounded) == 0;
 #endif
 }
+
+#if defined(__APPLE__)
+using ProcPidRusage = int (*)(int, int, rusage_info_t*);
+
+ProcPidRusage apple_proc_pid_rusage() {
+  static const auto function = [] {
+    auto* library = ::dlopen("/usr/lib/libproc.dylib", RTLD_NOW | RTLD_LOCAL);
+    return library != nullptr ? reinterpret_cast<ProcPidRusage>(::dlsym(library, "proc_pid_rusage"))
+                              : nullptr;
+  }();
+  return function;
+}
+
+bool guardian_worker_within_memory_limit(pid_t worker_pid) {
+  struct rusage_info_v2 usage{};
+  const auto proc_pid_rusage = apple_proc_pid_rusage();
+  if (proc_pid_rusage == nullptr ||
+      proc_pid_rusage(worker_pid, RUSAGE_INFO_V2, reinterpret_cast<rusage_info_t*>(&usage)) != 0) {
+    errno = 0;
+    return ::kill(worker_pid, 0) != 0 && errno == ESRCH;
+  }
+  return std::max(usage.ri_resident_size, usage.ri_phys_footprint) <=
+         kMaximumWorkerAddressSpaceBytes;
+}
+#endif
 
 void guardian_terminate_worker(pid_t worker_pid) {
   kill_worker_process_group(worker_pid);
@@ -975,6 +1006,7 @@ std::size_t format_guardian_parent_argument(char* destination, std::size_t capac
   (void)::close(start_gate[1]);
 
   int worker_status = 0;
+  bool memory_termination_sent = false;
   while (true) {
     const auto wait_result = ::waitpid(worker_pid, &worker_status, WNOHANG);
     if (wait_result == worker_pid) {
@@ -988,6 +1020,14 @@ std::size_t format_guardian_parent_argument(char* destination, std::size_t capac
       guardian_terminate_worker(worker_pid);
       guardian_exit(2);
     }
+#if defined(__APPLE__)
+    if (!memory_termination_sent && !guardian_worker_within_memory_limit(worker_pid)) {
+      kill_worker_process_group(worker_pid);
+      memory_termination_sent = true;
+    }
+#else
+    (void)memory_termination_sent;
+#endif
     pollfd control{.fd = STDIN_FILENO, .events = POLLIN, .revents = 0};
     const auto poll_result = ::poll(&control, 1, 2);
     if (poll_result < 0 && errno == EINTR) {
@@ -1029,8 +1069,6 @@ public:
   ~GuardianProcess() { terminate(); }
 
   [[nodiscard]] int control() const { return control_.get(); }
-  void set_worker_pid(pid_t worker_pid) { worker_pid_ = worker_pid; }
-  void mark_worker_exited() { worker_pid_ = -1; }
 
   bool finish() {
     if (pid_ <= 0) {
@@ -1058,7 +1096,6 @@ private:
     if (pid_ <= 0) {
       return;
     }
-    kill_worker_process_group(worker_pid_);
     const char terminate = kGuardianTerminate;
     (void)::send(control_.get(), &terminate, 1,
 #if defined(MSG_NOSIGNAL)
@@ -1084,7 +1121,6 @@ private:
   }
 
   pid_t pid_ = -1;
-  pid_t worker_pid_ = -1;
   UniqueFd control_;
   std::chrono::steady_clock::time_point deadline_;
 };
@@ -1124,6 +1160,11 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   auto guard_control = duplicate_for_guardian(child_control.get());
   auto guard_input = duplicate_for_guardian(child_input.get());
   auto guard_output = duplicate_for_guardian(child_output.get());
+#if defined(__APPLE__)
+  if (apple_proc_pid_rusage() == nullptr) {
+    throw GpuVideoProbeError("failed to load the macOS worker memory monitor");
+  }
+#endif
   const auto maximum_descriptor = descriptor_scan_limit();
   if (maximum_descriptor < kGuardianFirstUnusedDescriptor) {
     throw GpuVideoProbeError("failed to determine the video probe guardian descriptor limit");
@@ -1162,7 +1203,6 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
       encoded_worker_pid > static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max())) {
     throw GpuVideoProbeError("video probe guardian returned an invalid worker process ID");
   }
-  guardian.set_worker_pid(static_cast<pid_t>(encoded_worker_pid));
   require_worker_launch_active(deadline);
   write_all(guardian.control(), std::string_view(&kGuardianRelease, 1), deadline);
   write_request(parent_input.get(), request, deadline);
@@ -1174,7 +1214,6 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   }
   int status = 0;
   read_exact(guardian.control(), reinterpret_cast<char*>(&status), sizeof(status), deadline);
-  guardian.mark_worker_exited();
   if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
     throw GpuVideoProbeError("failed to start video probe worker");
   }
