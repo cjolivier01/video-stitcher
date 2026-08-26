@@ -14,6 +14,8 @@ cc_library(
     hdrs = [
         "include/reco/io/gstreamer.hpp",
         "include/reco/io/gpu_decode.hpp",
+        "include/reco/io/detail/nvbufsurface_7_1.hpp",
+        "include/reco/io/detail/nvbufsurface_9_1.hpp",
         "include/reco/io/jsonl_sink.hpp",
         "include/reco/io/nvmm.hpp",
         "include/reco/io/output.hpp",

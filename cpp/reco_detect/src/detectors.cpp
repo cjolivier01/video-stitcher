@@ -411,6 +411,10 @@ std::vector<Detection> OrtCudaYoloDetector::detect_gpu_raw(CameraId camera,
   if ((frame.width % 2) != 0 || (frame.height % 2) != 0) {
     throw DetectorError::inference_failed("GpuNv12Frame dimensions must be even for 4:2:0 chroma");
   }
+  if (frame.color_matrix.has_value() != frame.color_range.has_value()) {
+    throw DetectorError::inference_failed(
+        "GpuNv12Frame color matrix and range must be provided together");
+  }
   core::CudaDevicePtr nv12_y = frame.y_ptr;
   core::CudaDevicePtr nv12_uv = frame.uv_ptr;
   std::uint32_t nv12_y_pitch = frame.width;
@@ -443,10 +447,17 @@ std::vector<Detection> OrtCudaYoloDetector::detect_gpu_raw(CameraId camera,
   }
 
   const auto input_size = session_.metadata().input_size;
-  nv12_to_rgb_chw_fullrange(backend_, nv12_y, nv12_uv, tensor_f32_.ptr(), nv12_y_pitch,
-                            frame.width, frame.height, input_size, input_size,
-                            static_cast<std::uint32_t>(pad_x_), static_cast<std::uint32_t>(pad_y_),
-                            scale_, frame.rotation);
+  if (frame.color_matrix.has_value()) {
+    nv12_to_rgb_chw(backend_, nv12_y, nv12_uv, tensor_f32_.ptr(), nv12_y_pitch, frame.width,
+                    frame.height, input_size, input_size, static_cast<std::uint32_t>(pad_x_),
+                    static_cast<std::uint32_t>(pad_y_), scale_, frame.rotation,
+                    *frame.color_matrix, *frame.color_range);
+  } else {
+    nv12_to_rgb_chw_fullrange(backend_, nv12_y, nv12_uv, tensor_f32_.ptr(), nv12_y_pitch,
+                              frame.width, frame.height, input_size, input_size,
+                              static_cast<std::uint32_t>(pad_x_),
+                              static_cast<std::uint32_t>(pad_y_), scale_, frame.rotation);
+  }
   const std::vector<std::int64_t> shape{1, 3, static_cast<std::int64_t>(input_size),
                                         static_cast<std::int64_t>(input_size)};
   const auto outputs = session_.run_cuda_f32(tensor_f32_.ptr(), tensor_f32_.size(), shape);
@@ -575,6 +586,10 @@ std::vector<Detection> TrtGpuDetector::detect_gpu_raw(CameraId camera, const Gpu
   if ((frame.width % 2) != 0 || (frame.height % 2) != 0) {
     throw DetectorError::inference_failed("GpuNv12Frame dimensions must be even for 4:2:0 chroma");
   }
+  if (frame.color_matrix.has_value() != frame.color_range.has_value()) {
+    throw DetectorError::inference_failed(
+        "GpuNv12Frame color matrix and range must be provided together");
+  }
 
   core::CudaDevicePtr nv12_y = frame.y_ptr;
   core::CudaDevicePtr nv12_uv = frame.uv_ptr;
@@ -605,8 +620,13 @@ std::vector<Detection> TrtGpuDetector::detect_gpu_raw(CameraId camera, const Gpu
     }
   }
 
-  npp_nv12_to_rgb(nv12_y, nv12_y_pitch, nv12_uv, nv12_uv_pitch, rgb_u8_.ptr(), frame.width,
-                  frame.height);
+  if (frame.color_matrix.has_value()) {
+    npp_nv12_to_rgb(nv12_y, nv12_y_pitch, nv12_uv, nv12_uv_pitch, rgb_u8_.ptr(), frame.width,
+                    frame.height, *frame.color_matrix, *frame.color_range);
+  } else {
+    npp_nv12_to_rgb(nv12_y, nv12_y_pitch, nv12_uv, nv12_uv_pitch, rgb_u8_.ptr(), frame.width,
+                    frame.height);
+  }
   core::CudaDevicePtr rgb_for_resize = rgb_u8_.ptr();
   if (frame.rotation == 180) {
     npp_mirror_c3(rgb_u8_.ptr(), rgb_scratch_.ptr(), frame.width, frame.height);

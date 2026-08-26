@@ -215,6 +215,38 @@ void fake_runtime_detector_contract() {
   unset_env("RECO_FAKE_TRT_VALIDATE_DETECTOR_BINDINGS");
   expect_eq(detections.size(), 0U, "fake TensorRT detector has zeroed output");
 
+  set_env("RECO_FAKE_TRT_VALIDATE_DETECTOR_BINDINGS", "1");
+  const auto colorimetry_detections = detector.detect(
+      CameraId::Left, DetectorFrame(GpuNv12Frame{
+                          .y_ptr = y_device.ptr(),
+                          .uv_ptr = uv_device.ptr(),
+                          .y_pitch = 4,
+                          .uv_pitch = 4,
+                          .width = 4,
+                          .height = 4,
+                          .color_matrix = reco::core::YuvColorMatrix::Bt601,
+                          .color_range = reco::core::YuvColorRange::Limited,
+                      }));
+  unset_env("RECO_FAKE_TRT_VALIDATE_DETECTOR_BINDINGS");
+  expect_eq(colorimetry_detections.size(), 0U, "TensorRT detector accepts colorimetry");
+
+  try {
+    (void)detector.detect(CameraId::Left, DetectorFrame(GpuNv12Frame{
+                                            .y_ptr = y_device.ptr(),
+                                            .uv_ptr = uv_device.ptr(),
+                                            .y_pitch = 4,
+                                            .uv_pitch = 4,
+                                            .width = 4,
+                                            .height = 4,
+                                            .color_range = reco::core::YuvColorRange::Full,
+                                        }));
+    std::cerr << "FAIL: TensorRT detector accepted partial colorimetry\n";
+    ++failures;
+  } catch (const DetectorError& error) {
+    expect_true(error.kind() == DetectorErrorKind::InferenceFailed,
+                "TensorRT detector rejects partial colorimetry");
+  }
+
   set_env("RECO_FAKE_TRT_ENQUEUE_FAIL", "1");
   try {
     (void)detector.detect(CameraId::Left, DetectorFrame(GpuNv12Frame{

@@ -67,6 +67,7 @@ gpu_decode_container_for_path(std::string_view path);
 [[nodiscard]] std::optional<std::string>
 validate_gpu_file_decode_config(const GpuFileDecodeConfig& config);
 [[nodiscard]] std::optional<std::string> validate_gpu_decoded_frame(const GpuDecodedFrame& frame);
+[[nodiscard]] NvmmCudaFrame map_gpu_decoded_frame_to_cuda(const GpuDecodedFrame& frame);
 [[nodiscard]] std::string
 build_gstreamer_gpu_file_decode_pipeline(const GpuFileDecodeConfig& config);
 [[nodiscard]] GpuDecodeReadResult make_gpu_decode_eos();

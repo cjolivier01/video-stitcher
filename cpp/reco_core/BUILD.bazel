@@ -33,6 +33,7 @@ cc_library(
         "include/reco/core/shader_catalog.hpp",
         "include/reco/core/source.hpp",
         "include/reco/core/telemetry.hpp",
+        "include/reco/core/video_format.hpp",
         "include/reco/core/viewport_position.hpp",
     ],
     includes = ["include"],

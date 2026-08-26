@@ -2,6 +2,7 @@
 
 #include "reco/core/cuda_backend.hpp"
 #include "reco/core/pipeline_event.hpp"
+#include "reco/core/video_format.hpp"
 #include "reco/detect/ncnn_session.hpp"
 #include "reco/detect/ort_session.hpp"
 #include "reco/detect/trt_engine.hpp"
@@ -60,6 +61,8 @@ struct GpuNv12Frame {
   std::uint32_t height = 0;
   int rotation = 0;
   bool is_10bit = false;
+  std::optional<core::YuvColorMatrix> color_matrix;
+  std::optional<core::YuvColorRange> color_range;
 };
 
 struct PreprocessedChwFrame {
