@@ -312,7 +312,8 @@ void command_execution_dispatches_available_stages() {
   expect_true(out.str().find("nvv4l2decoder") != std::string::npos,
               "blocked stitch describes GPU decode contract");
   expect_true(out.str().find("qtdemux ! capsfilter caps=\"video/x-h264;video/x-h265\" ! "
-                             "parsebin ! nvv4l2decoder") != std::string::npos,
+                             "parsebin ! identity name=display_info silent=true ! "
+                             "nvv4l2decoder") != std::string::npos,
               "blocked stitch selects a supported video pad for containers");
   expect_true(out.str().find("video/x-raw(memory:NVMM),format=NV12") != std::string::npos,
               "blocked stitch preserves NVMM decode caps");
@@ -362,7 +363,8 @@ void command_execution_dispatches_available_stages() {
       .left = "left.hevc", .right = "right.h265", .calibration = calibration_path.string()};
   const auto hevc_preview_status = run_command(Command{hevc_preview}, out, err);
   expect_eq(hevc_preview_status, 2, "HEVC preview exits blocked");
-  expect_true(out.str().find("h265parse ! nvv4l2decoder") != std::string::npos,
+  expect_true(out.str().find("h265parse ! identity name=display_info silent=true ! "
+                             "nvv4l2decoder") != std::string::npos,
               "HEVC preview plan selects HEVC parser");
   expect_true(out.str().find("qtdemux ! h265parse") == std::string::npos,
               "HEVC preview raw stream bypasses qtdemux");

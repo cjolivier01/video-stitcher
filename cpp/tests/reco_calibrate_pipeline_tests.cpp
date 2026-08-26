@@ -96,7 +96,8 @@ void plan_keeps_calibration_gpu_resident() {
   expect_true(description.find("nvv4l2decoder") != std::string::npos,
               "plan describes hardware decode pipeline");
   expect_true(description.find("qtdemux ! capsfilter caps=\"video/x-h264;video/x-h265\" ! "
-                               "parsebin ! nvv4l2decoder") != std::string::npos,
+                               "parsebin ! identity name=display_info silent=true ! "
+                               "nvv4l2decoder") != std::string::npos,
               "containerized inputs select a supported video pad");
   expect_true(description.find("video/x-raw(memory:NVMM),format=NV12") != std::string::npos,
               "plan preserves NVMM decode caps");
@@ -112,7 +113,8 @@ void calibration_plan_selects_hevc_decode_for_hevc_paths() {
   request.right.path = "right.h265";
   const auto plan = build_gpu_calibration_plan(request, ready_backends());
   const auto description = describe_calibration_plan(plan);
-  expect_true(description.find("h265parse ! nvv4l2decoder") != std::string::npos,
+  expect_true(description.find("h265parse ! identity name=display_info silent=true ! "
+                               "nvv4l2decoder") != std::string::npos,
               "calibration HEVC inputs use HEVC parser");
   expect_true(description.find("qtdemux ! h265parse") == std::string::npos,
               "calibration raw HEVC inputs bypass qtdemux");

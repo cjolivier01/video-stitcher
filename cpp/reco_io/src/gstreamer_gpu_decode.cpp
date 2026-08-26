@@ -160,13 +160,15 @@ public:
   using Version = void (*)(std::uint32_t*, std::uint32_t*, std::uint32_t*, std::uint32_t*);
   using ParseLaunch = void* (*)(const char*, GErrorAbi**);
   using BinGetByName = void* (*)(void*, const char*);
+  using ElementGetStaticPad = void* (*)(void*, const char*);
   using ElementSetState = int (*)(void*, int);
   using ElementGetBus = void* (*)(void*);
   using ObjectUnref = void (*)(void*);
+  using PadGetCurrentCaps = void* (*)(void*);
+  using CapsUnref = void (*)(void*);
   using AppSinkTryPullSample = void* (*)(void*, std::uint64_t);
   using AppSinkIsEos = int (*)(void*);
   using SampleGetBuffer = void* (*)(void*);
-  using SampleGetCaps = void* (*)(void*);
   using SampleUnref = void (*)(void*);
   using CapsGetStructure = void* (*)(const void*, std::uint32_t);
   using StructureGetInt = int (*)(const void*, const char*, int*);
@@ -206,11 +208,14 @@ public:
     version = core_library->symbol<Version>("gst_version");
     parse_launch = core_library->symbol<ParseLaunch>("gst_parse_launch");
     bin_get_by_name = core_library->symbol<BinGetByName>("gst_bin_get_by_name");
+    element_get_static_pad =
+        core_library->symbol<ElementGetStaticPad>("gst_element_get_static_pad");
     element_set_state = core_library->symbol<ElementSetState>("gst_element_set_state");
     element_get_bus = core_library->symbol<ElementGetBus>("gst_element_get_bus");
     object_unref = core_library->symbol<ObjectUnref>("gst_object_unref");
+    pad_get_current_caps = core_library->symbol<PadGetCurrentCaps>("gst_pad_get_current_caps");
+    caps_unref = core_library->symbol<CapsUnref>("gst_caps_unref");
     sample_get_buffer = core_library->symbol<SampleGetBuffer>("gst_sample_get_buffer");
-    sample_get_caps = core_library->symbol<SampleGetCaps>("gst_sample_get_caps");
     sample_unref = core_library->symbol<SampleUnref>("gst_sample_unref");
     caps_get_structure = core_library->symbol<CapsGetStructure>("gst_caps_get_structure");
     structure_get_int = core_library->symbol<StructureGetInt>("gst_structure_get_int");
@@ -234,13 +239,15 @@ public:
   Version version = nullptr;
   ParseLaunch parse_launch = nullptr;
   BinGetByName bin_get_by_name = nullptr;
+  ElementGetStaticPad element_get_static_pad = nullptr;
   ElementSetState element_set_state = nullptr;
   ElementGetBus element_get_bus = nullptr;
   ObjectUnref object_unref = nullptr;
+  PadGetCurrentCaps pad_get_current_caps = nullptr;
+  CapsUnref caps_unref = nullptr;
   AppSinkTryPullSample app_sink_try_pull_sample = nullptr;
   AppSinkIsEos app_sink_is_eos = nullptr;
   SampleGetBuffer sample_get_buffer = nullptr;
-  SampleGetCaps sample_get_caps = nullptr;
   SampleUnref sample_unref = nullptr;
   CapsGetStructure caps_get_structure = nullptr;
   StructureGetInt structure_get_int = nullptr;
@@ -267,20 +274,21 @@ std::string take_error(const std::shared_ptr<GstreamerApi>& api, GErrorAbi*& err
 }
 
 std::pair<std::uint32_t, std::uint32_t> visible_dimensions(const std::shared_ptr<GstreamerApi>& api,
-                                                           void* sample) {
-  void* caps = api->sample_get_caps(sample);
+                                                           void* predecoder_pad) {
+  void* caps = api->pad_get_current_caps(predecoder_pad);
   if (caps == nullptr) {
-    throw GpuDecodeError("GStreamer sample does not contain negotiated caps");
+    throw GpuDecodeError("GStreamer pre-decoder pad does not contain negotiated caps");
   }
+  const std::unique_ptr<void, GstreamerApi::CapsUnref> caps_owner(caps, api->caps_unref);
   void* structure = api->caps_get_structure(caps, 0);
   if (structure == nullptr) {
-    throw GpuDecodeError("GStreamer sample caps do not contain a structure");
+    throw GpuDecodeError("GStreamer pre-decoder caps do not contain a structure");
   }
   int width = 0;
   int height = 0;
   if (api->structure_get_int(structure, "width", &width) == 0 ||
       api->structure_get_int(structure, "height", &height) == 0 || width <= 0 || height <= 0) {
-    throw GpuDecodeError("GStreamer sample caps do not contain valid visible dimensions");
+    throw GpuDecodeError("GStreamer pre-decoder caps do not contain valid visible dimensions");
   }
   return {static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height)};
 }
@@ -367,6 +375,15 @@ public:
     if (sink_ == nullptr) {
       throw GpuDecodeError("GStreamer pipeline does not contain appsink 'sink'");
     }
+    display_info_ = api_->bin_get_by_name(pipeline_, "display_info");
+    if (display_info_ == nullptr) {
+      throw GpuDecodeError(
+          "GStreamer pipeline does not contain pre-decoder identity 'display_info'");
+    }
+    display_info_pad_ = api_->element_get_static_pad(display_info_, "src");
+    if (display_info_pad_ == nullptr) {
+      throw GpuDecodeError("GStreamer pre-decoder identity does not provide a source pad");
+    }
     bus_ = api_->element_get_bus(pipeline_);
     if (bus_ == nullptr) {
       throw GpuDecodeError("GStreamer pipeline does not provide a message bus");
@@ -411,7 +428,7 @@ public:
       throw GpuDecodeError("GStreamer sample does not contain a buffer");
     }
     owner->map_buffer(buffer);
-    const auto [visible_width, visible_height] = visible_dimensions(api_, sample);
+    const auto [visible_width, visible_height] = visible_dimensions(api_, display_info_pad_);
 
     NvmmFrameInfo nvmm;
     try {
@@ -472,6 +489,14 @@ private:
       api_->object_unref(bus_);
       bus_ = nullptr;
     }
+    if (display_info_pad_ != nullptr) {
+      api_->object_unref(display_info_pad_);
+      display_info_pad_ = nullptr;
+    }
+    if (display_info_ != nullptr) {
+      api_->object_unref(display_info_);
+      display_info_ = nullptr;
+    }
     if (sink_ != nullptr) {
       api_->object_unref(sink_);
       sink_ = nullptr;
@@ -488,6 +513,8 @@ private:
   std::shared_ptr<GstreamerApi> api_;
   void* pipeline_ = nullptr;
   void* sink_ = nullptr;
+  void* display_info_ = nullptr;
+  void* display_info_pad_ = nullptr;
   void* bus_ = nullptr;
   std::mutex read_mutex_;
   std::uint64_t next_frame_index_ = 0;

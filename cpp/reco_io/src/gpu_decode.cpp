@@ -159,7 +159,8 @@ std::string build_gstreamer_gpu_file_decode_pipeline(const GpuFileDecodeConfig& 
     pipeline << gpu_decode_container_demuxer(*config.container)
              << " ! capsfilter caps=\"video/x-h264;video/x-h265\" ! parsebin";
   }
-  pipeline << " ! nvv4l2decoder"
+  pipeline << " ! identity name=display_info silent=true"
+           << " ! nvv4l2decoder"
            << " ! nvvideoconvert compute-hw=1 bl-output=false disable-passthrough=true"
            << " ! video/x-raw(memory:NVMM),format=NV12"
            << " ! appsink name=sink emit-signals=false sync=false max-buffers="

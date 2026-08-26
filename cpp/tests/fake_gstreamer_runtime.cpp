@@ -62,6 +62,8 @@ enum class ObjectKind {
   Pipeline,
   Sink,
   Bus,
+  DisplayInfo,
+  Pad,
 };
 
 struct FakeObject {
@@ -82,6 +84,20 @@ struct FakeBus : FakeObject {
   FakeBus() : FakeObject(ObjectKind::Bus) {}
   bool emitted_error = false;
   std::uint32_t poll_count = 0;
+};
+
+struct FakeDisplayInfo : FakeObject {
+  FakeDisplayInfo() : FakeObject(ObjectKind::DisplayInfo) {}
+};
+
+struct FakePad : FakeObject {
+  FakePad() : FakeObject(ObjectKind::Pad) {}
+};
+
+constexpr std::uint64_t kFakeCapsMagic = 0x5245434f43415053ULL;
+
+struct FakeCaps {
+  std::uint64_t magic = kFakeCapsMagic;
 };
 
 struct FakeMessage {};
@@ -189,12 +205,24 @@ RECO_FAKE_EXPORT void* gst_parse_launch(const char*, GErrorAbi** error) {
   return new FakePipeline;
 }
 
-RECO_FAKE_EXPORT void* gst_bin_get_by_name(void*, const char*) {
-  record("get-sink");
-  if (scenario() == "missing-sink") {
+RECO_FAKE_EXPORT void* gst_bin_get_by_name(void*, const char* name) {
+  if (name != nullptr && std::strcmp(name, "sink") == 0) {
+    record("get-sink");
+    return scenario() == "missing-sink" ? nullptr : new FakeSink;
+  }
+  if (name != nullptr && std::strcmp(name, "display_info") == 0) {
+    record("get-display-info");
+    return scenario() == "missing-display-info" ? nullptr : new FakeDisplayInfo;
+  }
+  return nullptr;
+}
+
+RECO_FAKE_EXPORT void* gst_element_get_static_pad(void*, const char* name) {
+  record("get-display-pad");
+  if (name == nullptr || std::strcmp(name, "src") != 0 || scenario() == "missing-display-pad") {
     return nullptr;
   }
-  return new FakeSink;
+  return new FakePad;
 }
 
 RECO_FAKE_EXPORT int gst_element_set_state(void*, int state) {
@@ -231,7 +259,25 @@ RECO_FAKE_EXPORT void gst_object_unref(void* object) {
     record("unref-bus");
     delete static_cast<FakeBus*>(object);
     break;
+  case ObjectKind::DisplayInfo:
+    record("unref-display-info");
+    delete static_cast<FakeDisplayInfo*>(object);
+    break;
+  case ObjectKind::Pad:
+    record("unref-display-pad");
+    delete static_cast<FakePad*>(object);
+    break;
   }
+}
+
+RECO_FAKE_EXPORT void* gst_pad_get_current_caps(void*) {
+  record("pad-current-caps");
+  return scenario() == "missing-caps" ? nullptr : new FakeCaps;
+}
+
+RECO_FAKE_EXPORT void gst_caps_unref(void* caps) {
+  record("caps-unref");
+  delete static_cast<FakeCaps*>(caps);
 }
 
 RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uint64_t) {
@@ -266,6 +312,7 @@ RECO_FAKE_EXPORT void* gst_sample_get_buffer(void* sample) {
 }
 
 RECO_FAKE_EXPORT void* gst_sample_get_caps(void* sample) {
+  record("sample-caps");
   return scenario() == "missing-caps" ? nullptr : sample;
 }
 
@@ -273,12 +320,19 @@ RECO_FAKE_EXPORT void* gst_caps_get_structure(const void* caps, std::uint32_t in
   return index == 0 && scenario() != "missing-caps-structure" ? const_cast<void*>(caps) : nullptr;
 }
 
-RECO_FAKE_EXPORT int gst_structure_get_int(const void*, const char* field, int* value) {
+RECO_FAKE_EXPORT int gst_structure_get_int(const void* structure, const char* field, int* value) {
   if (value == nullptr || field == nullptr || scenario() == "invalid-caps") {
     return 0;
   }
   if (std::strcmp(field, "width") == 0) {
-    *value = scenario() == "visible-crop" ? 854 : (scenario() == "oversized-caps" ? 1290 : 1280);
+    std::uint64_t magic = 0;
+    if (structure != nullptr) {
+      std::memcpy(&magic, structure, sizeof(magic));
+    }
+    const bool predecoder_caps = magic == kFakeCapsMagic;
+    *value = scenario() == "visible-crop"     ? (predecoder_caps ? 854 : 864)
+             : scenario() == "oversized-caps" ? 1290
+                                              : 1280;
     return 1;
   }
   if (std::strcmp(field, "height") == 0) {

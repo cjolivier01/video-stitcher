@@ -136,8 +136,8 @@ void production_source_retains_mapped_sample() {
               "selected DeepStream ABI preserved");
   expect_true(first.frame->nvmm.memory_type == NvmmMemoryType::CudaDevice,
               "dGPU CUDA-device memory preserved");
-  expect_eq(first.frame->visible_width, 1280U, "sample caps visible width preserved");
-  expect_eq(first.frame->visible_height, 720U, "sample caps visible height preserved");
+  expect_eq(first.frame->visible_width, 1280U, "pre-decoder visible width preserved");
+  expect_eq(first.frame->visible_height, 720U, "pre-decoder visible height preserved");
   expect_true(first.frame->nvmm.color_matrix == Nv12ColorMatrix::Bt709,
               "NV12 matrix metadata preserved");
 
@@ -173,8 +173,10 @@ void production_source_retains_mapped_sample() {
             "idempotent EOS does not perform a third pull on either source");
 }
 
-void aligned_nvmm_allocation_preserves_visible_caps() {
+void padded_sink_caps_preserve_predecoder_dimensions() {
   set_scenario("visible-crop");
+  const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
+  std::filesystem::remove(event_path);
   auto source =
       open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
   const auto result = source->read();
@@ -184,8 +186,13 @@ void aligned_nvmm_allocation_preserves_visible_caps() {
   }
   expect_eq(result.frame->nvmm.width, 864U, "aligned NVMM allocation width preserved");
   expect_eq(result.frame->nvmm.y_pitch, 1024U, "aligned NVMM allocation pitch preserved");
-  expect_eq(result.frame->visible_width, 854U, "caps visible width preserved separately");
-  expect_eq(result.frame->visible_height, 720U, "caps visible height preserved separately");
+  expect_eq(result.frame->visible_width, 854U, "pre-decoder width preserved separately");
+  expect_eq(result.frame->visible_height, 720U, "pre-decoder height preserved separately");
+  const auto events = read_events(event_path);
+  expect_eq(count_event(events, "pad-current-caps"), 1U,
+            "display dimensions come from pre-decoder caps");
+  expect_eq(count_event(events, "sample-caps"), 0U,
+            "padded appsink caps are not treated as display dimensions");
 }
 
 void unknown_timestamps_are_not_fabricated() {
@@ -276,11 +283,13 @@ void fatal_pipeline_errors_are_latched() {
 
 void runtime_failures_are_reported() {
   for (const auto& [scenario_name, fragment] :
-       std::array<std::pair<std::string_view, std::string_view>, 6>{
+       std::array<std::pair<std::string_view, std::string_view>, 8>{
            {{"old-version", "1.10 or newer"},
             {"init-error", "fake initialization failure"},
             {"parse-error", "fake parse failure"},
             {"missing-sink", "does not contain appsink"},
+            {"missing-display-info", "does not contain pre-decoder identity"},
+            {"missing-display-pad", "does not provide a source pad"},
             {"missing-bus", "does not provide a message bus"},
             {"state-error", "rejected the PLAYING state"}}}) {
     set_scenario(scenario_name);
@@ -324,7 +333,7 @@ int main() {
   set_environment("RECO_FAKE_GST_EVENT_PATH", event_path.string());
 
   production_source_retains_mapped_sample();
-  aligned_nvmm_allocation_preserves_visible_caps();
+  padded_sink_caps_preserve_predecoder_dimensions();
   unknown_timestamps_are_not_fabricated();
   concurrent_reads_serialize_appsink_access();
   fatal_pipeline_errors_are_latched();
