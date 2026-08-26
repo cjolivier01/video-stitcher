@@ -15,9 +15,9 @@ struct GpuVideoProbe {
   std::uint32_t width = 0;
   /// Parser-visible video height in pixels.
   std::uint32_t height = 0;
-  /// Exact frame-rate numerator reported by the parser.
+  /// Exact frame-rate numerator from constant parser timing or parser caps.
   std::uint32_t fps_numerator = 0;
-  /// Exact frame-rate denominator reported by the parser.
+  /// Exact frame-rate denominator from constant parser timing or parser caps.
   std::uint32_t fps_denominator = 0;
   /// Frame rate as a floating-point value for Rust-compatible selection math.
   double fps = 0.0;

@@ -90,6 +90,7 @@ struct FakeSink : FakeObject {
   bool probe_eos = false;
   std::uint64_t observed_seek_generation = 0;
   std::uint32_t probe_pulls_since_seek = 0;
+  std::uint64_t probe_sequential_pull_count = 0;
 };
 
 struct FakeBus : FakeObject {
@@ -149,7 +150,11 @@ struct FakeCaps {
   std::int32_t fps_denominator = 1'001;
 };
 
-struct FakeMessage {};
+constexpr std::uint64_t kFakeMessageMagic = 0x5245434f4d534747ULL;
+
+struct FakeMessage {
+  std::uint64_t magic = kFakeMessageMagic;
+};
 
 struct FakePadProbeInfo {
   std::int32_t type = 0;
@@ -188,9 +193,13 @@ FakeCaps parser_sample_caps() {
     caps.fps_numerator = 90'000;
     caps.fps_denominator = 1;
   } else if (scenario() == "probe-duration-mismatch" || scenario() == "probe-delayed-stream" ||
-             scenario() == "probe-nonzero-origin" || scenario() == "probe-decode-order-origin") {
+             scenario() == "probe-nonzero-origin" || scenario() == "probe-decode-order-origin" ||
+             scenario() == "probe-unknown-pts" || scenario() == "probe-one-frame-rounding") {
     caps.fps_numerator = 30;
     caps.fps_denominator = 1;
+  } else if (scenario() == "probe-inexact-caps-fps") {
+    caps.fps_numerator = 59;
+    caps.fps_denominator = 2;
   } else if (scenario() == "probe-caps-runahead") {
     caps.width = 854;
     caps.height = 480;
@@ -198,6 +207,11 @@ FakeCaps parser_sample_caps() {
     caps.fps_denominator = 1;
   }
   return caps;
+}
+
+std::uint64_t parser_frame_offset(std::uint64_t frame_index, const FakeCaps& caps) {
+  return frame_index * 1'000'000'000ULL * static_cast<std::uint32_t>(caps.fps_denominator) /
+         static_cast<std::uint32_t>(caps.fps_numerator);
 }
 
 void record(std::string_view event) {
@@ -668,6 +682,12 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
       return nullptr;
     }
     const auto current_scenario = scenario();
+    const auto sample_caps = parser_sample_caps();
+    auto timing_caps = sample_caps;
+    if (current_scenario == "probe-inexact-caps-fps") {
+      timing_caps.fps_numerator = 30;
+      timing_caps.fps_denominator = 1;
+    }
     const std::uint64_t selected_stream_start_ns =
         current_scenario == "probe-delayed-stream"   ? 4'000'000'000ULL
         : current_scenario == "probe-nonzero-origin" ? 766'666'666ULL
@@ -677,33 +697,50 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
         : current_scenario == "probe-nonzero-origin"       ? 2'766'666'666ULL
         : current_scenario == "probe-duration-mismatch"    ? 1'000'000'000ULL
         : current_scenario == "probe-decode-order-origin"  ? 1'000'000'000ULL
+        : current_scenario == "probe-unknown-pts"          ? 1'000'000'000ULL
+        : current_scenario == "probe-one-frame-rounding"   ? 33'333'333ULL
+        : current_scenario == "probe-inexact-caps-fps"     ? 2'000'000'000ULL
         : current_scenario == "probe-exact-frame-count"    ? 100'100'000ULL
         : current_scenario == "probe-integral-frame-count" ? 1'001'000'000'000ULL
         : current_scenario == "probe-frame-count-overflow"
             ? static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())
             : 10'000'000'000ULL;
-    const std::uint64_t frame_duration_ns = current_scenario == "probe-duration-mismatch" ||
-                                                    current_scenario == "probe-delayed-stream" ||
-                                                    current_scenario == "probe-nonzero-origin" ||
-                                                    current_scenario == "probe-decode-order-origin"
-                                                ? 33'333'333ULL
-                                                : 33'366'666ULL;
-    const auto requested_target_ns = static_cast<std::uint64_t>(sink->pipeline->seek_target_ns);
-    const auto target_ns = std::max(requested_target_ns, selected_stream_start_ns);
+    const auto sequential_index = sink->probe_sequential_pull_count;
+    const auto target_ns =
+        sink->pipeline->has_seek
+            ? std::max(static_cast<std::uint64_t>(sink->pipeline->seek_target_ns),
+                       selected_stream_start_ns)
+            : selected_stream_start_ns + parser_frame_offset(sequential_index, timing_caps);
     if (target_ns >= selected_duration_ns) {
       sink->probe_eos = true;
       return nullptr;
     }
+    if (!sink->pipeline->has_seek) {
+      ++sink->probe_sequential_pull_count;
+    }
     auto* sample = new FakeSample;
     sample->pipeline = sink->pipeline;
-    sample->sample_caps = parser_sample_caps();
+    sample->sample_caps = sample_caps;
     sample->non_time_segment = sink->pipeline->elementary_probe;
     sample->segment_stream_origin_ns = selected_stream_start_ns;
     sample->segment_outside = scenario() == "probe-seek-preroll" && sink->pipeline->has_seek &&
                               sink->probe_pulls_since_seek++ == 0;
-    sample->buffer.pts =
-        current_scenario == "probe-decode-order-origin" && !sink->pipeline->has_seek ? 66'666'666ULL
-                                                                                     : target_ns;
+    if (current_scenario == "probe-unknown-pts") {
+      sample->buffer.pts = std::numeric_limits<std::uint64_t>::max();
+    } else if (current_scenario == "probe-decode-order-origin" && !sink->pipeline->has_seek) {
+      const auto presentation_index = sequential_index == 0   ? 2ULL
+                                      : sequential_index == 1 ? 0ULL
+                                      : sequential_index == 2 ? 1ULL
+                                                              : sequential_index;
+      sample->buffer.pts =
+          selected_stream_start_ns + parser_frame_offset(presentation_index, timing_caps);
+    } else {
+      sample->buffer.pts = target_ns;
+    }
+    const auto frame_duration_ns = sink->pipeline->has_seek
+                                       ? parser_frame_offset(1, timing_caps)
+                                       : parser_frame_offset(sequential_index + 1, timing_caps) -
+                                             parser_frame_offset(sequential_index, timing_caps);
     const auto remaining_ns = selected_duration_ns - target_ns;
     sample->buffer.duration =
         remaining_ns > frame_duration_ns && remaining_ns - frame_duration_ns > 1 ? frame_duration_ns
@@ -988,6 +1025,16 @@ RECO_FAKE_EXPORT void gst_sample_unref(void* sample) {
   delete fake_sample;
 }
 
+RECO_FAKE_EXPORT void gst_mini_object_unref(void* object) {
+  std::uint64_t magic = 0;
+  std::memcpy(&magic, object, sizeof(magic));
+  if (magic == kFakeMessageMagic) {
+    delete static_cast<FakeMessage*>(object);
+    return;
+  }
+  gst_sample_unref(object);
+}
+
 RECO_FAKE_EXPORT int gst_buffer_map(void* buffer, GstMapInfoAbi* map, std::uint32_t) {
   record("map");
   if (scenario() == "map-error") {
@@ -1021,9 +1068,7 @@ RECO_FAKE_EXPORT void gst_message_parse_error(void*, GErrorAbi** error, char** d
   *debug = duplicate("fake debug detail");
 }
 
-RECO_FAKE_EXPORT void gst_message_unref(void* message) {
-  delete static_cast<FakeMessage*>(message);
-}
+RECO_FAKE_EXPORT void gst_message_unref(void* message) { gst_mini_object_unref(message); }
 
 RECO_FAKE_EXPORT void g_error_free(GErrorAbi* error) {
   if (error != nullptr) {

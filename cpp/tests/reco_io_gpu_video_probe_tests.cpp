@@ -234,6 +234,25 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_eq(sample_caps.fps_numerator, 24U,
             "metadata frame rate remains correlated with the selected sample");
 
+  set_scenario("probe-unknown-pts");
+  const auto unknown_pts = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(unknown_pts.duration_ns, 1'000'000'000ULL,
+            "unknown-PTS short stream uses frame-count duration");
+  expect_eq(unknown_pts.total_frames, 30ULL, "unknown-PTS access units remain valid frames");
+  expect_true(unknown_pts.duration_is_estimated,
+              "unknown-PTS frame-count duration is explicitly estimated");
+
+  set_scenario("probe-one-frame-rounding");
+  const auto one_frame = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(one_frame.total_frames, 1ULL, "nanosecond rounding cannot erase a proven frame");
+
+  set_scenario("probe-inexact-caps-fps");
+  const auto inferred_fps = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(inferred_fps.fps_numerator, 30U,
+            "constant presentation timing corrects inexact container caps");
+  expect_eq(inferred_fps.fps_denominator, 1U, "inferred constant frame rate is reduced exactly");
+  expect_eq(inferred_fps.total_frames, 60ULL, "inexact container caps do not lose a proven frame");
+
   set_scenario("probe-seek-unsupported");
   const auto unseekable = probe_gpu_video(container_config(video_path), timeout_ns);
   expect_eq(unseekable.duration_ns, 10'000'000'000ULL,
