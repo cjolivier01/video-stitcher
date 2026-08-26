@@ -132,7 +132,8 @@ struct FakeInputBudget : FakeObject {
 };
 
 struct FakePad : FakeObject {
-  FakePad() : FakeObject(ObjectKind::Pad) {}
+  explicit FakePad(FakePipeline* owner) : FakeObject(ObjectKind::Pad), pipeline(owner) {}
+  FakePipeline* pipeline = nullptr;
   FakePadProbeCallback callback = nullptr;
   void* callback_data = nullptr;
   FakeDestroyNotify destroy_notify = nullptr;
@@ -142,6 +143,7 @@ struct FakePad : FakeObject {
   bool output = false;
   bool probe = false;
   bool container = false;
+  bool input_budget = false;
 };
 
 struct FakePipeline : FakeObject {
@@ -154,6 +156,8 @@ struct FakePipeline : FakeObject {
   bool has_seek = false;
   std::uint64_t seek_generation = 0;
   FakeInputBudget* input_budget = nullptr;
+  FakePad* input_budget_pad = nullptr;
+  std::uint64_t compressed_input_count = 0;
 };
 
 constexpr std::uint64_t kFakeCapsMagic = 0x5245434f43415053ULL;
@@ -634,6 +638,24 @@ FakeSample* deliver_output(FakeSink* sink, FakeSample* sample) {
   return sample;
 }
 
+bool push_compressed_input(FakePipeline* pipeline, std::size_t bytes) {
+  GstBufferAbi buffer;
+  buffer.offset = static_cast<std::uint64_t>(bytes);
+  ++pipeline->compressed_input_count;
+  auto* pad = pipeline->input_budget_pad;
+  if (pad == nullptr || pad->callback == nullptr) {
+    record("parser-input");
+    return true;
+  }
+  FakePadProbeInfo info{.data = &buffer};
+  if (pad->callback(pad, &info, pad->callback_data) == 0) {
+    record("input-budget-drop");
+    return false;
+  }
+  record("parser-input");
+  return true;
+}
+
 } // namespace
 
 RECO_FAKE_EXPORT void gst_version(std::uint32_t* major, std::uint32_t* minor, std::uint32_t* micro,
@@ -734,29 +756,39 @@ RECO_FAKE_EXPORT void* gst_element_get_static_pad(void* element_pointer, const c
   const auto* element = static_cast<FakeObject*>(element_pointer);
   const bool output = element->kind == ObjectKind::OutputInfo;
   const bool probe = element->kind == ObjectKind::ProbeInfo;
+  const bool input_budget = element->kind == ObjectKind::InputBudget;
   const bool container = probe && static_cast<const FakeProbeInfo*>(element_pointer)->container;
-  record(output      ? "get-output-pad"
-         : container ? "get-container-pad"
-         : probe     ? "get-probe-pad"
-                     : "get-display-pad");
+  record(output         ? "get-output-pad"
+         : container    ? "get-container-pad"
+         : probe        ? "get-probe-pad"
+         : input_budget ? "get-input-budget-pad"
+                        : "get-display-pad");
   if (name == nullptr || std::strcmp(name, "src") != 0 ||
-      (!output && scenario() == "missing-display-pad") ||
+      (!output && !probe && !input_budget && scenario() == "missing-display-pad") ||
       (output && scenario() == "missing-output-pad") ||
-      (probe && scenario() == "probe-missing-pad")) {
+      (probe && scenario() == "probe-missing-pad") ||
+      (input_budget && scenario() == "probe-input-budget-missing-pad")) {
     return nullptr;
   }
-  auto* pad = new FakePad;
+  auto* pipeline = input_budget ? static_cast<FakeInputBudget*>(element_pointer)->pipeline
+                   : probe      ? static_cast<FakeProbeInfo*>(element_pointer)->pipeline
+                   : output     ? static_cast<FakeOutputInfo*>(element_pointer)->pipeline
+                                : static_cast<FakeDisplayInfo*>(element_pointer)->pipeline;
+  auto* pad = new FakePad(pipeline);
   pad->output = output;
   pad->probe = probe;
   pad->container = container;
+  pad->input_budget = input_budget;
   if (probe) {
     pad->current_width = 3840;
     pad->current_height = 2160;
   }
   if (output) {
-    static_cast<FakeOutputInfo*>(element_pointer)->pipeline->output_pad = pad;
+    pipeline->output_pad = pad;
+  } else if (input_budget) {
+    pipeline->input_budget_pad = pad;
   } else if (!probe) {
-    static_cast<FakeDisplayInfo*>(element_pointer)->pipeline->display_pad = pad;
+    pipeline->display_pad = pad;
   }
   return pad;
 }
@@ -1071,11 +1103,15 @@ RECO_FAKE_EXPORT void gst_object_unref(void* object) {
     break;
   }
   case ObjectKind::Pad:
-    record("unref-display-pad");
-    if (static_cast<FakePad*>(object)->probe_id != 0) {
+    auto* pad = static_cast<FakePad*>(object);
+    record(pad->input_budget ? "unref-input-budget-pad" : "unref-display-pad");
+    if (pad->probe_id != 0) {
       record("probe-leaked");
     }
-    delete static_cast<FakePad*>(object);
+    if (pad->input_budget && pad->pipeline != nullptr && pad->pipeline->input_budget_pad == pad) {
+      pad->pipeline->input_budget_pad = nullptr;
+    }
+    delete pad;
     break;
   }
 }
@@ -1100,8 +1136,11 @@ RECO_FAKE_EXPORT unsigned long gst_pad_add_probe(void* pad_pointer, int,
                                                  FakePadProbeCallback callback, void* user_data,
                                                  FakeDestroyNotify destroy_notify) {
   auto* pad = static_cast<FakePad*>(pad_pointer);
-  record(pad->output ? "add-output-probe" : "add-display-probe");
-  if ((!pad->output && scenario() == "probe-install-error") ||
+  record(pad->input_budget ? "add-input-budget-probe"
+         : pad->output     ? "add-output-probe"
+                           : "add-display-probe");
+  if ((pad->input_budget && scenario() == "probe-input-budget-install-error") ||
+      (!pad->input_budget && !pad->output && scenario() == "probe-install-error") ||
       (pad->output && scenario() == "output-probe-install-error")) {
     return 0;
   }
@@ -1114,7 +1153,9 @@ RECO_FAKE_EXPORT unsigned long gst_pad_add_probe(void* pad_pointer, int,
 
 RECO_FAKE_EXPORT void gst_pad_remove_probe(void* pad_pointer, unsigned long probe_id) {
   auto* pad = static_cast<FakePad*>(pad_pointer);
-  record(pad->output ? "remove-output-probe" : "remove-display-probe");
+  record(pad->input_budget ? "remove-input-budget-probe"
+         : pad->output     ? "remove-output-probe"
+                           : "remove-display-probe");
   if (pad->probe_id == probe_id) {
     auto* callback_data = pad->callback_data;
     const auto destroy_notify = pad->destroy_notify;
@@ -1123,7 +1164,9 @@ RECO_FAKE_EXPORT void gst_pad_remove_probe(void* pad_pointer, unsigned long prob
     pad->destroy_notify = nullptr;
     pad->probe_id = 0;
     if (destroy_notify != nullptr) {
-      record(pad->output ? "destroy-output-probe-data" : "destroy-display-probe-data");
+      record(pad->input_budget ? "destroy-input-budget-probe-data"
+             : pad->output     ? "destroy-output-probe-data"
+                               : "destroy-display-probe-data");
       destroy_notify(callback_data);
     }
   }
@@ -1182,10 +1225,26 @@ RECO_FAKE_EXPORT void gst_caps_unref(void* caps) {
 RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uint64_t timeout_ns) {
   auto* sink = static_cast<FakeSink*>(sink_pointer);
   if (sink->pipeline->parser_probe) {
-    if (auto* budget = sink->pipeline->input_budget;
-        budget != nullptr && budget->callback != nullptr) {
-      GstBufferAbi input_buffer;
-      budget->callback(budget, &input_buffer, budget->callback_data);
+    const auto current_scenario = scenario();
+    if (current_scenario == "probe-input-byte-budget-runahead") {
+      constexpr auto kChunkBytes = 8ULL * 1024ULL * 1024ULL;
+      for (std::size_t index = 0; index < 8; ++index) {
+        if (!push_compressed_input(sink->pipeline, kChunkBytes)) {
+          return nullptr;
+        }
+      }
+      if (!push_compressed_input(sink->pipeline, 1)) {
+        return nullptr;
+      }
+    } else {
+      const auto bytes = current_scenario == "probe-input-byte-budget" ? 65ULL * 1024ULL * 1024ULL
+                         : current_scenario == "probe-input-byte-budget-checkpoint" &&
+                                 sink->pipeline->compressed_input_count == 0
+                             ? 64ULL * 1024ULL * 1024ULL
+                             : 4'096ULL;
+      if (!push_compressed_input(sink->pipeline, bytes)) {
+        return nullptr;
+      }
     }
     record("pull-probe");
     sink->probe_eos = false;
@@ -1208,7 +1267,6 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
       std::this_thread::sleep_for(std::chrono::nanoseconds(timeout_ns));
       return nullptr;
     }
-    const auto current_scenario = scenario();
     auto sample_caps = parser_sample_caps();
     auto timing_caps = sample_caps;
     if (current_scenario == "probe-inexact-caps-fps") {
@@ -1816,8 +1874,9 @@ RECO_FAKE_EXPORT void gst_sample_unref(void* sample) {
   delete fake_sample;
 }
 
-RECO_FAKE_EXPORT std::size_t gst_buffer_get_size(const void*) {
-  return scenario() == "probe-input-byte-budget" ? 65ULL * 1024ULL * 1024ULL : 4'096ULL;
+RECO_FAKE_EXPORT std::size_t gst_buffer_get_size(const void* buffer_pointer) {
+  const auto* buffer = static_cast<const GstBufferAbi*>(buffer_pointer);
+  return buffer->offset == 0 ? 4'096ULL : static_cast<std::size_t>(buffer->offset);
 }
 
 RECO_FAKE_EXPORT void gst_mini_object_unref(void* object) {

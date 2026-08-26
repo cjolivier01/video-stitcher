@@ -1037,7 +1037,7 @@ void invalid_inputs_fail(const std::filesystem::path& video_path,
       "not a readable regular file", "missing input rejected before probing");
 
   for (const auto& [scenario_name, fragment] :
-       std::array<std::pair<std::string_view, std::string_view>, 20>{
+       std::array<std::pair<std::string_view, std::string_view>, 19>{
            {{"old-version", "1.10 or newer"},
             {"init-error", "fake initialization failure"},
             {"probe-parse-error", "fake parse failure"},
@@ -1056,12 +1056,41 @@ void invalid_inputs_fail(const std::filesystem::path& video_path,
             {"probe-unparsed-caps", "decoder-compatible"},
             {"probe-avc-caps", "decoder-compatible"},
             {"probe-nal-caps", "decoder-compatible"},
-            {"probe-input-byte-budget", "bytes-per-access-unit"},
             {"probe-bad-dimensions", "invalid visible"}}}) {
     set_scenario(scenario_name);
     expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
                        fragment, scenario_name);
   }
+
+  for (const auto& [scenario_name, expected_parser_inputs] :
+       std::array<std::pair<std::string_view, std::size_t>, 2>{
+           {{"probe-input-byte-budget", 0}, {"probe-input-byte-budget-runahead", 8}}}) {
+    set_scenario(scenario_name);
+    std::filesystem::remove(event_path);
+    expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
+                       "bytes-per-access-unit", scenario_name);
+    const auto events = read_events(event_path);
+    expect_true(has_event(events, "add-input-budget-probe"),
+                std::string(scenario_name) + " installs a synchronous input pad probe");
+    expect_eq(count_event(events, "parser-input"), expected_parser_inputs,
+              std::string(scenario_name) + " blocks the offending buffer before the parser");
+    expect_eq(count_event(events, "input-budget-drop"), std::size_t{1},
+              std::string(scenario_name) + " drops the first buffer over the byte budget");
+    expect_true(has_event(events, "remove-input-budget-probe"),
+                std::string(scenario_name) + " removes the input probe during teardown");
+    expect_true(!has_event(events, "probe-leaked"),
+                std::string(scenario_name) + " does not leak the input probe");
+  }
+
+  set_scenario("probe-input-byte-budget-checkpoint");
+  std::filesystem::remove(event_path);
+  expect_eq(probe_video(container_config(video_path), timeout_ns).width, 3840U,
+            "an exact-limit input snapshot is accepted and checkpointed atomically");
+  const auto checkpoint_events = read_events(event_path);
+  expect_true(count_event(checkpoint_events, "parser-input") > 1,
+              "input following an exact-limit access unit continues through the parser");
+  expect_true(!has_event(checkpoint_events, "input-budget-drop"),
+              "checkpointing the exact-limit snapshot does not charge later input twice");
 
   for (const auto scenario_name : {"probe-timeout", "probe-pull-timeout"}) {
     set_scenario(scenario_name);
