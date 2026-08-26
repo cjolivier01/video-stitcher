@@ -173,7 +173,9 @@ FakeSample* make_sample(std::uint32_t sample_index = 0) {
              scenario() == "duplicate-transition-pts" || scenario() == "same-allocation-runahead") {
     sample->buffer.pts = (static_cast<std::uint64_t>(sample_index) + 1U) * 1'000'000'000ULL;
   } else if (scenario() == "drop-transition-first" ||
-             scenario() == "drop-duplicate-transition-first") {
+             scenario() == "drop-duplicate-transition-first" ||
+             scenario() == "nonmonotonic-duplicate-transition" ||
+             scenario() == "nonmonotonic-unique-transition") {
     sample->buffer.pts = 2'000'000'000ULL;
   }
 
@@ -439,6 +441,34 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     GstBufferAbi next_buffer;
     next_buffer.pts = sample->buffer.pts;
     push_predecoder_buffer(sink->pipeline->display_pad, next_buffer, 1100, 720);
+    return sample;
+  }
+  if (current_scenario == "nonmonotonic-duplicate-transition" && current == 0) {
+    auto* sample = make_sample(current);
+    GstBufferAbi first_old_buffer;
+    first_old_buffer.pts = 500'000'000ULL;
+    push_predecoder_buffer(sink->pipeline->display_pad, first_old_buffer, 1280, 720);
+    push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, 1280, 720);
+    GstBufferAbi reordered_old_buffer;
+    reordered_old_buffer.pts = 1'000'000'000ULL;
+    push_predecoder_buffer(sink->pipeline->display_pad, reordered_old_buffer, 1280, 720);
+    GstBufferAbi next_buffer;
+    next_buffer.pts = sample->buffer.pts;
+    push_predecoder_buffer(sink->pipeline->display_pad, next_buffer, 1100, 720);
+    return sample;
+  }
+  if (current_scenario == "nonmonotonic-unique-transition" && current == 0) {
+    auto* sample = make_sample(current);
+    GstBufferAbi first_old_buffer;
+    first_old_buffer.pts = 500'000'000ULL;
+    push_predecoder_buffer(sink->pipeline->display_pad, first_old_buffer, 1100, 720);
+    GstBufferAbi reordered_old_buffer;
+    reordered_old_buffer.pts = 3'000'000'000ULL;
+    push_predecoder_buffer(sink->pipeline->display_pad, reordered_old_buffer, 1100, 720);
+    GstBufferAbi first_new_buffer;
+    first_new_buffer.pts = 4'000'000'000ULL;
+    push_predecoder_buffer(sink->pipeline->display_pad, first_new_buffer, 1200, 720);
+    push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, 1200, 720);
     return sample;
   }
   const bool caps_runahead = current_scenario == "caps-runahead" ||

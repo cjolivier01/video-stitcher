@@ -290,6 +290,33 @@ void dropped_first_duplicate_pts_at_transition_is_ambiguous() {
                           "first retained duplicate-PTS boundary frame remains ambiguous");
 }
 
+void nonmonotonic_parser_pts_preserve_duplicate_boundary_evidence() {
+  set_scenario("nonmonotonic-duplicate-transition");
+  auto config = valid_config();
+  config.drop = true;
+  auto source =
+      open_gstreamer_gpu_file_decode_source(std::move(config), NvbufSurfaceAbi::DeepStream9_1);
+
+  expect_gpu_decode_error([&] { (void)source->read(); },
+                          "timestamp is ambiguous at a geometry transition",
+                          "reordered parser PTS cannot hide duplicate-boundary ambiguity");
+}
+
+void nonmonotonic_parser_pts_correlate_unique_geometry() {
+  set_scenario("nonmonotonic-unique-transition");
+  auto source =
+      open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+
+  const auto result = source->read();
+  expect_true(result.frame.has_value(), "nonmonotonic unique transition frame returned");
+  if (result.frame.has_value()) {
+    expect_eq(result.frame->pts_ns.value_or(0), 2'000'000'000ULL,
+              "nonmonotonic unique transition PTS preserved");
+    expect_eq(result.frame->visible_width, 1200U,
+              "nonmonotonic PTS uses its exact pre-decoder geometry");
+  }
+}
+
 void stale_parser_caps_reject_allocation_changes() {
   set_scenario("caps-runahead-stale-caps");
   auto source =
@@ -481,6 +508,8 @@ int main() {
   valid_transition_with_unchanged_allocation_is_correlated();
   dropped_first_frame_can_land_on_exact_transition();
   dropped_first_duplicate_pts_at_transition_is_ambiguous();
+  nonmonotonic_parser_pts_preserve_duplicate_boundary_evidence();
+  nonmonotonic_parser_pts_correlate_unique_geometry();
   stale_parser_caps_reject_allocation_changes();
   dropped_samples_do_not_accumulate_geometry_records();
   first_frame_rejects_grossly_stale_geometry();

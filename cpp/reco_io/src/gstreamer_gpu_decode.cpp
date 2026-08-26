@@ -16,6 +16,7 @@
 #include <sstream>
 #include <string>
 #include <utility>
+#include <vector>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -36,6 +37,7 @@ constexpr int kGstPadProbeOk = 1;
 constexpr std::uint64_t kGstClockTimeNone = std::numeric_limits<std::uint64_t>::max();
 constexpr std::uint64_t kSamplePollTimeoutNs = 100'000'000;
 constexpr std::size_t kMaximumGeometryTransitions = 4096;
+constexpr std::size_t kMaximumGeometryObservations = 4096;
 // Codec block alignment can pad a surface, but not by an entire 256-pixel block.
 constexpr std::uint32_t kMaximumVisibleAllocationPadding = 255;
 
@@ -364,9 +366,8 @@ enum class GeometryProbeFailure {
   Unknown,
 };
 
-struct GeometryTransition {
-  std::optional<std::uint64_t> pts_ns;
-  std::optional<std::uint64_t> last_pts_ns;
+struct GeometryObservation {
+  std::uint64_t pts_ns = 0;
   std::uint32_t width = 0;
   std::uint32_t height = 0;
 };
@@ -391,11 +392,11 @@ public:
     delete static_cast<std::shared_ptr<GeometryProbeState>*>(user_data);
   }
 
-  [[nodiscard]] std::pair<std::uint32_t, std::uint32_t>
-  take_dimensions(std::optional<std::uint64_t> pts_ns,
-                  const std::pair<std::uint32_t, std::uint32_t>& allocation_dimensions,
-                  const std::optional<std::pair<std::uint32_t, std::uint32_t>>&
-                      previous_allocation_dimensions) {
+  [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> take_dimensions(
+      std::optional<std::uint64_t> pts_ns,
+      const std::pair<std::uint32_t, std::uint32_t>& allocation_dimensions,
+      const std::optional<std::pair<std::uint32_t, std::uint32_t>>& previous_allocation_dimensions,
+      const std::optional<std::pair<std::uint32_t, std::uint32_t>>& previous_visible_dimensions) {
     std::lock_guard lock(mutex_);
     switch (failure_.load(std::memory_order_acquire)) {
     case GeometryProbeFailure::None:
@@ -413,58 +414,74 @@ public:
     case GeometryProbeFailure::Unknown:
       throw GpuDecodeError("GStreamer pre-decoder geometry probe failed");
     }
-    if (transitions_.empty()) {
+    if (!last_dimensions_.has_value()) {
       throw GpuDecodeError("GStreamer decoded frame has no correlated pre-decoder geometry");
     }
-    if (pts_ns.has_value() && last_output_pts_.has_value() && *pts_ns < *last_output_pts_) {
-      throw GpuDecodeError(
-          "GStreamer decoded frame timestamps are not monotonic across geometry correlation");
-    }
 
-    auto selected = transitions_.begin();
-    if (transitions_.size() > 1) {
-      if (!pts_ns.has_value() || std::any_of(transitions_.begin(), transitions_.end(),
-                                             [](const GeometryTransition& transition) {
-                                               return !transition.pts_ns.has_value();
-                                             })) {
+    if (!pts_ns.has_value()) {
+      if (geometry_epoch_count_ > 1) {
         throw GpuDecodeError(
             "GStreamer decoded frame timestamp cannot be correlated across a geometry change");
       }
-      selected = transitions_.end();
-      for (auto transition = transitions_.begin(); transition != transitions_.end(); ++transition) {
-        if (*transition->pts_ns > *pts_ns) {
-          continue;
-        }
-        if (selected == transitions_.end() || *transition->pts_ns > *selected->pts_ns) {
-          selected = transition;
-        } else if (*transition->pts_ns == *selected->pts_ns &&
-                   (transition->width != selected->width ||
-                    transition->height != selected->height)) {
-          throw GpuDecodeError(
-              "GStreamer decoded frame timestamp matches conflicting pre-decoder geometry");
-        }
-      }
-      if (selected == transitions_.end()) {
-        throw GpuDecodeError(
-            "GStreamer decoded frame timestamp precedes known pre-decoder geometry");
-      }
-      if (selected != transitions_.begin() && selected->pts_ns == pts_ns) {
-        const auto previous = std::prev(selected);
-        if (previous->last_pts_ns == pts_ns &&
-            (!previous_allocation_dimensions.has_value() ||
-             *previous_allocation_dimensions == allocation_dimensions)) {
-          throw GpuDecodeError(
-              "GStreamer decoded frame timestamp is ambiguous at a geometry transition");
-        }
-      }
+      return *last_dimensions_;
     }
 
-    const auto dimensions = std::pair{selected->width, selected->height};
-    transitions_.erase(transitions_.begin(), selected);
-    if (pts_ns.has_value()) {
-      last_output_pts_ = pts_ns;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> candidates;
+    for (const auto& observation : observations_) {
+      if (observation.pts_ns != *pts_ns) {
+        continue;
+      }
+      const auto dimensions = std::pair(observation.width, observation.height);
+      if (std::find(candidates.begin(), candidates.end(), dimensions) == candidates.end()) {
+        candidates.push_back(dimensions);
+      }
     }
-    return dimensions;
+    if (candidates.empty()) {
+      if (geometry_epoch_count_ == 1) {
+        return *last_dimensions_;
+      }
+      throw GpuDecodeError(
+          "GStreamer decoded frame timestamp has no correlated pre-decoder geometry");
+    }
+    if (candidates.size() == 1) {
+      return candidates.front();
+    }
+
+    const auto allocation_compatible = [&](const auto& dimensions) {
+      return dimensions.first <= allocation_dimensions.first &&
+             dimensions.second <= allocation_dimensions.second &&
+             allocation_dimensions.first - dimensions.first <= kMaximumVisibleAllocationPadding &&
+             allocation_dimensions.second - dimensions.second <= kMaximumVisibleAllocationPadding;
+    };
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> compatible_candidates;
+    std::copy_if(candidates.begin(), candidates.end(), std::back_inserter(compatible_candidates),
+                 allocation_compatible);
+    if (compatible_candidates.size() == 1) {
+      return compatible_candidates.front();
+    }
+    if (compatible_candidates.empty()) {
+      throw GpuDecodeError(
+          "GStreamer decoded frame allocation does not match timestamped pre-decoder geometry");
+    }
+
+    if (previous_allocation_dimensions.has_value() && previous_visible_dimensions.has_value() &&
+        *previous_allocation_dimensions != allocation_dimensions) {
+      std::optional<std::pair<std::uint32_t, std::uint32_t>> changed_candidate;
+      for (const auto& candidate : compatible_candidates) {
+        if (candidate == *previous_visible_dimensions) {
+          continue;
+        }
+        if (changed_candidate.has_value()) {
+          changed_candidate.reset();
+          break;
+        }
+        changed_candidate = candidate;
+      }
+      if (changed_candidate.has_value()) {
+        return *changed_candidate;
+      }
+    }
+    throw GpuDecodeError("GStreamer decoded frame timestamp is ambiguous at a geometry transition");
   }
 
 private:
@@ -475,20 +492,21 @@ private:
     }
     const auto [width, height] = visible_dimensions(api_, pad);
     const auto pts = static_cast<const GstBufferAbi*>(buffer)->pts;
-    const auto observed_pts =
-        pts == kGstClockTimeNone ? std::nullopt : std::optional<std::uint64_t>(pts);
     std::lock_guard lock(mutex_);
     const auto dimensions = std::pair(width, height);
-    if (last_dimensions_.has_value() && *last_dimensions_ == dimensions) {
-      transitions_.back().last_pts_ns = observed_pts;
-      return;
+    if (!last_dimensions_.has_value() || *last_dimensions_ != dimensions) {
+      if (geometry_epoch_count_ >= kMaximumGeometryTransitions) {
+        throw GpuDecodeError("GStreamer pre-decoder geometry history exceeded its safety limit");
+      }
+      ++geometry_epoch_count_;
+      last_dimensions_ = dimensions;
     }
-    if (transitions_.size() >= kMaximumGeometryTransitions) {
-      throw GpuDecodeError("GStreamer pre-decoder geometry history exceeded its safety limit");
+    if (pts != kGstClockTimeNone) {
+      observations_.push_back({.pts_ns = pts, .width = width, .height = height});
+      if (observations_.size() > kMaximumGeometryObservations) {
+        observations_.pop_front();
+      }
     }
-    transitions_.push_back(
-        {.pts_ns = observed_pts, .last_pts_ns = observed_pts, .width = width, .height = height});
-    last_dimensions_ = dimensions;
   }
 
   void record_error(const char* message) noexcept {
@@ -513,9 +531,9 @@ private:
 
   std::shared_ptr<GstreamerApi> api_;
   std::mutex mutex_;
-  std::deque<GeometryTransition> transitions_;
+  std::deque<GeometryObservation> observations_;
   std::optional<std::pair<std::uint32_t, std::uint32_t>> last_dimensions_;
-  std::optional<std::uint64_t> last_output_pts_;
+  std::size_t geometry_epoch_count_ = 0;
   std::atomic<GeometryProbeFailure> failure_{GeometryProbeFailure::None};
 };
 
@@ -640,7 +658,8 @@ public:
                             : std::optional<std::uint64_t>(gst_buffer.pts);
     const auto allocation_dimensions = std::pair(nvmm.width, nvmm.height);
     const auto [visible_width, visible_height] = geometry_probe_state_->take_dimensions(
-        pts_ns, allocation_dimensions, previous_allocation_dimensions_);
+        pts_ns, allocation_dimensions, previous_allocation_dimensions_,
+        previous_visible_dimensions_);
     GpuDecodedFrame frame{
         .nvmm = nvmm,
         .visible_width = visible_width,
