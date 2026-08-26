@@ -54,9 +54,10 @@ public:
 /// `reco_video_probe_worker` executable.
 /// The worker is isolated so a blocked native multimedia call can be killed
 /// with its process-owned resources. The timeout covers worker launch, IPC,
-/// probing, and teardown; a bounded part of it is reserved for process
-/// termination and reaping, subject to operating-system progress. It must be
-/// between one second and one hour, inclusive.
+/// probing, termination, and reaping. Worker executable loading occurs behind
+/// a guardian boundary, and a bounded part of the timeout is reserved for
+/// deterministic process cleanup. It must be between one second and one hour,
+/// inclusive.
 [[nodiscard]] GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config,
                                             const std::filesystem::path& worker_path,
                                             std::uint64_t timeout_ns);

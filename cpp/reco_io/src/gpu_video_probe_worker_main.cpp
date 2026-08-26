@@ -16,9 +16,10 @@
 #endif
 
 namespace reco::io::detail {
-int run_gpu_video_probe_worker(std::uint64_t expected_parent_pid,
-                               std::uintptr_t parent_liveness_handle, std::uintptr_t job_handle,
-                               std::uintptr_t start_gate_handle);
+int run_gpu_video_probe_worker();
+#if defined(_WIN32)
+int run_gpu_video_probe_guardian();
+#endif
 #if !defined(_WIN32)
 int run_gpu_video_probe_guard();
 #endif
@@ -66,6 +67,11 @@ bool close_unrelated_descriptors() {
 #endif
 
 int main(int argc, char** argv) {
+#if defined(_WIN32)
+  if (argc == 2 && std::strcmp(argv[1], "--reco-video-probe-guardian") == 0) {
+    return reco::io::detail::run_gpu_video_probe_guardian();
+  }
+#endif
 #if !defined(_WIN32)
   if (argc == 2 && std::strcmp(argv[1], "--reco-video-probe-guard") == 0) {
     return reco::io::detail::run_gpu_video_probe_guard();
@@ -75,32 +81,13 @@ int main(int argc, char** argv) {
     return 2;
   }
 #if defined(_WIN32)
-  if (argc != 5) {
-    return 2;
-  }
-  const auto parse_handle = [](const char* value, std::uintptr_t& handle) {
-    const std::string_view text(value);
-    std::uint64_t parsed = 0;
-    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), parsed);
-    if (error != std::errc{} || end != text.data() + text.size() || parsed == 0 ||
-        parsed > std::numeric_limits<std::uintptr_t>::max()) {
-      return false;
-    }
-    handle = static_cast<std::uintptr_t>(parsed);
-    return true;
-  };
-  std::uintptr_t parent_liveness_handle = 0;
-  std::uintptr_t job_handle = 0;
-  std::uintptr_t start_gate_handle = 0;
-  if (!parse_handle(argv[2], parent_liveness_handle) || !parse_handle(argv[3], job_handle) ||
-      !parse_handle(argv[4], start_gate_handle)) {
+  if (argc != 2) {
     return 2;
   }
   if (_setmode(_fileno(stdin), _O_BINARY) == -1 || _setmode(_fileno(stdout), _O_BINARY) == -1) {
     return 2;
   }
-  return reco::io::detail::run_gpu_video_probe_worker(0, parent_liveness_handle, job_handle,
-                                                      start_gate_handle);
+  return reco::io::detail::run_gpu_video_probe_worker();
 #else
   if (argc != 3) {
     return 2;
@@ -119,6 +106,6 @@ int main(int argc, char** argv) {
       expected_parent_pid == 0 || (value[separator + 1] == '0' && !close_unrelated_descriptors())) {
     return 2;
   }
-  return reco::io::detail::run_gpu_video_probe_worker(expected_parent_pid, 0, 0, 0);
+  return reco::io::detail::run_gpu_video_probe_worker();
 #endif
 }

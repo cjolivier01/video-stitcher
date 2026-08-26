@@ -1,18 +1,18 @@
 #include "gpu_video_probe_internal.hpp"
 #include "gpu_video_probe_protocol.hpp"
 
+#include <array>
 #include <cerrno>
 #include <charconv>
-#include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <system_error>
-#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -28,6 +28,37 @@
 
 namespace reco::io::detail {
 namespace {
+
+#if defined(_WIN32)
+class StartupAttributes {
+public:
+  StartupAttributes() {
+    SIZE_T size = 0;
+    (void)InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
+    if (size == 0) {
+      return;
+    }
+    storage_.resize(size);
+    value_ = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(storage_.data());
+    if (InitializeProcThreadAttributeList(value_, 1, 0, &size) == 0) {
+      value_ = nullptr;
+    }
+  }
+  StartupAttributes(const StartupAttributes&) = delete;
+  StartupAttributes& operator=(const StartupAttributes&) = delete;
+  ~StartupAttributes() {
+    if (value_ != nullptr) {
+      DeleteProcThreadAttributeList(value_);
+    }
+  }
+
+  [[nodiscard]] LPPROC_THREAD_ATTRIBUTE_LIST get() const { return value_; }
+
+private:
+  std::vector<unsigned char> storage_;
+  LPPROC_THREAD_ATTRIBUTE_LIST value_ = nullptr;
+};
+#endif
 
 #if !defined(_WIN32)
 [[noreturn]] void kill_guarded_process_group() {
@@ -131,66 +162,69 @@ void write_response(std::string_view response) {
   }
 }
 
-void start_parent_liveness_watch(std::uint64_t expected_parent_pid,
-                                 std::uintptr_t parent_liveness_handle, std::uintptr_t job_handle) {
-#if defined(_WIN32)
-  (void)expected_parent_pid;
-  const auto parent = reinterpret_cast<HANDLE>(parent_liveness_handle);
-  const auto job = reinterpret_cast<HANDLE>(job_handle);
-  DWORD parent_flags = 0;
-  DWORD job_flags = 0;
-  if (GetHandleInformation(parent, &parent_flags) == 0 ||
-      GetHandleInformation(job, &job_flags) == 0) {
-    throw GpuVideoProbeError("video probe worker received invalid lifecycle handles");
-  }
-  std::thread([parent, job] {
-    (void)WaitForSingleObject(parent, INFINITE);
-    (void)TerminateJobObject(job, 3);
-    (void)TerminateProcess(GetCurrentProcess(), 3);
-    std::_Exit(3);
-  }).detach();
-#else
-  (void)parent_liveness_handle;
-  (void)job_handle;
-  std::thread([expected_parent_pid] {
-    while (true) {
-      if (static_cast<std::uint64_t>(::getppid()) != expected_parent_pid) {
-        (void)::kill(0, SIGKILL);
-        std::_Exit(3);
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-  }).detach();
-#endif
-}
-
-void wait_for_start_gate(std::uintptr_t start_gate_handle) {
-#if defined(_WIN32)
-  const auto start_gate = reinterpret_cast<HANDLE>(start_gate_handle);
-  DWORD flags = 0;
-  if (GetHandleInformation(start_gate, &flags) == 0 ||
-      WaitForSingleObject(start_gate, INFINITE) != WAIT_OBJECT_0) {
-    throw GpuVideoProbeError("video probe worker received an invalid start gate");
-  }
-  (void)CloseHandle(start_gate);
-#else
-  (void)start_gate_handle;
-#endif
-}
-
 } // namespace
+
+#if defined(_WIN32)
+int run_gpu_video_probe_guardian() {
+  std::vector<wchar_t> executable(32'768);
+  const auto length =
+      GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+  if (length == 0 || length >= executable.size()) {
+    return 2;
+  }
+  const std::wstring application(executable.data(), length);
+  auto command_line = L"\"" + application + L"\" --reco-video-probe-worker";
+  STARTUPINFOEXW startup{};
+  startup.StartupInfo.cb = sizeof(startup);
+  startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+  startup.StartupInfo.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+  startup.StartupInfo.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+  startup.StartupInfo.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+  std::array<HANDLE, 3> inherited_handles{
+      startup.StartupInfo.hStdInput, startup.StartupInfo.hStdOutput, startup.StartupInfo.hStdError};
+  StartupAttributes attributes;
+  if (attributes.get() == nullptr ||
+      UpdateProcThreadAttribute(attributes.get(), 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                inherited_handles.data(), sizeof(inherited_handles), nullptr,
+                                nullptr) == 0) {
+    return 2;
+  }
+  startup.lpAttributeList = attributes.get();
+  PROCESS_INFORMATION process{};
+  if (CreateProcessW(application.c_str(), command_line.data(), nullptr, nullptr, TRUE,
+                     CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT, nullptr,
+                     nullptr, &startup.StartupInfo, &process) == 0) {
+    return 2;
+  }
+  BOOL worker_in_job = FALSE;
+  const bool contained =
+      IsProcessInJob(process.hProcess, nullptr, &worker_in_job) != 0 && worker_in_job != FALSE;
+  if (!contained || ResumeThread(process.hThread) == std::numeric_limits<DWORD>::max()) {
+    (void)TerminateProcess(process.hProcess, 2);
+    (void)CloseHandle(process.hThread);
+    (void)CloseHandle(process.hProcess);
+    return 2;
+  }
+  (void)CloseHandle(process.hThread);
+  const auto wait_result = WaitForSingleObject(process.hProcess, INFINITE);
+  DWORD exit_code = 2;
+  if (wait_result != WAIT_OBJECT_0 || GetExitCodeProcess(process.hProcess, &exit_code) == 0) {
+    exit_code = 2;
+  }
+  (void)CloseHandle(process.hProcess);
+  return exit_code <= static_cast<DWORD>(std::numeric_limits<int>::max())
+             ? static_cast<int>(exit_code)
+             : 2;
+}
+#endif
 
 #if !defined(_WIN32)
 int run_gpu_video_probe_guard() { return run_process_group_guard(); }
 #endif
 
-int run_gpu_video_probe_worker(std::uint64_t expected_parent_pid,
-                               std::uintptr_t parent_liveness_handle, std::uintptr_t job_handle,
-                               std::uintptr_t start_gate_handle) {
+int run_gpu_video_probe_worker() {
   std::string response;
   try {
-    start_parent_liveness_watch(expected_parent_pid, parent_liveness_handle, job_handle);
-    wait_for_start_gate(start_gate_handle);
     const auto payload = read_request();
     const auto request = decode_probe_request(payload);
     response = encode_probe_success(probe_gpu_video_in_process(request.config, request.timeout_ns));

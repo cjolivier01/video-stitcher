@@ -33,13 +33,12 @@ constexpr DWORD_PTR kProcThreadAttributeJobList = ProcThreadAttributeValue(13, F
 #include <cstring>
 #include <fcntl.h>
 #include <poll.h>
-#include <spawn.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #if defined(__linux__)
-#include <dlfcn.h>
+#include <sys/syscall.h>
 #endif
 
 extern char** environ;
@@ -255,6 +254,7 @@ std::string read_response(HANDLE input, std::chrono::steady_clock::time_point de
 
 std::string run_probe_worker(const std::filesystem::path& worker_path, std::string_view request,
                              std::chrono::steady_clock::time_point deadline,
+                             std::chrono::steady_clock::time_point cleanup_deadline,
                              std::chrono::nanoseconds pre_worker_spawn_delay) {
   require_worker_launch_active(deadline);
   SECURITY_ATTRIBUTES security{.nLength = sizeof(SECURITY_ATTRIBUTES),
@@ -305,27 +305,9 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
     throw GpuVideoProbeError("failed to configure video probe worker Job");
   }
 
-  HANDLE parent_liveness_raw = nullptr;
-  if (DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(),
-                      &parent_liveness_raw, SYNCHRONIZE, TRUE, 0) == 0) {
-    throw GpuVideoProbeError("failed to duplicate the video probe caller process handle");
-  }
-  UniqueHandle parent_liveness(parent_liveness_raw);
-  HANDLE child_job_raw = nullptr;
-  if (DuplicateHandle(GetCurrentProcess(), job.get(), GetCurrentProcess(), &child_job_raw,
-                      JOB_OBJECT_TERMINATE, TRUE, 0) == 0) {
-    throw GpuVideoProbeError("failed to duplicate the video probe worker Job handle");
-  }
-  UniqueHandle child_job(child_job_raw);
-  UniqueHandle start_gate(CreateEventW(&security, TRUE, FALSE, nullptr));
-  if (!start_gate) {
-    throw GpuVideoProbeError("failed to create the video probe worker start gate");
-  }
-
   StartupAttributeList attributes(2);
-  std::array<HANDLE, 6> inherited_handles{child_stdin.get(),  child_stdout.get(),
-                                          child_stderr.get(), parent_liveness.get(),
-                                          child_job.get(),    start_gate.get()};
+  std::array<HANDLE, 3> inherited_handles{child_stdin.get(), child_stdout.get(),
+                                          child_stderr.get()};
   if (UpdateProcThreadAttribute(attributes.get(), 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
                                 inherited_handles.data(), sizeof(inherited_handles), nullptr,
                                 nullptr) == 0) {
@@ -342,10 +324,7 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   const std::string utf8_path(reinterpret_cast<const char*>(encoded_path.data()),
                               encoded_path.size());
   const auto application = utf8_to_wide(utf8_path);
-  auto command_line = L"\"" + application + L"\" --reco-video-probe-worker " +
-                      std::to_wstring(reinterpret_cast<std::uintptr_t>(parent_liveness.get())) +
-                      L" " + std::to_wstring(reinterpret_cast<std::uintptr_t>(child_job.get())) +
-                      L" " + std::to_wstring(reinterpret_cast<std::uintptr_t>(start_gate.get()));
+  auto command_line = L"\"" + application + L"\" --reco-video-probe-guardian";
   STARTUPINFOEXW startup{};
   startup.StartupInfo.cb = sizeof(startup);
   startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
@@ -355,18 +334,25 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   PROCESS_INFORMATION process_info{};
   wait_for_worker_launch_delay(pre_worker_spawn_delay, deadline);
   if (CreateProcessW(application.c_str(), command_line.data(), nullptr, nullptr, TRUE,
-                     CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr,
-                     &startup.StartupInfo, &process_info) == 0) {
+                     CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT, nullptr,
+                     nullptr, &startup.StartupInfo, &process_info) == 0) {
     throw GpuVideoProbeError("failed to start video probe worker (Windows error " +
                              std::to_string(GetLastError()) + ")");
   }
   UniqueHandle process(process_info.hProcess);
   UniqueHandle thread(process_info.hThread);
-  thread.reset();
   const auto terminate_worker = [&] {
     (void)TerminateJobObject(job.get(), 1);
     (void)TerminateProcess(process.get(), 1);
-    (void)WaitForSingleObject(process.get(), INFINITE);
+    const auto now = std::chrono::steady_clock::now();
+    if (now < cleanup_deadline) {
+      const auto remaining =
+          std::chrono::duration_cast<std::chrono::milliseconds>(cleanup_deadline - now);
+      const auto wait_ms = static_cast<DWORD>(
+          std::clamp<std::uint64_t>(static_cast<std::uint64_t>(remaining.count()) + 1ULL, 1ULL,
+                                    std::numeric_limits<DWORD>::max() - 1ULL));
+      (void)WaitForSingleObject(process.get(), wait_ms);
+    }
     job.reset();
   };
   BOOL worker_in_job = FALSE;
@@ -375,13 +361,11 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
     terminate_worker();
     throw GpuVideoProbeError("failed to verify video probe worker Job containment");
   }
-  if (SetEvent(start_gate.get()) == 0) {
+  if (ResumeThread(thread.get()) == std::numeric_limits<DWORD>::max()) {
     terminate_worker();
-    throw GpuVideoProbeError("failed to release the video probe worker start gate");
+    throw GpuVideoProbeError("failed to release the video probe guardian");
   }
-  start_gate.reset();
-  parent_liveness.reset();
-  child_job.reset();
+  thread.reset();
   if (std::chrono::steady_clock::now() >= deadline) {
     terminate_worker();
     throw_worker_timeout();
@@ -468,90 +452,6 @@ public:
 
 private:
   int value_ = -1;
-};
-
-class PosixSpawnFileActions {
-public:
-  explicit PosixSpawnFileActions(std::string_view description) {
-    const auto result = ::posix_spawn_file_actions_init(&value_);
-    if (result != 0) {
-      throw GpuVideoProbeError("failed to initialize " + std::string(description) + ": " +
-                               std::string(std::strerror(result)));
-    }
-  }
-  PosixSpawnFileActions(const PosixSpawnFileActions&) = delete;
-  PosixSpawnFileActions& operator=(const PosixSpawnFileActions&) = delete;
-  ~PosixSpawnFileActions() { (void)::posix_spawn_file_actions_destroy(&value_); }
-
-  posix_spawn_file_actions_t* get() noexcept { return &value_; }
-
-private:
-  posix_spawn_file_actions_t value_{};
-};
-
-class PosixSpawnAttributes {
-public:
-  explicit PosixSpawnAttributes(std::string_view description) {
-    const auto result = ::posix_spawnattr_init(&value_);
-    if (result != 0) {
-      throw GpuVideoProbeError("failed to initialize " + std::string(description) + ": " +
-                               std::string(std::strerror(result)));
-    }
-  }
-  PosixSpawnAttributes(const PosixSpawnAttributes&) = delete;
-  PosixSpawnAttributes& operator=(const PosixSpawnAttributes&) = delete;
-  ~PosixSpawnAttributes() { (void)::posix_spawnattr_destroy(&value_); }
-
-  posix_spawnattr_t* get() noexcept { return &value_; }
-
-private:
-  posix_spawnattr_t value_{};
-};
-
-class ChildProcess {
-public:
-  explicit ChildProcess(pid_t value) : value_(value) {}
-  ChildProcess(const ChildProcess&) = delete;
-  ChildProcess& operator=(const ChildProcess&) = delete;
-  ~ChildProcess() {
-    if (value_ <= 0) {
-      return;
-    }
-    (void)::kill(-value_, SIGKILL);
-    int status = 0;
-    while (::waitpid(value_, &status, 0) < 0 && errno == EINTR) {
-    }
-  }
-
-  [[nodiscard]] pid_t get() const { return value_; }
-  void release() { value_ = -1; }
-
-private:
-  pid_t value_ = -1;
-};
-
-class ProcessGroupGuard {
-public:
-  ProcessGroupGuard() = default;
-  ProcessGroupGuard(pid_t pid, UniqueFd control) : pid_(pid), control_(std::move(control)) {}
-  ProcessGroupGuard(const ProcessGroupGuard&) = delete;
-  ProcessGroupGuard& operator=(const ProcessGroupGuard&) = delete;
-  ProcessGroupGuard(ProcessGroupGuard&& other) noexcept
-      : pid_(std::exchange(other.pid_, -1)), control_(std::move(other.control_)) {}
-  ProcessGroupGuard& operator=(ProcessGroupGuard&&) = delete;
-  ~ProcessGroupGuard() {
-    control_.reset();
-    if (pid_ <= 0) {
-      return;
-    }
-    int status = 0;
-    while (::waitpid(pid_, &status, 0) < 0 && errno == EINTR) {
-    }
-  }
-
-private:
-  pid_t pid_ = -1;
-  UniqueFd control_;
 };
 
 void wait_for_socket(int socket, short events, std::chrono::steady_clock::time_point deadline) {
@@ -700,78 +600,337 @@ std::string read_response(int input, std::chrono::steady_clock::time_point deadl
   return response;
 }
 
-ProcessGroupGuard spawn_process_group_guard(const std::string& executable, pid_t process_group,
-                                            std::chrono::steady_clock::time_point deadline) {
-  int guard_socket[2] = {-1, -1};
-  create_socket_pair(guard_socket, "process-group guard");
-  UniqueFd child_control(guard_socket[0]);
-  UniqueFd parent_control(guard_socket[1]);
-  make_nonblocking(parent_control.get());
+constexpr int kGuardianWorkerInput = 3;
+constexpr int kGuardianWorkerOutput = 4;
+constexpr int kGuardianFirstUnusedDescriptor = 5;
+constexpr char kGuardianReady = 'R';
+constexpr char kGuardianLaunch = 'L';
+constexpr char kGuardianStarted = 'S';
+constexpr char kGuardianExited = 'E';
+constexpr char kGuardianAcknowledge = 'A';
+constexpr char kGuardianTerminate = 'T';
 
-  PosixSpawnFileActions actions("video probe guard launch");
-  auto action_error =
-      posix_spawn_file_actions_adddup2(actions.get(), child_control.get(), STDIN_FILENO);
-  if (action_error == 0) {
-    action_error =
-        posix_spawn_file_actions_adddup2(actions.get(), child_control.get(), STDOUT_FILENO);
+UniqueFd duplicate_for_guardian(int descriptor) {
+#if defined(F_DUPFD_CLOEXEC)
+  const auto duplicate = ::fcntl(descriptor, F_DUPFD_CLOEXEC, kGuardianFirstUnusedDescriptor);
+#else
+  const auto duplicate = ::fcntl(descriptor, F_DUPFD, kGuardianFirstUnusedDescriptor);
+#endif
+  if (duplicate < 0) {
+    throw GpuVideoProbeError("failed to isolate video probe guardian descriptors: " +
+                             std::string(std::strerror(errno)));
   }
-  for (const int descriptor : {child_control.get(), parent_control.get()}) {
-    if (action_error == 0 && descriptor != STDIN_FILENO && descriptor != STDOUT_FILENO) {
-      action_error = posix_spawn_file_actions_addclose(actions.get(), descriptor);
+#if !defined(F_DUPFD_CLOEXEC)
+  try {
+    make_close_on_exec(duplicate);
+  } catch (...) {
+    (void)::close(duplicate);
+    throw;
+  }
+#endif
+  return UniqueFd(duplicate);
+}
+
+void kill_worker_process_group(pid_t worker_pid) {
+  if (worker_pid <= 0) {
+    return;
+  }
+  (void)::kill(-worker_pid, SIGKILL);
+  (void)::kill(worker_pid, SIGKILL);
+}
+
+void kill_worker_descendants(pid_t worker_pid) {
+  if (worker_pid > 0) {
+    (void)::kill(-worker_pid, SIGKILL);
+  }
+}
+
+bool wait_for_process_exit(pid_t pid, int* status, std::chrono::steady_clock::time_point deadline) {
+  while (true) {
+    const auto result = ::waitpid(pid, status, WNOHANG);
+    if (result == pid || (result < 0 && errno == ECHILD)) {
+      return true;
+    }
+    if (result < 0 && errno != EINTR) {
+      return false;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return false;
+    }
+    std::this_thread::sleep_for(kProcessPollInterval);
+  }
+}
+
+[[noreturn]] void guardian_exit(int status) { std::_Exit(status); }
+
+bool guardian_write(int descriptor, const void* data, std::size_t size) {
+  auto* bytes = static_cast<const char*>(data);
+  std::size_t offset = 0;
+  while (offset < size) {
+    const auto written = ::send(descriptor, bytes + offset, size - offset,
+#if defined(MSG_NOSIGNAL)
+                                MSG_NOSIGNAL
+#else
+                                0
+#endif
+    );
+    if (written < 0 && errno == EINTR) {
+      continue;
+    }
+    if (written <= 0) {
+      return false;
+    }
+    offset += static_cast<std::size_t>(written);
+  }
+  return true;
+}
+
+void guardian_close_from(int descriptor, long maximum_descriptor) {
+#if defined(__linux__) && defined(SYS_close_range)
+  if (::syscall(SYS_close_range, static_cast<unsigned int>(descriptor),
+                std::numeric_limits<unsigned int>::max(), 0U) == 0) {
+    return;
+  }
+#elif defined(__APPLE__)
+  ::closefrom(descriptor);
+  return;
+#endif
+  for (long value = descriptor; value < maximum_descriptor; ++value) {
+    (void)::close(static_cast<int>(value));
+  }
+}
+
+void guardian_terminate_worker(pid_t worker_pid) {
+  kill_worker_process_group(worker_pid);
+  if (worker_pid <= 0) {
+    return;
+  }
+  constexpr auto kGuardianReapAttempts = 25;
+  constexpr timespec kReapPause{.tv_sec = 0, .tv_nsec = 2'000'000};
+  for (int attempt = 0; attempt < kGuardianReapAttempts; ++attempt) {
+    int status = 0;
+    const auto result = ::waitpid(worker_pid, &status, WNOHANG);
+    if (result == worker_pid || (result < 0 && errno == ECHILD)) {
+      return;
+    }
+    if (result < 0 && errno != EINTR) {
+      return;
+    }
+    (void)::nanosleep(&kReapPause, nullptr);
+  }
+}
+
+std::size_t format_guardian_parent_argument(char* destination, std::size_t capacity, pid_t pid) {
+  char reversed[32]{};
+  auto value = static_cast<std::uint64_t>(pid);
+  std::size_t digits = 0;
+  do {
+    reversed[digits++] = static_cast<char>('0' + (value % 10U));
+    value /= 10U;
+  } while (value != 0 && digits < sizeof(reversed));
+  if (digits + 3U > capacity) {
+    return 0;
+  }
+  for (std::size_t index = 0; index < digits; ++index) {
+    destination[index] = reversed[digits - index - 1U];
+  }
+  destination[digits] = ':';
+  destination[digits + 1U] = '1';
+  destination[digits + 2U] = '\0';
+  return digits + 2U;
+}
+
+[[noreturn]] void run_guardian_child(const char* executable, int control_descriptor,
+                                     int worker_input_descriptor, int worker_output_descriptor,
+                                     long maximum_descriptor) {
+  if (::setpgid(0, 0) != 0 || ::dup2(control_descriptor, STDIN_FILENO) < 0 ||
+      ::dup2(control_descriptor, STDOUT_FILENO) < 0 ||
+      ::dup2(worker_input_descriptor, kGuardianWorkerInput) < 0 ||
+      ::dup2(worker_output_descriptor, kGuardianWorkerOutput) < 0) {
+    guardian_exit(2);
+  }
+  guardian_close_from(kGuardianFirstUnusedDescriptor, maximum_descriptor);
+  struct sigaction child_action{};
+  child_action.sa_handler = SIG_DFL;
+  (void)::sigemptyset(&child_action.sa_mask);
+  if (::sigaction(SIGCHLD, &child_action, nullptr) != 0 ||
+      !guardian_write(STDOUT_FILENO, &kGuardianReady, 1)) {
+    guardian_exit(2);
+  }
+
+  char command = '\0';
+  ssize_t received = -1;
+  do {
+    received = ::recv(STDIN_FILENO, &command, 1, 0);
+  } while (received < 0 && errno == EINTR);
+  if (received != 1 || command != kGuardianLaunch) {
+    guardian_exit(0);
+  }
+
+  const auto worker_pid = ::fork();
+  if (worker_pid == 0) {
+    if (::setpgid(0, 0) != 0 || ::dup2(kGuardianWorkerInput, STDIN_FILENO) < 0 ||
+        ::dup2(kGuardianWorkerOutput, STDOUT_FILENO) < 0) {
+      guardian_exit(127);
+    }
+    guardian_close_from(kGuardianWorkerInput, maximum_descriptor);
+    char parent_argument[40]{};
+    if (format_guardian_parent_argument(parent_argument, sizeof(parent_argument), ::getppid()) ==
+        0) {
+      guardian_exit(127);
+    }
+    char* const arguments[] = {const_cast<char*>(executable),
+                               const_cast<char*>("--reco-video-probe-worker"), parent_argument,
+                               nullptr};
+    ::execve(executable, arguments, environ);
+    guardian_exit(127);
+  }
+  if (worker_pid < 0) {
+    guardian_exit(2);
+  }
+  (void)::setpgid(worker_pid, worker_pid);
+  (void)::close(kGuardianWorkerInput);
+  (void)::close(kGuardianWorkerOutput);
+  const auto encoded_worker_pid = static_cast<std::uint64_t>(worker_pid);
+  if (!guardian_write(STDOUT_FILENO, &kGuardianStarted, 1) ||
+      !guardian_write(STDOUT_FILENO, &encoded_worker_pid, sizeof(encoded_worker_pid))) {
+    guardian_terminate_worker(worker_pid);
+    guardian_exit(2);
+  }
+
+  int worker_status = 0;
+  while (true) {
+    const auto wait_result = ::waitpid(worker_pid, &worker_status, WNOHANG);
+    if (wait_result == worker_pid) {
+      break;
+    }
+    if (wait_result < 0 && errno == ECHILD) {
+      worker_status = 0;
+      break;
+    }
+    if (wait_result < 0 && errno != EINTR) {
+      guardian_terminate_worker(worker_pid);
+      guardian_exit(2);
+    }
+    pollfd control{.fd = STDIN_FILENO, .events = POLLIN, .revents = 0};
+    const auto poll_result = ::poll(&control, 1, 2);
+    if (poll_result < 0 && errno == EINTR) {
+      continue;
+    }
+    if (poll_result < 0) {
+      guardian_terminate_worker(worker_pid);
+      guardian_exit(2);
+    }
+    if (poll_result > 0) {
+      command = '\0';
+      do {
+        received = ::recv(STDIN_FILENO, &command, 1, 0);
+      } while (received < 0 && errno == EINTR);
+      if (received != 1 || command == kGuardianTerminate) {
+        guardian_terminate_worker(worker_pid);
+        guardian_exit(0);
+      }
     }
   }
-  if (action_error != 0) {
-    throw GpuVideoProbeError("failed to configure video probe guard launch: " +
-                             std::string(std::strerror(action_error)));
-  }
 
-  PosixSpawnAttributes attributes("video probe guard attributes");
-  short spawn_flags = POSIX_SPAWN_SETPGROUP;
-#if defined(POSIX_SPAWN_CLOEXEC_DEFAULT)
-  spawn_flags = static_cast<short>(spawn_flags | POSIX_SPAWN_CLOEXEC_DEFAULT);
-#endif
-  auto attribute_error = posix_spawnattr_setpgroup(attributes.get(), process_group);
-  if (attribute_error == 0) {
-    attribute_error = posix_spawnattr_setflags(attributes.get(), spawn_flags);
+  kill_worker_descendants(worker_pid);
+  if (!guardian_write(STDOUT_FILENO, &kGuardianExited, 1) ||
+      !guardian_write(STDOUT_FILENO, &worker_status, sizeof(worker_status))) {
+    guardian_exit(2);
   }
-  if (attribute_error != 0) {
-    throw GpuVideoProbeError("failed to isolate video probe guard process: " +
-                             std::string(std::strerror(attribute_error)));
-  }
-
-  char* const arguments[] = {const_cast<char*>(executable.c_str()),
-                             const_cast<char*>("--reco-video-probe-guard"), nullptr};
-  pid_t guard_pid = -1;
-  const auto spawn_result = ::posix_spawn(&guard_pid, executable.c_str(), actions.get(),
-                                          attributes.get(), arguments, environ);
-  if (spawn_result != 0) {
-    throw GpuVideoProbeError("failed to start video probe guard: " +
-                             std::string(std::strerror(spawn_result)));
-  }
-  child_control.reset();
-  ProcessGroupGuard guard(guard_pid, std::move(parent_control));
-  char ready = '\0';
-  read_exact(guard_socket[1], &ready, 1, deadline);
-  if (ready != 'R') {
-    throw GpuVideoProbeError("video probe guard failed its readiness handshake");
-  }
-  return guard;
+  do {
+    received = ::recv(STDIN_FILENO, &command, 1, 0);
+  } while (received < 0 && errno == EINTR);
+  guardian_exit(received == 1 && command == kGuardianAcknowledge ? 0 : 2);
 }
+
+class GuardianProcess {
+public:
+  GuardianProcess(pid_t pid, UniqueFd control, std::chrono::steady_clock::time_point deadline)
+      : pid_(pid), control_(std::move(control)), deadline_(deadline) {}
+  GuardianProcess(const GuardianProcess&) = delete;
+  GuardianProcess& operator=(const GuardianProcess&) = delete;
+  ~GuardianProcess() { terminate(); }
+
+  [[nodiscard]] int control() const { return control_.get(); }
+  void set_worker_pid(pid_t worker_pid) { worker_pid_ = worker_pid; }
+  void mark_worker_exited() { worker_pid_ = -1; }
+
+  bool finish() {
+    if (pid_ <= 0) {
+      return true;
+    }
+    const char acknowledge = kGuardianAcknowledge;
+    (void)::send(control_.get(), &acknowledge, 1,
+#if defined(MSG_NOSIGNAL)
+                 MSG_NOSIGNAL
+#else
+                 0
+#endif
+    );
+    control_.reset();
+    int status = 0;
+    const auto exited = wait_for_process_exit(pid_, &status, deadline_);
+    if (exited) {
+      pid_ = -1;
+    }
+    return exited && (status == 0 || (WIFEXITED(status) && WEXITSTATUS(status) == 0));
+  }
+
+private:
+  void terminate() {
+    if (pid_ <= 0) {
+      return;
+    }
+    kill_worker_process_group(worker_pid_);
+    const char terminate = kGuardianTerminate;
+    (void)::send(control_.get(), &terminate, 1,
+#if defined(MSG_NOSIGNAL)
+                 MSG_NOSIGNAL
+#else
+                 0
+#endif
+    );
+    control_.reset();
+    int status = 0;
+    const auto now = std::chrono::steady_clock::now();
+    const auto maximum_grace = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::milliseconds(50));
+    const auto grace_deadline =
+        now < deadline_ ? now + std::min((deadline_ - now) / 2, maximum_grace) : now;
+    if (!wait_for_process_exit(pid_, &status, grace_deadline)) {
+      (void)::kill(pid_, SIGKILL);
+      (void)wait_for_process_exit(pid_, &status, deadline_);
+    }
+    pid_ = -1;
+  }
+
+  pid_t pid_ = -1;
+  pid_t worker_pid_ = -1;
+  UniqueFd control_;
+  std::chrono::steady_clock::time_point deadline_;
+};
 
 std::string run_probe_worker(const std::filesystem::path& worker_path, std::string_view request,
                              std::chrono::steady_clock::time_point deadline,
+                             std::chrono::steady_clock::time_point cleanup_deadline,
                              std::chrono::nanoseconds pre_worker_spawn_delay) {
   require_worker_launch_active(deadline);
   int request_socket[2] = {-1, -1};
   int response_socket[2] = {-1, -1};
+  int control_socket[2] = {-1, -1};
   create_socket_pair(request_socket, "input");
   UniqueFd child_input(request_socket[0]);
   UniqueFd parent_input(request_socket[1]);
   create_socket_pair(response_socket, "output");
   UniqueFd parent_output(response_socket[0]);
   UniqueFd child_output(response_socket[1]);
+  create_socket_pair(control_socket, "guardian control");
+  UniqueFd child_control(control_socket[0]);
+  UniqueFd parent_control(control_socket[1]);
   make_nonblocking(parent_input.get());
   make_nonblocking(parent_output.get());
+  make_nonblocking(parent_control.get());
 #if defined(SO_NOSIGPIPE) && !defined(MSG_NOSIGNAL)
   const int suppress_sigpipe = 1;
   if (::setsockopt(parent_input.get(), SOL_SOCKET, SO_NOSIGPIPE, &suppress_sigpipe,
@@ -781,109 +940,71 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   }
 #endif
 
-  PosixSpawnFileActions actions("video probe worker launch");
-  auto action_error =
-      posix_spawn_file_actions_adddup2(actions.get(), child_input.get(), STDIN_FILENO);
-  if (action_error == 0) {
-    action_error =
-        posix_spawn_file_actions_adddup2(actions.get(), child_output.get(), STDOUT_FILENO);
-  }
-  bool closes_all_unrelated_descriptors = false;
-#if defined(__linux__)
-  using AddCloseFrom = int (*)(posix_spawn_file_actions_t*, int);
-  const auto add_close_from = reinterpret_cast<AddCloseFrom>(
-      ::dlsym(RTLD_DEFAULT, "posix_spawn_file_actions_addclosefrom_np"));
-  if (action_error == 0 && add_close_from != nullptr) {
-    action_error = add_close_from(actions.get(), STDERR_FILENO + 1);
-    closes_all_unrelated_descriptors = action_error == 0;
-  }
-#endif
-  if (!closes_all_unrelated_descriptors) {
-    for (const int descriptor :
-         {child_input.get(), parent_input.get(), parent_output.get(), child_output.get()}) {
-      if (action_error == 0 && descriptor != STDIN_FILENO && descriptor != STDOUT_FILENO) {
-        action_error = posix_spawn_file_actions_addclose(actions.get(), descriptor);
-      }
-    }
-  }
-  if (action_error != 0) {
-    throw GpuVideoProbeError("failed to configure video probe worker launch: " +
-                             std::string(std::strerror(action_error)));
-  }
-
-  PosixSpawnAttributes attributes("video probe worker attributes");
-  short spawn_flags = POSIX_SPAWN_SETPGROUP;
-#if defined(POSIX_SPAWN_CLOEXEC_DEFAULT)
-  spawn_flags = static_cast<short>(spawn_flags | POSIX_SPAWN_CLOEXEC_DEFAULT);
-  closes_all_unrelated_descriptors = true;
-#endif
-  auto attribute_error = posix_spawnattr_setpgroup(attributes.get(), 0);
-  if (attribute_error == 0) {
-    attribute_error = posix_spawnattr_setflags(attributes.get(), spawn_flags);
-  }
-  if (attribute_error != 0) {
-    throw GpuVideoProbeError("failed to isolate video probe worker process group: " +
-                             std::string(std::strerror(attribute_error)));
-  }
-
   const auto executable = worker_path.string();
-  const auto parent_pid_argument = std::to_string(static_cast<std::uint64_t>(::getpid())) +
-                                   (closes_all_unrelated_descriptors ? ":1" : ":0");
-  char* const arguments[] = {const_cast<char*>(executable.c_str()),
-                             const_cast<char*>("--reco-video-probe-worker"),
-                             const_cast<char*>(parent_pid_argument.c_str()), nullptr};
-  pid_t pid = -1;
-  wait_for_worker_launch_delay(pre_worker_spawn_delay, deadline);
-  const auto spawn_result =
-      ::posix_spawn(&pid, executable.c_str(), actions.get(), attributes.get(), arguments, environ);
-  if (spawn_result != 0) {
-    throw GpuVideoProbeError("failed to start video probe worker: " +
-                             std::string(std::strerror(spawn_result)));
+  auto guard_control = duplicate_for_guardian(child_control.get());
+  auto guard_input = duplicate_for_guardian(child_input.get());
+  auto guard_output = duplicate_for_guardian(child_output.get());
+  const auto maximum_descriptor = ::sysconf(_SC_OPEN_MAX);
+  if (maximum_descriptor < kGuardianFirstUnusedDescriptor) {
+    throw GpuVideoProbeError("failed to determine the video probe guardian descriptor limit");
   }
-  ChildProcess child(pid);
-  auto group_guard = spawn_process_group_guard(executable, pid, deadline);
+  wait_for_worker_launch_delay(pre_worker_spawn_delay, deadline);
+  const auto guardian_pid = ::fork();
+  if (guardian_pid == 0) {
+    run_guardian_child(executable.c_str(), guard_control.get(), guard_input.get(),
+                       guard_output.get(), maximum_descriptor);
+  }
+  if (guardian_pid < 0) {
+    throw GpuVideoProbeError("failed to start video probe guardian: " +
+                             std::string(std::strerror(errno)));
+  }
+  GuardianProcess guardian(guardian_pid, std::move(parent_control), cleanup_deadline);
   child_input.reset();
   child_output.reset();
+  child_control.reset();
+  guard_control.reset();
+  guard_input.reset();
+  guard_output.reset();
+  char lifecycle = '\0';
+  read_exact(guardian.control(), &lifecycle, 1, deadline);
+  if (lifecycle != kGuardianReady) {
+    throw GpuVideoProbeError("video probe guardian failed its readiness handshake");
+  }
+  write_all(guardian.control(), std::string_view(&kGuardianLaunch, 1), deadline);
+  read_exact(guardian.control(), &lifecycle, 1, deadline);
+  if (lifecycle != kGuardianStarted) {
+    throw GpuVideoProbeError("video probe guardian failed its worker launch handshake");
+  }
+  std::uint64_t encoded_worker_pid = 0;
+  read_exact(guardian.control(), reinterpret_cast<char*>(&encoded_worker_pid),
+             sizeof(encoded_worker_pid), deadline);
+  if (encoded_worker_pid == 0 ||
+      encoded_worker_pid > static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max())) {
+    throw GpuVideoProbeError("video probe guardian returned an invalid worker process ID");
+  }
+  guardian.set_worker_pid(static_cast<pid_t>(encoded_worker_pid));
   require_worker_launch_active(deadline);
   write_request(parent_input.get(), request, deadline);
   parent_input.reset();
 
-  int status = 0;
-  bool has_wait_status = false;
-  while (true) {
-    siginfo_t exit_info{};
-    const auto wait_result =
-        ::waitid(P_PID, static_cast<id_t>(child.get()), &exit_info, WEXITED | WNOHANG | WNOWAIT);
-    if (wait_result == 0 && exit_info.si_pid == child.get()) {
-      (void)::kill(-child.get(), SIGKILL);
-      while (::waitpid(child.get(), &status, 0) < 0 && errno == EINTR) {
-      }
-      child.release();
-      has_wait_status = true;
-      break;
-    }
-    if (wait_result < 0 && errno == ECHILD) {
-      (void)::kill(-child.get(), SIGKILL);
-      child.release();
-      break;
-    }
-    if (wait_result < 0 && errno != EINTR) {
-      throw GpuVideoProbeError("failed while waiting for video probe worker: " +
-                               std::string(std::strerror(errno)));
-    }
-    if (std::chrono::steady_clock::now() >= deadline) {
-      (void)::kill(-child.get(), SIGKILL);
-      while (::waitpid(child.get(), &status, 0) < 0 && errno == EINTR) {
-      }
-      child.release();
-      throw_worker_timeout();
-    }
-    std::this_thread::sleep_for(kProcessPollInterval);
+  read_exact(guardian.control(), &lifecycle, 1, deadline);
+  if (lifecycle != kGuardianExited) {
+    throw GpuVideoProbeError("video probe guardian failed its worker exit handshake");
   }
-  if (has_wait_status && (!WIFEXITED(status) || WEXITSTATUS(status) != 0)) {
+  int status = 0;
+  read_exact(guardian.control(), reinterpret_cast<char*>(&status), sizeof(status), deadline);
+  guardian.mark_worker_exited();
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
+    throw GpuVideoProbeError("failed to start video probe worker");
+  }
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
     throw GpuVideoProbeError("video probe worker exited abnormally");
   }
-  return read_response(parent_output.get(), deadline);
+  auto response = read_response(parent_output.get(), deadline);
+  if (!guardian.finish()) {
+    throw GpuVideoProbeError("failed to reap video probe guardian before the configured timeout");
+  }
+  return response;
 }
 
 #endif
@@ -895,7 +1016,8 @@ std::string run_probe_worker_bounded(std::filesystem::path worker_path, std::str
                                      std::chrono::nanoseconds pre_worker_spawn_delay) {
   SupervisorSlot supervisor_slot;
   wait_for_worker_launch_delay(supervisor_start_delay, public_deadline);
-  return run_probe_worker(worker_path, request, worker_deadline, pre_worker_spawn_delay);
+  return run_probe_worker(worker_path, request, worker_deadline, public_deadline,
+                          pre_worker_spawn_delay);
 }
 
 GpuVideoProbe probe_gpu_video_with_delays(const GpuFileDecodeConfig& config,

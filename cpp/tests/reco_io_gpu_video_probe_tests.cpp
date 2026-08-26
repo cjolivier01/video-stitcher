@@ -1271,6 +1271,153 @@ void caller_death_reclaims_worker_and_descendant(const std::filesystem::path& vi
 #endif
 }
 
+void caller_death_before_worker_main(const std::filesystem::path& video_path) {
+#if defined(_WIN32)
+  const auto worker_marker =
+      video_path.parent_path() / (video_path.filename().string() + ".pre-main-worker");
+  const auto lifecycle_path =
+      video_path.parent_path() / (video_path.filename().string() + ".pre-main-lifecycle");
+  std::filesystem::remove(worker_marker);
+  std::filesystem::remove(lifecycle_path);
+  set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", worker_marker.string());
+  set_environment("RECO_FAKE_PROBE_LIFECYCLE_PATH", lifecycle_path.string());
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "pre-main-block");
+  set_environment("RECO_FAKE_PROBE_CALLER_VIDEO_PATH", video_path.string());
+  set_environment("RECO_FAKE_PROBE_CALLER_WORKER_PATH", fake_probe_worker_path.string());
+
+  const auto application = current_test_executable().native();
+  auto command_line = L"\"" + application + L"\" --reco-parent-death-probe-caller";
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION caller_info{};
+  const bool caller_started =
+      CreateProcessW(application.c_str(), command_line.data(), nullptr, nullptr, FALSE,
+                     CREATE_NO_WINDOW, nullptr, nullptr, &startup, &caller_info) != 0;
+  expect_true(caller_started, "Windows pre-main parent-death probe caller starts");
+  if (caller_started) {
+    WindowsHandle caller_process(caller_info.hProcess);
+    WindowsHandle caller_thread(caller_info.hThread);
+    const auto worker = wait_for_process_marker(worker_marker, std::chrono::steady_clock::now() +
+                                                                   std::chrono::seconds(2));
+    expect_true(worker.has_value(), "Windows worker reaches its pre-main stall");
+    WindowsHandle worker_process(
+        worker.has_value() && *worker <= std::numeric_limits<DWORD>::max()
+            ? OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, static_cast<DWORD>(*worker))
+            : nullptr);
+    expect_true(worker_process && WaitForSingleObject(worker_process.get(), 0) == WAIT_TIMEOUT,
+                "Windows pre-main worker is live before caller death");
+
+    (void)TerminateProcess(caller_process.get(), 1);
+    (void)WaitForSingleObject(caller_process.get(), 2'000);
+    const bool worker_exited =
+        worker_process && WaitForSingleObject(worker_process.get(), 2'000) == WAIT_OBJECT_0;
+    expect_true(worker_exited, "Windows Job kill-on-close reclaims the worker before worker main");
+    expect_true(!has_event(read_events(lifecycle_path), "worker"),
+                "Windows startup-death test terminates before worker main");
+    if (worker_process && !worker_exited) {
+      (void)TerminateProcess(worker_process.get(), 1);
+    }
+  }
+
+  set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", "");
+  set_environment("RECO_FAKE_PROBE_LIFECYCLE_PATH", "");
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+  set_environment("RECO_FAKE_PROBE_CALLER_VIDEO_PATH", "");
+  set_environment("RECO_FAKE_PROBE_CALLER_WORKER_PATH", "");
+  std::filesystem::remove(worker_marker);
+  std::filesystem::remove(lifecycle_path);
+#else
+  const auto worker_marker =
+      video_path.parent_path() / (video_path.filename().string() + ".pre-main-worker");
+  const auto lifecycle_path =
+      video_path.parent_path() / (video_path.filename().string() + ".pre-main-lifecycle");
+  std::filesystem::remove(worker_marker);
+  std::filesystem::remove(lifecycle_path);
+  set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", worker_marker.string());
+  set_environment("RECO_FAKE_PROBE_LIFECYCLE_PATH", lifecycle_path.string());
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "pre-main-block");
+  const auto caller = ::fork();
+  if (caller == 0) {
+    try {
+      (void)reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
+                                      30'000'000'000ULL);
+    } catch (...) {
+    }
+    std::_Exit(EXIT_SUCCESS);
+  }
+  expect_true(caller > 0, "POSIX pre-main parent-death probe caller starts");
+  if (caller > 0) {
+    const auto worker = wait_for_process_marker(worker_marker, std::chrono::steady_clock::now() +
+                                                                   std::chrono::seconds(2));
+    expect_true(worker.has_value(), "POSIX worker reaches its pre-main stall");
+    (void)::kill(caller, SIGKILL);
+    int caller_status = 0;
+    while (::waitpid(caller, &caller_status, 0) < 0 && errno == EINTR) {
+    }
+    bool worker_exited = false;
+    const auto exit_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (worker.has_value() && std::chrono::steady_clock::now() < exit_deadline) {
+      errno = 0;
+      if (::kill(static_cast<pid_t>(*worker), 0) != 0 && errno == ESRCH) {
+        worker_exited = true;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    expect_true(worker_exited,
+                "POSIX guardian reclaims the worker before worker main after caller death");
+    expect_true(!has_event(read_events(lifecycle_path), "worker"),
+                "POSIX startup-death test terminates before worker main");
+    if (worker.has_value() && !worker_exited) {
+      (void)::kill(static_cast<pid_t>(*worker), SIGKILL);
+    }
+  }
+  set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", "");
+  set_environment("RECO_FAKE_PROBE_LIFECYCLE_PATH", "");
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+  std::filesystem::remove(worker_marker);
+  std::filesystem::remove(lifecycle_path);
+#endif
+}
+
+void pre_main_loader_stall_respects_timeout(const std::filesystem::path& video_path) {
+  const auto worker_marker =
+      video_path.parent_path() / (video_path.filename().string() + ".loader-stall-worker");
+  std::filesystem::remove(worker_marker);
+  set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", worker_marker.string());
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "pre-main-block");
+  const auto started = std::chrono::steady_clock::now();
+  expect_probe_error(
+      [&] {
+        (void)reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
+                                        1'000'000'000ULL);
+      },
+      "timed out", "pre-main worker loader stall reaches a bounded timeout");
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  expect_true(elapsed >= std::chrono::milliseconds(800) &&
+                  elapsed < std::chrono::milliseconds(1'200),
+              "pre-main worker loader stall returns within the public timeout bound");
+  const auto worker = wait_for_process_marker(worker_marker, std::chrono::steady_clock::now() +
+                                                                 std::chrono::milliseconds(100));
+  expect_true(worker.has_value(), "pre-main timeout observes the contained process");
+#if defined(_WIN32)
+  WindowsHandle worker_process(
+      worker.has_value() && *worker <= std::numeric_limits<DWORD>::max()
+          ? OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, static_cast<DWORD>(*worker))
+          : nullptr);
+  const bool worker_exited =
+      !worker_process || WaitForSingleObject(worker_process.get(), 0) == WAIT_OBJECT_0;
+#else
+  errno = 0;
+  const bool worker_exited =
+      worker.has_value() && ::kill(static_cast<pid_t>(*worker), 0) != 0 && errno == ESRCH;
+#endif
+  expect_true(worker_exited, "pre-main timeout synchronously reclaims the contained process");
+  set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", "");
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+  std::filesystem::remove(worker_marker);
+}
+
 void unrelated_descriptor_writer_does_not_delay_pipe_eof(const std::filesystem::path& video_path) {
 #if !defined(_WIN32)
   int pipe_descriptors[2] = {-1, -1};
@@ -1295,19 +1442,15 @@ void unrelated_descriptor_writer_does_not_delay_pipe_eof(const std::filesystem::
   });
 
   bool worker_started = false;
-  bool guard_started = false;
   const auto launch_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-  while (std::chrono::steady_clock::now() < launch_deadline &&
-         (!worker_started || !guard_started)) {
+  while (std::chrono::steady_clock::now() < launch_deadline && !worker_started) {
     const auto events = read_events(lifecycle_path);
     worker_started = has_event(events, "worker");
-    guard_started = has_event(events, "guard");
-    if (!worker_started || !guard_started) {
+    if (!worker_started) {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
   }
   expect_true(worker_started, "pipe EOF regression observes the blocked worker");
-  expect_true(guard_started, "pipe EOF regression observes the process-group guard");
 
   (void)::close(pipe_descriptors[1]);
   pipe_descriptors[1] = -1;
@@ -1539,6 +1682,8 @@ int main(int argc, char** argv) {
   unrelated_descriptor_writer_does_not_delay_pipe_eof(video_path);
   parent_death_reclaims_worker(video_path);
   caller_death_reclaims_worker_and_descendant(video_path);
+  caller_death_before_worker_main(video_path);
+  pre_main_loader_stall_respects_timeout(video_path);
   expect_no_unreaped_children();
 
   std::filesystem::remove(video_path);

@@ -1,5 +1,6 @@
 #include <array>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -22,11 +23,62 @@
 #include <io.h>
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
 
 namespace {
+
+class PreMainWorkerBlock {
+public:
+  PreMainWorkerBlock() {
+    const char* scenario = std::getenv("RECO_FAKE_PROBE_WORKER_SCENARIO");
+    const char* marker_path = std::getenv("RECO_FAKE_PROBE_WORKER_PID_PATH");
+    if (scenario == nullptr || std::strcmp(scenario, "pre-main-block") != 0 ||
+        marker_path == nullptr || marker_path[0] == '\0') {
+      return;
+    }
+#if defined(_WIN32)
+    const auto marker = CreateFileA(marker_path, GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (marker == INVALID_HANDLE_VALUE) {
+      return;
+    }
+#else
+    const auto marker = ::open(marker_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (marker < 0) {
+      return;
+    }
+#endif
+    std::array<char, 32> process_id{};
+    const auto [end, error] =
+        std::to_chars(process_id.data(), process_id.data() + process_id.size(),
+                      static_cast<std::uint64_t>(
+#if defined(_WIN32)
+                          GetCurrentProcessId()
+#else
+                          ::getpid()
+#endif
+                              ));
+#if defined(_WIN32)
+    DWORD written = 0;
+    if (error == std::errc{}) {
+      (void)WriteFile(marker, process_id.data(), static_cast<DWORD>(end - process_id.data()),
+                      &written, nullptr);
+    }
+    (void)CloseHandle(marker);
+#else
+    if (error == std::errc{}) {
+      (void)::write(marker, process_id.data(), static_cast<std::size_t>(end - process_id.data()));
+    }
+    (void)::close(marker);
+#endif
+    std::this_thread::sleep_for(std::chrono::seconds(30));
+  }
+};
+
+PreMainWorkerBlock pre_main_worker_block;
 
 constexpr std::size_t kMaximumFrameBytes = 256U * 1024U;
 constexpr std::size_t kFrameHeaderBytes = sizeof(std::uint32_t);
@@ -193,60 +245,47 @@ int run_process_group_guard() {
   }
 }
 
-void start_parent_liveness_watch(const char* parent_argument) {
-  errno = 0;
-  char* end = nullptr;
-  const auto parent_id = std::strtoull(parent_argument, &end, 10);
-  if (errno != 0 || end == parent_argument || end == nullptr || *end != ':' || parent_id == 0) {
-    return;
-  }
-  std::thread([parent_id] {
-    while (static_cast<unsigned long long>(::getppid()) == parent_id) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    (void)::kill(0, SIGKILL);
-    std::_Exit(EXIT_FAILURE);
-  }).detach();
-}
 #else
-bool parse_handle(const char* value, HANDLE& handle) {
-  const std::string_view text(value);
-  std::uint64_t parsed = 0;
-  const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), parsed);
-  if (error != std::errc{} || end != text.data() + text.size() || parsed == 0 ||
-      parsed > std::numeric_limits<std::uintptr_t>::max()) {
-    return false;
+int run_windows_guardian() {
+  std::vector<wchar_t> executable(32'768);
+  const auto length =
+      GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+  if (length == 0 || length >= executable.size()) {
+    return EXIT_FAILURE;
   }
-  handle = reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(parsed));
-  DWORD flags = 0;
-  return GetHandleInformation(handle, &flags) != 0;
-}
-
-bool start_parent_liveness_watch(const char* parent_argument, const char* job_argument) {
-  HANDLE parent = nullptr;
-  HANDLE job = nullptr;
-  if (!parse_handle(parent_argument, parent) || !parse_handle(job_argument, job)) {
-    return false;
+  const std::wstring application(executable.data(), length);
+  auto command_line = L"\"" + application + L"\" --reco-video-probe-worker";
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  startup.dwFlags = STARTF_USESTDHANDLES;
+  startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+  startup.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+  startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+  PROCESS_INFORMATION process{};
+  if (CreateProcessW(application.c_str(), command_line.data(), nullptr, nullptr, TRUE,
+                     CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, nullptr, &startup,
+                     &process) == 0) {
+    return EXIT_FAILURE;
   }
-  try {
-    std::thread([parent, job] {
-      (void)WaitForSingleObject(parent, INFINITE);
-      (void)TerminateJobObject(job, 3);
-      (void)TerminateProcess(GetCurrentProcess(), 3);
-      std::_Exit(EXIT_FAILURE);
-    }).detach();
-  } catch (...) {
-    return false;
+  BOOL worker_in_job = FALSE;
+  const bool contained =
+      IsProcessInJob(process.hProcess, nullptr, &worker_in_job) != 0 && worker_in_job != FALSE;
+  if (!contained || ResumeThread(process.hThread) == std::numeric_limits<DWORD>::max()) {
+    (void)TerminateProcess(process.hProcess, EXIT_FAILURE);
+    (void)CloseHandle(process.hThread);
+    (void)CloseHandle(process.hProcess);
+    return EXIT_FAILURE;
   }
-  return true;
-}
-
-bool wait_for_start_gate(const char* gate_argument) {
-  HANDLE gate = nullptr;
-  if (!parse_handle(gate_argument, gate) || WaitForSingleObject(gate, INFINITE) != WAIT_OBJECT_0) {
-    return false;
+  (void)CloseHandle(process.hThread);
+  const auto wait_result = WaitForSingleObject(process.hProcess, INFINITE);
+  DWORD exit_code = EXIT_FAILURE;
+  if (wait_result != WAIT_OBJECT_0 || GetExitCodeProcess(process.hProcess, &exit_code) == 0) {
+    exit_code = EXIT_FAILURE;
   }
-  return CloseHandle(gate) != 0;
+  (void)CloseHandle(process.hProcess);
+  return exit_code <= static_cast<DWORD>(std::numeric_limits<int>::max())
+             ? static_cast<int>(exit_code)
+             : EXIT_FAILURE;
 }
 #endif
 
@@ -261,9 +300,13 @@ int main(int argc, char** argv) {
   if (argc == 2 && std::strcmp(argv[1], "--reco-video-probe-guard") == 0) {
     return run_process_group_guard();
   }
+#else
+  if (argc == 2 && std::strcmp(argv[1], "--reco-video-probe-guardian") == 0) {
+    return run_windows_guardian();
+  }
 #endif
 #if defined(_WIN32)
-  constexpr int kExpectedArguments = 5;
+  constexpr int kExpectedArguments = 2;
 #else
   constexpr int kExpectedArguments = 3;
 #endif
@@ -281,16 +324,8 @@ int main(int argc, char** argv) {
   if (_setmode(_fileno(stdin), _O_BINARY) == -1 || _setmode(_fileno(stdout), _O_BINARY) == -1) {
     return EXIT_FAILURE;
   }
-  if (!start_parent_liveness_watch(argv[2], argv[3]) || !wait_for_start_gate(argv[4])) {
-    return EXIT_FAILURE;
-  }
 #endif
   const char* scenario = std::getenv("RECO_FAKE_PROBE_WORKER_SCENARIO");
-#if !defined(_WIN32)
-  if (scenario != nullptr && std::strcmp(scenario, "block-input") == 0) {
-    start_parent_liveness_watch(argv[2]);
-  }
-#endif
   if (!write_lifecycle_event("worker")) {
     return EXIT_FAILURE;
   }
