@@ -28,6 +28,7 @@ struct GpuCalibrationFrame {
   std::size_t pitch = 0;
   std::uint32_t width = 0;
   std::uint32_t height = 0;
+  reco::core::YuvColorRange color_range = reco::core::YuvColorRange::Full;
   std::uint64_t frame_index = 0;
   std::optional<std::uint64_t> pts_ns;
   std::optional<std::uint64_t> duration_ns;

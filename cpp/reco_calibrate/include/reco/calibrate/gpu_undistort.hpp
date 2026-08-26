@@ -2,6 +2,7 @@
 
 #include "reco/core/calibration.hpp"
 #include "reco/core/cuda_backend.hpp"
+#include "reco/core/video_format.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +15,7 @@ struct GpuGrayFrame {
   std::size_t pitch = 0;
   std::uint32_t width = 0;
   std::uint32_t height = 0;
+  reco::core::YuvColorRange color_range = reco::core::YuvColorRange::Full;
 };
 
 struct GpuUndistortConfig {

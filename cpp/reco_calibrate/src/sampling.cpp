@@ -98,7 +98,11 @@ GrayFrame downscale_if_needed(const GrayFrame& frame, std::uint32_t target_width
 }
 
 GpuGrayFrame GpuCalibrationFrame::view() const {
-  return {.ptr = y_plane.ptr(), .pitch = pitch, .width = width, .height = height};
+  return {.ptr = y_plane.ptr(),
+          .pitch = pitch,
+          .width = width,
+          .height = height,
+          .color_range = color_range};
 }
 
 std::vector<GpuCalibrationFrame>
@@ -176,6 +180,7 @@ extract_gpu_gray_frames(reco::core::CudaBackend& backend, reco::io::GpuFileDecod
                          .pitch = allocation.pitch,
                          .width = mapped.width,
                          .height = mapped.height,
+                         .color_range = mapped.color_range,
                          .frame_index = decoded.frame_index,
                          .pts_ns = decoded.pts_ns,
                          .duration_ns = decoded.duration_ns});

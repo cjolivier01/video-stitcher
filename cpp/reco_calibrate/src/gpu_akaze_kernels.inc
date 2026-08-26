@@ -45,6 +45,26 @@ __device__ __forceinline__ float akaze_load_replicated(
   return akaze_const_row<float>(image, pitch, (unsigned int)cy)[cx];
 }
 
+__device__ __forceinline__ float akaze_normalize_y(
+    unsigned char value, unsigned int limited_range) {
+  if (limited_range != 0U) {
+    if (value <= 16U) {
+      return 0.0f;
+    }
+    if (value >= 235U) {
+      return 1.0f;
+    }
+    return ((float)value - 16.0f) * (1.0f / 219.0f);
+  }
+  if (value == 0U) {
+    return 0.0f;
+  }
+  if (value == 255U) {
+    return 1.0f;
+  }
+  return (float)value * (1.0f / 255.0f);
+}
+
 // The layout intentionally matches reco::calibrate::GpuFeaturePoint.
 struct AkazeFeaturePoint {
   float x;
@@ -85,6 +105,10 @@ struct AkazeLevelView {
   unsigned int reserved;
 };
 
+static_assert(sizeof(AkazeFeaturePoint) == 24, "feature point ABI must be 24 bytes");
+static_assert(sizeof(AkazeCandidate) == 76, "candidate ABI must be 76 bytes");
+static_assert(sizeof(AkazeLevelView) == 64, "level view ABI must be 64 bytes");
+
 extern "C" __global__ void akaze_y_to_float(
     unsigned long long src,
     unsigned long long src_pitch,
@@ -124,18 +148,13 @@ extern "C" __global__ void akaze_y_to_float(
   const float ty = sy - (float)y0;
   const unsigned char* row0 = akaze_const_row<unsigned char>(src, src_pitch, y0);
   const unsigned char* row1 = akaze_const_row<unsigned char>(src, src_pitch, y1);
-  const float upper = (1.0f - tx) * (float)row0[x0] + tx * (float)row0[x1];
-  const float lower = (1.0f - tx) * (float)row1[x0] + tx * (float)row1[x1];
-  const float y_sample = (1.0f - ty) * upper + ty * lower;
-
-  float normalized;
-  if (limited_range != 0U) {
-    normalized = (y_sample - 16.0f) * (1.0f / 219.0f);
-  } else {
-    normalized = y_sample * (1.0f / 255.0f);
-  }
-  normalized = normalized < 0.0f ? 0.0f : (normalized > 1.0f ? 1.0f : normalized);
-  akaze_row<float>(dst, dst_pitch, y)[x] = normalized;
+  const float upper =
+      (1.0f - tx) * akaze_normalize_y(row0[x0], limited_range) +
+      tx * akaze_normalize_y(row0[x1], limited_range);
+  const float lower =
+      (1.0f - tx) * akaze_normalize_y(row1[x0], limited_range) +
+      tx * akaze_normalize_y(row1[x1], limited_range);
+  akaze_row<float>(dst, dst_pitch, y)[x] = (1.0f - ty) * upper + ty * lower;
 }
 
 extern "C" __global__ void akaze_gaussian_x(
@@ -358,7 +377,8 @@ extern "C" __global__ void akaze_conductivity(
     unsigned long long conductivity_pitch,
     unsigned int width,
     unsigned int height,
-    float contrast) {
+    unsigned long long base_contrast,
+    float contrast_scale) {
   const unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
   const unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
   if (x >= width || y >= height) {
@@ -366,6 +386,8 @@ extern "C" __global__ void akaze_conductivity(
   }
   const float gx = akaze_const_row<float>(lx, lx_pitch, y)[x];
   const float gy = akaze_const_row<float>(ly, ly_pitch, y)[x];
+  const float contrast =
+      *akaze_const_pointer<float>(base_contrast) * contrast_scale;
   const float k = contrast > 1.0e-6f ? contrast : 1.0e-6f;
   const float inverse_k_squared = 1.0f / (k * k);
   akaze_row<float>(conductivity, conductivity_pitch, y)[x] =
