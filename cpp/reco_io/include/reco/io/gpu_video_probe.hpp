@@ -11,9 +11,9 @@ namespace reco::io {
 
 /// Parser-derived metadata used to select GPU calibration frames.
 struct GpuVideoProbe {
-  /// Coded video width in pixels.
+  /// Parser-visible video width in pixels.
   std::uint32_t width = 0;
-  /// Coded video height in pixels.
+  /// Parser-visible video height in pixels.
   std::uint32_t height = 0;
   /// Exact frame-rate numerator reported by the parser.
   std::uint32_t fps_numerator = 0;

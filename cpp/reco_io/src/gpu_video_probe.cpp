@@ -161,7 +161,6 @@ public:
   using ElementGetBus = void* (*)(void*);
   using ElementQueryDuration = int (*)(void*, int, std::int64_t*);
   using ElementSeekSimple = int (*)(void*, int, int, std::int64_t);
-  using PadGetCurrentCaps = void* (*)(void*);
   using CapsGetStructure = void* (*)(const void*, std::uint32_t);
   using StructureGetName = const char* (*)(const void*);
   using StructureGetInt = int (*)(const void*, const char*, int*);
@@ -171,14 +170,15 @@ public:
   using AppSinkTryPullSample = void* (*)(void*, std::uint64_t);
   using AppSinkIsEos = int (*)(void*);
   using SampleGetBuffer = void* (*)(void*);
+  using SampleGetCaps = void* (*)(void*);
   using SampleGetSegment = const void* (*)(void*);
   using SampleUnref = void (*)(void*);
   using SegmentToStreamTime = std::uint64_t (*)(const void*, int, std::uint64_t);
+  using SegmentPositionFromStreamTime = std::uint64_t (*)(const void*, int, std::uint64_t);
   using BusTimedPopFiltered = void* (*)(void*, std::uint64_t, std::uint32_t);
   using MessageParseError = void (*)(void*, GErrorAbi**, char**);
   using MessageUnref = void (*)(void*);
   using ObjectUnref = void (*)(void*);
-  using CapsUnref = void (*)(void*);
   using ErrorFree = void (*)(GErrorAbi*);
   using Free = void (*)(void*);
 
@@ -211,7 +211,6 @@ public:
     element_get_bus = core->symbol<ElementGetBus>("gst_element_get_bus");
     element_query_duration = core->symbol<ElementQueryDuration>("gst_element_query_duration");
     element_seek_simple = core->symbol<ElementSeekSimple>("gst_element_seek_simple");
-    pad_get_current_caps = core->symbol<PadGetCurrentCaps>("gst_pad_get_current_caps");
     caps_get_structure = core->symbol<CapsGetStructure>("gst_caps_get_structure");
     structure_get_name = core->symbol<StructureGetName>("gst_structure_get_name");
     structure_get_int = core->symbol<StructureGetInt>("gst_structure_get_int");
@@ -221,14 +220,16 @@ public:
     app_sink_try_pull_sample = app->symbol<AppSinkTryPullSample>("gst_app_sink_try_pull_sample");
     app_sink_is_eos = app->symbol<AppSinkIsEos>("gst_app_sink_is_eos");
     sample_get_buffer = core->symbol<SampleGetBuffer>("gst_sample_get_buffer");
+    sample_get_caps = core->symbol<SampleGetCaps>("gst_sample_get_caps");
     sample_get_segment = core->symbol<SampleGetSegment>("gst_sample_get_segment");
     sample_unref = core->symbol<SampleUnref>("gst_sample_unref");
     segment_to_stream_time = core->symbol<SegmentToStreamTime>("gst_segment_to_stream_time");
+    segment_position_from_stream_time =
+        core->symbol<SegmentPositionFromStreamTime>("gst_segment_position_from_stream_time");
     bus_timed_pop_filtered = core->symbol<BusTimedPopFiltered>("gst_bus_timed_pop_filtered");
     message_parse_error = core->symbol<MessageParseError>("gst_message_parse_error");
     message_unref = core->symbol<MessageUnref>("gst_message_unref");
     object_unref = core->symbol<ObjectUnref>("gst_object_unref");
-    caps_unref = core->symbol<CapsUnref>("gst_caps_unref");
     error_free = glib->symbol<ErrorFree>("g_error_free");
     free = glib->symbol<Free>("g_free");
   }
@@ -245,7 +246,6 @@ public:
   ElementGetBus element_get_bus = nullptr;
   ElementQueryDuration element_query_duration = nullptr;
   ElementSeekSimple element_seek_simple = nullptr;
-  PadGetCurrentCaps pad_get_current_caps = nullptr;
   CapsGetStructure caps_get_structure = nullptr;
   StructureGetName structure_get_name = nullptr;
   StructureGetInt structure_get_int = nullptr;
@@ -255,14 +255,15 @@ public:
   AppSinkTryPullSample app_sink_try_pull_sample = nullptr;
   AppSinkIsEos app_sink_is_eos = nullptr;
   SampleGetBuffer sample_get_buffer = nullptr;
+  SampleGetCaps sample_get_caps = nullptr;
   SampleGetSegment sample_get_segment = nullptr;
   SampleUnref sample_unref = nullptr;
   SegmentToStreamTime segment_to_stream_time = nullptr;
+  SegmentPositionFromStreamTime segment_position_from_stream_time = nullptr;
   BusTimedPopFiltered bus_timed_pop_filtered = nullptr;
   MessageParseError message_parse_error = nullptr;
   MessageUnref message_unref = nullptr;
   ObjectUnref object_unref = nullptr;
-  CapsUnref caps_unref = nullptr;
   ErrorFree error_free = nullptr;
   Free free = nullptr;
 };
@@ -379,6 +380,29 @@ std::uint64_t frame_timestamp_ns(std::uint64_t frame_index, std::uint32_t fps_nu
              : base + tail;
 }
 
+std::uint64_t minimum_duration_for_frame_count(std::uint64_t frame_count,
+                                               std::uint32_t fps_numerator,
+                                               std::uint32_t fps_denominator) {
+  auto duration_ns = frame_timestamp_ns(frame_count, fps_numerator, fps_denominator);
+  if (duration_ns != std::numeric_limits<std::uint64_t>::max() &&
+      frame_count_for_duration(duration_ns, fps_numerator, fps_denominator) < frame_count) {
+    ++duration_ns;
+  }
+  return duration_ns;
+}
+
+std::uint64_t frame_count_ceiling_for_duration(std::uint64_t duration_ns,
+                                               std::uint32_t fps_numerator,
+                                               std::uint32_t fps_denominator) {
+  const auto floor_count = frame_count_for_duration(duration_ns, fps_numerator, fps_denominator);
+  if (floor_count == std::numeric_limits<std::uint64_t>::max()) {
+    return floor_count;
+  }
+  return minimum_duration_for_frame_count(floor_count, fps_numerator, fps_denominator) < duration_ns
+             ? floor_count + 1
+             : floor_count;
+}
+
 std::uint64_t remaining_timeout_ns(std::chrono::steady_clock::time_point deadline,
                                    std::string_view timeout_message) {
   const auto now = std::chrono::steady_clock::now();
@@ -426,6 +450,28 @@ void* pull_compressed_sample(const std::shared_ptr<ProbeApi>& api, void* probe_s
   }
 }
 
+std::optional<std::uint64_t> segment_stream_origin(const std::shared_ptr<ProbeApi>& api,
+                                                   const void* segment,
+                                                   std::uint64_t sample_stream_time) {
+  if (api->segment_position_from_stream_time(segment, kGstFormatTime, sample_stream_time) ==
+      kGstClockTimeNone) {
+    return std::nullopt;
+  }
+
+  std::uint64_t first = 0;
+  std::uint64_t last = sample_stream_time;
+  while (first < last) {
+    const auto candidate = first + (last - first) / 2;
+    if (api->segment_position_from_stream_time(segment, kGstFormatTime, candidate) ==
+        kGstClockTimeNone) {
+      first = candidate + 1;
+    } else {
+      last = candidate;
+    }
+  }
+  return first;
+}
+
 struct FrameSeekResult {
   bool usable = true;
   bool available = false;
@@ -434,15 +480,15 @@ struct FrameSeekResult {
 };
 
 FrameSeekResult seek_compressed_frame(const std::shared_ptr<ProbeApi>& api, void* pipeline,
-                                      void* probe_sink, void* bus, std::uint64_t stream_start_ns,
+                                      void* probe_sink, void* bus, std::uint64_t stream_origin_ns,
                                       std::uint64_t frame_index, std::uint32_t fps_numerator,
                                       std::uint32_t fps_denominator,
                                       std::chrono::steady_clock::time_point deadline) {
   const auto relative_target_ns = frame_timestamp_ns(frame_index, fps_numerator, fps_denominator);
-  if (relative_target_ns > std::numeric_limits<std::uint64_t>::max() - stream_start_ns) {
+  if (relative_target_ns > std::numeric_limits<std::uint64_t>::max() - stream_origin_ns) {
     return {.usable = false};
   }
-  const auto target_ns = stream_start_ns + relative_target_ns;
+  const auto target_ns = stream_origin_ns + relative_target_ns;
   if (target_ns > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ||
       api->element_seek_simple(pipeline, kGstFormatTime, kGstSeekFlagFlushAccurate,
                                static_cast<std::int64_t>(target_ns)) == 0) {
@@ -489,30 +535,38 @@ FrameSeekResult seek_compressed_frame(const std::shared_ptr<ProbeApi>& api, void
   }
 }
 
-std::optional<std::uint64_t> selected_stream_duration(
-    const std::shared_ptr<ProbeApi>& api, void* pipeline, void* probe_sink, void* bus,
-    std::uint64_t container_duration_ns, std::uint64_t stream_start_ns, std::uint32_t fps_numerator,
-    std::uint32_t fps_denominator, std::chrono::steady_clock::time_point deadline) {
-  if (stream_start_ns >= container_duration_ns) {
+std::optional<std::uint64_t>
+selected_stream_duration(const std::shared_ptr<ProbeApi>& api, void* pipeline, void* probe_sink,
+                         void* bus, std::uint64_t container_duration_ns,
+                         std::uint64_t stream_origin_ns, std::uint32_t fps_numerator,
+                         std::uint32_t fps_denominator,
+                         std::chrono::steady_clock::time_point deadline) {
+  const auto duration_frame_ceiling =
+      frame_count_ceiling_for_duration(container_duration_ns, fps_numerator, fps_denominator);
+  if (duration_frame_ceiling == std::numeric_limits<std::uint64_t>::max()) {
     return std::nullopt;
   }
-  const auto maximum_stream_span_ns = container_duration_ns - stream_start_ns;
-  const auto container_frames =
-      frame_count_for_duration(maximum_stream_span_ns, fps_numerator, fps_denominator);
-  if (container_frames == 0 || container_frames == std::numeric_limits<std::uint64_t>::max()) {
+  const auto search_frame_limit = duration_frame_ceiling + 1;
+  const auto maximum_stream_span_ns =
+      minimum_duration_for_frame_count(search_frame_limit, fps_numerator, fps_denominator);
+  if (maximum_stream_span_ns == std::numeric_limits<std::uint64_t>::max()) {
     return std::nullopt;
   }
 
   std::uint64_t first = 0;
-  std::uint64_t last = container_frames;
+  std::uint64_t last = search_frame_limit;
+  std::optional<std::pair<std::uint64_t, FrameSeekResult>> final_available_frame;
   while (first < last) {
     const auto candidate = first + (last - first) / 2;
-    const auto result = seek_compressed_frame(api, pipeline, probe_sink, bus, stream_start_ns,
+    const auto result = seek_compressed_frame(api, pipeline, probe_sink, bus, stream_origin_ns,
                                               candidate, fps_numerator, fps_denominator, deadline);
     if (!result.usable) {
       return std::nullopt;
     }
     if (result.available) {
+      if (!final_available_frame.has_value() || candidate > final_available_frame->first) {
+        final_available_frame = std::pair(candidate, result);
+      }
       first = candidate + 1;
     } else {
       last = candidate;
@@ -521,27 +575,21 @@ std::optional<std::uint64_t> selected_stream_duration(
   if (first == 0) {
     throw GpuVideoProbeError("video parser found no frames in the selected stream");
   }
-  if (first == container_frames) {
-    return maximum_stream_span_ns;
-  }
-
-  const auto final_frame =
-      seek_compressed_frame(api, pipeline, probe_sink, bus, stream_start_ns, first - 1,
-                            fps_numerator, fps_denominator, deadline);
-  if (!final_frame.usable) {
+  if (first == search_frame_limit) {
     return std::nullopt;
   }
-  if (!final_frame.available) {
+  if (!final_available_frame.has_value() || final_available_frame->first != first - 1) {
     throw GpuVideoProbeError("video parser could not correlate the selected stream duration");
   }
+  const auto& final_frame = final_available_frame->second;
   const auto frame_end =
       final_frame.duration_ns > std::numeric_limits<std::uint64_t>::max() - final_frame.pts_ns
           ? std::numeric_limits<std::uint64_t>::max()
           : final_frame.pts_ns + final_frame.duration_ns;
-  if (frame_end <= stream_start_ns) {
+  if (frame_end <= stream_origin_ns) {
     return std::nullopt;
   }
-  return std::min(frame_end - stream_start_ns, maximum_stream_span_ns);
+  return std::min(frame_end - stream_origin_ns, maximum_stream_span_ns);
 }
 
 } // namespace
@@ -623,13 +671,14 @@ GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config, std::uint64_t t
   if (api->element_set_state(pipeline, kGstStatePlaying) == kGstStateChangeFailure) {
     throw GpuVideoProbeError("GStreamer parser-only probe failed to enter playing state");
   }
-  std::uint64_t stream_start_ns = 0;
+  void* initial_sample = nullptr;
+  std::unique_ptr<void, ProbeApi::SampleUnref> initial_sample_owner(nullptr, api->sample_unref);
+  std::uint64_t stream_origin_ns = 0;
   while (true) {
-    void* initial_sample = pull_compressed_sample(
+    initial_sample = pull_compressed_sample(
         api, probe_sink, bus, deadline,
         "GStreamer parser-only probe timed out while parsing stream metadata");
-    std::unique_ptr<void, ProbeApi::SampleUnref> initial_sample_owner(initial_sample,
-                                                                      api->sample_unref);
+    initial_sample_owner.reset(initial_sample);
     if (initial_sample == nullptr) {
       throw GpuVideoProbeError(
           "video discovery found no H.264 or HEVC moving-video stream compatible with NVDEC");
@@ -654,12 +703,15 @@ GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config, std::uint64_t t
     if (initial_stream_time == kGstClockTimeNone) {
       continue;
     }
-    stream_start_ns = initial_stream_time;
+    const auto origin = segment_stream_origin(api, initial_segment, initial_stream_time);
+    if (!origin.has_value()) {
+      continue;
+    }
+    stream_origin_ns = *origin;
     break;
   }
 
-  void* caps = api->pad_get_current_caps(probe_pad);
-  std::unique_ptr<void, ProbeApi::CapsUnref> caps_owner(caps, api->caps_unref);
+  void* caps = api->sample_get_caps(initial_sample);
   if (caps == nullptr) {
     throw GpuVideoProbeError(
         "video discovery found no H.264 or HEVC moving-video stream compatible with NVDEC");
@@ -702,6 +754,7 @@ GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config, std::uint64_t t
   if (!std::isfinite(fps) || fps <= 0.0 || fps > kMaximumSaneFps) {
     throw GpuVideoProbeError("video parser returned an implausible frame rate");
   }
+  initial_sample_owner.reset();
 
   std::int64_t queried_duration = 0;
   bool duration_is_estimated =
@@ -711,7 +764,7 @@ GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config, std::uint64_t t
                                            : static_cast<std::uint64_t>(queried_duration);
   if (!duration_is_estimated && !config.elementary_stream) {
     const auto selected_duration =
-        selected_stream_duration(api, pipeline, probe_sink, bus, duration_ns, stream_start_ns,
+        selected_stream_duration(api, pipeline, probe_sink, bus, duration_ns, stream_origin_ns,
                                  static_cast<std::uint32_t>(fps_numerator),
                                  static_cast<std::uint32_t>(fps_denominator), deadline);
     if (selected_duration.has_value()) {

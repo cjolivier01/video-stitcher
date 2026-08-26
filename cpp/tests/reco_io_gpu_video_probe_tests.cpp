@@ -163,6 +163,9 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_true(!has_event(events, "pull"), "probe does not pull a decoded frame");
   expect_true(has_event(events, "pull-probe"),
               "probe seeks only compressed access-unit timestamps");
+  expect_true(has_event(events, "sample-caps"),
+              "probe reads caps from the retained compressed sample");
+  expect_true(!has_event(events, "pad-current-caps"), "probe does not race mutable live-pad caps");
   expect_true(!has_event(events, "map"), "probe does not map frame memory");
   expect_true(!has_event(events, "raw-video-caps"), "probe never negotiates raw video caps");
 
@@ -208,6 +211,28 @@ void probe_contracts(const std::filesystem::path& video_path,
             "delayed selected stream reports only its own frame count");
   expect_true(!delayed_stream.duration_is_estimated,
               "delayed selected stream duration remains timestamp-correlated");
+
+  set_scenario("probe-nonzero-origin");
+  const auto nonzero_origin = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(nonzero_origin.duration_ns, 2'000'000'000ULL,
+            "nonzero timeline origin does not shorten a duration span");
+  expect_eq(nonzero_origin.total_frames, 60ULL,
+            "short demux duration still searches the final access unit");
+
+  set_scenario("probe-decode-order-origin");
+  const auto decode_order_origin = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(decode_order_origin.duration_ns, 1'000'000'000ULL,
+            "first decode-order access unit does not define the timeline origin");
+  expect_eq(decode_order_origin.total_frames, 30ULL,
+            "decode-ordered first PTS does not drop presentation frames");
+
+  set_scenario("probe-caps-runahead");
+  const auto sample_caps = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(sample_caps.width, 854U, "metadata width remains correlated with the selected sample");
+  expect_eq(sample_caps.height, 480U,
+            "metadata height remains correlated with the selected sample");
+  expect_eq(sample_caps.fps_numerator, 24U,
+            "metadata frame rate remains correlated with the selected sample");
 
   set_scenario("probe-seek-unsupported");
   const auto unseekable = probe_gpu_video(container_config(video_path), timeout_ns);
@@ -268,7 +293,7 @@ void invalid_inputs_fail(const std::filesystem::path& video_path,
             {"probe-stream-error", "playing state"},
             {"probe-async-error", "fake parser failure"},
             {"probe-no-supported-video", "H.264 or HEVC"},
-            {"probe-missing-current-caps", "H.264 or HEVC"},
+            {"probe-missing-sample-caps", "H.264 or HEVC"},
             {"probe-missing-caps-structure", "no structure"},
             {"probe-wrong-codec-caps", "decoder-compatible"},
             {"probe-unparsed-caps", "decoder-compatible"},

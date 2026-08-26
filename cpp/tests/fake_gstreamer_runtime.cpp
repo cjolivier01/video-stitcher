@@ -161,10 +161,12 @@ struct FakeSample {
   GstBufferAbi buffer;
   abi::SurfaceParams params;
   abi::Surface surface;
+  FakeCaps sample_caps;
   FakePipeline* pipeline = nullptr;
   bool post_pull_runahead_emitted = false;
   bool segment_outside = false;
   bool non_time_segment = false;
+  std::uint64_t segment_stream_origin_ns = 0;
 };
 
 std::mutex event_mutex;
@@ -172,6 +174,30 @@ std::mutex event_mutex;
 std::string scenario() {
   const char* value = std::getenv("RECO_FAKE_GST_SCENARIO");
   return value == nullptr ? "frame-eos" : value;
+}
+
+FakeCaps parser_sample_caps() {
+  FakeCaps caps{.width = 3840, .height = 2160};
+  if (scenario() == "probe-bad-dimensions") {
+    caps.width = 0;
+  } else if (scenario() == "probe-odd-dimensions") {
+    caps.width = 853;
+  } else if (scenario() == "probe-bad-fps") {
+    caps.fps_denominator = 0;
+  } else if (scenario() == "probe-high-fps") {
+    caps.fps_numerator = 90'000;
+    caps.fps_denominator = 1;
+  } else if (scenario() == "probe-duration-mismatch" || scenario() == "probe-delayed-stream" ||
+             scenario() == "probe-nonzero-origin" || scenario() == "probe-decode-order-origin") {
+    caps.fps_numerator = 30;
+    caps.fps_denominator = 1;
+  } else if (scenario() == "probe-caps-runahead") {
+    caps.width = 854;
+    caps.height = 480;
+    caps.fps_numerator = 24;
+    caps.fps_denominator = 1;
+  }
+  return caps;
 }
 
 void record(std::string_view event) {
@@ -483,6 +509,14 @@ RECO_FAKE_EXPORT int gst_element_query_duration(void*, int format, std::int64_t*
     *duration = 5'000'000'000;
     return 1;
   }
+  if (scenario() == "probe-nonzero-origin") {
+    *duration = 1'978'082'185;
+    return 1;
+  }
+  if (scenario() == "probe-decode-order-origin") {
+    *duration = 1'000'000'000;
+    return 1;
+  }
   *duration = 10'000'000'000LL;
   return 1;
 }
@@ -553,22 +587,11 @@ RECO_FAKE_EXPORT void* gst_pad_get_current_caps(void* pad_pointer) {
   if (scenario() == "missing-caps" || (pad->probe && scenario() == "probe-missing-current-caps")) {
     return nullptr;
   }
-  auto* caps = new FakeCaps{.width = pad->current_width, .height = pad->current_height};
-  if (pad->probe && scenario() == "probe-bad-dimensions") {
-    caps->width = 0;
-  } else if (pad->probe && scenario() == "probe-odd-dimensions") {
-    caps->width = 853;
-  } else if (pad->probe && scenario() == "probe-bad-fps") {
-    caps->fps_denominator = 0;
-  } else if (pad->probe && scenario() == "probe-high-fps") {
-    caps->fps_numerator = 90'000;
-    caps->fps_denominator = 1;
-  } else if (pad->probe &&
-             (scenario() == "probe-duration-mismatch" || scenario() == "probe-delayed-stream")) {
-    caps->fps_numerator = 30;
-    caps->fps_denominator = 1;
+  if (pad->probe && scenario() == "probe-caps-runahead") {
+    return new FakeCaps{.width = 1280, .height = 720, .fps_numerator = 30, .fps_denominator = 1};
   }
-  return caps;
+  return pad->probe ? new FakeCaps(parser_sample_caps())
+                    : new FakeCaps{.width = pad->current_width, .height = pad->current_height};
 }
 
 RECO_FAKE_EXPORT unsigned long gst_pad_add_probe(void* pad_pointer, int,
@@ -644,20 +667,27 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
       std::this_thread::sleep_for(std::chrono::nanoseconds(timeout_ns));
       return nullptr;
     }
+    const auto current_scenario = scenario();
     const std::uint64_t selected_stream_start_ns =
-        scenario() == "probe-delayed-stream" ? 4'000'000'000ULL : 0;
+        current_scenario == "probe-delayed-stream"   ? 4'000'000'000ULL
+        : current_scenario == "probe-nonzero-origin" ? 766'666'666ULL
+                                                     : 0;
     const std::uint64_t selected_duration_ns =
-        scenario() == "probe-delayed-stream"         ? 5'000'000'000ULL
-        : scenario() == "probe-duration-mismatch"    ? 1'000'000'000ULL
-        : scenario() == "probe-exact-frame-count"    ? 100'100'000ULL
-        : scenario() == "probe-integral-frame-count" ? 1'001'000'000'000ULL
-        : scenario() == "probe-frame-count-overflow"
+        current_scenario == "probe-delayed-stream"         ? 5'000'000'000ULL
+        : current_scenario == "probe-nonzero-origin"       ? 2'766'666'666ULL
+        : current_scenario == "probe-duration-mismatch"    ? 1'000'000'000ULL
+        : current_scenario == "probe-decode-order-origin"  ? 1'000'000'000ULL
+        : current_scenario == "probe-exact-frame-count"    ? 100'100'000ULL
+        : current_scenario == "probe-integral-frame-count" ? 1'001'000'000'000ULL
+        : current_scenario == "probe-frame-count-overflow"
             ? static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())
             : 10'000'000'000ULL;
-    const std::uint64_t frame_duration_ns =
-        scenario() == "probe-duration-mismatch" || scenario() == "probe-delayed-stream"
-            ? 33'333'333ULL
-            : 33'366'666ULL;
+    const std::uint64_t frame_duration_ns = current_scenario == "probe-duration-mismatch" ||
+                                                    current_scenario == "probe-delayed-stream" ||
+                                                    current_scenario == "probe-nonzero-origin" ||
+                                                    current_scenario == "probe-decode-order-origin"
+                                                ? 33'333'333ULL
+                                                : 33'366'666ULL;
     const auto requested_target_ns = static_cast<std::uint64_t>(sink->pipeline->seek_target_ns);
     const auto target_ns = std::max(requested_target_ns, selected_stream_start_ns);
     if (target_ns >= selected_duration_ns) {
@@ -666,10 +696,14 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     }
     auto* sample = new FakeSample;
     sample->pipeline = sink->pipeline;
+    sample->sample_caps = parser_sample_caps();
     sample->non_time_segment = sink->pipeline->elementary_probe;
+    sample->segment_stream_origin_ns = selected_stream_start_ns;
     sample->segment_outside = scenario() == "probe-seek-preroll" && sink->pipeline->has_seek &&
                               sink->probe_pulls_since_seek++ == 0;
-    sample->buffer.pts = target_ns;
+    sample->buffer.pts =
+        current_scenario == "probe-decode-order-origin" && !sink->pipeline->has_seek ? 66'666'666ULL
+                                                                                     : target_ns;
     const auto remaining_ns = selected_duration_ns - target_ns;
     sample->buffer.duration =
         remaining_ns > frame_duration_ns && remaining_ns - frame_duration_ns > 1 ? frame_duration_ns
@@ -858,9 +892,24 @@ RECO_FAKE_EXPORT std::uint64_t gst_segment_to_stream_time(const void* segment, i
              : std::numeric_limits<std::uint64_t>::max();
 }
 
+RECO_FAKE_EXPORT std::uint64_t
+gst_segment_position_from_stream_time(const void* segment, int format, std::uint64_t stream_time) {
+  const auto* sample = static_cast<const FakeSample*>(segment);
+  return format == 3 && !sample->segment_outside && !sample->non_time_segment &&
+                 stream_time >= sample->segment_stream_origin_ns
+             ? stream_time
+             : std::numeric_limits<std::uint64_t>::max();
+}
+
 RECO_FAKE_EXPORT void* gst_sample_get_caps(void* sample) {
   record("sample-caps");
-  return scenario() == "missing-caps" ? nullptr : sample;
+  if (scenario() == "missing-caps" || scenario() == "probe-missing-sample-caps") {
+    return nullptr;
+  }
+  auto* fake_sample = static_cast<FakeSample*>(sample);
+  return fake_sample->pipeline != nullptr && fake_sample->pipeline->parser_probe
+             ? &fake_sample->sample_caps
+             : sample;
 }
 
 RECO_FAKE_EXPORT void* gst_caps_get_structure(const void* caps, std::uint32_t index) {
