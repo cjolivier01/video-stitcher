@@ -2,6 +2,7 @@
 #include "gpu_video_probe_protocol.hpp"
 
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -10,14 +11,96 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <thread>
+#include <vector>
 
 #if !defined(_WIN32)
+#include <dirent.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #endif
 
 namespace reco::io::detail {
 namespace {
+
+#if !defined(_WIN32)
+[[noreturn]] void kill_guarded_process_group() {
+  (void)::kill(0, SIGKILL);
+  std::_Exit(3);
+}
+
+bool close_unrelated_descriptors() {
+#if defined(__linux__)
+  if (auto* directory = ::opendir("/proc/self/fd"); directory != nullptr) {
+    const auto directory_descriptor = ::dirfd(directory);
+    std::vector<int> descriptors;
+    while (const auto* entry = ::readdir(directory)) {
+      const std::string_view name(entry->d_name);
+      int descriptor = -1;
+      const auto [end, error] = std::from_chars(name.data(), name.data() + name.size(), descriptor);
+      if (error == std::errc{} && end == name.data() + name.size() && descriptor > 2 &&
+          descriptor != directory_descriptor) {
+        descriptors.push_back(descriptor);
+      }
+    }
+    (void)::closedir(directory);
+    for (const int descriptor : descriptors) {
+      if (::close(descriptor) != 0 && errno != EINTR && errno != EBADF) {
+        return false;
+      }
+    }
+    return true;
+  }
+#endif
+  const auto maximum_descriptor = ::sysconf(_SC_OPEN_MAX);
+  if (maximum_descriptor < 0) {
+    return false;
+  }
+  for (long descriptor = 3; descriptor < maximum_descriptor; ++descriptor) {
+    if (::close(static_cast<int>(descriptor)) != 0 && errno != EINTR && errno != EBADF) {
+      return false;
+    }
+  }
+  return true;
+}
+
+int run_process_group_guard() {
+  if (!close_unrelated_descriptors()) {
+    kill_guarded_process_group();
+  }
+  constexpr char kReady = 'R';
+#if defined(SO_NOSIGPIPE) && !defined(MSG_NOSIGNAL)
+  const int suppress_sigpipe = 1;
+  if (::setsockopt(STDOUT_FILENO, SOL_SOCKET, SO_NOSIGPIPE, &suppress_sigpipe,
+                   sizeof(suppress_sigpipe)) != 0) {
+    kill_guarded_process_group();
+  }
+#endif
+  ssize_t written = -1;
+  do {
+    written = ::send(STDOUT_FILENO, &kReady, 1,
+#if defined(MSG_NOSIGNAL)
+                     MSG_NOSIGNAL
+#else
+                     0
+#endif
+    );
+  } while (written < 0 && errno == EINTR);
+  if (written != 1) {
+    kill_guarded_process_group();
+  }
+
+  char value = '\0';
+  while (true) {
+    const auto received = ::read(STDIN_FILENO, &value, 1);
+    if (received > 0 || (received < 0 && errno == EINTR)) {
+      continue;
+    }
+    kill_guarded_process_group();
+  }
+}
+#endif
 
 std::string read_request() {
   const auto read_exact = [](char* destination, std::size_t size) {
@@ -60,6 +143,10 @@ void start_parent_liveness_watch(std::uint64_t expected_parent_pid) {
 }
 
 } // namespace
+
+#if !defined(_WIN32)
+int run_gpu_video_probe_guard() { return run_process_group_guard(); }
+#endif
 
 int run_gpu_video_probe_worker(std::uint64_t expected_parent_pid) {
   std::string response;

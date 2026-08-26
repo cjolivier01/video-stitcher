@@ -11,9 +11,11 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -24,6 +26,7 @@
 
 #if !defined(_WIN32)
 #include <csignal>
+#include <poll.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #else
@@ -984,6 +987,31 @@ void cancelled_supervisor_cannot_launch_worker(const std::filesystem::path& vide
   std::filesystem::remove(marker_path);
 }
 
+void launch_gate_prevents_post_timeout_process_start(const std::filesystem::path& video_path) {
+  const auto lifecycle_path =
+      video_path.parent_path() / (video_path.filename().string() + ".launch-lifecycle");
+  std::filesystem::remove(lifecycle_path);
+  set_environment("RECO_FAKE_PROBE_LIFECYCLE_PATH", lifecycle_path.string());
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+  const auto started = std::chrono::steady_clock::now();
+  expect_probe_error(
+      [&] {
+        (void)reco::io::detail::probe_gpu_video_with_pre_worker_spawn_delay_for_test(
+            container_config(video_path), fake_probe_worker_path, 1'000'000'000ULL,
+            1'250'000'000ULL);
+      },
+      "timed out", "pre-worker-spawn delay reaches a bounded timeout");
+  expect_true(std::chrono::steady_clock::now() - started >= std::chrono::milliseconds(1'200),
+              "public timeout waits for the in-progress launch gate");
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  const auto events = read_events(lifecycle_path);
+  expect_true(!has_event(events, "worker"), "expired launch sequence does not spawn a worker");
+  expect_true(!has_event(events, "guard"), "expired launch sequence does not spawn a guard");
+  expect_true(!has_event(events, "request"), "expired launch sequence does not write a request");
+  set_environment("RECO_FAKE_PROBE_LIFECYCLE_PATH", "");
+  std::filesystem::remove(lifecycle_path);
+}
+
 void auto_reaped_workers_are_supported(const std::filesystem::path& video_path) {
 #if !defined(_WIN32)
   struct sigaction ignore_action{};
@@ -1089,13 +1117,17 @@ void windows_job_reclaims_worker_descendants(const std::filesystem::path& video_
 #endif
 }
 
-void portable_parent_death_reclaims_worker(const std::filesystem::path& video_path) {
+void caller_death_reclaims_worker_and_descendant(const std::filesystem::path& video_path) {
 #if !defined(_WIN32)
-  const auto worker_path =
+  const auto worker_marker =
       video_path.parent_path() / (video_path.filename().string() + ".caller-worker");
-  std::filesystem::remove(worker_path);
-  set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", worker_path.string());
-  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "block-input");
+  const auto descendant_marker =
+      video_path.parent_path() / (video_path.filename().string() + ".caller-descendant");
+  std::filesystem::remove(worker_marker);
+  std::filesystem::remove(descendant_marker);
+  set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", worker_marker.string());
+  set_environment("RECO_FAKE_PROBE_DESCENDANT_PATH", descendant_marker.string());
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "block-input-with-descendant");
   const auto caller = ::fork();
   if (caller == 0) {
     try {
@@ -1107,41 +1139,55 @@ void portable_parent_death_reclaims_worker(const std::filesystem::path& video_pa
   }
   expect_true(caller > 0, "POSIX parent-death probe caller starts");
   if (caller > 0) {
-    const auto worker = wait_for_process_marker(worker_path, std::chrono::steady_clock::now() +
-                                                                 std::chrono::seconds(2));
+    const auto marker_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    const auto worker = wait_for_process_marker(worker_marker, marker_deadline);
+    const auto descendant = wait_for_process_marker(descendant_marker, marker_deadline);
     expect_true(worker.has_value(), "POSIX isolated worker starts before caller death");
+    expect_true(descendant.has_value(), "POSIX worker descendant starts before caller death");
     (void)::kill(caller, SIGKILL);
     int caller_status = 0;
     while (::waitpid(caller, &caller_status, 0) < 0 && errno == EINTR) {
     }
-    if (worker.has_value() &&
-        *worker <= static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max())) {
-      const auto worker_pid = static_cast<pid_t>(*worker);
+    const auto expect_process_exit = [](const std::optional<std::uint64_t>& process_id,
+                                        std::string_view message) {
+      if (!process_id.has_value() ||
+          *process_id > static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max())) {
+        return;
+      }
+      const auto pid = static_cast<pid_t>(*process_id);
       bool exited = false;
       const auto exit_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
       while (std::chrono::steady_clock::now() < exit_deadline) {
         errno = 0;
-        if (::kill(worker_pid, 0) != 0 && errno == ESRCH) {
+        if (::kill(pid, 0) != 0 && errno == ESRCH) {
           exited = true;
           break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
       }
-      expect_true(exited, "POSIX worker process group exits when its caller dies");
+      expect_true(exited, message);
       if (!exited) {
-        (void)::kill(-worker_pid, SIGKILL);
+        (void)::kill(pid, SIGKILL);
       }
-    }
+    };
+    expect_process_exit(worker, "POSIX worker exits when its caller dies");
+    expect_process_exit(descendant, "POSIX worker descendant exits when its caller dies");
   }
   set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", "");
-  std::filesystem::remove(worker_path);
+  set_environment("RECO_FAKE_PROBE_DESCENDANT_PATH", "");
+  std::filesystem::remove(worker_marker);
+  std::filesystem::remove(descendant_marker);
   set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
 #elif defined(_WIN32)
   const auto worker_marker =
       video_path.parent_path() / (video_path.filename().string() + ".caller-worker");
+  const auto descendant_marker =
+      video_path.parent_path() / (video_path.filename().string() + ".caller-descendant");
   std::filesystem::remove(worker_marker);
+  std::filesystem::remove(descendant_marker);
   set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", worker_marker.string());
-  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "block-input");
+  set_environment("RECO_FAKE_PROBE_DESCENDANT_PATH", descendant_marker.string());
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "block-input-with-descendant");
   set_environment("RECO_FAKE_PROBE_CALLER_VIDEO_PATH", video_path.string());
   set_environment("RECO_FAKE_PROBE_CALLER_WORKER_PATH", fake_probe_worker_path.string());
 
@@ -1157,33 +1203,119 @@ void portable_parent_death_reclaims_worker(const std::filesystem::path& video_pa
   if (caller_started) {
     WindowsHandle caller_process(caller_info.hProcess);
     WindowsHandle caller_thread(caller_info.hThread);
-    const auto worker = wait_for_process_marker(worker_marker, std::chrono::steady_clock::now() +
-                                                                   std::chrono::seconds(2));
+    const auto marker_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    const auto worker = wait_for_process_marker(worker_marker, marker_deadline);
+    const auto descendant = wait_for_process_marker(descendant_marker, marker_deadline);
     expect_true(worker.has_value(), "Windows isolated worker starts before caller death");
+    expect_true(descendant.has_value(), "Windows worker descendant starts before caller death");
 
-    HANDLE worker_handle = nullptr;
-    if (worker.has_value() && *worker <= std::numeric_limits<DWORD>::max()) {
-      worker_handle =
-          OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, static_cast<DWORD>(*worker));
-    }
-    WindowsHandle worker_process(worker_handle);
+    const auto open_process = [](const std::optional<std::uint64_t>& process_id) {
+      if (!process_id.has_value() || *process_id > std::numeric_limits<DWORD>::max()) {
+        return static_cast<HANDLE>(nullptr);
+      }
+      return OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, static_cast<DWORD>(*process_id));
+    };
+    WindowsHandle worker_process(open_process(worker));
+    WindowsHandle descendant_process(open_process(descendant));
     expect_true(worker_process && WaitForSingleObject(worker_process.get(), 0) == WAIT_TIMEOUT,
                 "Windows isolated worker is live before caller death");
+    expect_true(descendant_process &&
+                    WaitForSingleObject(descendant_process.get(), 0) == WAIT_TIMEOUT,
+                "Windows worker descendant is live before caller death");
 
     (void)TerminateProcess(caller_process.get(), 1);
     (void)WaitForSingleObject(caller_process.get(), 2'000);
     const bool worker_exited =
         worker_process && WaitForSingleObject(worker_process.get(), 2'000) == WAIT_OBJECT_0;
     expect_true(worker_exited, "Windows Job kill-on-close reclaims the worker after caller death");
+    const bool descendant_exited =
+        descendant_process && WaitForSingleObject(descendant_process.get(), 2'000) == WAIT_OBJECT_0;
+    expect_true(descendant_exited,
+                "Windows Job kill-on-close reclaims the descendant after caller death");
     if (worker_process && !worker_exited) {
       (void)TerminateProcess(worker_process.get(), 1);
     }
+    if (descendant_process && !descendant_exited) {
+      (void)TerminateProcess(descendant_process.get(), 1);
+    }
   }
   set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", "");
+  set_environment("RECO_FAKE_PROBE_DESCENDANT_PATH", "");
   set_environment("RECO_FAKE_PROBE_CALLER_VIDEO_PATH", "");
   set_environment("RECO_FAKE_PROBE_CALLER_WORKER_PATH", "");
   std::filesystem::remove(worker_marker);
+  std::filesystem::remove(descendant_marker);
   set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+#else
+  (void)video_path;
+#endif
+}
+
+void unrelated_descriptor_writer_does_not_delay_pipe_eof(const std::filesystem::path& video_path) {
+#if !defined(_WIN32)
+  int pipe_descriptors[2] = {-1, -1};
+  if (::pipe(pipe_descriptors) != 0) {
+    expect_true(false, "unrelated descriptor EOF pipe opens");
+    return;
+  }
+
+  const auto lifecycle_path =
+      video_path.parent_path() / (video_path.filename().string() + ".pipe-lifecycle");
+  std::filesystem::remove(lifecycle_path);
+  set_environment("RECO_FAKE_PROBE_LIFECYCLE_PATH", lifecycle_path.string());
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "block-input");
+  std::exception_ptr probe_failure;
+  std::thread probe([&] {
+    try {
+      (void)reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
+                                      2'000'000'000ULL);
+    } catch (...) {
+      probe_failure = std::current_exception();
+    }
+  });
+
+  bool worker_started = false;
+  bool guard_started = false;
+  const auto launch_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (std::chrono::steady_clock::now() < launch_deadline &&
+         (!worker_started || !guard_started)) {
+    const auto events = read_events(lifecycle_path);
+    worker_started = has_event(events, "worker");
+    guard_started = has_event(events, "guard");
+    if (!worker_started || !guard_started) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
+  expect_true(worker_started, "pipe EOF regression observes the blocked worker");
+  expect_true(guard_started, "pipe EOF regression observes the process-group guard");
+
+  (void)::close(pipe_descriptors[1]);
+  pipe_descriptors[1] = -1;
+  pollfd read_end{.fd = pipe_descriptors[0], .events = POLLIN, .revents = 0};
+  int poll_result = -1;
+  do {
+    poll_result = ::poll(&read_end, 1, 500);
+  } while (poll_result < 0 && errno == EINTR);
+  char byte = '\0';
+  const auto read_result = poll_result > 0 ? ::read(pipe_descriptors[0], &byte, 1) : -1;
+  expect_true(read_result == 0,
+              "unrelated worker and guard descriptors do not keep a caller pipe open");
+  (void)::close(pipe_descriptors[0]);
+  probe.join();
+
+  bool timed_out = false;
+  try {
+    if (probe_failure != nullptr) {
+      std::rethrow_exception(probe_failure);
+    }
+  } catch (const GpuVideoProbeError& error) {
+    timed_out = std::string_view(error.what()).find("timed out") != std::string_view::npos;
+  } catch (...) {
+  }
+  expect_true(timed_out, "pipe EOF regression's blocked worker reaches its bounded timeout");
+  set_environment("RECO_FAKE_PROBE_LIFECYCLE_PATH", "");
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+  std::filesystem::remove(lifecycle_path);
 #else
   (void)video_path;
 #endif
@@ -1343,11 +1475,13 @@ int main(int argc, char** argv) {
   windows_unicode_path_round_trips();
   worker_ipc_failures_are_bounded(video_path);
   cancelled_supervisor_cannot_launch_worker(video_path);
+  launch_gate_prevents_post_timeout_process_start(video_path);
   auto_reaped_workers_are_supported(video_path);
   windows_job_reclaims_worker_descendants(video_path);
   unrelated_descriptors_are_not_inherited(video_path);
+  unrelated_descriptor_writer_does_not_delay_pipe_eof(video_path);
   parent_death_reclaims_worker(video_path);
-  portable_parent_death_reclaims_worker(video_path);
+  caller_death_reclaims_worker_and_descendant(video_path);
   expect_no_unreaped_children();
 
   std::filesystem::remove(video_path);

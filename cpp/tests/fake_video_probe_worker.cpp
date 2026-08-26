@@ -22,6 +22,7 @@
 #include <io.h>
 #include <windows.h>
 #else
+#include <sys/socket.h>
 #include <unistd.h>
 #endif
 
@@ -75,6 +76,16 @@ bool write_process_marker(const char* environment_name, std::uint64_t process_id
   return static_cast<bool>(marker);
 }
 
+bool write_lifecycle_event(std::string_view event) {
+  const char* path = std::getenv("RECO_FAKE_PROBE_LIFECYCLE_PATH");
+  if (path == nullptr || path[0] == '\0') {
+    return true;
+  }
+  std::ofstream output(path, std::ios::app);
+  output << event << '\n';
+  return static_cast<bool>(output);
+}
+
 std::uint64_t spawn_sleeping_descendant() {
 #if defined(_WIN32)
   std::vector<wchar_t> executable(32'768);
@@ -107,6 +118,81 @@ std::uint64_t spawn_sleeping_descendant() {
 }
 
 #if !defined(_WIN32)
+bool close_unrelated_descriptors() {
+#if defined(__linux__)
+  std::error_code directory_error;
+  std::vector<int> descriptors;
+  for (const auto& entry : std::filesystem::directory_iterator("/proc/self/fd", directory_error)) {
+    const auto name = entry.path().filename().string();
+    errno = 0;
+    char* end = nullptr;
+    const auto descriptor = std::strtol(name.c_str(), &end, 10);
+    if (errno == 0 && end != name.c_str() && end != nullptr && *end == '\0' && descriptor > 2 &&
+        descriptor <= std::numeric_limits<int>::max()) {
+      descriptors.push_back(static_cast<int>(descriptor));
+    }
+  }
+  if (!directory_error) {
+    for (const int descriptor : descriptors) {
+      if (::close(descriptor) != 0 && errno != EINTR && errno != EBADF) {
+        return false;
+      }
+    }
+    return true;
+  }
+#endif
+  const auto maximum_descriptor = ::sysconf(_SC_OPEN_MAX);
+  if (maximum_descriptor < 0) {
+    return false;
+  }
+  for (long descriptor = 3; descriptor < maximum_descriptor; ++descriptor) {
+    if (::close(static_cast<int>(descriptor)) != 0 && errno != EINTR && errno != EBADF) {
+      return false;
+    }
+  }
+  return true;
+}
+
+[[noreturn]] void kill_guarded_process_group() {
+  (void)::kill(0, SIGKILL);
+  std::_Exit(EXIT_FAILURE);
+}
+
+int run_process_group_guard() {
+  if (!close_unrelated_descriptors() || !write_lifecycle_event("guard")) {
+    kill_guarded_process_group();
+  }
+  constexpr char kReady = 'R';
+#if defined(SO_NOSIGPIPE) && !defined(MSG_NOSIGNAL)
+  const int suppress_sigpipe = 1;
+  if (::setsockopt(STDOUT_FILENO, SOL_SOCKET, SO_NOSIGPIPE, &suppress_sigpipe,
+                   sizeof(suppress_sigpipe)) != 0) {
+    kill_guarded_process_group();
+  }
+#endif
+  ssize_t written = -1;
+  do {
+    written = ::send(STDOUT_FILENO, &kReady, 1,
+#if defined(MSG_NOSIGNAL)
+                     MSG_NOSIGNAL
+#else
+                     0
+#endif
+    );
+  } while (written < 0 && errno == EINTR);
+  if (written != 1) {
+    kill_guarded_process_group();
+  }
+  char value = '\0';
+  while (true) {
+    const auto received = ::read(STDIN_FILENO, &value, 1);
+    if (received > 0 || (received < 0 && errno == EINTR)) {
+      continue;
+    }
+    kill_guarded_process_group();
+  }
+}
+
 void start_parent_liveness_watch(const char* parent_argument) {
   errno = 0;
   char* end = nullptr;
@@ -133,14 +219,7 @@ int main(int argc, char** argv) {
   }
 #if !defined(_WIN32)
   if (argc == 2 && std::strcmp(argv[1], "--reco-video-probe-guard") == 0) {
-    constexpr char kReady = 'R';
-    if (::write(STDOUT_FILENO, &kReady, 1) != 1) {
-      return EXIT_FAILURE;
-    }
-    char value = '\0';
-    while (::read(STDIN_FILENO, &value, 1) < 0 && errno == EINTR) {
-    }
-    return EXIT_SUCCESS;
+    return run_process_group_guard();
   }
 #endif
 #if defined(_WIN32)
@@ -151,6 +230,13 @@ int main(int argc, char** argv) {
   if (argc != kExpectedArguments || std::strcmp(argv[1], "--reco-video-probe-worker") != 0) {
     return EXIT_FAILURE;
   }
+#if !defined(_WIN32)
+  const auto parent_argument = std::string_view(argv[2]);
+  if (parent_argument.size() >= 2 && parent_argument.substr(parent_argument.size() - 2) == ":0" &&
+      !close_unrelated_descriptors()) {
+    return EXIT_FAILURE;
+  }
+#endif
 #if defined(_WIN32)
   if (_setmode(_fileno(stdin), _O_BINARY) == -1 || _setmode(_fileno(stdout), _O_BINARY) == -1) {
     return EXIT_FAILURE;
@@ -162,6 +248,9 @@ int main(int argc, char** argv) {
     start_parent_liveness_watch(argv[2]);
   }
 #endif
+  if (!write_lifecycle_event("worker")) {
+    return EXIT_FAILURE;
+  }
   const auto current_process_id =
 #if defined(_WIN32)
       static_cast<std::uint64_t>(GetCurrentProcessId());
@@ -207,7 +296,8 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     return EXIT_SUCCESS;
   }
-  if (scenario != nullptr && std::strcmp(scenario, "valid-metadata-with-descendant") == 0) {
+  if (scenario != nullptr && (std::strcmp(scenario, "valid-metadata-with-descendant") == 0 ||
+                              std::strcmp(scenario, "block-input-with-descendant") == 0)) {
     const char* descendant_path = std::getenv("RECO_FAKE_PROBE_DESCENDANT_PATH");
     if (descendant_path == nullptr || descendant_path[0] == '\0') {
       return EXIT_FAILURE;
@@ -220,8 +310,12 @@ int main(int argc, char** argv) {
       return EXIT_FAILURE;
     }
   }
-  if (scenario != nullptr && std::strcmp(scenario, "block-input") != 0) {
+  if (scenario != nullptr && std::strcmp(scenario, "block-input") != 0 &&
+      std::strcmp(scenario, "block-input-with-descendant") != 0) {
     if (!read_request()) {
+      return EXIT_FAILURE;
+    }
+    if (!write_lifecycle_event("request")) {
       return EXIT_FAILURE;
     }
     if (std::strcmp(scenario, "crash") == 0) {

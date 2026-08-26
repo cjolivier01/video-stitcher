@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <exception>
@@ -88,11 +87,22 @@ public:
   throw GpuVideoProbeError("video probe worker timed out after exceeding the configured timeout");
 }
 
-void require_worker_launch_active(const std::shared_ptr<std::atomic_bool>& cancelled,
-                                  std::chrono::steady_clock::time_point deadline) {
-  if (cancelled->load(std::memory_order_acquire) || std::chrono::steady_clock::now() >= deadline) {
+struct WorkerLaunchState {
+  std::mutex mutex;
+  bool cancelled = false;
+};
+
+void require_worker_launch_active_locked(const WorkerLaunchState& launch_state,
+                                         std::chrono::steady_clock::time_point deadline) {
+  if (launch_state.cancelled || std::chrono::steady_clock::now() >= deadline) {
     throw_worker_timeout();
   }
+}
+
+void require_worker_launch_active(const std::shared_ptr<WorkerLaunchState>& launch_state,
+                                  std::chrono::steady_clock::time_point deadline) {
+  std::lock_guard lock(launch_state->mutex);
+  require_worker_launch_active_locked(*launch_state, deadline);
 }
 
 #if defined(_WIN32)
@@ -240,8 +250,9 @@ std::string read_response(HANDLE input, std::chrono::steady_clock::time_point de
 
 std::string run_probe_worker(const std::filesystem::path& worker_path, std::string_view request,
                              std::chrono::steady_clock::time_point deadline,
-                             const std::shared_ptr<std::atomic_bool>& cancelled) {
-  require_worker_launch_active(cancelled, deadline);
+                             const std::shared_ptr<WorkerLaunchState>& launch_state,
+                             std::chrono::nanoseconds pre_worker_spawn_delay) {
+  require_worker_launch_active(launch_state, deadline);
   SECURITY_ATTRIBUTES security{.nLength = sizeof(SECURITY_ATTRIBUTES),
                                .lpSecurityDescriptor = nullptr,
                                .bInheritHandle = TRUE};
@@ -303,7 +314,12 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   startup.StartupInfo.hStdOutput = child_stdout.get();
   startup.StartupInfo.hStdError = child_stderr.get();
   PROCESS_INFORMATION process_info{};
-  require_worker_launch_active(cancelled, deadline);
+  std::unique_lock launch_lock(launch_state->mutex);
+  require_worker_launch_active_locked(*launch_state, deadline);
+  if (pre_worker_spawn_delay.count() > 0) {
+    std::this_thread::sleep_for(pre_worker_spawn_delay);
+  }
+  require_worker_launch_active_locked(*launch_state, deadline);
   if (CreateProcessW(application.c_str(), command_line.data(), nullptr, nullptr, TRUE,
                      CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT, nullptr,
                      nullptr, &startup.StartupInfo, &process_info) == 0) {
@@ -322,7 +338,7 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
     TerminateProcess(process.get(), 1);
     throw GpuVideoProbeError("failed to isolate video probe worker process");
   }
-  if (cancelled->load(std::memory_order_acquire) || std::chrono::steady_clock::now() >= deadline) {
+  if (std::chrono::steady_clock::now() >= deadline) {
     (void)TerminateJobObject(job.get(), 1);
     (void)WaitForSingleObject(process.get(), INFINITE);
     throw_worker_timeout();
@@ -335,7 +351,7 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   child_stdin.reset();
   child_stdout.reset();
   child_stderr.reset();
-  if (cancelled->load(std::memory_order_acquire) || std::chrono::steady_clock::now() >= deadline) {
+  if (std::chrono::steady_clock::now() >= deadline) {
     (void)TerminateJobObject(job.get(), 1);
     (void)WaitForSingleObject(process.get(), INFINITE);
     throw_worker_timeout();
@@ -348,6 +364,7 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
       write_error = std::current_exception();
     }
   });
+  launch_lock.unlock();
 
   const auto terminate_and_join = [&] {
     if (TerminateJobObject(job.get(), 1) == 0) {
@@ -683,8 +700,9 @@ ProcessGroupGuard spawn_process_group_guard(const std::string& executable, pid_t
 
 std::string run_probe_worker(const std::filesystem::path& worker_path, std::string_view request,
                              std::chrono::steady_clock::time_point deadline,
-                             const std::shared_ptr<std::atomic_bool>& cancelled) {
-  require_worker_launch_active(cancelled, deadline);
+                             const std::shared_ptr<WorkerLaunchState>& launch_state,
+                             std::chrono::nanoseconds pre_worker_spawn_delay) {
+  require_worker_launch_active(launch_state, deadline);
   int request_socket[2] = {-1, -1};
   int response_socket[2] = {-1, -1};
   create_socket_pair(request_socket, "input");
@@ -770,7 +788,12 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
                              const_cast<char*>("--reco-video-probe-worker"),
                              const_cast<char*>(parent_pid_argument.c_str()), nullptr};
   pid_t pid = -1;
-  require_worker_launch_active(cancelled, deadline);
+  std::unique_lock launch_lock(launch_state->mutex);
+  require_worker_launch_active_locked(*launch_state, deadline);
+  if (pre_worker_spawn_delay.count() > 0) {
+    std::this_thread::sleep_for(pre_worker_spawn_delay);
+  }
+  require_worker_launch_active_locked(*launch_state, deadline);
   const auto spawn_result =
       ::posix_spawn(&pid, executable.c_str(), &actions, &attributes, arguments, environ);
   destroy_attributes();
@@ -783,9 +806,10 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   auto group_guard = spawn_process_group_guard(executable, pid, deadline);
   child_input.reset();
   child_output.reset();
-  require_worker_launch_active(cancelled, deadline);
+  require_worker_launch_active_locked(*launch_state, deadline);
   write_request(parent_input.get(), request, deadline);
   parent_input.reset();
+  launch_lock.unlock();
 
   int status = 0;
   bool has_wait_status = false;
@@ -830,26 +854,29 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
 std::string run_probe_worker_bounded(std::filesystem::path worker_path, std::string request,
                                      std::chrono::steady_clock::time_point worker_deadline,
                                      std::chrono::steady_clock::time_point public_deadline,
-                                     std::chrono::nanoseconds supervisor_start_delay = {}) {
+                                     std::chrono::nanoseconds supervisor_start_delay,
+                                     std::chrono::nanoseconds pre_worker_spawn_delay) {
   auto supervisor_slot = std::make_shared<SupervisorSlot>();
-  auto cancelled = std::make_shared<std::atomic_bool>(false);
+  auto launch_state = std::make_shared<WorkerLaunchState>();
   std::promise<std::string> result;
   auto future = result.get_future();
   std::thread supervisor([supervisor_slot = std::move(supervisor_slot),
                           worker_path = std::move(worker_path), request = std::move(request),
-                          result = std::move(result), worker_deadline, cancelled,
-                          supervisor_start_delay]() mutable {
+                          result = std::move(result), worker_deadline, launch_state,
+                          supervisor_start_delay, pre_worker_spawn_delay]() mutable {
     try {
       if (supervisor_start_delay.count() > 0) {
         std::this_thread::sleep_for(supervisor_start_delay);
       }
-      result.set_value(run_probe_worker(worker_path, request, worker_deadline, cancelled));
+      result.set_value(run_probe_worker(worker_path, request, worker_deadline, launch_state,
+                                        pre_worker_spawn_delay));
     } catch (...) {
       result.set_exception(std::current_exception());
     }
   });
   if (future.wait_until(public_deadline) != std::future_status::ready) {
-    cancelled->store(true, std::memory_order_release);
+    std::lock_guard lock(launch_state->mutex);
+    launch_state->cancelled = true;
     supervisor.detach();
     throw_worker_timeout();
   }
@@ -857,10 +884,11 @@ std::string run_probe_worker_bounded(std::filesystem::path worker_path, std::str
   return future.get();
 }
 
-GpuVideoProbe probe_gpu_video_with_delay(const GpuFileDecodeConfig& config,
-                                         const std::filesystem::path& worker_path,
-                                         std::uint64_t timeout_ns,
-                                         std::chrono::nanoseconds supervisor_start_delay) {
+GpuVideoProbe probe_gpu_video_with_delays(const GpuFileDecodeConfig& config,
+                                          const std::filesystem::path& worker_path,
+                                          std::uint64_t timeout_ns,
+                                          std::chrono::nanoseconds supervisor_start_delay,
+                                          std::chrono::nanoseconds pre_worker_spawn_delay) {
   if (const auto error = validate_gpu_file_decode_config(config); error.has_value()) {
     throw std::invalid_argument(*error);
   }
@@ -881,23 +909,34 @@ GpuVideoProbe probe_gpu_video_with_delay(const GpuFileDecodeConfig& config,
   const auto public_deadline = std::chrono::steady_clock::now() + timeout;
   const auto worker_deadline = public_deadline - termination_reserve;
   const auto request = detail::encode_probe_request(config, timeout_ns);
-  return detail::decode_probe_response(run_probe_worker_bounded(
-      worker_path, request, worker_deadline, public_deadline, supervisor_start_delay));
+  return detail::decode_probe_response(
+      run_probe_worker_bounded(worker_path, request, worker_deadline, public_deadline,
+                               supervisor_start_delay, pre_worker_spawn_delay));
 }
 
 } // namespace
 
 GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config,
                               const std::filesystem::path& worker_path, std::uint64_t timeout_ns) {
-  return probe_gpu_video_with_delay(config, worker_path, timeout_ns,
-                                    std::chrono::nanoseconds::zero());
+  return probe_gpu_video_with_delays(config, worker_path, timeout_ns,
+                                     std::chrono::nanoseconds::zero(),
+                                     std::chrono::nanoseconds::zero());
 }
 
 GpuVideoProbe detail::probe_gpu_video_with_supervisor_start_delay_for_test(
     const GpuFileDecodeConfig& config, const std::filesystem::path& worker_path,
     std::uint64_t timeout_ns, std::uint64_t supervisor_start_delay_ns) {
-  return probe_gpu_video_with_delay(config, worker_path, timeout_ns,
-                                    std::chrono::nanoseconds(supervisor_start_delay_ns));
+  return probe_gpu_video_with_delays(config, worker_path, timeout_ns,
+                                     std::chrono::nanoseconds(supervisor_start_delay_ns),
+                                     std::chrono::nanoseconds::zero());
+}
+
+GpuVideoProbe detail::probe_gpu_video_with_pre_worker_spawn_delay_for_test(
+    const GpuFileDecodeConfig& config, const std::filesystem::path& worker_path,
+    std::uint64_t timeout_ns, std::uint64_t pre_worker_spawn_delay_ns) {
+  return probe_gpu_video_with_delays(config, worker_path, timeout_ns,
+                                     std::chrono::nanoseconds::zero(),
+                                     std::chrono::nanoseconds(pre_worker_spawn_delay_ns));
 }
 
 } // namespace reco::io
