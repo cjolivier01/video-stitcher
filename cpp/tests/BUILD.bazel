@@ -120,6 +120,7 @@ cc_test(
         "//cpp/reco_io:reco_video_probe_worker",
     ],
     deps = [
+        "//cpp/reco_io:gpu_video_probe_test_support",
         "//cpp/reco_io",
         "@rules_cc//cc/runfiles",
     ],

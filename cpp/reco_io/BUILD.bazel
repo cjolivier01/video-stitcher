@@ -9,6 +9,7 @@ cc_library(
         "src/gpu_video_probe.cpp",
         "src/gpu_video_probe_internal.hpp",
         "src/gpu_video_probe_process.cpp",
+        "src/gpu_video_probe_process_test.hpp",
         "src/gpu_video_probe_protocol.cpp",
         "src/gpu_video_probe_protocol.hpp",
         "src/jsonl_sink.cpp",
@@ -35,6 +36,15 @@ cc_library(
         "//cpp/reco_core",
         "@nlohmann_json//:json",
     ],
+)
+
+cc_library(
+    name = "gpu_video_probe_test_support",
+    testonly = True,
+    hdrs = ["src/gpu_video_probe_process_test.hpp"],
+    strip_include_prefix = "src",
+    visibility = ["//cpp/tests:__pkg__"],
+    deps = [":reco_io"],
 )
 
 cc_binary(

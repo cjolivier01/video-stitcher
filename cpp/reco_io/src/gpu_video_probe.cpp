@@ -58,6 +58,8 @@ constexpr std::uint64_t kMaximumDecodeReorderFrames = 32;
 // prefix are explicitly marked estimated after duration correlation.
 constexpr std::uint64_t kMaximumExactCountSamples = 512;
 constexpr std::uint64_t kMaximumConflictingMetadataCountSamples = 4096;
+constexpr std::size_t kTailTimingSamples = 256;
+constexpr std::uint64_t kTailTimingWindowNs = 5ULL * kNanosecondsPerSecond;
 constexpr std::size_t kStoredTimingSamples = kMaximumConflictingMetadataCountSamples + 1;
 static_assert(kStoredTimingSamples >= kTimingAnalysisSamples + kTimingReorderLookahead);
 constexpr std::size_t kMinimumExactNoncanonicalRateSamples = 128;
@@ -916,8 +918,9 @@ std::optional<InferredFrameRate> infer_constant_frame_rate(const TimingScan& sca
   return std::nullopt;
 }
 
-bool inferred_frame_rate_is_eligible(const InferredFrameRate& inferred, bool complete_stream) {
-  return !inferred.requires_complete_stream || complete_stream;
+bool inferred_frame_rate_is_eligible(const InferredFrameRate& inferred, bool complete_stream,
+                                     bool representative_tail_matches = false) {
+  return !inferred.requires_complete_stream || complete_stream || representative_tail_matches;
 }
 
 bool inferred_frame_rate_improves_on_caps(const InferredFrameRate& inferred,
@@ -1014,6 +1017,63 @@ std::optional<std::uint64_t> observed_eos_duration(const TimingScan& scan,
   return final_duration > std::numeric_limits<std::uint64_t>::max() - span
              ? std::numeric_limits<std::uint64_t>::max()
              : span + final_duration;
+}
+
+std::optional<std::uint64_t> sample_presentation_stream_time(const std::shared_ptr<ProbeApi>& api,
+                                                             void* sample) {
+  const auto* buffer = static_cast<const GstBufferAbi*>(api->sample_get_buffer(sample));
+  if (buffer == nullptr) {
+    throw GpuVideoProbeError("GStreamer parser-only probe returned a sample without a buffer");
+  }
+  if (buffer->pts == kGstClockTimeNone) {
+    return std::nullopt;
+  }
+  const void* segment = api->sample_get_segment(sample);
+  if (segment == nullptr) {
+    return std::nullopt;
+  }
+  const auto stream_time = api->segment_to_stream_time(segment, kGstFormatTime, buffer->pts);
+  return stream_time == kGstClockTimeNone ? std::nullopt
+                                          : std::optional<std::uint64_t>(stream_time);
+}
+
+std::optional<InferredFrameRate>
+infer_tail_frame_rate(const std::shared_ptr<ProbeApi>& api, void* pipeline, void* probe_sink,
+                      void* bus, std::uint64_t container_duration_ns,
+                      std::chrono::steady_clock::time_point deadline) {
+  if (container_duration_ns <= kTailTimingWindowNs) {
+    return std::nullopt;
+  }
+  const auto target_ns = container_duration_ns - kTailTimingWindowNs;
+  if (target_ns > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ||
+      api->element_seek_simple(pipeline, kGstFormatTime, kGstSeekFlagFlushAccurate,
+                               static_cast<std::int64_t>(target_ns)) == 0) {
+    return std::nullopt;
+  }
+
+  TimingScan tail_scan;
+  constexpr std::size_t kMaximumTailPrerollSamples =
+      kTailTimingSamples + kMaximumDecodeReorderFrames;
+  for (std::size_t pulls = 0;
+       pulls < kMaximumTailPrerollSamples && tail_scan.sample_count < kTailTimingSamples; ++pulls) {
+    void* sample = pull_compressed_sample(
+        api, probe_sink, bus, deadline,
+        "GStreamer parser-only probe timed out while sampling terminal stream timing");
+    std::unique_ptr<void, ProbeApi::SampleUnref> sample_owner(sample, api->sample_unref);
+    if (sample == nullptr) {
+      tail_scan.reached_eos = true;
+      break;
+    }
+    const auto stream_time = sample_presentation_stream_time(api, sample);
+    if (!stream_time.has_value()) {
+      return std::nullopt;
+    }
+    if (*stream_time < target_ns) {
+      continue;
+    }
+    observe_timing_sample(api, sample, tail_scan);
+  }
+  return infer_constant_frame_rate(tail_scan, false);
 }
 
 struct FrameSeekResult {
@@ -1340,19 +1400,16 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
                      kTimingReorderLookahead) < timing_scan.sample_count;
   const auto preliminary_frame_rate =
       infer_constant_frame_rate(timing_scan, timing_scan.reached_eos);
-  const bool preliminary_rate_is_conclusive =
-      preliminary_frame_rate.has_value() &&
-      inferred_frame_rate_is_eligible(*preliminary_frame_rate, timing_scan.reached_eos) &&
-      inferred_frame_rate_improves_on_caps(*preliminary_frame_rate, caps_frame_rate_is_plausible,
-                                           fps_numerator, fps_denominator);
   const bool caps_rate_conflict_needs_more_evidence =
       preliminary_frame_rate.has_value() && caps_frame_rate_is_plausible &&
-      !preliminary_rate_is_conclusive &&
       !frame_rates_are_identical(
           preliminary_frame_rate->numerator, preliminary_frame_rate->denominator,
           static_cast<std::uint32_t>(fps_numerator), static_cast<std::uint32_t>(fps_denominator));
+  const bool incomplete_noncanonical_rate_needs_more_evidence =
+      preliminary_frame_rate.has_value() && preliminary_frame_rate->requires_complete_stream;
   if (!timing_scan.reached_eos &&
-      (caps_rate_cannot_cover_observed_samples || caps_rate_conflict_needs_more_evidence)) {
+      (caps_rate_cannot_cover_observed_samples || caps_rate_conflict_needs_more_evidence ||
+       incomplete_noncanonical_rate_needs_more_evidence)) {
     while (timing_scan.sample_count <= kMaximumConflictingMetadataCountSamples) {
       void* sample = pull_compressed_sample(
           api, probe_sink, bus, deadline,
@@ -1366,6 +1423,21 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
     }
   }
   const auto inferred_frame_rate = infer_constant_frame_rate(timing_scan, timing_scan.reached_eos);
+  const auto tail_frame_rate = inferred_frame_rate.has_value() && !timing_scan.reached_eos &&
+                                       queried_container_duration.has_value()
+                                   ? infer_tail_frame_rate(api, pipeline, probe_sink, bus,
+                                                           *queried_container_duration, deadline)
+                                   : std::nullopt;
+  const bool representative_tail_matches =
+      inferred_frame_rate.has_value() && tail_frame_rate.has_value() &&
+      frame_rates_are_close(inferred_frame_rate->numerator, inferred_frame_rate->denominator,
+                            tail_frame_rate->numerator, tail_frame_rate->denominator,
+                            kCanonicalFrameRateTolerance);
+  if (inferred_frame_rate.has_value() && tail_frame_rate.has_value() &&
+      !representative_tail_matches) {
+    throw GpuVideoProbeError(
+        "variable frame-rate video is unsupported for indexed GPU calibration sampling");
+  }
   if (inferred_frame_rate.has_value() &&
       static_cast<long double>(inferred_frame_rate->numerator) / inferred_frame_rate->denominator >
           kMaximumSaneFps) {
@@ -1373,7 +1445,9 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
   }
   const bool inferred_frame_rate_is_no_worse_than_caps =
       inferred_frame_rate.has_value() &&
-      inferred_frame_rate_is_eligible(*inferred_frame_rate, timing_scan.reached_eos) &&
+      inferred_frame_rate_is_eligible(*inferred_frame_rate, timing_scan.reached_eos,
+                                      representative_tail_matches) &&
+      (!caps_frame_rate_is_plausible || timing_scan.reached_eos || representative_tail_matches) &&
       inferred_frame_rate_improves_on_caps(*inferred_frame_rate, caps_frame_rate_is_plausible,
                                            fps_numerator, fps_denominator);
   const bool prefer_inferred_frame_rate = inferred_frame_rate_is_no_worse_than_caps;

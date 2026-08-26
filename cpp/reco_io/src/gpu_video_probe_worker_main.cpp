@@ -61,6 +61,18 @@ bool close_unrelated_descriptors() {
 #endif
 
 int main(int argc, char** argv) {
+#if !defined(_WIN32)
+  if (argc == 2 && std::strcmp(argv[1], "--reco-video-probe-guard") == 0) {
+    constexpr char kReady = 'R';
+    if (::write(STDOUT_FILENO, &kReady, 1) != 1) {
+      return 2;
+    }
+    char value = '\0';
+    while (::read(STDIN_FILENO, &value, 1) < 0 && errno == EINTR) {
+    }
+    return 0;
+  }
+#endif
   if (argc < 2 || std::strcmp(argv[1], "--reco-video-probe-worker") != 0) {
     return 2;
   }

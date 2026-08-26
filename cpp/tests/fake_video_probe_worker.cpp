@@ -1,9 +1,12 @@
 #include <array>
+#include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -19,7 +22,6 @@
 #include <io.h>
 #include <windows.h>
 #else
-#include <filesystem>
 #include <unistd.h>
 #endif
 
@@ -63,9 +65,84 @@ void write_frame(std::string_view payload) {
   std::cout.write(payload.data(), static_cast<std::streamsize>(payload.size()));
 }
 
+bool write_process_marker(const char* environment_name, std::uint64_t process_id) {
+  const char* marker_path = std::getenv(environment_name);
+  if (marker_path == nullptr || marker_path[0] == '\0') {
+    return true;
+  }
+  std::ofstream marker(marker_path);
+  marker << process_id;
+  return static_cast<bool>(marker);
+}
+
+std::uint64_t spawn_sleeping_descendant() {
+#if defined(_WIN32)
+  std::vector<wchar_t> executable(32'768);
+  const auto length =
+      GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+  if (length == 0 || length >= executable.size()) {
+    return 0;
+  }
+  const std::wstring application(executable.data(), length);
+  auto command_line = L"\"" + application + L"\" --reco-fake-probe-sleeper";
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process{};
+  if (CreateProcessW(application.c_str(), command_line.data(), nullptr, nullptr, FALSE,
+                     CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process) == 0) {
+    return 0;
+  }
+  const auto process_id = static_cast<std::uint64_t>(process.dwProcessId);
+  CloseHandle(process.hThread);
+  CloseHandle(process.hProcess);
+  return process_id;
+#else
+  const auto process_id = ::fork();
+  if (process_id == 0) {
+    std::this_thread::sleep_for(std::chrono::seconds(30));
+    std::_Exit(EXIT_SUCCESS);
+  }
+  return process_id < 0 ? 0 : static_cast<std::uint64_t>(process_id);
+#endif
+}
+
+#if !defined(_WIN32)
+void start_parent_liveness_watch(const char* parent_argument) {
+  errno = 0;
+  char* end = nullptr;
+  const auto parent_id = std::strtoull(parent_argument, &end, 10);
+  if (errno != 0 || end == parent_argument || end == nullptr || *end != ':' || parent_id == 0) {
+    return;
+  }
+  std::thread([parent_id] {
+    while (static_cast<unsigned long long>(::getppid()) == parent_id) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    (void)::kill(0, SIGKILL);
+    std::_Exit(EXIT_FAILURE);
+  }).detach();
+}
+#endif
+
 } // namespace
 
 int main(int argc, char** argv) {
+  if (argc == 2 && std::strcmp(argv[1], "--reco-fake-probe-sleeper") == 0) {
+    std::this_thread::sleep_for(std::chrono::seconds(30));
+    return EXIT_SUCCESS;
+  }
+#if !defined(_WIN32)
+  if (argc == 2 && std::strcmp(argv[1], "--reco-video-probe-guard") == 0) {
+    constexpr char kReady = 'R';
+    if (::write(STDOUT_FILENO, &kReady, 1) != 1) {
+      return EXIT_FAILURE;
+    }
+    char value = '\0';
+    while (::read(STDIN_FILENO, &value, 1) < 0 && errno == EINTR) {
+    }
+    return EXIT_SUCCESS;
+  }
+#endif
 #if defined(_WIN32)
   constexpr int kExpectedArguments = 2;
 #else
@@ -80,6 +157,31 @@ int main(int argc, char** argv) {
   }
 #endif
   const char* scenario = std::getenv("RECO_FAKE_PROBE_WORKER_SCENARIO");
+#if !defined(_WIN32)
+  if (scenario != nullptr && std::strcmp(scenario, "block-input") == 0) {
+    start_parent_liveness_watch(argv[2]);
+  }
+#endif
+  const auto current_process_id =
+#if defined(_WIN32)
+      static_cast<std::uint64_t>(GetCurrentProcessId());
+#else
+      static_cast<std::uint64_t>(::getpid());
+#endif
+  if (!write_process_marker("RECO_FAKE_PROBE_WORKER_PID_PATH", current_process_id)) {
+    return EXIT_FAILURE;
+  }
+  if (scenario != nullptr && std::strcmp(scenario, "startup-marker") == 0) {
+    const char* marker_path = std::getenv("RECO_FAKE_PROBE_STARTUP_MARKER_PATH");
+    if (marker_path == nullptr || marker_path[0] == '\0') {
+      return EXIT_FAILURE;
+    }
+    std::ofstream marker(marker_path);
+    marker << "started";
+    if (!marker) {
+      return EXIT_FAILURE;
+    }
+  }
 #if defined(__linux__)
   if (scenario != nullptr && std::strcmp(scenario, "descriptor-isolation") == 0) {
     const char* forbidden_path = std::getenv("RECO_FAKE_PROBE_FORBIDDEN_PATH");
@@ -105,27 +207,19 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     return EXIT_SUCCESS;
   }
-#if defined(__linux__)
   if (scenario != nullptr && std::strcmp(scenario, "valid-metadata-with-descendant") == 0) {
     const char* descendant_path = std::getenv("RECO_FAKE_PROBE_DESCENDANT_PATH");
     if (descendant_path == nullptr || descendant_path[0] == '\0') {
       return EXIT_FAILURE;
     }
-    const auto descendant = fork();
-    if (descendant < 0) {
+    const auto descendant = spawn_sleeping_descendant();
+    if (descendant == 0) {
       return EXIT_FAILURE;
     }
-    if (descendant == 0) {
-      std::this_thread::sleep_for(std::chrono::seconds(30));
-      std::_Exit(EXIT_SUCCESS);
-    }
-    std::ofstream output(descendant_path);
-    output << descendant;
-    if (!output) {
+    if (!write_process_marker("RECO_FAKE_PROBE_DESCENDANT_PATH", descendant)) {
       return EXIT_FAILURE;
     }
   }
-#endif
   if (scenario != nullptr && std::strcmp(scenario, "block-input") != 0) {
     if (!read_request()) {
       return EXIT_FAILURE;
@@ -160,8 +254,8 @@ int main(int argc, char** argv) {
     } else if (std::strcmp(scenario, "wrapped-version") == 0) {
       response = {{"protocol_version", std::numeric_limits<std::uint64_t>::max()}, {"ok", false}};
     } else if (std::strcmp(scenario, "valid-metadata") == 0 ||
-#if defined(__linux__)
                std::strcmp(scenario, "valid-metadata-with-descendant") == 0 ||
+#if defined(__linux__)
                std::strcmp(scenario, "descriptor-isolation") == 0 ||
 #endif
                std::strcmp(scenario, "invalid-metadata") == 0 ||
@@ -177,8 +271,8 @@ int main(int argc, char** argv) {
                        ? nlohmann::json(std::numeric_limits<std::uint64_t>::max())
                        : nlohmann::json(
                              std::strcmp(scenario, "valid-metadata") == 0 ||
-#if defined(__linux__)
                                      std::strcmp(scenario, "valid-metadata-with-descendant") == 0 ||
+#if defined(__linux__)
                                      std::strcmp(scenario, "descriptor-isolation") == 0 ||
 #endif
                                      false

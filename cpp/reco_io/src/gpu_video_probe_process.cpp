@@ -1,9 +1,11 @@
 #include "reco/io/gpu_video_probe.hpp"
 
+#include "gpu_video_probe_process_test.hpp"
 #include "gpu_video_probe_protocol.hpp"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <exception>
@@ -84,6 +86,13 @@ public:
 
 [[noreturn]] void throw_worker_timeout() {
   throw GpuVideoProbeError("video probe worker timed out after exceeding the configured timeout");
+}
+
+void require_worker_launch_active(const std::shared_ptr<std::atomic_bool>& cancelled,
+                                  std::chrono::steady_clock::time_point deadline) {
+  if (cancelled->load(std::memory_order_acquire) || std::chrono::steady_clock::now() >= deadline) {
+    throw_worker_timeout();
+  }
 }
 
 #if defined(_WIN32)
@@ -230,7 +239,9 @@ std::string read_response(HANDLE input, std::chrono::steady_clock::time_point de
 }
 
 std::string run_probe_worker(const std::filesystem::path& worker_path, std::string_view request,
-                             std::chrono::steady_clock::time_point deadline) {
+                             std::chrono::steady_clock::time_point deadline,
+                             const std::shared_ptr<std::atomic_bool>& cancelled) {
+  require_worker_launch_active(cancelled, deadline);
   SECURITY_ATTRIBUTES security{.nLength = sizeof(SECURITY_ATTRIBUTES),
                                .lpSecurityDescriptor = nullptr,
                                .bInheritHandle = TRUE};
@@ -292,6 +303,7 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   startup.StartupInfo.hStdOutput = child_stdout.get();
   startup.StartupInfo.hStdError = child_stderr.get();
   PROCESS_INFORMATION process_info{};
+  require_worker_launch_active(cancelled, deadline);
   if (CreateProcessW(application.c_str(), command_line.data(), nullptr, nullptr, TRUE,
                      CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT, nullptr,
                      nullptr, &startup.StartupInfo, &process_info) == 0) {
@@ -310,6 +322,11 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
     TerminateProcess(process.get(), 1);
     throw GpuVideoProbeError("failed to isolate video probe worker process");
   }
+  if (cancelled->load(std::memory_order_acquire) || std::chrono::steady_clock::now() >= deadline) {
+    (void)TerminateJobObject(job.get(), 1);
+    (void)WaitForSingleObject(process.get(), INFINITE);
+    throw_worker_timeout();
+  }
   if (ResumeThread(thread.get()) == std::numeric_limits<DWORD>::max()) {
     TerminateJobObject(job.get(), 1);
     throw GpuVideoProbeError("failed to resume video probe worker process");
@@ -318,6 +335,11 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   child_stdin.reset();
   child_stdout.reset();
   child_stderr.reset();
+  if (cancelled->load(std::memory_order_acquire) || std::chrono::steady_clock::now() >= deadline) {
+    (void)TerminateJobObject(job.get(), 1);
+    (void)WaitForSingleObject(process.get(), INFINITE);
+    throw_worker_timeout();
+  }
   std::exception_ptr write_error;
   std::thread writer([input = std::move(parent_stdin), request, &write_error]() {
     try {
@@ -416,6 +438,30 @@ public:
 
 private:
   pid_t value_ = -1;
+};
+
+class ProcessGroupGuard {
+public:
+  ProcessGroupGuard() = default;
+  ProcessGroupGuard(pid_t pid, UniqueFd control) : pid_(pid), control_(std::move(control)) {}
+  ProcessGroupGuard(const ProcessGroupGuard&) = delete;
+  ProcessGroupGuard& operator=(const ProcessGroupGuard&) = delete;
+  ProcessGroupGuard(ProcessGroupGuard&& other) noexcept
+      : pid_(std::exchange(other.pid_, -1)), control_(std::move(other.control_)) {}
+  ProcessGroupGuard& operator=(ProcessGroupGuard&&) = delete;
+  ~ProcessGroupGuard() {
+    control_.reset();
+    if (pid_ <= 0) {
+      return;
+    }
+    int status = 0;
+    while (::waitpid(pid_, &status, 0) < 0 && errno == EINTR) {
+    }
+  }
+
+private:
+  pid_t pid_ = -1;
+  UniqueFd control_;
 };
 
 void wait_for_socket(int socket, short events, std::chrono::steady_clock::time_point deadline) {
@@ -561,8 +607,84 @@ std::string read_response(int input, std::chrono::steady_clock::time_point deadl
   return response;
 }
 
+ProcessGroupGuard spawn_process_group_guard(const std::string& executable, pid_t process_group,
+                                            std::chrono::steady_clock::time_point deadline) {
+  int guard_socket[2] = {-1, -1};
+  create_socket_pair(guard_socket, "process-group guard");
+  UniqueFd child_control(guard_socket[0]);
+  UniqueFd parent_control(guard_socket[1]);
+  make_nonblocking(parent_control.get());
+
+  posix_spawn_file_actions_t actions;
+  const auto actions_result = posix_spawn_file_actions_init(&actions);
+  if (actions_result != 0) {
+    throw GpuVideoProbeError("failed to initialize video probe guard launch: " +
+                             std::string(std::strerror(actions_result)));
+  }
+  const auto destroy_actions = [&actions] { posix_spawn_file_actions_destroy(&actions); };
+  auto action_error = posix_spawn_file_actions_adddup2(&actions, child_control.get(), STDIN_FILENO);
+  if (action_error == 0) {
+    action_error = posix_spawn_file_actions_adddup2(&actions, child_control.get(), STDOUT_FILENO);
+  }
+  for (const int descriptor : {child_control.get(), parent_control.get()}) {
+    if (action_error == 0 && descriptor != STDIN_FILENO && descriptor != STDOUT_FILENO) {
+      action_error = posix_spawn_file_actions_addclose(&actions, descriptor);
+    }
+  }
+  if (action_error != 0) {
+    destroy_actions();
+    throw GpuVideoProbeError("failed to configure video probe guard launch: " +
+                             std::string(std::strerror(action_error)));
+  }
+
+  posix_spawnattr_t attributes;
+  const auto attributes_result = posix_spawnattr_init(&attributes);
+  if (attributes_result != 0) {
+    destroy_actions();
+    throw GpuVideoProbeError("failed to initialize video probe guard attributes: " +
+                             std::string(std::strerror(attributes_result)));
+  }
+  const auto destroy_attributes = [&attributes] { posix_spawnattr_destroy(&attributes); };
+  short spawn_flags = POSIX_SPAWN_SETPGROUP;
+#if defined(POSIX_SPAWN_CLOEXEC_DEFAULT)
+  spawn_flags = static_cast<short>(spawn_flags | POSIX_SPAWN_CLOEXEC_DEFAULT);
+#endif
+  auto attribute_error = posix_spawnattr_setpgroup(&attributes, process_group);
+  if (attribute_error == 0) {
+    attribute_error = posix_spawnattr_setflags(&attributes, spawn_flags);
+  }
+  if (attribute_error != 0) {
+    destroy_attributes();
+    destroy_actions();
+    throw GpuVideoProbeError("failed to isolate video probe guard process: " +
+                             std::string(std::strerror(attribute_error)));
+  }
+
+  char* const arguments[] = {const_cast<char*>(executable.c_str()),
+                             const_cast<char*>("--reco-video-probe-guard"), nullptr};
+  pid_t guard_pid = -1;
+  const auto spawn_result =
+      ::posix_spawn(&guard_pid, executable.c_str(), &actions, &attributes, arguments, environ);
+  destroy_attributes();
+  destroy_actions();
+  if (spawn_result != 0) {
+    throw GpuVideoProbeError("failed to start video probe guard: " +
+                             std::string(std::strerror(spawn_result)));
+  }
+  child_control.reset();
+  ProcessGroupGuard guard(guard_pid, std::move(parent_control));
+  char ready = '\0';
+  read_exact(guard_socket[1], &ready, 1, deadline);
+  if (ready != 'R') {
+    throw GpuVideoProbeError("video probe guard failed its readiness handshake");
+  }
+  return guard;
+}
+
 std::string run_probe_worker(const std::filesystem::path& worker_path, std::string_view request,
-                             std::chrono::steady_clock::time_point deadline) {
+                             std::chrono::steady_clock::time_point deadline,
+                             const std::shared_ptr<std::atomic_bool>& cancelled) {
+  require_worker_launch_active(cancelled, deadline);
   int request_socket[2] = {-1, -1};
   int response_socket[2] = {-1, -1};
   create_socket_pair(request_socket, "input");
@@ -648,6 +770,7 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
                              const_cast<char*>("--reco-video-probe-worker"),
                              const_cast<char*>(parent_pid_argument.c_str()), nullptr};
   pid_t pid = -1;
+  require_worker_launch_active(cancelled, deadline);
   const auto spawn_result =
       ::posix_spawn(&pid, executable.c_str(), &actions, &attributes, arguments, environ);
   destroy_attributes();
@@ -657,17 +780,23 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
                              std::string(std::strerror(spawn_result)));
   }
   ChildProcess child(pid);
+  auto group_guard = spawn_process_group_guard(executable, pid, deadline);
   child_input.reset();
   child_output.reset();
+  require_worker_launch_active(cancelled, deadline);
   write_request(parent_input.get(), request, deadline);
   parent_input.reset();
 
   int status = 0;
   bool has_wait_status = false;
   while (true) {
-    const auto wait_result = ::waitpid(child.get(), &status, WNOHANG);
-    if (wait_result == child.get()) {
+    siginfo_t exit_info{};
+    const auto wait_result =
+        ::waitid(P_PID, static_cast<id_t>(child.get()), &exit_info, WEXITED | WNOHANG | WNOWAIT);
+    if (wait_result == 0 && exit_info.si_pid == child.get()) {
       (void)::kill(-child.get(), SIGKILL);
+      while (::waitpid(child.get(), &status, 0) < 0 && errno == EINTR) {
+      }
       child.release();
       has_wait_status = true;
       break;
@@ -700,20 +829,27 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
 
 std::string run_probe_worker_bounded(std::filesystem::path worker_path, std::string request,
                                      std::chrono::steady_clock::time_point worker_deadline,
-                                     std::chrono::steady_clock::time_point public_deadline) {
+                                     std::chrono::steady_clock::time_point public_deadline,
+                                     std::chrono::nanoseconds supervisor_start_delay = {}) {
   auto supervisor_slot = std::make_shared<SupervisorSlot>();
+  auto cancelled = std::make_shared<std::atomic_bool>(false);
   std::promise<std::string> result;
   auto future = result.get_future();
   std::thread supervisor([supervisor_slot = std::move(supervisor_slot),
                           worker_path = std::move(worker_path), request = std::move(request),
-                          result = std::move(result), worker_deadline]() mutable {
+                          result = std::move(result), worker_deadline, cancelled,
+                          supervisor_start_delay]() mutable {
     try {
-      result.set_value(run_probe_worker(worker_path, request, worker_deadline));
+      if (supervisor_start_delay.count() > 0) {
+        std::this_thread::sleep_for(supervisor_start_delay);
+      }
+      result.set_value(run_probe_worker(worker_path, request, worker_deadline, cancelled));
     } catch (...) {
       result.set_exception(std::current_exception());
     }
   });
   if (future.wait_until(public_deadline) != std::future_status::ready) {
+    cancelled->store(true, std::memory_order_release);
     supervisor.detach();
     throw_worker_timeout();
   }
@@ -721,10 +857,10 @@ std::string run_probe_worker_bounded(std::filesystem::path worker_path, std::str
   return future.get();
 }
 
-} // namespace
-
-GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config,
-                              const std::filesystem::path& worker_path, std::uint64_t timeout_ns) {
+GpuVideoProbe probe_gpu_video_with_delay(const GpuFileDecodeConfig& config,
+                                         const std::filesystem::path& worker_path,
+                                         std::uint64_t timeout_ns,
+                                         std::chrono::nanoseconds supervisor_start_delay) {
   if (const auto error = validate_gpu_file_decode_config(config); error.has_value()) {
     throw std::invalid_argument(*error);
   }
@@ -745,8 +881,23 @@ GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config,
   const auto public_deadline = std::chrono::steady_clock::now() + timeout;
   const auto worker_deadline = public_deadline - termination_reserve;
   const auto request = detail::encode_probe_request(config, timeout_ns);
-  return detail::decode_probe_response(
-      run_probe_worker_bounded(worker_path, request, worker_deadline, public_deadline));
+  return detail::decode_probe_response(run_probe_worker_bounded(
+      worker_path, request, worker_deadline, public_deadline, supervisor_start_delay));
+}
+
+} // namespace
+
+GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config,
+                              const std::filesystem::path& worker_path, std::uint64_t timeout_ns) {
+  return probe_gpu_video_with_delay(config, worker_path, timeout_ns,
+                                    std::chrono::nanoseconds::zero());
+}
+
+GpuVideoProbe detail::probe_gpu_video_with_supervisor_start_delay_for_test(
+    const GpuFileDecodeConfig& config, const std::filesystem::path& worker_path,
+    std::uint64_t timeout_ns, std::uint64_t supervisor_start_delay_ns) {
+  return probe_gpu_video_with_delay(config, worker_path, timeout_ns,
+                                    std::chrono::nanoseconds(supervisor_start_delay_ns));
 }
 
 } // namespace reco::io

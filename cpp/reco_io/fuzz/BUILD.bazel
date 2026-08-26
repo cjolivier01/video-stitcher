@@ -1,0 +1,15 @@
+load("@rules_cc//cc:defs.bzl", "cc_binary")
+
+cc_binary(
+    name = "gpu_video_probe_request_cbor_fuzz",
+    testonly = True,
+    srcs = ["gpu_video_probe_request_cbor_fuzz.cpp"],
+    deps = ["//cpp/reco_io:reco_io"],
+)
+
+cc_binary(
+    name = "gpu_video_probe_response_cbor_fuzz",
+    testonly = True,
+    srcs = ["gpu_video_probe_response_cbor_fuzz.cpp"],
+    deps = ["//cpp/reco_io:reco_io"],
+)

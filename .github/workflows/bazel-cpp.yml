@@ -32,7 +32,12 @@ jobs:
       - name: Test C++ port
         run: bazel test ${{ matrix.bazel_args }} ${{ matrix.test_target }}
       - name: Build C++ fuzz harnesses
-        run: bazel build ${{ matrix.bazel_args }} //cpp/reco_core:input_path_fuzz //cpp/reco_core:calibration_json_fuzz
+        run: >-
+          bazel build ${{ matrix.bazel_args }}
+          //cpp/reco_core:input_path_fuzz
+          //cpp/reco_core:calibration_json_fuzz
+          //cpp/reco_io/fuzz:gpu_video_probe_request_cbor_fuzz
+          //cpp/reco_io/fuzz:gpu_video_probe_response_cbor_fuzz
 
   sanitizers:
     name: Bazel C++ sanitizers
@@ -44,9 +49,25 @@ jobs:
           bazelisk-cache: true
           disk-cache: true
           repository-cache: true
-      - name: Test probe and decode runtimes with ASan
-        run: bazel test --config=asan //cpp/tests:reco_io_gpu_video_probe_tests //cpp/tests:reco_io_gpu_decode_runtime_tests
-      - name: Test probe and decode runtimes with UBSan
-        run: bazel test --config=ubsan //cpp/tests:reco_io_gpu_video_probe_tests //cpp/tests:reco_io_gpu_decode_runtime_tests
+      - name: Test C++ port with ASan
+        run: >-
+          bazel test --config=asan
+          //cpp/tests:reco_control_tests
+          //cpp/tests:reco_core_data_tests
+          //cpp/tests:reco_core_math_events_tests
+          //cpp/tests:reco_io_config_tests
+          //cpp/tests:reco_autocam_policy_tests
+          //cpp/tests:reco_io_gpu_video_probe_tests
+          //cpp/tests:reco_io_gpu_decode_runtime_tests
+      - name: Test C++ port with UBSan
+        run: >-
+          bazel test --config=ubsan
+          //cpp/tests:reco_control_tests
+          //cpp/tests:reco_core_data_tests
+          //cpp/tests:reco_core_math_events_tests
+          //cpp/tests:reco_io_config_tests
+          //cpp/tests:reco_autocam_policy_tests
+          //cpp/tests:reco_io_gpu_video_probe_tests
+          //cpp/tests:reco_io_gpu_decode_runtime_tests
       - name: Test probe runtime with TSan
         run: bazel test --config=tsan //cpp/tests:reco_io_gpu_video_probe_tests
