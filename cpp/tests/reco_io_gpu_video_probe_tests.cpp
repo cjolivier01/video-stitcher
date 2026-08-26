@@ -369,6 +369,18 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_eq(duplicate_pts.duration_ns, 4'000'000'000ULL,
             "duplicate PTS pairs retain their observed terminal span");
 
+  set_scenario("probe-duplicate-clustered-missing-groups");
+  const auto duplicate_clustered_missing =
+      probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(duplicate_clustered_missing.fps_numerator, 50U,
+            "periodically untimed duplicate groups preserve the AU rate");
+  expect_eq(duplicate_clustered_missing.fps_denominator, 1U,
+            "periodically untimed duplicate groups preserve the rate denominator");
+  expect_eq(duplicate_clustered_missing.total_frames, 200ULL,
+            "periodically untimed duplicate groups retain their EOS-proven AU count");
+  expect_eq(duplicate_clustered_missing.duration_ns, 4'000'000'000ULL,
+            "periodically untimed duplicate groups retain caps-rate duration");
+
   set_scenario("probe-duplicate-pts-transition");
   const auto duplicate_transition = probe_gpu_video(container_config(video_path), timeout_ns);
   expect_eq(duplicate_transition.fps_numerator, 25U,
@@ -532,6 +544,7 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_true(unknown_pts_preroll.duration_is_estimated,
               "PTS-less seek-preroll duration remains explicitly estimated");
 
+  std::filesystem::remove(event_path);
   set_scenario("probe-seek-untimestamped-tail");
   const auto untimestamped_tail = probe_gpu_video(container_config(video_path), timeout_ns);
   expect_eq(untimestamped_tail.duration_ns, 20'000'000'000ULL,
@@ -542,6 +555,39 @@ void probe_contracts(const std::filesystem::path& video_path,
               "untimestamped seek-tail count remains explicitly estimated");
   expect_true(untimestamped_tail.duration_is_estimated,
               "untimestamped seek-tail duration remains explicitly estimated");
+  const auto untimestamped_tail_events = read_events(event_path);
+  expect_true(std::count(untimestamped_tail_events.begin(), untimestamped_tail_events.end(),
+                         "pull-probe") <= 514,
+              "untimestamped seek tail abandons correlation without a linear parser drain");
+
+  set_scenario("probe-seek-dts-reorder-tail");
+  const auto dts_reorder_tail = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(dts_reorder_tail.duration_ns, 20'000'000'000ULL,
+            "DTS-only reordered seek tail retains the final presentation span");
+  expect_eq(dts_reorder_tail.total_frames, 600ULL,
+            "DTS-only reordered seek tail retains the final presentation frame");
+  expect_true(dts_reorder_tail.total_frames_is_estimated,
+              "DTS-correlated bounded count remains explicitly estimated");
+  expect_true(dts_reorder_tail.duration_is_estimated,
+              "DTS-correlated bounded duration remains explicitly estimated");
+
+  set_scenario("probe-blocking-seek");
+  const auto blocking_seek_started = std::chrono::steady_clock::now();
+  expect_probe_error([&] { (void)probe_gpu_video(container_config(video_path), 1'000'000'000ULL); },
+                     "timed out while seeking stream end",
+                     "blocking seek respects the probe deadline");
+  const auto blocking_seek_elapsed = std::chrono::steady_clock::now() - blocking_seek_started;
+  expect_true(blocking_seek_elapsed < std::chrono::milliseconds(1'800),
+              "blocking seek returns before the synchronous runtime call completes");
+
+  set_scenario("probe-blocking-duration-query");
+  const auto blocking_query_started = std::chrono::steady_clock::now();
+  expect_probe_error([&] { (void)probe_gpu_video(container_config(video_path), 1'000'000'000ULL); },
+                     "timed out while querying stream duration",
+                     "blocking duration query respects the probe deadline");
+  const auto blocking_query_elapsed = std::chrono::steady_clock::now() - blocking_query_started;
+  expect_true(blocking_query_elapsed < std::chrono::milliseconds(1'800),
+              "blocking duration query returns before the runtime call completes");
 
   set_scenario("probe-ok");
   expect_eq(probe_gpu_video(container_config(video_path), 1'000'000'000ULL).width, 3840U,

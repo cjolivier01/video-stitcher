@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -77,6 +78,7 @@ enum class ObjectKind {
 struct FakeObject {
   explicit FakeObject(ObjectKind object_kind) : kind(object_kind) {}
   ObjectKind kind;
+  std::atomic<std::uint32_t> reference_count{1};
 };
 
 struct FakePipeline;
@@ -200,7 +202,9 @@ FakeCaps parser_sample_caps() {
              scenario() == "probe-long-mixed-prefix-pts" ||
              scenario() == "probe-reordered-untimed-prefix" ||
              scenario() == "probe-one-frame-rounding" ||
-             scenario() == "probe-seek-untimestamped-tail") {
+             scenario() == "probe-seek-untimestamped-tail" ||
+             scenario() == "probe-seek-dts-reorder-tail" || scenario() == "probe-blocking-seek" ||
+             scenario() == "probe-blocking-duration-query") {
     caps.fps_numerator = 30;
     caps.fps_denominator = 1;
   } else if (scenario() == "probe-inexact-caps-fps") {
@@ -252,7 +256,8 @@ FakeCaps parser_sample_caps() {
   } else if (scenario() == "probe-vfr-missing-durations") {
     caps.fps_numerator = 45;
     caps.fps_denominator = 1;
-  } else if (scenario() == "probe-duplicate-pts-pairs") {
+  } else if (scenario() == "probe-duplicate-pts-pairs" ||
+             scenario() == "probe-duplicate-clustered-missing-groups") {
     caps.fps_numerator = 50;
     caps.fps_denominator = 1;
   } else if (scenario() == "probe-paired-au-missing-pts") {
@@ -331,7 +336,8 @@ std::uint64_t parser_timing_offset(std::uint64_t frame_index, const FakeCaps& ca
     return frame_index <= 90U ? frame_index * 1'000'000'000ULL / 30U
                               : 3'000'000'000ULL + (frame_index - 90U) * 1'000'000'000ULL / 15U;
   }
-  if (scenario() == "probe-duplicate-pts-pairs" || scenario() == "probe-paired-au-missing-pts") {
+  if (scenario() == "probe-duplicate-pts-pairs" || scenario() == "probe-paired-au-missing-pts" ||
+      scenario() == "probe-duplicate-clustered-missing-groups") {
     return (frame_index / 2U) * 40'000'000ULL;
   }
   if (scenario() == "probe-quantized-no-vui-5994") {
@@ -640,6 +646,15 @@ RECO_FAKE_EXPORT int gst_element_get_state(void*, int* state, int* pending, std:
 
 RECO_FAKE_EXPORT int gst_element_query_duration(void*, int format, std::int64_t* duration) {
   record("query-duration");
+  const auto current_scenario = scenario();
+  if (current_scenario == "probe-blocking-duration-query") {
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    if (format != 3 || duration == nullptr) {
+      return 0;
+    }
+    *duration = 20'000'000'000;
+    return 1;
+  }
   if (format != 3 || duration == nullptr || scenario() == "probe-duration-unknown" ||
       scenario() == "probe-long-unknown-pts") {
     return 0;
@@ -648,7 +663,12 @@ RECO_FAKE_EXPORT int gst_element_query_duration(void*, int format, std::int64_t*
     *duration = 0;
     return 1;
   }
-  if (scenario() == "probe-seek-untimestamped-tail") {
+  if (scenario() == "probe-seek-untimestamped-tail" || scenario() == "probe-blocking-seek" ||
+      scenario() == "probe-blocking-duration-query") {
+    *duration = 20'000'000'000;
+    return 1;
+  }
+  if (scenario() == "probe-seek-dts-reorder-tail") {
     *duration = 20'000'000'000;
     return 1;
   }
@@ -720,7 +740,8 @@ RECO_FAKE_EXPORT int gst_element_query_duration(void*, int format, std::int64_t*
     *duration = 575'935'624'115;
     return 1;
   }
-  if (scenario() == "probe-duplicate-pts-pairs" || scenario() == "probe-paired-au-missing-pts") {
+  if (scenario() == "probe-duplicate-pts-pairs" || scenario() == "probe-paired-au-missing-pts" ||
+      scenario() == "probe-duplicate-clustered-missing-groups") {
     *duration = 4'000'000'000;
     return 1;
   }
@@ -735,6 +756,17 @@ RECO_FAKE_EXPORT int gst_element_query_duration(void*, int format, std::int64_t*
 RECO_FAKE_EXPORT int gst_element_seek_simple(void* pipeline_pointer, int format, int,
                                              std::int64_t target) {
   record("seek-compressed");
+  const auto current_scenario = scenario();
+  if (current_scenario == "probe-blocking-seek") {
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    if (format != 3 || target < 0) {
+      return 0;
+    }
+    static_cast<FakePipeline*>(pipeline_pointer)->seek_target_ns = target;
+    static_cast<FakePipeline*>(pipeline_pointer)->has_seek = true;
+    ++static_cast<FakePipeline*>(pipeline_pointer)->seek_generation;
+    return 1;
+  }
   if (format != 3 || target < 0 || scenario() == "probe-seek-unsupported") {
     return 0;
   }
@@ -752,11 +784,21 @@ RECO_FAKE_EXPORT void* gst_element_get_bus(void*) {
   return new FakeBus;
 }
 
+RECO_FAKE_EXPORT void* gst_object_ref(void* object) {
+  if (object != nullptr) {
+    static_cast<FakeObject*>(object)->reference_count.fetch_add(1, std::memory_order_relaxed);
+  }
+  return object;
+}
+
 RECO_FAKE_EXPORT void gst_object_unref(void* object) {
   if (object == nullptr) {
     return;
   }
   auto* base = static_cast<FakeObject*>(object);
+  if (base->reference_count.fetch_sub(1, std::memory_order_acq_rel) != 1) {
+    return;
+  }
   switch (base->kind) {
   case ObjectKind::Pipeline:
     record("unref-pipeline");
@@ -938,6 +980,7 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
         : current_scenario == "probe-retimed-constant-pts"                  ? 5'000'000'000ULL
         : current_scenario == "probe-long-untimed-elementary"               ? 600'000'000'000ULL
         : current_scenario == "probe-duplicate-pts-pairs"                   ? 4'000'000'000ULL
+        : current_scenario == "probe-duplicate-clustered-missing-groups"    ? 4'000'000'000ULL
         : current_scenario == "probe-duplicate-pts-transition"              ? 20'000'000'000ULL
         : current_scenario == "probe-duplicate-pts-reorder-cutoff"          ? 20'000'000'000ULL
         : current_scenario == "probe-duplicate-pts-transition-untimed-tail" ? 20'000'000'000ULL
@@ -948,6 +991,9 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
         : current_scenario == "probe-quantized-no-vui-5994"                 ? 4'004'000'000ULL
         : current_scenario == "probe-bframe-cutoff"                         ? 4'000'000'000ULL
         : current_scenario == "probe-seek-untimestamped-tail"               ? 20'000'000'000ULL
+        : current_scenario == "probe-seek-dts-reorder-tail"                 ? 20'000'000'000ULL
+        : current_scenario == "probe-blocking-seek"                         ? 20'000'000'000ULL
+        : current_scenario == "probe-blocking-duration-query"               ? 20'000'000'000ULL
         : current_scenario == "probe-quantized-timestamps"                  ? 4'170'833'333ULL
         : current_scenario == "probe-exact-frame-count"                     ? 100'100'000ULL
         : current_scenario == "probe-integral-frame-count"                  ? 1'001'000'000'000ULL
@@ -986,7 +1032,11 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     sample->segment_stream_origin_ns = selected_stream_start_ns;
     sample->segment_outside = current_scenario == "probe-seek-preroll" &&
                               sink->pipeline->has_seek && seek_pull_index == 0;
-    if (current_scenario == "probe-seek-untimestamped-tail" && sink->pipeline->has_seek) {
+    if (current_scenario == "probe-seek-dts-reorder-tail" && sink->pipeline->has_seek) {
+      sample->buffer.pts = std::numeric_limits<std::uint64_t>::max();
+      const auto reorder_delay = parser_frame_offset(2, timing_caps);
+      sample->buffer.dts = target_ns > reorder_delay ? target_ns - reorder_delay : 0;
+    } else if (current_scenario == "probe-seek-untimestamped-tail" && sink->pipeline->has_seek) {
       sample->buffer.pts = std::numeric_limits<std::uint64_t>::max();
       sample->buffer.dts = std::numeric_limits<std::uint64_t>::max();
     } else if (current_scenario == "probe-seek-unknown-pts-preroll" && sink->pipeline->has_seek &&
@@ -994,6 +1044,9 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
       sample->buffer.pts = std::numeric_limits<std::uint64_t>::max();
     } else if (current_scenario == "probe-duplicate-pts-transition-untimed-tail" &&
                !sink->pipeline->has_seek && sequential_index >= 450U) {
+      sample->buffer.pts = std::numeric_limits<std::uint64_t>::max();
+    } else if (current_scenario == "probe-duplicate-clustered-missing-groups" &&
+               !sink->pipeline->has_seek && ((sequential_index / 2U) % 2U) != 0U) {
       sample->buffer.pts = std::numeric_limits<std::uint64_t>::max();
     } else if (current_scenario == "probe-paired-au-missing-pts" && !sink->pipeline->has_seek &&
                (sequential_index % 2U) != 0) {
