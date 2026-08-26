@@ -1,11 +1,15 @@
 #include "reco/io/gpu_video_probe.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdlib>
 #include <filesystem>
 #include <initializer_list>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -28,15 +32,43 @@ constexpr std::uint64_t kMaximumProbeTimeoutNs = 3'600ULL * kNanosecondsPerSecon
 constexpr double kMaximumSaneFps = 1000.0;
 constexpr int kGstFormatTime = 3;
 constexpr int kGstStateNull = 1;
-constexpr int kGstStatePaused = 3;
+constexpr int kGstStatePlaying = 4;
 constexpr int kGstStateChangeFailure = 0;
-constexpr int kGstStateChangeSuccess = 1;
+constexpr int kGstSeekFlagFlushAccurate = (1 << 0) | (1 << 1);
+constexpr std::uint64_t kGstClockTimeNone = std::numeric_limits<std::uint64_t>::max();
 
 struct GErrorAbi {
   std::uint32_t domain = 0;
   std::int32_t code = 0;
   char* message = nullptr;
 };
+
+// GstBuffer is a public GStreamer 1.x ABI struct. The runtime major-version
+// check below prevents this layout from being used with an incompatible ABI.
+struct GstMiniObjectAbi {
+  std::uintptr_t type = 0;
+  std::int32_t ref_count = 0;
+  std::int32_t lock_state = 0;
+  std::uint32_t flags = 0;
+  void* copy = nullptr;
+  void* dispose = nullptr;
+  void* free = nullptr;
+  std::uint32_t private_uint = 0;
+  void* private_pointer = nullptr;
+};
+
+struct GstBufferAbi {
+  GstMiniObjectAbi mini_object;
+  void* pool = nullptr;
+  std::uint64_t pts = kGstClockTimeNone;
+  std::uint64_t dts = kGstClockTimeNone;
+  std::uint64_t duration = kGstClockTimeNone;
+  std::uint64_t offset = 0;
+  std::uint64_t offset_end = 0;
+};
+
+static_assert(offsetof(GstBufferAbi, pts) == (sizeof(void*) == 8 ? 72 : 40));
+static_assert(sizeof(GstBufferAbi) == (sizeof(void*) == 8 ? 112 : 80));
 
 class DynamicLibrary {
 public:
@@ -124,12 +156,21 @@ public:
   using BinGetByName = void* (*)(void*, const char*);
   using ElementGetStaticPad = void* (*)(void*, const char*);
   using ElementSetState = int (*)(void*, int);
-  using ElementGetState = int (*)(void*, int*, int*, std::uint64_t);
   using ElementQueryDuration = int (*)(void*, int, std::int64_t*);
+  using ElementSeekSimple = int (*)(void*, int, int, std::int64_t);
   using PadGetCurrentCaps = void* (*)(void*);
   using CapsGetStructure = void* (*)(const void*, std::uint32_t);
+  using StructureGetName = const char* (*)(const void*);
   using StructureGetInt = int (*)(const void*, const char*, int*);
+  using StructureGetBoolean = int (*)(const void*, const char*, int*);
   using StructureGetFraction = int (*)(const void*, const char*, int*, int*);
+  using StructureGetString = const char* (*)(const void*, const char*);
+  using AppSinkTryPullSample = void* (*)(void*, std::uint64_t);
+  using AppSinkIsEos = int (*)(void*);
+  using SampleGetBuffer = void* (*)(void*);
+  using SampleGetSegment = const void* (*)(void*);
+  using SampleUnref = void (*)(void*);
+  using SegmentToStreamTime = std::uint64_t (*)(const void*, int, std::uint64_t);
   using ObjectUnref = void (*)(void*);
   using CapsUnref = void (*)(void*);
   using ErrorFree = void (*)(GErrorAbi*);
@@ -137,15 +178,20 @@ public:
   ProbeApi() {
 #if defined(_WIN32)
     core = load_library("RECO_GSTREAMER_DYLIB_PATH", {"gstreamer-1.0-0.dll"}, "GStreamer");
+    app = load_library("RECO_GSTAPP_DYLIB_PATH", {"gstapp-1.0-0.dll"}, "GstApp");
     glib = load_library("RECO_GLIB_DYLIB_PATH", {"libglib-2.0-0.dll", "glib-2.0-0.dll"}, "GLib");
 #elif defined(__APPLE__)
     core = load_library("RECO_GSTREAMER_DYLIB_PATH",
                         {"libgstreamer-1.0.0.dylib", "libgstreamer-1.0.dylib"}, "GStreamer");
+    app = load_library("RECO_GSTAPP_DYLIB_PATH", {"libgstapp-1.0.0.dylib", "libgstapp-1.0.dylib"},
+                       "GstApp");
     glib =
         load_library("RECO_GLIB_DYLIB_PATH", {"libglib-2.0.0.dylib", "libglib-2.0.dylib"}, "GLib");
 #else
     core = load_library("RECO_GSTREAMER_DYLIB_PATH",
                         {"libgstreamer-1.0.so.0", "libgstreamer-1.0.so"}, "GStreamer");
+    app = load_library("RECO_GSTAPP_DYLIB_PATH", {"libgstapp-1.0.so.0", "libgstapp-1.0.so"},
+                       "GstApp");
     glib = load_library("RECO_GLIB_DYLIB_PATH", {"libglib-2.0.so.0", "libglib-2.0.so"}, "GLib");
 #endif
 
@@ -155,18 +201,28 @@ public:
     bin_get_by_name = core->symbol<BinGetByName>("gst_bin_get_by_name");
     element_get_static_pad = core->symbol<ElementGetStaticPad>("gst_element_get_static_pad");
     element_set_state = core->symbol<ElementSetState>("gst_element_set_state");
-    element_get_state = core->symbol<ElementGetState>("gst_element_get_state");
     element_query_duration = core->symbol<ElementQueryDuration>("gst_element_query_duration");
+    element_seek_simple = core->symbol<ElementSeekSimple>("gst_element_seek_simple");
     pad_get_current_caps = core->symbol<PadGetCurrentCaps>("gst_pad_get_current_caps");
     caps_get_structure = core->symbol<CapsGetStructure>("gst_caps_get_structure");
+    structure_get_name = core->symbol<StructureGetName>("gst_structure_get_name");
     structure_get_int = core->symbol<StructureGetInt>("gst_structure_get_int");
+    structure_get_boolean = core->symbol<StructureGetBoolean>("gst_structure_get_boolean");
     structure_get_fraction = core->symbol<StructureGetFraction>("gst_structure_get_fraction");
+    structure_get_string = core->symbol<StructureGetString>("gst_structure_get_string");
+    app_sink_try_pull_sample = app->symbol<AppSinkTryPullSample>("gst_app_sink_try_pull_sample");
+    app_sink_is_eos = app->symbol<AppSinkIsEos>("gst_app_sink_is_eos");
+    sample_get_buffer = core->symbol<SampleGetBuffer>("gst_sample_get_buffer");
+    sample_get_segment = core->symbol<SampleGetSegment>("gst_sample_get_segment");
+    sample_unref = core->symbol<SampleUnref>("gst_sample_unref");
+    segment_to_stream_time = core->symbol<SegmentToStreamTime>("gst_segment_to_stream_time");
     object_unref = core->symbol<ObjectUnref>("gst_object_unref");
     caps_unref = core->symbol<CapsUnref>("gst_caps_unref");
     error_free = glib->symbol<ErrorFree>("g_error_free");
   }
 
   std::shared_ptr<DynamicLibrary> core;
+  std::shared_ptr<DynamicLibrary> app;
   std::shared_ptr<DynamicLibrary> glib;
   InitCheck init_check = nullptr;
   Version version = nullptr;
@@ -174,12 +230,21 @@ public:
   BinGetByName bin_get_by_name = nullptr;
   ElementGetStaticPad element_get_static_pad = nullptr;
   ElementSetState element_set_state = nullptr;
-  ElementGetState element_get_state = nullptr;
   ElementQueryDuration element_query_duration = nullptr;
+  ElementSeekSimple element_seek_simple = nullptr;
   PadGetCurrentCaps pad_get_current_caps = nullptr;
   CapsGetStructure caps_get_structure = nullptr;
+  StructureGetName structure_get_name = nullptr;
   StructureGetInt structure_get_int = nullptr;
+  StructureGetBoolean structure_get_boolean = nullptr;
   StructureGetFraction structure_get_fraction = nullptr;
+  StructureGetString structure_get_string = nullptr;
+  AppSinkTryPullSample app_sink_try_pull_sample = nullptr;
+  AppSinkIsEos app_sink_is_eos = nullptr;
+  SampleGetBuffer sample_get_buffer = nullptr;
+  SampleGetSegment sample_get_segment = nullptr;
+  SampleUnref sample_unref = nullptr;
+  SegmentToStreamTime segment_to_stream_time = nullptr;
   ObjectUnref object_unref = nullptr;
   CapsUnref caps_unref = nullptr;
   ErrorFree error_free = nullptr;
@@ -241,8 +306,10 @@ std::string build_probe_pipeline(const GpuFileDecodeConfig& config,
     pipeline << gpu_decode_container_demuxer(*config.container)
              << " ! capsfilter caps=\"video/x-h264;video/x-h265\" ! parsebin";
   }
-  pipeline << " ! identity name=probe_info silent=true"
-           << " ! fakesink sync=false enable-last-sample=false";
+  pipeline << " ! capsfilter caps=\"video/x-h264,stream-format=byte-stream,alignment=au;"
+              "video/x-h265,stream-format=byte-stream,alignment=au\""
+           << " ! identity name=probe_info silent=true"
+           << " ! appsink name=probe_sink emit-signals=false sync=false max-buffers=1 drop=false";
   return pipeline.str();
 }
 
@@ -280,6 +347,137 @@ std::uint64_t frame_count_for_duration(std::uint64_t duration_ns, std::uint32_t 
   return multiply_divide_floor_saturating(duration_ns, fps_numerator, divisor);
 }
 
+std::uint64_t frame_timestamp_ns(std::uint64_t frame_index, std::uint32_t fps_numerator,
+                                 std::uint32_t fps_denominator) {
+  const auto period_numerator = kNanosecondsPerSecond * fps_denominator;
+  const auto whole_periods = frame_index / fps_numerator;
+  if (whole_periods > std::numeric_limits<std::uint64_t>::max() / period_numerator) {
+    return std::numeric_limits<std::uint64_t>::max();
+  }
+  const auto base = whole_periods * period_numerator;
+  const auto remainder = static_cast<std::uint32_t>(frame_index % fps_numerator);
+  const auto tail = multiply_divide_floor_saturating(period_numerator, remainder, fps_numerator);
+  return tail > std::numeric_limits<std::uint64_t>::max() - base
+             ? std::numeric_limits<std::uint64_t>::max()
+             : base + tail;
+}
+
+std::uint64_t remaining_timeout_ns(std::chrono::steady_clock::time_point deadline) {
+  const auto now = std::chrono::steady_clock::now();
+  if (now >= deadline) {
+    throw GpuVideoProbeError("GStreamer parser-only probe timed out while parsing stream metadata");
+  }
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now).count());
+}
+
+struct FrameSeekResult {
+  bool usable = true;
+  bool available = false;
+  std::uint64_t pts_ns = 0;
+  std::uint64_t duration_ns = 0;
+};
+
+FrameSeekResult seek_compressed_frame(const std::shared_ptr<ProbeApi>& api, void* pipeline,
+                                      void* probe_sink, std::uint64_t frame_index,
+                                      std::uint32_t fps_numerator, std::uint32_t fps_denominator,
+                                      std::chrono::steady_clock::time_point deadline) {
+  const auto target_ns = frame_timestamp_ns(frame_index, fps_numerator, fps_denominator);
+  if (target_ns > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ||
+      api->element_seek_simple(pipeline, kGstFormatTime, kGstSeekFlagFlushAccurate,
+                               static_cast<std::int64_t>(target_ns)) == 0) {
+    return {.usable = false};
+  }
+
+  const auto period_numerator = kNanosecondsPerSecond * fps_denominator;
+  const auto half_frame_ns = period_numerator / (2ULL * fps_numerator);
+  const auto earliest_matching_pts = target_ns > half_frame_ns ? target_ns - half_frame_ns : 0;
+  const auto nominal_duration_ns = std::max<std::uint64_t>(period_numerator / fps_numerator, 1);
+  while (true) {
+    void* sample = api->app_sink_try_pull_sample(probe_sink, remaining_timeout_ns(deadline));
+    std::unique_ptr<void, ProbeApi::SampleUnref> sample_owner(sample, api->sample_unref);
+    if (sample == nullptr) {
+      if (api->app_sink_is_eos(probe_sink) != 0) {
+        return {.usable = true, .available = false};
+      }
+      throw GpuVideoProbeError("GStreamer parser-only probe timed out while seeking stream end");
+    }
+
+    const auto* buffer = static_cast<const GstBufferAbi*>(api->sample_get_buffer(sample));
+    if (buffer == nullptr) {
+      throw GpuVideoProbeError("GStreamer parser-only probe returned a sample without a buffer");
+    }
+    if (buffer->pts == kGstClockTimeNone) {
+      return {.usable = false};
+    }
+    const void* segment = api->sample_get_segment(sample);
+    if (segment == nullptr) {
+      return {.usable = false};
+    }
+    const auto stream_pts = api->segment_to_stream_time(segment, kGstFormatTime, buffer->pts);
+    if (stream_pts == kGstClockTimeNone) {
+      continue;
+    }
+    if (stream_pts < earliest_matching_pts) {
+      continue;
+    }
+    return {.usable = true,
+            .available = true,
+            .pts_ns = stream_pts,
+            .duration_ns = buffer->duration == 0 || buffer->duration == kGstClockTimeNone
+                               ? nominal_duration_ns
+                               : buffer->duration};
+  }
+}
+
+std::optional<std::uint64_t>
+selected_stream_duration(const std::shared_ptr<ProbeApi>& api, void* pipeline, void* probe_sink,
+                         std::uint64_t container_duration_ns, std::uint32_t fps_numerator,
+                         std::uint32_t fps_denominator,
+                         std::chrono::steady_clock::time_point deadline) {
+  const auto container_frames =
+      frame_count_for_duration(container_duration_ns, fps_numerator, fps_denominator);
+  if (container_frames == 0 || container_frames == std::numeric_limits<std::uint64_t>::max()) {
+    return std::nullopt;
+  }
+
+  std::uint64_t first = 0;
+  std::uint64_t last = container_frames;
+  while (first < last) {
+    const auto candidate = first + (last - first) / 2;
+    const auto result = seek_compressed_frame(api, pipeline, probe_sink, candidate, fps_numerator,
+                                              fps_denominator, deadline);
+    if (!result.usable) {
+      return std::nullopt;
+    }
+    if (result.available) {
+      first = candidate + 1;
+    } else {
+      last = candidate;
+    }
+  }
+  if (first == 0) {
+    throw GpuVideoProbeError("video parser found no frames in the selected stream");
+  }
+  if (first == container_frames) {
+    return container_duration_ns;
+  }
+
+  const auto final_frame = seek_compressed_frame(api, pipeline, probe_sink, first - 1,
+                                                 fps_numerator, fps_denominator, deadline);
+  if (!final_frame.usable) {
+    return std::nullopt;
+  }
+  if (!final_frame.available) {
+    throw GpuVideoProbeError("video parser could not correlate the selected stream duration");
+  }
+  const auto frame_end =
+      final_frame.duration_ns > std::numeric_limits<std::uint64_t>::max() - final_frame.pts_ns
+          ? std::numeric_limits<std::uint64_t>::max()
+          : final_frame.pts_ns + final_frame.duration_ns;
+  return std::min(frame_end, container_duration_ns);
+}
+
 } // namespace
 
 GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config, std::uint64_t timeout_ns) {
@@ -289,6 +487,7 @@ GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config, std::uint64_t t
   if (timeout_ns < kMinimumProbeTimeoutNs || timeout_ns > kMaximumProbeTimeoutNs) {
     throw std::invalid_argument("video probe timeout must be between one second and one hour");
   }
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeout_ns);
 
   std::error_code path_error;
   const auto absolute_path = std::filesystem::absolute(config.path, path_error);
@@ -339,24 +538,36 @@ GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config, std::uint64_t t
   if (probe_pad == nullptr) {
     throw GpuVideoProbeError("GStreamer parser-only probe has no metadata pad");
   }
+  void* probe_sink = api->bin_get_by_name(pipeline, "probe_sink");
+  std::unique_ptr<void, ProbeApi::ObjectUnref> probe_sink_owner(probe_sink, api->object_unref);
+  if (probe_sink == nullptr) {
+    throw GpuVideoProbeError("GStreamer parser-only probe has no compressed-stream sink");
+  }
 
   struct ResetPipeline {
     std::shared_ptr<ProbeApi> api;
     void* pipeline = nullptr;
     ~ResetPipeline() { (void)api->element_set_state(pipeline, kGstStateNull); }
   } reset{api, pipeline};
-  if (api->element_set_state(pipeline, kGstStatePaused) == kGstStateChangeFailure) {
-    throw GpuVideoProbeError("GStreamer parser-only probe failed to enter paused state");
+  if (api->element_set_state(pipeline, kGstStatePlaying) == kGstStateChangeFailure) {
+    throw GpuVideoProbeError("GStreamer parser-only probe failed to enter playing state");
   }
-
-  int state = 0;
-  int pending = 0;
-  const int state_result = api->element_get_state(pipeline, &state, &pending, timeout_ns);
-  if (state_result == kGstStateChangeFailure) {
-    throw GpuVideoProbeError("GStreamer parser-only probe failed while parsing stream metadata");
-  }
-  if (state_result != kGstStateChangeSuccess || state != kGstStatePaused) {
-    throw GpuVideoProbeError("GStreamer parser-only probe timed out while parsing stream metadata");
+  {
+    void* initial_sample =
+        api->app_sink_try_pull_sample(probe_sink, remaining_timeout_ns(deadline));
+    std::unique_ptr<void, ProbeApi::SampleUnref> initial_sample_owner(initial_sample,
+                                                                      api->sample_unref);
+    if (initial_sample == nullptr) {
+      if (api->app_sink_is_eos(probe_sink) != 0) {
+        throw GpuVideoProbeError(
+            "video discovery found no H.264 or HEVC moving-video stream compatible with NVDEC");
+      }
+      throw GpuVideoProbeError(
+          "GStreamer parser-only probe timed out while parsing stream metadata");
+    }
+    if (api->sample_get_buffer(initial_sample) == nullptr) {
+      throw GpuVideoProbeError("GStreamer parser-only probe returned a sample without a buffer");
+    }
   }
 
   void* caps = api->pad_get_current_caps(probe_pad);
@@ -368,6 +579,20 @@ GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config, std::uint64_t t
   void* structure = api->caps_get_structure(caps, 0);
   if (structure == nullptr) {
     throw GpuVideoProbeError("GStreamer parser-only probe caps contain no structure");
+  }
+
+  const char* codec_caps = api->structure_get_name(structure);
+  const char* stream_format = api->structure_get_string(structure, "stream-format");
+  const char* alignment = api->structure_get_string(structure, "alignment");
+  int parsed = 0;
+  const bool supported_codec =
+      codec_caps != nullptr && (std::string_view(codec_caps) == "video/x-h264" ||
+                                std::string_view(codec_caps) == "video/x-h265");
+  if (!supported_codec || api->structure_get_boolean(structure, "parsed", &parsed) == 0 ||
+      parsed == 0 || stream_format == nullptr || std::string_view(stream_format) != "byte-stream" ||
+      alignment == nullptr || std::string_view(alignment) != "au") {
+    throw GpuVideoProbeError(
+        "video parser output is not decoder-compatible H.264/HEVC byte-stream AU data");
   }
 
   int width = 0;
@@ -391,11 +616,21 @@ GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config, std::uint64_t t
   }
 
   std::int64_t queried_duration = 0;
-  const bool duration_is_estimated =
+  bool duration_is_estimated =
       api->element_query_duration(pipeline, kGstFormatTime, &queried_duration) == 0 ||
       queried_duration <= 0;
-  const auto duration_ns = duration_is_estimated ? kFallbackDurationSeconds * kNanosecondsPerSecond
-                                                 : static_cast<std::uint64_t>(queried_duration);
+  auto duration_ns = duration_is_estimated ? kFallbackDurationSeconds * kNanosecondsPerSecond
+                                           : static_cast<std::uint64_t>(queried_duration);
+  if (!duration_is_estimated && !config.elementary_stream) {
+    const auto selected_duration = selected_stream_duration(
+        api, pipeline, probe_sink, duration_ns, static_cast<std::uint32_t>(fps_numerator),
+        static_cast<std::uint32_t>(fps_denominator), deadline);
+    if (selected_duration.has_value()) {
+      duration_ns = *selected_duration;
+    } else {
+      duration_is_estimated = true;
+    }
+  }
   return {.width = static_cast<std::uint32_t>(width),
           .height = static_cast<std::uint32_t>(height),
           .fps_numerator = static_cast<std::uint32_t>(fps_numerator),

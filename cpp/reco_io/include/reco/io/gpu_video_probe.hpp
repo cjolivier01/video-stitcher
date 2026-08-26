@@ -38,7 +38,9 @@ public:
 /// Uses the production GStreamer demux/parser topology to probe a local input.
 ///
 /// The pipeline stops before NVDEC and never produces a decoded frame. The
-/// timeout must be between one second and one hour, inclusive.
+/// selected stream's duration is correlated with bounded seeks over compressed
+/// access-unit timestamps. The timeout must be between one second and one hour,
+/// inclusive.
 [[nodiscard]] GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config,
                                             std::uint64_t timeout_ns);
 

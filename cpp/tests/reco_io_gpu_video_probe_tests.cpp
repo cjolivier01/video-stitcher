@@ -154,10 +154,15 @@ void probe_contracts(const std::filesystem::path& video_path,
               "container probe filters out attached images and unsupported codecs");
   expect_true(has_event(events, "probe-parsebin"),
               "container probe uses the production parser selection topology");
-  expect_true(has_event(events, "state-paused"), "probe prerolls compressed parser caps");
+  expect_true(has_event(events, "probe-decoder-caps"),
+              "probe constrains parser output to the NVDEC sink contract");
+  expect_true(has_event(events, "state-playing"),
+              "probe runs only the backpressured compressed parser branch");
   expect_true(has_event(events, "state-null"), "probe resets pipeline before release");
   expect_true(!has_event(events, "decoder-element"), "probe does not construct a decoder");
   expect_true(!has_event(events, "pull"), "probe does not pull a decoded frame");
+  expect_true(has_event(events, "pull-probe"),
+              "probe seeks only compressed access-unit timestamps");
   expect_true(!has_event(events, "map"), "probe does not map frame memory");
   expect_true(!has_event(events, "raw-video-caps"), "probe never negotiates raw video caps");
 
@@ -184,6 +189,27 @@ void probe_contracts(const std::filesystem::path& video_path,
   set_scenario("probe-frame-count-overflow");
   expect_eq(probe_gpu_video(container_config(video_path), timeout_ns).total_frames,
             276'424'736'369ULL, "large duration remains exact without intermediate overflow");
+
+  set_scenario("probe-duration-mismatch");
+  const auto selected_duration = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_true(selected_duration.duration_ns > 900'000'000ULL &&
+                  selected_duration.duration_ns < 1'100'000'000ULL,
+              "selected stream duration excludes longer unrelated tracks");
+  expect_eq(selected_duration.total_frames, 30ULL,
+            "selected stream frame count excludes longer unrelated tracks");
+  expect_true(!selected_duration.duration_is_estimated,
+              "timestamp-correlated selected duration is not estimated");
+
+  set_scenario("probe-seek-unsupported");
+  const auto unseekable = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(unseekable.duration_ns, 10'000'000'000ULL,
+            "unseekable parser retains bounded container-duration fallback");
+  expect_true(unseekable.duration_is_estimated,
+              "uncorrelated container duration is explicitly marked estimated");
+
+  set_scenario("probe-seek-preroll");
+  expect_eq(probe_gpu_video(container_config(video_path), timeout_ns).total_frames, 299ULL,
+            "seek preroll outside the active segment is ignored");
 
   set_scenario("probe-ok");
   expect_eq(probe_gpu_video(container_config(video_path), 1'000'000'000ULL).width, 3840U,
@@ -221,19 +247,25 @@ void invalid_inputs_fail(const std::filesystem::path& video_path,
       "not a readable regular file", "missing input rejected before probing");
 
   for (const auto& [scenario_name, fragment] :
-       std::array<std::pair<std::string_view, std::string_view>, 12>{
+       std::array<std::pair<std::string_view, std::string_view>, 18>{
            {{"old-version", "1.10 or newer"},
             {"init-error", "fake initialization failure"},
             {"probe-parse-error", "fake parse failure"},
             {"probe-missing-info", "metadata identity"},
             {"probe-missing-pad", "metadata pad"},
-            {"probe-state-error", "paused state"},
-            {"probe-stream-error", "failed while parsing"},
+            {"probe-missing-sink", "compressed-stream sink"},
+            {"probe-state-error", "playing state"},
+            {"probe-stream-error", "playing state"},
             {"probe-timeout", "timed out"},
-            {"probe-no-supported-video", "failed while parsing"},
+            {"probe-no-supported-video", "H.264 or HEVC"},
             {"probe-missing-current-caps", "H.264 or HEVC"},
             {"probe-missing-caps-structure", "no structure"},
-            {"probe-bad-dimensions", "invalid visible"}}}) {
+            {"probe-wrong-codec-caps", "decoder-compatible"},
+            {"probe-unparsed-caps", "decoder-compatible"},
+            {"probe-avc-caps", "decoder-compatible"},
+            {"probe-nal-caps", "decoder-compatible"},
+            {"probe-bad-dimensions", "invalid visible"},
+            {"probe-pull-timeout", "timed out while seeking"}}}) {
     set_scenario(scenario_name);
     expect_probe_error([&] { (void)probe_gpu_video(container_config(video_path), timeout_ns); },
                        fragment, scenario_name);
@@ -263,6 +295,7 @@ int main() {
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
   const auto runtime = find_fake_runtime_runfile();
   set_environment("RECO_GSTREAMER_DYLIB_PATH", runtime.string());
+  set_environment("RECO_GSTAPP_DYLIB_PATH", runtime.string());
   set_environment("RECO_GLIB_DYLIB_PATH", runtime.string());
 
   const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();

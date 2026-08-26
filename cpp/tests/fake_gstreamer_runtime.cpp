@@ -84,6 +84,9 @@ struct FakeSink : FakeObject {
   explicit FakeSink(FakePipeline* owner) : FakeObject(ObjectKind::Sink), pipeline(owner) {}
   FakePipeline* pipeline = nullptr;
   std::uint32_t pull_count = 0;
+  bool probe_eos = false;
+  std::uint64_t observed_seek_generation = 0;
+  std::uint32_t probe_pulls_since_seek = 0;
 };
 
 struct FakeBus : FakeObject {
@@ -127,6 +130,9 @@ struct FakePipeline : FakeObject {
   FakePad* display_pad = nullptr;
   FakePad* output_pad = nullptr;
   bool parser_probe = false;
+  std::int64_t seek_target_ns = 0;
+  bool has_seek = false;
+  std::uint64_t seek_generation = 0;
 };
 
 constexpr std::uint64_t kFakeCapsMagic = 0x5245434f43415053ULL;
@@ -153,6 +159,7 @@ struct FakeSample {
   abi::Surface surface;
   FakePipeline* pipeline = nullptr;
   bool post_pull_runahead_emitted = false;
+  bool segment_outside = false;
 };
 
 std::mutex event_mutex;
@@ -335,6 +342,10 @@ RECO_FAKE_EXPORT void* gst_parse_launch(const char* description, GErrorAbi** err
   if (parser_probe && std::strstr(description, "parsebin") != nullptr) {
     record("probe-parsebin");
   }
+  if (parser_probe &&
+      std::strstr(description, "stream-format=byte-stream,alignment=au") != nullptr) {
+    record("probe-decoder-caps");
+  }
   if (parser_probe && std::strstr(description, "h264parse") != nullptr) {
     record("probe-h264-parser");
   }
@@ -364,6 +375,10 @@ RECO_FAKE_EXPORT void* gst_bin_get_by_name(void* pipeline_pointer, const char* n
   if (name != nullptr && std::strcmp(name, "sink") == 0) {
     record("get-sink");
     return scenario() == "missing-sink" ? nullptr : new FakeSink(pipeline);
+  }
+  if (name != nullptr && std::strcmp(name, "probe_sink") == 0) {
+    record("get-probe-sink");
+    return scenario() == "probe-missing-sink" ? nullptr : new FakeSink(pipeline);
   }
   if (name != nullptr && std::strcmp(name, "display_info") == 0) {
     record("get-display-info");
@@ -406,10 +421,12 @@ RECO_FAKE_EXPORT void* gst_element_get_static_pad(void* element_pointer, const c
   return pad;
 }
 
-RECO_FAKE_EXPORT int gst_element_set_state(void*, int state) {
+RECO_FAKE_EXPORT int gst_element_set_state(void* pipeline_pointer, int state) {
   record(state == 4 ? "state-playing" : state == 3 ? "state-paused" : "state-null");
-  if ((state == 4 && scenario() == "state-error") ||
-      (state == 3 && scenario() == "probe-state-error")) {
+  const auto* pipeline = static_cast<FakePipeline*>(pipeline_pointer);
+  if (state == 4 && ((!pipeline->parser_probe && scenario() == "state-error") ||
+                     (pipeline->parser_probe &&
+                      (scenario() == "probe-state-error" || scenario() == "probe-stream-error")))) {
     return 0;
   }
   return 1;
@@ -456,7 +473,23 @@ RECO_FAKE_EXPORT int gst_element_query_duration(void*, int format, std::int64_t*
     *duration = std::numeric_limits<std::int64_t>::max();
     return 1;
   }
+  if (scenario() == "probe-duration-mismatch") {
+    *duration = 5'000'000'000;
+    return 1;
+  }
   *duration = 10'000'000'000LL;
+  return 1;
+}
+
+RECO_FAKE_EXPORT int gst_element_seek_simple(void* pipeline_pointer, int format, int,
+                                             std::int64_t target) {
+  record("seek-compressed");
+  if (format != 3 || target < 0 || scenario() == "probe-seek-unsupported") {
+    return 0;
+  }
+  static_cast<FakePipeline*>(pipeline_pointer)->seek_target_ns = target;
+  static_cast<FakePipeline*>(pipeline_pointer)->has_seek = true;
+  ++static_cast<FakePipeline*>(pipeline_pointer)->seek_generation;
   return 1;
 }
 
@@ -524,6 +557,9 @@ RECO_FAKE_EXPORT void* gst_pad_get_current_caps(void* pad_pointer) {
   } else if (pad->probe && scenario() == "probe-high-fps") {
     caps->fps_numerator = 90'000;
     caps->fps_denominator = 1;
+  } else if (pad->probe && scenario() == "probe-duration-mismatch") {
+    caps->fps_numerator = 30;
+    caps->fps_denominator = 1;
   }
   return caps;
 }
@@ -581,8 +617,48 @@ RECO_FAKE_EXPORT void gst_caps_unref(void* caps) {
 }
 
 RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uint64_t) {
-  record("pull");
   auto* sink = static_cast<FakeSink*>(sink_pointer);
+  if (sink->pipeline->parser_probe) {
+    record("pull-probe");
+    sink->probe_eos = false;
+    if (sink->observed_seek_generation != sink->pipeline->seek_generation) {
+      sink->observed_seek_generation = sink->pipeline->seek_generation;
+      sink->probe_pulls_since_seek = 0;
+    }
+    if (scenario() == "probe-no-supported-video") {
+      sink->probe_eos = true;
+      return nullptr;
+    }
+    if (scenario() == "probe-timeout" ||
+        (scenario() == "probe-pull-timeout" && sink->pipeline->has_seek)) {
+      return nullptr;
+    }
+    const std::uint64_t selected_duration_ns =
+        scenario() == "probe-duration-mismatch"      ? 1'000'000'000ULL
+        : scenario() == "probe-exact-frame-count"    ? 100'100'000ULL
+        : scenario() == "probe-integral-frame-count" ? 1'001'000'000'000ULL
+        : scenario() == "probe-frame-count-overflow"
+            ? static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())
+            : 10'000'000'000ULL;
+    const std::uint64_t frame_duration_ns =
+        scenario() == "probe-duration-mismatch" ? 33'333'333ULL : 33'366'666ULL;
+    const auto target_ns = static_cast<std::uint64_t>(sink->pipeline->seek_target_ns);
+    if (target_ns >= selected_duration_ns) {
+      sink->probe_eos = true;
+      return nullptr;
+    }
+    auto* sample = new FakeSample;
+    sample->pipeline = sink->pipeline;
+    sample->segment_outside = scenario() == "probe-seek-preroll" && sink->pipeline->has_seek &&
+                              sink->probe_pulls_since_seek++ == 0;
+    sample->buffer.pts = target_ns;
+    const auto remaining_ns = selected_duration_ns - target_ns;
+    sample->buffer.duration =
+        remaining_ns > frame_duration_ns && remaining_ns - frame_duration_ns > 1 ? frame_duration_ns
+                                                                                 : remaining_ns;
+    return sample;
+  }
+  record("pull");
   const auto current = sink->pull_count++;
   const auto current_scenario = scenario();
   if (current_scenario == "duplicate-transition-pts" && current < 2) {
@@ -719,6 +795,9 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
 RECO_FAKE_EXPORT int gst_app_sink_is_eos(void* sink_pointer) {
   const auto current_scenario = scenario();
   const auto* sink = static_cast<FakeSink*>(sink_pointer);
+  if (sink->pipeline->parser_probe) {
+    return sink->probe_eos ? 1 : 0;
+  }
   return (current_scenario == "frame-eos" || current_scenario == "unknown-time" ||
           current_scenario == "visible-crop" || current_scenario == "caps-runahead" ||
           current_scenario == "caps-runahead-unknown-time" ||
@@ -751,6 +830,15 @@ RECO_FAKE_EXPORT void* gst_sample_get_buffer(void* sample) {
   return &fake_sample->buffer;
 }
 
+RECO_FAKE_EXPORT const void* gst_sample_get_segment(void* sample) { return sample; }
+
+RECO_FAKE_EXPORT std::uint64_t gst_segment_to_stream_time(const void* segment, int format,
+                                                          std::uint64_t position) {
+  return format == 3 && !static_cast<const FakeSample*>(segment)->segment_outside
+             ? position
+             : std::numeric_limits<std::uint64_t>::max();
+}
+
 RECO_FAKE_EXPORT void* gst_sample_get_caps(void* sample) {
   record("sample-caps");
   return scenario() == "missing-caps" ? nullptr : sample;
@@ -761,6 +849,31 @@ RECO_FAKE_EXPORT void* gst_caps_get_structure(const void* caps, std::uint32_t in
                  scenario() != "probe-missing-caps-structure"
              ? const_cast<void*>(caps)
              : nullptr;
+}
+
+RECO_FAKE_EXPORT const char* gst_structure_get_name(const void*) {
+  return scenario() == "probe-wrong-codec-caps" ? "video/x-vp9" : "video/x-h264";
+}
+
+RECO_FAKE_EXPORT int gst_structure_get_boolean(const void*, const char* field, int* value) {
+  if (field == nullptr || value == nullptr || std::strcmp(field, "parsed") != 0) {
+    return 0;
+  }
+  *value = scenario() == "probe-unparsed-caps" ? 0 : 1;
+  return 1;
+}
+
+RECO_FAKE_EXPORT const char* gst_structure_get_string(const void*, const char* field) {
+  if (field == nullptr) {
+    return nullptr;
+  }
+  if (std::strcmp(field, "stream-format") == 0) {
+    return scenario() == "probe-avc-caps" ? "avc" : "byte-stream";
+  }
+  if (std::strcmp(field, "alignment") == 0) {
+    return scenario() == "probe-nal-caps" ? "nal" : "au";
+  }
+  return nullptr;
 }
 
 RECO_FAKE_EXPORT int gst_structure_get_int(const void* structure, const char* field, int* value) {
