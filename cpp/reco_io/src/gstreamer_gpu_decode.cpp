@@ -550,6 +550,9 @@ private:
     {
       std::lock_guard lock(mutex_);
       if (pts == kGstClockTimeNone) {
+        if (unknown_ambiguity_active_) {
+          metadata->failure = GeometryMetadataFailure::UnknownTimestampAcrossChange;
+        }
         for (const auto& observation : observations_) {
           if (!observation.pts_ns.has_value()) {
             add_candidate(metadata->candidates, observation.dimensions);
@@ -560,11 +563,17 @@ private:
                          [](const auto& value) { return !value.pts_ns.has_value(); });
         if (observation == observations_.end()) {
           metadata->failure = GeometryMetadataFailure::MissingCorrelation;
+          unknown_ambiguity_active_ = false;
         } else {
           if (metadata->candidates.size() > 1) {
             metadata->failure = GeometryMetadataFailure::UnknownTimestampAcrossChange;
+            unknown_ambiguity_active_ = true;
           }
           observations_.erase(observation);
+          if (std::none_of(observations_.begin(), observations_.end(),
+                           [](const auto& value) { return !value.pts_ns.has_value(); })) {
+            unknown_ambiguity_active_ = false;
+          }
         }
       } else {
         auto group = std::find_if(ambiguity_groups_.begin(), ambiguity_groups_.end(),
@@ -648,6 +657,7 @@ private:
   std::mutex mutex_;
   std::deque<GeometryObservation> observations_;
   std::deque<GeometryAmbiguityGroup> ambiguity_groups_;
+  bool unknown_ambiguity_active_ = false;
   std::atomic<GeometryProbeFailure> failure_{GeometryProbeFailure::None};
 };
 

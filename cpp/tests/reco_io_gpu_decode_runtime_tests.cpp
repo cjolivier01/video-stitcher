@@ -429,6 +429,18 @@ void unknown_output_retires_only_unknown_observations() {
   }
 }
 
+void dropped_ambiguous_unknown_output_keeps_batch_ambiguous() {
+  set_scenario("dropped-unknown-transition");
+  auto config = valid_config();
+  config.drop = true;
+  auto source =
+      open_gstreamer_gpu_file_decode_source(std::move(config), NvbufSurfaceAbi::DeepStream9_1);
+
+  expect_gpu_decode_error([&] { (void)source->read(); },
+                          "timestamp cannot be correlated across a geometry change",
+                          "dropped ambiguous unknown frame keeps remaining batch fail-closed");
+}
+
 void concurrent_reads_serialize_appsink_access() {
   set_scenario("frame-eos");
   const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
@@ -590,6 +602,7 @@ int main() {
   first_frame_rejects_grossly_stale_geometry();
   unknown_timestamps_are_not_fabricated();
   unknown_output_retires_only_unknown_observations();
+  dropped_ambiguous_unknown_output_keeps_batch_ambiguous();
   concurrent_reads_serialize_appsink_access();
   fatal_pipeline_errors_are_latched();
   geometry_probe_errors_are_latched_before_further_pulls();

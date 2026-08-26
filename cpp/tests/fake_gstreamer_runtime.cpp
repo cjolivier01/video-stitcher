@@ -181,7 +181,8 @@ GErrorAbi* make_error(const char* message) {
 
 FakeSample* make_sample(std::uint32_t sample_index = 0) {
   auto* sample = new FakeSample;
-  if (scenario() == "unknown-time" || scenario() == "caps-runahead-unknown-time") {
+  if (scenario() == "unknown-time" || scenario() == "caps-runahead-unknown-time" ||
+      scenario() == "dropped-unknown-transition") {
     sample->buffer.pts = std::numeric_limits<std::uint64_t>::max();
     sample->buffer.duration = std::numeric_limits<std::uint64_t>::max();
   } else if (scenario() == "caps-runahead" || scenario() == "caps-runahead-stale-caps" ||
@@ -562,6 +563,16 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
       push_predecoder_buffer(sink->pipeline->display_pad, known_buffer, 1280, 720);
       push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, 1280, 720);
     }
+    return deliver_output(sink, sample);
+  }
+  if (current_scenario == "dropped-unknown-transition" && current == 0) {
+    auto* sample = make_sample(current);
+    GstBufferAbi dropped_buffer;
+    dropped_buffer.pts = std::numeric_limits<std::uint64_t>::max();
+    push_predecoder_buffer(sink->pipeline->display_pad, dropped_buffer, 1100, 720);
+    push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, 1200, 720);
+    push_output_buffer(sink->pipeline->output_pad, dropped_buffer);
+    release_buffer_qdata(dropped_buffer);
     return deliver_output(sink, sample);
   }
   const bool caps_runahead = current_scenario == "caps-runahead" ||
