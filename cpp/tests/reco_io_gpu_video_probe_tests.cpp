@@ -317,6 +317,14 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_true(!selected_duration.duration_is_estimated,
               "timestamp-correlated selected duration is not estimated");
 
+  set_scenario("probe-long-video-shorter-than-container");
+  const auto long_selected_stream = probe_video(container_config(video_path), timeout_ns);
+  expect_true(long_selected_stream.duration_ns > 199'000'000'000ULL &&
+                  long_selected_stream.duration_ns < 201'000'000'000ULL,
+              "timing windows use the selected video duration instead of a longer container track");
+  expect_eq(long_selected_stream.total_frames, 5'995ULL,
+            "long selected-stream correlation excludes trailing unrelated tracks");
+
   set_scenario("probe-delayed-stream");
   const auto delayed_stream = probe_video(container_config(video_path), timeout_ns);
   expect_eq(delayed_stream.duration_ns, 1'000'000'000ULL,
@@ -664,10 +672,20 @@ void probe_contracts(const std::filesystem::path& video_path,
                      "variable frame-rate",
                      "mixed cadence inside the terminal timing window is rejected");
 
+  set_scenario("probe-low-amplitude-vfr");
+  expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
+                     "variable frame-rate",
+                     "a 30-to-31 fps EOS transition fails cadence phase validation");
+
   set_scenario("probe-interior-vfr-recovery");
   expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
                      "variable frame-rate",
                      "a middle 30-to-15-to-30 cadence change is rejected by interior sampling");
+
+  set_scenario("probe-interior-seek-gap");
+  expect_probe_error(
+      [&] { (void)probe_video(container_config(video_path), timeout_ns); }, "variable frame-rate",
+      "samples beyond an interior window cannot stand in for its missing timing evidence");
 
   set_scenario("probe-prefix-vfr-tail-cfr");
   expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
@@ -693,6 +711,11 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_probe_error(
       [&] { (void)probe_video(container_config(video_path), timeout_ns); }, "variable frame-rate",
       "a terminal cadence transition after 256 analyzed samples is detected before EOS");
+
+  set_scenario("probe-terminal-duplicate-pts-transition");
+  expect_probe_error(
+      [&] { (void)probe_video(container_config(video_path), timeout_ns); }, "variable frame-rate",
+      "EOS-complete terminal timing rejects smaller duplicate-PTS groups in the final 32 AUs");
 
   set_scenario("probe-vfr-missing-durations");
   expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
@@ -965,7 +988,7 @@ void worker_ipc_failures_are_bounded(const std::filesystem::path& video_path) {
   }
 }
 
-void cancelled_supervisor_cannot_launch_worker(const std::filesystem::path& video_path) {
+void delayed_supervision_cannot_launch_worker(const std::filesystem::path& video_path) {
   const auto marker_path =
       video_path.parent_path() / (video_path.filename().string() + ".delayed-worker-startup");
   std::filesystem::remove(marker_path);
@@ -977,10 +1000,9 @@ void cancelled_supervisor_cannot_launch_worker(const std::filesystem::path& vide
             container_config(video_path), fake_probe_worker_path, 1'000'000'000ULL,
             1'250'000'000ULL);
       },
-      "timed out", "delayed supervisor returns at the public deadline");
-  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      "timed out", "delayed supervision returns at the public deadline");
   expect_true(!std::filesystem::exists(marker_path),
-              "cancelled supervisor never launches its delayed worker");
+              "expired supervision delay never launches a worker");
   std::filesystem::remove(marker_path);
 }
 
@@ -998,9 +1020,10 @@ void launch_gate_prevents_post_timeout_process_start(const std::filesystem::path
             1'250'000'000ULL);
       },
       "timed out", "pre-worker-spawn delay reaches a bounded timeout");
-  expect_true(std::chrono::steady_clock::now() - started >= std::chrono::milliseconds(1'200),
-              "public timeout waits for the in-progress launch gate");
-  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  expect_true(elapsed >= std::chrono::milliseconds(800) &&
+                  elapsed < std::chrono::milliseconds(1'200),
+              "pre-worker launch delay returns within the public timeout bound");
   const auto events = read_events(lifecycle_path);
   expect_true(!has_event(events, "worker"), "expired launch sequence does not spawn a worker");
   expect_true(!has_event(events, "guard"), "expired launch sequence does not spawn a guard");
@@ -1375,6 +1398,42 @@ void windows_unicode_path_round_trips() {
 #endif
 }
 
+void windows_path_runtime_discovery(const std::filesystem::path& video_path,
+                                    const std::filesystem::path& runtime) {
+#if defined(_WIN32)
+  const auto directory = std::filesystem::temp_directory_path() /
+                         ("reco_gstreamer_path_" + std::to_string(GetCurrentProcessId()));
+  std::filesystem::remove_all(directory);
+  std::filesystem::create_directories(directory);
+  for (const auto* name : {"gstreamer-1.0-0.dll", "gstapp-1.0-0.dll", "libglib-2.0-0.dll"}) {
+    std::filesystem::copy_file(runtime, directory / name,
+                               std::filesystem::copy_options::overwrite_existing);
+  }
+  const char* current_path = std::getenv("PATH");
+  const std::string original_path = current_path == nullptr ? "" : current_path;
+  set_environment("PATH", directory.string() + ";" + original_path);
+  set_environment("RECO_GSTREAMER_DYLIB_PATH", "");
+  set_environment("RECO_GSTAPP_DYLIB_PATH", "");
+  set_environment("RECO_GLIB_DYLIB_PATH", "");
+  try {
+    set_scenario("probe-ok");
+    expect_eq(probe_video(container_config(video_path), 5'000'000'000ULL).width, 3840U,
+              "Windows probe resolves conventional GStreamer DLLs from PATH securely");
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: Windows PATH GStreamer discovery threw: " << error.what() << '\n';
+    ++failures;
+  }
+  set_environment("PATH", original_path);
+  set_environment("RECO_GSTREAMER_DYLIB_PATH", runtime.string());
+  set_environment("RECO_GSTAPP_DYLIB_PATH", runtime.string());
+  set_environment("RECO_GLIB_DYLIB_PATH", runtime.string());
+  std::filesystem::remove_all(directory);
+#else
+  (void)video_path;
+  (void)runtime;
+#endif
+}
+
 void parent_death_reclaims_worker(const std::filesystem::path& video_path) {
 #if defined(__linux__)
   set_scenario("probe-blocking-playing");
@@ -1470,8 +1529,9 @@ int main(int argc, char** argv) {
   invalid_inputs_fail(video_path, event_path);
   non_utf8_path_round_trips();
   windows_unicode_path_round_trips();
+  windows_path_runtime_discovery(video_path, runtime);
   worker_ipc_failures_are_bounded(video_path);
-  cancelled_supervisor_cannot_launch_worker(video_path);
+  delayed_supervision_cannot_launch_worker(video_path);
   launch_gate_prevents_post_timeout_process_start(video_path);
   auto_reaped_workers_are_supported(video_path);
   windows_job_reclaims_worker_descendants(video_path);

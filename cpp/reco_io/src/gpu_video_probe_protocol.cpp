@@ -18,9 +18,10 @@ constexpr std::size_t kMaximumErrorMessageBytes = 1024;
 constexpr std::size_t kMaximumCborNestingDepth = 32;
 constexpr std::uint32_t kProbeProtocolVersion = 1;
 constexpr double kMaximumSaneFps = 1000.0;
-constexpr std::uint32_t kMaximumGpuVideoDimension = 65'536;
+constexpr std::uint32_t kMaximumGpuVideoDimension = 8'192;
+constexpr std::uint64_t kMaximumNv12FrameBytes = 8'192ULL * 8'192ULL * 3ULL / 2ULL;
 constexpr std::uint64_t kNanosecondsPerSecond = 1'000'000'000ULL;
-constexpr std::uint64_t kExactFrameCountTolerance = 32;
+constexpr std::uint64_t kExactFrameCountTolerance = 1;
 
 struct DivisionResult {
   std::uint64_t quotient;
@@ -103,6 +104,19 @@ bool exact_frame_count_is_consistent(const GpuVideoProbe& probe) {
   const auto difference = probe.total_frames > *expected ? probe.total_frames - *expected
                                                          : *expected - probe.total_frames;
   return difference <= kExactFrameCountTolerance;
+}
+
+bool gpu_geometry_is_valid(std::uint32_t width, std::uint32_t height) {
+  if (width == 0 || height == 0 || width > kMaximumGpuVideoDimension ||
+      height > kMaximumGpuVideoDimension || (width % 2U) != 0 || (height % 2U) != 0 ||
+      width > std::numeric_limits<std::uint64_t>::max() / height) {
+    return false;
+  }
+  const auto pixels = static_cast<std::uint64_t>(width) * height;
+  if (pixels > std::numeric_limits<std::uint64_t>::max() - pixels / 2U) {
+    return false;
+  }
+  return pixels + pixels / 2U <= kMaximumNv12FrameBytes;
 }
 
 int encode_container(const std::optional<GpuDecodeContainer>& container) {
@@ -420,10 +434,8 @@ GpuVideoProbe decode_probe_response(std::string_view payload) {
       required_value<bool>(response, "duration_is_estimated", "video probe worker response");
   probe.total_frames_is_estimated =
       required_value<bool>(response, "total_frames_is_estimated", "video probe worker response");
-  if (probe.width == 0 || probe.width > kMaximumGpuVideoDimension || probe.height == 0 ||
-      probe.height > kMaximumGpuVideoDimension || (probe.width % 2U) != 0 ||
-      (probe.height % 2U) != 0 || probe.fps_numerator == 0 || probe.fps_denominator == 0 ||
-      probe.duration_ns == 0 || probe.total_frames == 0) {
+  if (!gpu_geometry_is_valid(probe.width, probe.height) || probe.fps_numerator == 0 ||
+      probe.fps_denominator == 0 || probe.duration_ns == 0 || probe.total_frames == 0) {
     throw GpuVideoProbeError("video probe worker returned invalid metadata");
   }
   probe.fps = static_cast<double>(probe.fps_numerator) / probe.fps_denominator;

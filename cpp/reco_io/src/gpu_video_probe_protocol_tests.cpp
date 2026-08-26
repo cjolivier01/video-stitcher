@@ -99,8 +99,14 @@ void response_numeric_domains_are_enforced() {
                        key, "out-of-domain response field " + key);
   }
 
-  auto impossible_dimensions = base;
-  impossible_dimensions["width"] = std::numeric_limits<std::uint32_t>::max();
+  auto maximum_dimensions = base;
+  maximum_dimensions["width"] = 8'192U;
+  maximum_dimensions["height"] = 8'192U;
+  expect_success([&] { (void)reco::io::detail::decode_probe_response(encode(maximum_dimensions)); },
+                 "maximum supported NVDEC geometry is accepted");
+
+  auto impossible_dimensions = maximum_dimensions;
+  impossible_dimensions["width"] = 8'194U;
   expect_probe_error(
       [&] { (void)reco::io::detail::decode_probe_response(encode(impossible_dimensions)); },
       "invalid metadata", "impossible GPU dimensions are rejected");
@@ -133,21 +139,27 @@ void exact_response_metadata_must_be_consistent() {
   auto boundary = valid_response();
   boundary["fps_numerator"] = 100U;
   boundary["duration_ns"] = 10'000'000'000ULL;
-  boundary["total_frames"] = 968ULL;
+  boundary["total_frames"] = 999ULL;
   expect_success([&] { (void)reco::io::detail::decode_probe_response(encode(boundary)); },
                  "exact response at the lower dropped-frame tolerance boundary");
-  boundary["total_frames"] = 1032ULL;
+  boundary["total_frames"] = 1001ULL;
   expect_success([&] { (void)reco::io::detail::decode_probe_response(encode(boundary)); },
                  "exact response at the upper dropped-frame tolerance boundary");
 
-  boundary["total_frames"] = 967ULL;
+  boundary["total_frames"] = 998ULL;
   expect_probe_error([&] { (void)reco::io::detail::decode_probe_response(encode(boundary)); },
                      "inconsistent exact metadata",
                      "exact response below the dropped-frame tolerance is rejected");
-  boundary["total_frames"] = 1033ULL;
+  boundary["total_frames"] = 1002ULL;
   expect_probe_error([&] { (void)reco::io::detail::decode_probe_response(encode(boundary)); },
                      "inconsistent exact metadata",
                      "exact response above the dropped-frame tolerance is rejected");
+
+  auto short_contradiction = valid_response();
+  short_contradiction["total_frames"] = 1ULL;
+  expect_probe_error(
+      [&] { (void)reco::io::detail::decode_probe_response(encode(short_contradiction)); },
+      "inconsistent exact metadata", "short exact response cannot hide a relative contradiction");
 
   auto rounded_duration = valid_response();
   rounded_duration["fps_numerator"] = 30'000U;

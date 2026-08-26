@@ -9,9 +9,7 @@
 #include <cstdint>
 #include <exception>
 #include <filesystem>
-#include <future>
 #include <limits>
-#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -91,22 +89,25 @@ public:
   throw GpuVideoProbeError("video probe worker timed out after exceeding the configured timeout");
 }
 
-struct WorkerLaunchState {
-  std::mutex mutex;
-  bool cancelled = false;
-};
-
-void require_worker_launch_active_locked(const WorkerLaunchState& launch_state,
-                                         std::chrono::steady_clock::time_point deadline) {
-  if (launch_state.cancelled || std::chrono::steady_clock::now() >= deadline) {
+void require_worker_launch_active(std::chrono::steady_clock::time_point deadline) {
+  if (std::chrono::steady_clock::now() >= deadline) {
     throw_worker_timeout();
   }
 }
 
-void require_worker_launch_active(const std::shared_ptr<WorkerLaunchState>& launch_state,
+void wait_for_worker_launch_delay(std::chrono::nanoseconds delay,
                                   std::chrono::steady_clock::time_point deadline) {
-  std::lock_guard lock(launch_state->mutex);
-  require_worker_launch_active_locked(*launch_state, deadline);
+  if (delay.count() <= 0) {
+    require_worker_launch_active(deadline);
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (now >= deadline || delay >= deadline - now) {
+    std::this_thread::sleep_until(deadline);
+    throw_worker_timeout();
+  }
+  std::this_thread::sleep_for(delay);
+  require_worker_launch_active(deadline);
 }
 
 #if defined(_WIN32)
@@ -254,9 +255,8 @@ std::string read_response(HANDLE input, std::chrono::steady_clock::time_point de
 
 std::string run_probe_worker(const std::filesystem::path& worker_path, std::string_view request,
                              std::chrono::steady_clock::time_point deadline,
-                             const std::shared_ptr<WorkerLaunchState>& launch_state,
                              std::chrono::nanoseconds pre_worker_spawn_delay) {
-  require_worker_launch_active(launch_state, deadline);
+  require_worker_launch_active(deadline);
   SECURITY_ATTRIBUTES security{.nLength = sizeof(SECURITY_ATTRIBUTES),
                                .lpSecurityDescriptor = nullptr,
                                .bInheritHandle = TRUE};
@@ -347,12 +347,7 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   startup.StartupInfo.hStdOutput = child_stdout.get();
   startup.StartupInfo.hStdError = child_stderr.get();
   PROCESS_INFORMATION process_info{};
-  std::unique_lock launch_lock(launch_state->mutex);
-  require_worker_launch_active_locked(*launch_state, deadline);
-  if (pre_worker_spawn_delay.count() > 0) {
-    std::this_thread::sleep_for(pre_worker_spawn_delay);
-  }
-  require_worker_launch_active_locked(*launch_state, deadline);
+  wait_for_worker_launch_delay(pre_worker_spawn_delay, deadline);
   if (CreateProcessW(application.c_str(), command_line.data(), nullptr, nullptr, TRUE,
                      CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr,
                      &startup.StartupInfo, &process_info) == 0) {
@@ -390,7 +385,6 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
       write_error = std::current_exception();
     }
   });
-  launch_lock.unlock();
 
   const auto terminate_and_join = [&] {
     terminate_worker();
@@ -750,9 +744,8 @@ ProcessGroupGuard spawn_process_group_guard(const std::string& executable, pid_t
 
 std::string run_probe_worker(const std::filesystem::path& worker_path, std::string_view request,
                              std::chrono::steady_clock::time_point deadline,
-                             const std::shared_ptr<WorkerLaunchState>& launch_state,
                              std::chrono::nanoseconds pre_worker_spawn_delay) {
-  require_worker_launch_active(launch_state, deadline);
+  require_worker_launch_active(deadline);
   int request_socket[2] = {-1, -1};
   int response_socket[2] = {-1, -1};
   create_socket_pair(request_socket, "input");
@@ -824,12 +817,7 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
                              const_cast<char*>("--reco-video-probe-worker"),
                              const_cast<char*>(parent_pid_argument.c_str()), nullptr};
   pid_t pid = -1;
-  std::unique_lock launch_lock(launch_state->mutex);
-  require_worker_launch_active_locked(*launch_state, deadline);
-  if (pre_worker_spawn_delay.count() > 0) {
-    std::this_thread::sleep_for(pre_worker_spawn_delay);
-  }
-  require_worker_launch_active_locked(*launch_state, deadline);
+  wait_for_worker_launch_delay(pre_worker_spawn_delay, deadline);
   const auto spawn_result =
       ::posix_spawn(&pid, executable.c_str(), actions.get(), attributes.get(), arguments, environ);
   if (spawn_result != 0) {
@@ -840,10 +828,9 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   auto group_guard = spawn_process_group_guard(executable, pid, deadline);
   child_input.reset();
   child_output.reset();
-  require_worker_launch_active_locked(*launch_state, deadline);
+  require_worker_launch_active(deadline);
   write_request(parent_input.get(), request, deadline);
   parent_input.reset();
-  launch_lock.unlock();
 
   int status = 0;
   bool has_wait_status = false;
@@ -890,32 +877,9 @@ std::string run_probe_worker_bounded(std::filesystem::path worker_path, std::str
                                      std::chrono::steady_clock::time_point public_deadline,
                                      std::chrono::nanoseconds supervisor_start_delay,
                                      std::chrono::nanoseconds pre_worker_spawn_delay) {
-  auto supervisor_slot = std::make_shared<SupervisorSlot>();
-  auto launch_state = std::make_shared<WorkerLaunchState>();
-  std::promise<std::string> result;
-  auto future = result.get_future();
-  std::thread supervisor([supervisor_slot = std::move(supervisor_slot),
-                          worker_path = std::move(worker_path), request = std::move(request),
-                          result = std::move(result), worker_deadline, launch_state,
-                          supervisor_start_delay, pre_worker_spawn_delay]() mutable {
-    try {
-      if (supervisor_start_delay.count() > 0) {
-        std::this_thread::sleep_for(supervisor_start_delay);
-      }
-      result.set_value(run_probe_worker(worker_path, request, worker_deadline, launch_state,
-                                        pre_worker_spawn_delay));
-    } catch (...) {
-      result.set_exception(std::current_exception());
-    }
-  });
-  if (future.wait_until(public_deadline) != std::future_status::ready) {
-    std::lock_guard lock(launch_state->mutex);
-    launch_state->cancelled = true;
-    supervisor.detach();
-    throw_worker_timeout();
-  }
-  supervisor.join();
-  return future.get();
+  SupervisorSlot supervisor_slot;
+  wait_for_worker_launch_delay(supervisor_start_delay, public_deadline);
+  return run_probe_worker(worker_path, request, worker_deadline, pre_worker_spawn_delay);
 }
 
 GpuVideoProbe probe_gpu_video_with_delays(const GpuFileDecodeConfig& config,

@@ -72,6 +72,7 @@ constexpr long double kFrameRatePreferenceTolerance = 0.05L;
 constexpr long double kMaximumTimingDeltaVariation = 0.10L;
 constexpr long double kCanonicalFrameRateTolerance = 0.0005L;
 constexpr long double kMaterialGridResidualImprovementFrames = 0.0001L;
+constexpr long double kMaximumTimestampPhaseResidualFrames = 0.05L;
 constexpr std::array<std::pair<std::uint32_t, std::uint32_t>, 17> kCanonicalFrameRates{{
     {24'000, 1'001},
     {24, 1},
@@ -142,13 +143,58 @@ std::wstring utf8_to_wide(std::string_view value) {
   }
   return result;
 }
+
+std::wstring resolve_windows_library_path(const std::wstring& requested) {
+  const std::filesystem::path requested_path(requested);
+  if (requested_path.is_absolute()) {
+    return requested_path.lexically_normal().native();
+  }
+  if (requested_path.has_parent_path()) {
+    std::error_code error;
+    const auto absolute = std::filesystem::absolute(requested_path, error);
+    return error ? requested : absolute.lexically_normal().native();
+  }
+
+  const auto required = GetEnvironmentVariableW(L"PATH", nullptr, 0);
+  if (required == 0) {
+    return requested;
+  }
+  std::wstring path_value(static_cast<std::size_t>(required), L'\0');
+  const auto written = GetEnvironmentVariableW(L"PATH", path_value.data(), required);
+  if (written == 0 || written >= required) {
+    return requested;
+  }
+  path_value.resize(written);
+  std::size_t offset = 0;
+  while (offset <= path_value.size()) {
+    const auto separator = path_value.find(L';', offset);
+    auto directory = path_value.substr(
+        offset, separator == std::wstring::npos ? std::wstring::npos : separator - offset);
+    if (directory.size() >= 2 && directory.front() == L'"' && directory.back() == L'"') {
+      directory = directory.substr(1, directory.size() - 2);
+    }
+    const std::filesystem::path directory_path(directory);
+    if (!directory.empty() && directory_path.is_absolute()) {
+      const auto candidate = (directory_path / requested_path).lexically_normal();
+      std::error_code error;
+      if (std::filesystem::is_regular_file(candidate, error) && !error) {
+        return candidate.native();
+      }
+    }
+    if (separator == std::wstring::npos) {
+      break;
+    }
+    offset = separator + 1;
+  }
+  return requested;
+}
 #endif
 
 class DynamicLibrary {
 public:
   explicit DynamicLibrary(std::string path) : path_(std::move(path)) {
 #if defined(_WIN32)
-    const auto wide_path = utf8_to_wide(path_);
+    const auto wide_path = resolve_windows_library_path(utf8_to_wide(path_));
     auto flags = LOAD_LIBRARY_SEARCH_DEFAULT_DIRS;
     if (std::filesystem::path(wide_path).is_absolute()) {
       flags |= LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR;
@@ -625,6 +671,21 @@ long double mean_timestamp_grid_residual(
   return total_residual / static_cast<long double>(unique_count - 1);
 }
 
+bool timestamps_fit_rate_phase(
+    const std::array<std::uint64_t, kStoredTimingSamples>& sorted_unique_times,
+    std::size_t unique_count, std::uint32_t numerator, std::uint32_t denominator) {
+  const auto fps = static_cast<long double>(numerator) / denominator;
+  for (std::size_t index = 1; index < unique_count; ++index) {
+    const auto offset_ns = sorted_unique_times[index] - sorted_unique_times[0];
+    const auto frame_position = static_cast<long double>(offset_ns) * fps / kNanosecondsPerSecond;
+    if (std::abs(frame_position - std::round(frame_position)) >
+        kMaximumTimestampPhaseResidualFrames) {
+      return false;
+    }
+  }
+  return true;
+}
+
 std::size_t positional_timestamp_multiplicity(
     const TimingScan& scan,
     const std::array<std::uint64_t, kStoredTimingSamples>& timestamp_group_first_indices,
@@ -906,7 +967,9 @@ std::optional<InferredFrameRate> infer_constant_frame_rate(const TimingScan& sca
           best_grid_residual + kMaterialGridResidualImprovementFrames < canonical_grid_residual;
     }
   }
-  if (noncanonical_rate_has_materially_better_grid_fit) {
+  if (noncanonical_rate_has_materially_better_grid_fit &&
+      timestamps_fit_rate_phase(times, unique_count, reduced_best_numerator,
+                                reduced_best_denominator)) {
     return InferredFrameRate{.numerator = reduced_best_numerator,
                              .denominator = reduced_best_denominator,
                              .timestamp_multiplicity = timestamp_multiplicity,
@@ -914,7 +977,9 @@ std::optional<InferredFrameRate> infer_constant_frame_rate(const TimingScan& sca
                              .finite_span_fps_uncertainty = finite_span_fps_uncertainty,
                              .requires_complete_stream = true};
   }
-  if (canonical_rate_is_close) {
+  if (canonical_rate_is_close &&
+      timestamps_fit_rate_phase(times, unique_count, nearest_canonical_rate->first,
+                                nearest_canonical_rate->second)) {
     return InferredFrameRate{.numerator = nearest_canonical_rate->first,
                              .denominator = nearest_canonical_rate->second,
                              .timestamp_multiplicity = timestamp_multiplicity,
@@ -1100,8 +1165,18 @@ TimingWindowEvidence infer_timing_window(const std::shared_ptr<ProbeApi>& api, v
       (end_ns.has_value() && !covered_end)) {
     return {};
   }
-  auto frame_rate = infer_constant_frame_rate(window_scan, false, true, !require_eos);
+  auto frame_rate = infer_constant_frame_rate(window_scan, require_eos, true, !require_eos);
   if (frame_rate.has_value()) {
+    const auto maximum_start_delay =
+        minimum_duration_for_frame_count(1, frame_rate->numerator, frame_rate->denominator);
+    if (!window_scan.first_stream_time.has_value() ||
+        *window_scan.first_stream_time > add_saturating(start_ns, maximum_start_delay)) {
+      return {.status = window_scan.sample_count >= 3 &&
+                                window_scan.timed_sample_count == window_scan.sample_count
+                            ? TimingWindowStatus::Nonconstant
+                            : TimingWindowStatus::Unavailable,
+              .frame_rate = std::nullopt};
+    }
     return {.status = TimingWindowStatus::Constant, .frame_rate = std::move(frame_rate)};
   }
   return {
@@ -1477,6 +1552,11 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
   }
 
   TimingWindowEvidence tail_timing;
+  bool selected_stream_probe_attempted = false;
+  std::optional<SelectedStreamProbe> correlated_selected_stream;
+  std::uint32_t correlated_fps_numerator = 0;
+  std::uint32_t correlated_fps_denominator = 0;
+  std::size_t correlated_timestamp_multiplicity = 0;
   if (!config.elementary_stream && !timing_scan.reached_eos &&
       queried_container_duration.has_value()) {
     std::optional<std::pair<std::uint32_t, std::uint32_t>> representative_rate;
@@ -1487,6 +1567,33 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
       representative_rate = std::pair(static_cast<std::uint32_t>(fps_numerator),
                                       static_cast<std::uint32_t>(fps_denominator));
     }
+    auto timing_range_start_ns = std::uint64_t{0};
+    auto timing_range_end_ns = *queried_container_duration;
+    if (representative_rate.has_value() && timing_scan.first_stream_time.has_value()) {
+      correlated_fps_numerator = representative_rate->first;
+      correlated_fps_denominator = representative_rate->second;
+      correlated_timestamp_multiplicity =
+          inferred_frame_rate.has_value() &&
+                  frame_rates_are_identical(inferred_frame_rate->numerator,
+                                            inferred_frame_rate->denominator,
+                                            correlated_fps_numerator, correlated_fps_denominator)
+              ? inferred_frame_rate->timestamp_multiplicity
+              : 1U;
+      selected_stream_probe_attempted = true;
+      correlated_selected_stream = selected_stream_duration(
+          api, pipeline, probe_sink, bus, *queried_container_duration,
+          *timing_scan.first_stream_time, correlated_fps_numerator, correlated_fps_denominator,
+          correlated_timestamp_multiplicity, deadline);
+      if (correlated_selected_stream.has_value()) {
+        timing_range_start_ns = *timing_scan.first_stream_time;
+        timing_range_end_ns =
+            add_saturating(timing_range_start_ns, correlated_selected_stream->duration_ns);
+      }
+    }
+    if (timing_range_end_ns <= timing_range_start_ns) {
+      throw GpuVideoProbeError("video parser returned an invalid selected stream timing range");
+    }
+    const auto timing_range_duration_ns = timing_range_end_ns - timing_range_start_ns;
     const auto validate_window = [&](const TimingWindowEvidence& evidence,
                                      std::uint64_t window_start_ns) {
       if (evidence.status != TimingWindowStatus::Constant || !evidence.frame_rate.has_value()) {
@@ -1516,19 +1623,23 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
     constexpr std::array<std::uint64_t, 3> kInteriorWindowQuarterPositions{1, 2, 3};
     constexpr auto kHalfTimingWindowNs = kTailTimingWindowNs / 2U;
     for (const auto quarter : kInteriorWindowQuarterPositions) {
-      const auto center_ns = multiply_divide_floor_saturating(
-          *queried_container_duration, quarter, kInteriorWindowQuarterPositions.size() + 1U);
-      const auto start_ns = center_ns > kHalfTimingWindowNs ? center_ns - kHalfTimingWindowNs : 0;
+      const auto center_ns = add_saturating(
+          timing_range_start_ns,
+          multiply_divide_floor_saturating(timing_range_duration_ns, quarter,
+                                           kInteriorWindowQuarterPositions.size() + 1U));
+      const auto start_ns = center_ns > add_saturating(timing_range_start_ns, kHalfTimingWindowNs)
+                                ? center_ns - kHalfTimingWindowNs
+                                : timing_range_start_ns;
       const auto end_ns =
-          std::min(add_saturating(start_ns, kTailTimingWindowNs), *queried_container_duration);
+          std::min(add_saturating(start_ns, kTailTimingWindowNs), timing_range_end_ns);
       validate_window(
           infer_timing_window(api, pipeline, probe_sink, bus, start_ns, end_ns, false, deadline),
           start_ns);
     }
 
-    const auto tail_start_ns = *queried_container_duration > kTailTimingWindowNs
-                                   ? *queried_container_duration - kTailTimingWindowNs
-                                   : 0;
+    const auto tail_start_ns = timing_range_duration_ns > kTailTimingWindowNs
+                                   ? timing_range_end_ns - kTailTimingWindowNs
+                                   : timing_range_start_ns;
     tail_timing = infer_timing_window(api, pipeline, probe_sink, bus, tail_start_ns, std::nullopt,
                                       true, deadline);
     validate_window(tail_timing, tail_start_ns);
@@ -1626,9 +1737,14 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
                                         : *queried_container_duration;
     if (!config.elementary_stream && !duration_is_estimated &&
         timing_scan.first_stream_time.has_value()) {
-      const auto selected_duration = selected_stream_duration(
-          api, pipeline, probe_sink, bus, duration_ns, *timing_scan.first_stream_time, fps_num,
-          fps_den, timestamp_multiplicity, deadline);
+      const auto selected_duration =
+          selected_stream_probe_attempted && correlated_fps_numerator == fps_num &&
+                  correlated_fps_denominator == fps_den &&
+                  correlated_timestamp_multiplicity == timestamp_multiplicity
+              ? correlated_selected_stream
+              : selected_stream_duration(api, pipeline, probe_sink, bus, duration_ns,
+                                         *timing_scan.first_stream_time, fps_num, fps_den,
+                                         timestamp_multiplicity, deadline);
       if (selected_duration.has_value()) {
         const auto untimed_prefix =
             infer_untimed_presentation_prefix(timing_scan, fps_num, fps_den);
