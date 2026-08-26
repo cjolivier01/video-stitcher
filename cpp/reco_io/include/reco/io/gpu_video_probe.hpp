@@ -27,7 +27,8 @@ struct GpuVideoProbe {
   /// EOS-proven compressed access-unit count when available, otherwise a
   /// bounded duration/timestamp estimate.
   std::uint64_t total_frames = 0;
-  /// Whether `duration_ns` is a fallback or an uncorrelated container estimate.
+  /// Whether `duration_ns` uses fallback, inferred terminal timing, or bounded
+  /// correlation rather than an EOS-proven final AU duration.
   bool duration_is_estimated = false;
   /// Whether `total_frames` comes from bounded duration/timestamp correlation
   /// instead of an EOS-proven compressed access-unit count.

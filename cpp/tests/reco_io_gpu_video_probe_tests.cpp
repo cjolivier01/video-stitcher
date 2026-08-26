@@ -290,6 +290,16 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_true(untimed_elementary.duration_is_estimated,
               "timing-less elementary duration remains explicitly estimated");
 
+  set_scenario("probe-long-untimed-elementary");
+  const auto long_untimed_elementary =
+      probe_gpu_video(elementary_config(video_path, GpuDecodeCodec::H264), timeout_ns);
+  expect_true(long_untimed_elementary.total_frames >= 513ULL,
+              "long elementary estimate preserves the observed AU lower bound");
+  expect_true(long_untimed_elementary.total_frames_is_estimated,
+              "long elementary AU count is explicitly estimated");
+  expect_true(long_untimed_elementary.duration_is_estimated,
+              "untimed elementary duration query is not treated as authoritative");
+
   set_scenario("probe-vfr-unset-fps");
   const auto vfr_fallback = probe_gpu_video(container_config(video_path), timeout_ns);
   expect_eq(vfr_fallback.fps_numerator, 30U, "VFR stream uses explicit fallback frame rate");
@@ -307,6 +317,22 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_eq(late_vfr.total_frames, 270ULL,
             "late VFR transition is counted by access units instead of timestamp slots");
   expect_true(!late_vfr.total_frames_is_estimated, "late VFR EOS scan reports an exact count");
+
+  set_scenario("probe-retimed-constant-pts");
+  const auto retimed_constant = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(retimed_constant.fps_numerator, 30U,
+            "whole-stream constant PTS timing overrides stale plausible caps");
+  expect_eq(retimed_constant.total_frames, 150ULL,
+            "retimed constant stream retains its EOS-proven AU count");
+
+  set_scenario("probe-vfr-missing-durations");
+  const auto missing_durations = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(missing_durations.duration_ns, 6'000'000'000ULL,
+            "missing buffer durations use the observed terminal PTS interval");
+  expect_eq(missing_durations.total_frames, 270ULL,
+            "missing buffer durations do not change the EOS-proven AU count");
+  expect_true(missing_durations.duration_is_estimated,
+              "duration inferred from PTS intervals is explicitly estimated");
 
   set_scenario("probe-dropped-frame-after-prefix");
   const auto dropped_frame = probe_gpu_video(container_config(video_path), timeout_ns);
@@ -353,6 +379,13 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_eq(invalid_caps_fps.fps_denominator, 1U,
             "invalid caps timing inference is reduced exactly");
 
+  set_scenario("probe-estimated-count-lower-bound");
+  const auto lower_bound = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(lower_bound.total_frames, 513ULL,
+            "estimated count cannot fall below observed compressed AUs");
+  expect_true(lower_bound.total_frames_is_estimated,
+              "bounded lower-bound count remains explicitly estimated");
+
   set_scenario("probe-seek-unsupported");
   const auto unseekable = probe_gpu_video(container_config(video_path), timeout_ns);
   expect_eq(unseekable.duration_ns, 10'000'000'000ULL,
@@ -368,6 +401,8 @@ void probe_contracts(const std::filesystem::path& video_path,
             "seek preroll outside the active segment is ignored");
   expect_true(seek_preroll.total_frames_is_estimated,
               "bounded-seek count remains explicitly estimated");
+  expect_true(seek_preroll.duration_is_estimated,
+              "bounded terminal seek duration remains explicitly estimated");
 
   set_scenario("probe-ok");
   expect_eq(probe_gpu_video(container_config(video_path), 1'000'000'000ULL).width, 3840U,

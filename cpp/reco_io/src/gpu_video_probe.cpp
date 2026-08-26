@@ -46,10 +46,11 @@ constexpr std::size_t kTimingAnalysisSamples = 64;
 // The lookahead keeps the analysis prefix presentation-contiguous when the
 // parser scan stops inside an H.264/HEVC picture-reorder group.
 constexpr std::size_t kTimingReorderLookahead = 32;
-constexpr std::size_t kInitialTimingSamples = kTimingAnalysisSamples + kTimingReorderLookahead;
 // Exact AU counting remains bounded for long recordings. Results beyond this
 // prefix are explicitly marked estimated after duration correlation.
 constexpr std::uint64_t kMaximumExactCountSamples = 512;
+constexpr std::size_t kStoredTimingSamples = kMaximumExactCountSamples + 1;
+static_assert(kStoredTimingSamples >= kTimingAnalysisSamples + kTimingReorderLookahead);
 constexpr std::uint32_t kMaximumFrameRateDenominator = 1001;
 constexpr long double kFrameRatePreferenceTolerance = 0.05L;
 
@@ -461,11 +462,12 @@ void* pull_compressed_sample(const std::shared_ptr<ProbeApi>& api, void* probe_s
 }
 
 struct TimingScan {
-  std::array<std::uint64_t, kInitialTimingSamples> stream_times{};
+  std::array<std::uint64_t, kStoredTimingSamples> stream_times{};
   std::uint64_t sample_count = 0;
   std::uint64_t timed_sample_count = 0;
   std::size_t stored_timing_count = 0;
   std::optional<std::uint64_t> first_stream_time;
+  std::optional<std::uint64_t> last_stream_time;
   std::optional<std::uint64_t> final_frame_end;
   std::optional<std::uint64_t> final_frame_duration;
   bool all_durations_known = true;
@@ -500,6 +502,9 @@ void observe_timing_sample(const std::shared_ptr<ProbeApi>& api, void* sample, T
   scan.first_stream_time = scan.first_stream_time.has_value()
                                ? std::min(*scan.first_stream_time, stream_time)
                                : stream_time;
+  scan.last_stream_time = scan.last_stream_time.has_value()
+                              ? std::max(*scan.last_stream_time, stream_time)
+                              : stream_time;
   if (buffer->duration == 0 || buffer->duration == kGstClockTimeNone) {
     scan.all_durations_known = false;
     return;
@@ -514,14 +519,16 @@ void observe_timing_sample(const std::shared_ptr<ProbeApi>& api, void* sample, T
 }
 
 std::optional<std::pair<std::uint32_t, std::uint32_t>>
-infer_constant_frame_rate(const TimingScan& scan) {
+infer_constant_frame_rate(const TimingScan& scan, bool complete_stream) {
   if (scan.stored_timing_count < 3) {
     return std::nullopt;
   }
   auto times = scan.stream_times;
   const auto stored_end = times.begin() + static_cast<std::ptrdiff_t>(scan.stored_timing_count);
   std::sort(times.begin(), stored_end);
-  const auto analysis_count = std::min(scan.stored_timing_count, kTimingAnalysisSamples);
+  const auto analysis_count = complete_stream
+                                  ? scan.stored_timing_count
+                                  : std::min(scan.stored_timing_count, kTimingAnalysisSamples);
   const auto timing_end = times.begin() + static_cast<std::ptrdiff_t>(analysis_count);
   const auto unique_end = std::unique(times.begin(), timing_end);
   const auto unique_count = static_cast<std::size_t>(unique_end - times.begin());
@@ -577,6 +584,27 @@ bool frame_rates_are_close(std::uint32_t first_numerator, std::uint32_t first_de
   const auto first = static_cast<long double>(first_numerator) / first_denominator;
   const auto second = static_cast<long double>(second_numerator) / second_denominator;
   return std::abs(first - second) <= std::max(first, second) * relative_tolerance;
+}
+
+std::optional<std::uint64_t> observed_eos_duration(const TimingScan& scan,
+                                                   std::uint64_t nominal_frame_duration) {
+  if (scan.timed_sample_count != scan.sample_count || !scan.first_stream_time.has_value() ||
+      !scan.last_stream_time.has_value() || scan.stored_timing_count == 0) {
+    return std::nullopt;
+  }
+  auto times = scan.stream_times;
+  const auto stored_end = times.begin() + static_cast<std::ptrdiff_t>(scan.stored_timing_count);
+  std::sort(times.begin(), stored_end);
+  const auto unique_end = std::unique(times.begin(), stored_end);
+  const auto unique_count = static_cast<std::size_t>(unique_end - times.begin());
+  auto final_duration = nominal_frame_duration;
+  if (unique_count >= 2) {
+    final_duration = times[unique_count - 1] - times[unique_count - 2];
+  }
+  const auto span = *scan.last_stream_time - *scan.first_stream_time;
+  return final_duration > std::numeric_limits<std::uint64_t>::max() - span
+             ? std::numeric_limits<std::uint64_t>::max()
+             : span + final_duration;
 }
 
 struct FrameSeekResult {
@@ -864,10 +892,10 @@ GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config, std::uint64_t t
     }
     observe_timing_sample(api, sample, timing_scan);
   }
-  const auto inferred_frame_rate = infer_constant_frame_rate(timing_scan);
+  const auto inferred_frame_rate = infer_constant_frame_rate(timing_scan, timing_scan.reached_eos);
   const bool prefer_inferred_frame_rate =
       inferred_frame_rate.has_value() &&
-      (!caps_frame_rate_is_plausible ||
+      (timing_scan.reached_eos || !caps_frame_rate_is_plausible ||
        frame_rates_are_close(inferred_frame_rate->first, inferred_frame_rate->second,
                              static_cast<std::uint32_t>(fps_numerator),
                              static_cast<std::uint32_t>(fps_denominator),
@@ -895,14 +923,15 @@ GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config, std::uint64_t t
   bool total_frames_is_estimated = false;
   if (timing_scan.reached_eos) {
     total_frames = timing_scan.sample_count;
-    const bool complete_timing = timing_scan.timed_sample_count == timing_scan.sample_count &&
-                                 timing_scan.first_stream_time.has_value() &&
-                                 timing_scan.final_frame_end.has_value();
-    if (complete_timing && timing_scan.all_durations_known &&
+    const bool complete_timestamps = timing_scan.timed_sample_count == timing_scan.sample_count &&
+                                     timing_scan.first_stream_time.has_value() &&
+                                     timing_scan.last_stream_time.has_value();
+    const auto nominal_frame_duration =
+        std::max<std::uint64_t>(kNanosecondsPerSecond * fps_den / fps_num, 1);
+    if (complete_timestamps && timing_scan.all_durations_known &&
+        timing_scan.final_frame_end.has_value() &&
         *timing_scan.final_frame_end >= *timing_scan.first_stream_time) {
       duration_ns = *timing_scan.final_frame_end - *timing_scan.first_stream_time;
-      const auto nominal_frame_duration =
-          std::max<std::uint64_t>(kNanosecondsPerSecond * fps_den / fps_num, 1);
       const auto minimum_boundary_duration =
           minimum_duration_for_frame_count(total_frames, fps_num, fps_den);
       if (timing_scan.final_frame_duration.has_value() &&
@@ -911,6 +940,10 @@ GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config, std::uint64_t t
           minimum_boundary_duration - duration_ns <= nominal_frame_duration / 2U) {
         duration_ns = minimum_boundary_duration;
       }
+    } else if (complete_timestamps) {
+      duration_ns = observed_eos_duration(timing_scan, nominal_frame_duration)
+                        .value_or(minimum_duration_for_frame_count(total_frames, fps_num, fps_den));
+      duration_is_estimated = true;
     } else {
       duration_ns = minimum_duration_for_frame_count(total_frames, fps_num, fps_den);
       duration_is_estimated = true;
@@ -931,14 +964,19 @@ GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config, std::uint64_t t
       if (selected_duration.has_value()) {
         duration_ns = selected_duration->duration_ns;
         correlated_frame_count = selected_duration->frame_count;
+        duration_is_estimated = true;
       } else {
         duration_is_estimated = true;
       }
     } else if (!config.elementary_stream && !timing_scan.first_stream_time.has_value()) {
       duration_is_estimated = true;
+    } else if (config.elementary_stream &&
+               timing_scan.timed_sample_count != timing_scan.sample_count) {
+      duration_is_estimated = true;
     }
     total_frames =
         correlated_frame_count.value_or(frame_count_for_duration(duration_ns, fps_num, fps_den));
+    total_frames = std::max(total_frames, timing_scan.sample_count);
   }
   return {.width = static_cast<std::uint32_t>(width),
           .height = static_cast<std::uint32_t>(height),

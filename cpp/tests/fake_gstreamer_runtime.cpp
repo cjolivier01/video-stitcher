@@ -220,6 +220,16 @@ FakeCaps parser_sample_caps() {
   } else if (scenario() == "probe-reduced-cadence-after-prefix") {
     caps.fps_numerator = 45;
     caps.fps_denominator = 2;
+  } else if (scenario() == "probe-estimated-count-lower-bound" ||
+             scenario() == "probe-long-untimed-elementary") {
+    caps.fps_numerator = 1;
+    caps.fps_denominator = 1;
+  } else if (scenario() == "probe-retimed-constant-pts") {
+    caps.fps_numerator = 15;
+    caps.fps_denominator = 1;
+  } else if (scenario() == "probe-vfr-missing-durations") {
+    caps.fps_numerator = 45;
+    caps.fps_denominator = 1;
   } else if (scenario() == "probe-caps-runahead") {
     caps.width = 854;
     caps.height = 480;
@@ -241,7 +251,7 @@ std::uint64_t parser_timing_offset(std::uint64_t frame_index, const FakeCaps& ca
   if (scenario() == "probe-vfr-unset-fps") {
     return (frame_index / 2U) * 70'000'000ULL + (frame_index % 2U) * 30'000'000ULL;
   }
-  if (scenario() == "probe-vfr-late-transition") {
+  if (scenario() == "probe-vfr-late-transition" || scenario() == "probe-vfr-missing-durations") {
     return frame_index <= 90U ? frame_index * 1'000'000'000ULL / 30U
                               : 3'000'000'000ULL + (frame_index - 90U) * 1'000'000'000ULL / 60U;
   }
@@ -601,8 +611,21 @@ RECO_FAKE_EXPORT int gst_element_query_duration(void*, int format, std::int64_t*
   }
   if (scenario() == "probe-vfr-late-transition" ||
       scenario() == "probe-dropped-frame-after-prefix" ||
-      scenario() == "probe-reduced-cadence-after-prefix") {
+      scenario() == "probe-reduced-cadence-after-prefix" ||
+      scenario() == "probe-vfr-missing-durations") {
     *duration = 6'000'000'000;
+    return 1;
+  }
+  if (scenario() == "probe-estimated-count-lower-bound") {
+    *duration = 10'000'000'000;
+    return 1;
+  }
+  if (scenario() == "probe-retimed-constant-pts") {
+    *duration = 5'000'000'000;
+    return 1;
+  }
+  if (scenario() == "probe-long-untimed-elementary") {
+    *duration = 575'935'624'115;
     return 1;
   }
   *duration = 10'000'000'000LL;
@@ -767,6 +790,12 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
                current_scenario == "probe-bframe-cutoff") {
       timing_caps.fps_numerator = 30;
       timing_caps.fps_denominator = 1;
+    } else if (current_scenario == "probe-estimated-count-lower-bound") {
+      timing_caps.fps_numerator = 60;
+      timing_caps.fps_denominator = 1;
+    } else if (current_scenario == "probe-retimed-constant-pts") {
+      timing_caps.fps_numerator = 30;
+      timing_caps.fps_denominator = 1;
     }
     const std::uint64_t selected_stream_start_ns =
         current_scenario == "probe-delayed-stream"   ? 4'000'000'000ULL
@@ -791,6 +820,10 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
         : current_scenario == "probe-vfr-late-transition"          ? 6'000'000'000ULL
         : current_scenario == "probe-dropped-frame-after-prefix"   ? 6'000'000'000ULL
         : current_scenario == "probe-reduced-cadence-after-prefix" ? 6'000'000'000ULL
+        : current_scenario == "probe-vfr-missing-durations"        ? 6'000'000'000ULL
+        : current_scenario == "probe-estimated-count-lower-bound"  ? 10'000'000'000ULL
+        : current_scenario == "probe-retimed-constant-pts"         ? 5'000'000'000ULL
+        : current_scenario == "probe-long-untimed-elementary"      ? 600'000'000'000ULL
         : current_scenario == "probe-bframe-cutoff"                ? 4'000'000'000ULL
         : current_scenario == "probe-quantized-timestamps"         ? 4'170'833'333ULL
         : current_scenario == "probe-exact-frame-count"            ? 100'100'000ULL
@@ -860,6 +893,9 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     sample->buffer.duration =
         remaining_ns > frame_duration_ns && remaining_ns - frame_duration_ns > 1 ? frame_duration_ns
                                                                                  : remaining_ns;
+    if (current_scenario == "probe-vfr-missing-durations") {
+      sample->buffer.duration = std::numeric_limits<std::uint64_t>::max();
+    }
     return sample;
   }
   record("pull");
