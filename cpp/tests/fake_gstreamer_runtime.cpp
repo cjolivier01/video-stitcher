@@ -205,7 +205,8 @@ FakeSample* make_sample(std::uint32_t sample_index = 0) {
 }
 
 std::uint32_t predecoder_width(std::uint32_t sample_index) {
-  if (scenario() == "visible-crop" || scenario() == "caps-runahead-stale-caps") {
+  if (scenario() == "visible-crop" || scenario() == "caps-runahead-stale-caps" ||
+      scenario() == "drop-stale-caps-first") {
     return 854;
   }
   if (scenario() == "oversized-caps") {
@@ -219,7 +220,7 @@ std::uint32_t predecoder_width(std::uint32_t sample_index) {
 }
 
 std::uint32_t predecoder_height() {
-  if (scenario() == "caps-runahead-stale-caps") {
+  if (scenario() == "caps-runahead-stale-caps" || scenario() == "drop-stale-caps-first") {
     return 480;
   }
   return 720;
@@ -383,6 +384,15 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
   auto* sink = static_cast<FakeSink*>(sink_pointer);
   const auto current = sink->pull_count++;
   const auto current_scenario = scenario();
+  if (current_scenario == "drop-runahead" && current == 0) {
+    auto* sample = make_sample(current);
+    for (std::uint64_t index = 0; index < 5'000; ++index) {
+      GstBufferAbi dropped_buffer;
+      dropped_buffer.pts = index * 33'333'333ULL;
+      push_predecoder_buffer(sink->pipeline->display_pad, dropped_buffer, 1280, 720);
+    }
+    return sample;
+  }
   const bool caps_runahead = current_scenario == "caps-runahead" ||
                              current_scenario == "caps-runahead-unknown-time" ||
                              current_scenario == "caps-runahead-stale-caps";
@@ -404,7 +414,8 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
        current_scenario == "missing-buffer" || current_scenario == "map-error" ||
        current_scenario == "invalid-surface" || current_scenario == "visible-crop" ||
        current_scenario == "missing-caps" || current_scenario == "missing-caps-structure" ||
-       current_scenario == "invalid-caps" || current_scenario == "oversized-caps") &&
+       current_scenario == "invalid-caps" || current_scenario == "oversized-caps" ||
+       current_scenario == "drop-stale-caps-first") &&
       current == 0) {
     auto* sample = make_sample(current);
     push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, predecoder_width(current),

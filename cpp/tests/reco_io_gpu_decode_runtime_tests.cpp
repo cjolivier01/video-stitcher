@@ -242,9 +242,34 @@ void stale_parser_caps_reject_allocation_changes() {
   expect_eq(first.frame->visible_width, 854U, "stale-caps initial visible width");
   expect_eq(first.frame->visible_height, 480U, "stale-caps initial visible height");
 
-  expect_gpu_decode_error([&] { (void)source->read(); },
-                          "allocation dimensions changed without a confirmed visible geometry",
+  expect_gpu_decode_error([&] { (void)source->read(); }, "visible geometry",
                           "stale parser caps cannot silently crop a resized NVMM frame");
+}
+
+void dropped_samples_do_not_accumulate_geometry_records() {
+  set_scenario("drop-runahead");
+  auto config = valid_config();
+  config.drop = true;
+  auto source =
+      open_gstreamer_gpu_file_decode_source(std::move(config), NvbufSurfaceAbi::DeepStream9_1);
+
+  const auto result = source->read();
+  expect_true(result.frame.has_value(), "drop-runahead frame returned after 5000 discarded inputs");
+  if (result.frame.has_value()) {
+    expect_eq(result.frame->visible_width, 1280U,
+              "drop-runahead static geometry remains correlated");
+  }
+}
+
+void first_frame_rejects_grossly_stale_geometry() {
+  set_scenario("drop-stale-caps-first");
+  auto config = valid_config();
+  config.drop = true;
+  auto source =
+      open_gstreamer_gpu_file_decode_source(std::move(config), NvbufSurfaceAbi::DeepStream9_1);
+  expect_gpu_decode_error([&] { (void)source->read(); },
+                          "allocation dimensions are inconsistent with visible geometry",
+                          "first retained frame cannot use grossly stale parser caps");
 }
 
 void unknown_timestamps_are_not_fabricated() {
@@ -390,6 +415,8 @@ int main() {
   padded_sink_caps_preserve_predecoder_dimensions();
   runahead_caps_are_correlated_by_timestamp();
   stale_parser_caps_reject_allocation_changes();
+  dropped_samples_do_not_accumulate_geometry_records();
+  first_frame_rejects_grossly_stale_geometry();
   unknown_timestamps_are_not_fabricated();
   concurrent_reads_serialize_appsink_access();
   fatal_pipeline_errors_are_latched();
