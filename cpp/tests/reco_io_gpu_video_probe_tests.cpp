@@ -532,6 +532,17 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_true(unknown_pts_preroll.duration_is_estimated,
               "PTS-less seek-preroll duration remains explicitly estimated");
 
+  set_scenario("probe-seek-untimestamped-tail");
+  const auto untimestamped_tail = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(untimestamped_tail.duration_ns, 20'000'000'000ULL,
+            "untimestamped seek tail falls back to the selected-stream duration");
+  expect_eq(untimestamped_tail.total_frames, 600ULL,
+            "untimestamped seek tail estimates frame count from validated caps");
+  expect_true(untimestamped_tail.total_frames_is_estimated,
+              "untimestamped seek-tail count remains explicitly estimated");
+  expect_true(untimestamped_tail.duration_is_estimated,
+              "untimestamped seek-tail duration remains explicitly estimated");
+
   set_scenario("probe-ok");
   expect_eq(probe_gpu_video(container_config(video_path), 1'000'000'000ULL).width, 3840U,
             "one-second timeout boundary accepted");

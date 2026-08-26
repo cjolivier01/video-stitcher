@@ -802,13 +802,14 @@ FrameSeekResult seek_compressed_frame(const std::shared_ptr<ProbeApi>& api, void
   }
 
   const auto nominal_duration_ns = std::max<std::uint64_t>(period_numerator / fps_numerator, 1);
+  bool saw_untimestamped_sample = false;
   while (true) {
     void* sample =
         pull_compressed_sample(api, probe_sink, bus, deadline,
                                "GStreamer parser-only probe timed out while seeking stream end");
     std::unique_ptr<void, ProbeApi::SampleUnref> sample_owner(sample, api->sample_unref);
     if (sample == nullptr) {
-      return {.usable = true, .available = false};
+      return {.usable = !saw_untimestamped_sample, .available = false};
     }
 
     const auto* buffer = static_cast<const GstBufferAbi*>(api->sample_get_buffer(sample));
@@ -818,6 +819,7 @@ FrameSeekResult seek_compressed_frame(const std::shared_ptr<ProbeApi>& api, void
     const bool has_presentation_time = buffer->pts != kGstClockTimeNone;
     const auto timestamp = has_presentation_time ? buffer->pts : buffer->dts;
     if (timestamp == kGstClockTimeNone) {
+      saw_untimestamped_sample = true;
       continue;
     }
     const void* segment = api->sample_get_segment(sample);

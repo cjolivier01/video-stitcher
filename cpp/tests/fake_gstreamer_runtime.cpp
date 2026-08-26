@@ -199,7 +199,8 @@ FakeCaps parser_sample_caps() {
              scenario() == "probe-mixed-prefix-pts" ||
              scenario() == "probe-long-mixed-prefix-pts" ||
              scenario() == "probe-reordered-untimed-prefix" ||
-             scenario() == "probe-one-frame-rounding") {
+             scenario() == "probe-one-frame-rounding" ||
+             scenario() == "probe-seek-untimestamped-tail") {
     caps.fps_numerator = 30;
     caps.fps_denominator = 1;
   } else if (scenario() == "probe-inexact-caps-fps") {
@@ -647,6 +648,10 @@ RECO_FAKE_EXPORT int gst_element_query_duration(void*, int format, std::int64_t*
     *duration = 0;
     return 1;
   }
+  if (scenario() == "probe-seek-untimestamped-tail") {
+    *duration = 20'000'000'000;
+    return 1;
+  }
   if (scenario() == "probe-exact-frame-count") {
     *duration = 100'100'000;
     return 1;
@@ -942,6 +947,7 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
         : current_scenario == "probe-exact-5997-fps"                        ? 4'000'000'000ULL
         : current_scenario == "probe-quantized-no-vui-5994"                 ? 4'004'000'000ULL
         : current_scenario == "probe-bframe-cutoff"                         ? 4'000'000'000ULL
+        : current_scenario == "probe-seek-untimestamped-tail"               ? 20'000'000'000ULL
         : current_scenario == "probe-quantized-timestamps"                  ? 4'170'833'333ULL
         : current_scenario == "probe-exact-frame-count"                     ? 100'100'000ULL
         : current_scenario == "probe-integral-frame-count"                  ? 1'001'000'000'000ULL
@@ -980,8 +986,11 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     sample->segment_stream_origin_ns = selected_stream_start_ns;
     sample->segment_outside = current_scenario == "probe-seek-preroll" &&
                               sink->pipeline->has_seek && seek_pull_index == 0;
-    if (current_scenario == "probe-seek-unknown-pts-preroll" && sink->pipeline->has_seek &&
-        seek_pull_index == 0) {
+    if (current_scenario == "probe-seek-untimestamped-tail" && sink->pipeline->has_seek) {
+      sample->buffer.pts = std::numeric_limits<std::uint64_t>::max();
+      sample->buffer.dts = std::numeric_limits<std::uint64_t>::max();
+    } else if (current_scenario == "probe-seek-unknown-pts-preroll" && sink->pipeline->has_seek &&
+               seek_pull_index == 0) {
       sample->buffer.pts = std::numeric_limits<std::uint64_t>::max();
     } else if (current_scenario == "probe-duplicate-pts-transition-untimed-tail" &&
                !sink->pipeline->has_seek && sequential_index >= 450U) {
