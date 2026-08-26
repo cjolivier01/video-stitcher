@@ -87,6 +87,22 @@ cc_test(
     ],
 )
 
+cc_binary(
+    name = "libfake_gstreamer_runtime.so",
+    testonly = True,
+    srcs = ["fake_gstreamer_runtime.cpp"],
+    linkshared = True,
+    deps = ["//cpp/reco_io"],
+)
+
+cc_test(
+    name = "reco_io_gpu_decode_runtime_tests",
+    size = "small",
+    srcs = ["reco_io_gpu_decode_runtime_tests.cpp"],
+    data = [":libfake_gstreamer_runtime.so"],
+    deps = ["//cpp/reco_io"],
+)
+
 cc_test(
     name = "reco_io_nvmm_tests",
     size = "small",

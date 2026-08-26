@@ -311,8 +311,9 @@ void command_execution_dispatches_available_stages() {
               "blocked stitch writes runtime plan");
   expect_true(out.str().find("nvv4l2decoder") != std::string::npos,
               "blocked stitch describes GPU decode contract");
-  expect_true(out.str().find("qtdemux ! parsebin ! nvv4l2decoder") != std::string::npos,
-              "blocked stitch uses parser auto-detection for containers");
+  expect_true(out.str().find("qtdemux ! capsfilter caps=\"video/x-h264;video/x-h265\" ! "
+                             "parsebin ! nvv4l2decoder") != std::string::npos,
+              "blocked stitch selects a supported video pad for containers");
   expect_true(out.str().find("video/x-raw(memory:NVMM),format=NV12") != std::string::npos,
               "blocked stitch preserves NVMM decode caps");
   expect_true(err.str().find("error:") != std::string::npos, "blocked stitch writes stderr");

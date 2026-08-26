@@ -5,8 +5,10 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace reco::io {
 
@@ -23,6 +25,8 @@ enum class GpuDecodeContainer {
 
 struct GpuFileDecodeConfig {
   std::string path;
+  // Elementary streams require an explicit parser. Supported containers
+  // select H264 or HEVC from their video pad at runtime.
   GpuDecodeCodec codec = GpuDecodeCodec::H264;
   bool elementary_stream = false;
   std::optional<GpuDecodeContainer> container;
@@ -39,8 +43,8 @@ struct GpuDecodedFrame {
   NvmmFrameInfo nvmm;
   std::shared_ptr<void> owner;
   std::uint64_t frame_index = 0;
-  std::int64_t pts_ns = 0;
-  std::int64_t duration_ns = 0;
+  std::optional<std::uint64_t> pts_ns;
+  std::optional<std::uint64_t> duration_ns;
 };
 
 struct GpuDecodeReadResult {
@@ -58,6 +62,12 @@ public:
   [[nodiscard]] virtual GpuDecodeReadResult read() = 0;
 };
 
+/// Failure while loading or consuming a GPU-resident GStreamer decode stream.
+class GpuDecodeError : public std::runtime_error {
+public:
+  explicit GpuDecodeError(std::string message) : std::runtime_error(std::move(message)) {}
+};
+
 [[nodiscard]] std::string_view gpu_decode_codec_name(GpuDecodeCodec codec);
 [[nodiscard]] std::string_view gpu_decode_container_demuxer(GpuDecodeContainer container);
 [[nodiscard]] GpuDecodeCodec gpu_decode_codec_for_path(std::string_view path);
@@ -72,5 +82,8 @@ validate_gpu_file_decode_config(const GpuFileDecodeConfig& config);
 build_gstreamer_gpu_file_decode_pipeline(const GpuFileDecodeConfig& config);
 [[nodiscard]] GpuDecodeReadResult make_gpu_decode_eos();
 [[nodiscard]] GpuDecodeReadResult make_gpu_decode_frame(GpuDecodedFrame frame);
+/// Opens an NVDEC/NVMM appsink source using the selected DeepStream surface ABI.
+[[nodiscard]] std::unique_ptr<GpuFileDecodeSource>
+open_gstreamer_gpu_file_decode_source(GpuFileDecodeConfig config, NvbufSurfaceAbi abi);
 
 } // namespace reco::io

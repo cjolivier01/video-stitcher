@@ -151,13 +151,16 @@ void gpu_file_decode_pipeline_preserves_nvmm() {
               "MP4 extension selects qtdemux");
   expect_true(gpu_decode_container_for_path("clip.mkv") == GpuDecodeContainer::Matroska,
               "MKV extension selects matroskademux");
+  expect_true(!gpu_decode_container_for_path("clip.webm").has_value(),
+              "unsupported VP8/VP9 WebM container is rejected");
   expect_true(gpu_decode_container_for_path("clip.ts") == GpuDecodeContainer::MpegTs,
               "transport stream extension selects tsdemux");
   const auto pipeline = build_gstreamer_gpu_file_decode_pipeline(config);
   expect_true(pipeline.find("filesrc location=\"/data/left video.mp4\"") != std::string::npos,
               "GPU file source is quoted");
-  expect_true(pipeline.find("qtdemux ! parsebin ! nvv4l2decoder") != std::string::npos,
-              "containerized hardware decode selected");
+  expect_true(pipeline.find("qtdemux ! capsfilter caps=\"video/x-h264;video/x-h265\" ! "
+                            "parsebin ! nvv4l2decoder") != std::string::npos,
+              "containerized H264/HEVC video pad and hardware decode selected");
   expect_true(pipeline.find("nvvideoconvert compute-hw=1 bl-output=false "
                             "disable-passthrough=true") != std::string::npos,
               "GPU decode converts block-linear output to pitch-linear NVMM");
@@ -176,11 +179,22 @@ void gpu_file_decode_pipeline_preserves_nvmm() {
   expect_true(hevc.find("qtdemux") == std::string::npos, "raw HEVC bypasses qtdemux");
 
   config.path = "/data/match.mkv";
+  config.codec = GpuDecodeCodec::H264;
   config.elementary_stream = gpu_decode_path_is_elementary_stream(config.path);
   config.container = gpu_decode_container_for_path(config.path);
   const auto matroska = build_gstreamer_gpu_file_decode_pipeline(config);
-  expect_true(matroska.find("matroskademux ! parsebin ! nvv4l2decoder") != std::string::npos,
-              "Matroska hardware decode selected");
+  expect_true(matroska.find("matroskademux ! capsfilter "
+                            "caps=\"video/x-h264;video/x-h265\" ! parsebin ! "
+                            "nvv4l2decoder") != std::string::npos,
+              "Matroska H264/HEVC video pad and hardware decode selected");
+
+  config.path = "/data/left-hevc.mp4";
+  config.codec = GpuDecodeCodec::Hevc;
+  config.container = GpuDecodeContainer::QuickTime;
+  const auto hevc_mp4 = build_gstreamer_gpu_file_decode_pipeline(config);
+  expect_true(hevc_mp4.find("qtdemux ! capsfilter caps=\"video/x-h264;video/x-h265\" ! "
+                            "parsebin ! nvv4l2decoder") != std::string::npos,
+              "containerized HEVC uses automatic video parser selection");
 
   config.path = "/data/left \"quoted\" video.mp4";
   config.elementary_stream = gpu_decode_path_is_elementary_stream(config.path);

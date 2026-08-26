@@ -4,6 +4,7 @@ cc_library(
     name = "reco_io",
     srcs = [
         "src/gstreamer.cpp",
+        "src/gstreamer_gpu_decode.cpp",
         "src/gpu_decode.cpp",
         "src/jsonl_sink.cpp",
         "src/nvmm.cpp",

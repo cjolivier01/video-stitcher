@@ -93,7 +93,7 @@ std::optional<GpuDecodeContainer> gpu_decode_container_for_path(std::string_view
   if (ext == ".mp4" || ext == ".mov" || ext == ".m4v") {
     return GpuDecodeContainer::QuickTime;
   }
-  if (ext == ".mkv" || ext == ".webm") {
+  if (ext == ".mkv") {
     return GpuDecodeContainer::Matroska;
   }
   if (ext == ".ts" || ext == ".mts" || ext == ".m2ts") {
@@ -125,9 +125,6 @@ std::optional<std::string> validate_gpu_decoded_frame(const GpuDecodedFrame& fra
   if (const auto error = validate_nvmm_frame_info(frame.nvmm); error.has_value()) {
     return "GPU decoded frame is invalid: " + *error;
   }
-  if (frame.duration_ns < 0) {
-    return "GPU decoded frame duration must be non-negative";
-  }
   return std::nullopt;
 }
 
@@ -147,7 +144,8 @@ std::string build_gstreamer_gpu_file_decode_pipeline(const GpuFileDecodeConfig& 
   if (config.elementary_stream) {
     pipeline << parser_for_codec(config.codec);
   } else {
-    pipeline << gpu_decode_container_demuxer(*config.container) << " ! parsebin";
+    pipeline << gpu_decode_container_demuxer(*config.container)
+             << " ! capsfilter caps=\"video/x-h264;video/x-h265\" ! parsebin";
   }
   pipeline << " ! nvv4l2decoder"
            << " ! nvvideoconvert compute-hw=1 bl-output=false disable-passthrough=true"
