@@ -125,9 +125,6 @@ std::optional<std::string> validate_gpu_decoded_frame(const GpuDecodedFrame& fra
   if (const auto error = validate_nvmm_frame_info(frame.nvmm); error.has_value()) {
     return "GPU decoded frame is invalid: " + *error;
   }
-  if (frame.duration_ns < 0) {
-    return "GPU decoded frame duration must be non-negative";
-  }
   return std::nullopt;
 }
 
