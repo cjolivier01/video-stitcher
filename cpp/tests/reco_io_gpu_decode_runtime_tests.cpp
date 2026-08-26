@@ -220,6 +220,43 @@ void concurrent_reads_serialize_appsink_access() {
   expect_eq(count_event(events, "pull"), 2U, "concurrent reads serialize appsink pulls");
 }
 
+void fatal_pipeline_errors_are_latched() {
+  set_scenario("stream-error");
+  const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
+  std::filesystem::remove(event_path);
+  auto source =
+      open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+
+  std::atomic<std::uint32_t> expected_errors{0};
+  std::atomic<std::uint32_t> unexpected_results{0};
+  std::vector<std::thread> readers;
+  readers.reserve(16);
+  for (std::uint32_t index = 0; index < 16; ++index) {
+    readers.emplace_back([&] {
+      try {
+        (void)source->read();
+        ++unexpected_results;
+      } catch (const GpuDecodeError& error) {
+        if (std::string_view(error.what()).find("fake decoder failure") != std::string_view::npos) {
+          ++expected_errors;
+        } else {
+          ++unexpected_results;
+        }
+      } catch (...) {
+        ++unexpected_results;
+      }
+    });
+  }
+  for (auto& reader : readers) {
+    reader.join();
+  }
+
+  expect_eq(expected_errors.load(), 16U, "all concurrent readers receive the fatal bus error");
+  expect_eq(unexpected_results.load(), 0U, "fatal bus errors return deterministic results");
+  const auto events = read_events(event_path);
+  expect_eq(count_event(events, "pull"), 1U, "latched bus error prevents later appsink pulls");
+}
+
 void runtime_failures_are_reported() {
   for (const auto& [scenario_name, fragment] :
        std::array<std::pair<std::string_view, std::string_view>, 6>{
@@ -268,6 +305,7 @@ int main() {
   production_source_retains_mapped_sample();
   unknown_timestamps_are_not_fabricated();
   concurrent_reads_serialize_appsink_access();
+  fatal_pipeline_errors_are_latched();
   runtime_failures_are_reported();
   std::filesystem::remove(event_path);
 #endif

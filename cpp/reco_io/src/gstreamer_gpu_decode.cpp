@@ -354,6 +354,9 @@ public:
 
   [[nodiscard]] GpuDecodeReadResult read() override {
     std::lock_guard lock(read_mutex_);
+    if (terminal_error_.has_value()) {
+      throw GpuDecodeError(*terminal_error_);
+    }
     if (ended_) {
       return make_gpu_decode_eos();
     }
@@ -365,7 +368,8 @@ public:
         break;
       }
       if (const auto error = pop_pipeline_error(); !error.empty()) {
-        throw GpuDecodeError(error);
+        terminal_error_ = error;
+        throw GpuDecodeError(*terminal_error_);
       }
       if (api_->app_sink_is_eos(sink_) != 0) {
         ended_ = true;
@@ -452,6 +456,7 @@ private:
   void* bus_ = nullptr;
   std::mutex read_mutex_;
   std::uint64_t next_frame_index_ = 0;
+  std::optional<std::string> terminal_error_;
   bool ended_ = false;
 };
 
