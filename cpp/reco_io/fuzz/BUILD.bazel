@@ -1,9 +1,32 @@
 load("@rules_cc//cc:defs.bzl", "cc_binary")
 
+filegroup(
+    name = "gpu_video_probe_request_cbor_corpus",
+    srcs = [
+        "corpus/request/hostile_deep_nesting.cbor",
+        "corpus/request/hostile_invalid_codec.cbor",
+        "corpus/request/hostile_map_length_overflow.cbor",
+        "corpus/request/hostile_text_path.cbor",
+        "corpus/request/valid_request.cbor",
+    ],
+)
+
+filegroup(
+    name = "gpu_video_probe_response_cbor_corpus",
+    srcs = [
+        "corpus/response/hostile_deep_nesting.cbor",
+        "corpus/response/hostile_impossible_metadata.cbor",
+        "corpus/response/hostile_text_failure_message.cbor",
+        "corpus/response/valid_failure.cbor",
+        "corpus/response/valid_success.cbor",
+    ],
+)
+
 cc_binary(
     name = "gpu_video_probe_request_cbor_fuzz",
     testonly = True,
     srcs = ["gpu_video_probe_request_cbor_fuzz.cpp"],
+    data = [":gpu_video_probe_request_cbor_corpus"],
     deps = ["//cpp/reco_io:reco_io"],
 )
 
@@ -11,5 +34,6 @@ cc_binary(
     name = "gpu_video_probe_response_cbor_fuzz",
     testonly = True,
     srcs = ["gpu_video_probe_response_cbor_fuzz.cpp"],
+    data = [":gpu_video_probe_response_cbor_corpus"],
     deps = ["//cpp/reco_io:reco_io"],
 )

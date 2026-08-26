@@ -59,6 +59,33 @@ jobs:
           //cpp/tests:reco_autocam_policy_tests
           //cpp/tests:reco_io_gpu_video_probe_tests
           //cpp/tests:reco_io_gpu_decode_runtime_tests
+      - name: Fuzz probe CBOR decoders with Clang and ASan
+        run: |
+          mkdir -p "$RUNNER_TEMP/reco-request-corpus" "$RUNNER_TEMP/reco-response-corpus"
+          bazel run \
+            --repo_env=CC=clang \
+            --config=asan \
+            --copt=-fsanitize=fuzzer-no-link \
+            --linkopt=-fsanitize=fuzzer \
+            --copt=-DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION \
+            //cpp/reco_io/fuzz:gpu_video_probe_request_cbor_fuzz -- \
+            "$RUNNER_TEMP/reco-request-corpus" \
+            "$GITHUB_WORKSPACE/cpp/reco_io/fuzz/corpus/request" \
+            -runs=10000 \
+            -max_len=262144 \
+            -timeout=10
+          bazel run \
+            --repo_env=CC=clang \
+            --config=asan \
+            --copt=-fsanitize=fuzzer-no-link \
+            --linkopt=-fsanitize=fuzzer \
+            --copt=-DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION \
+            //cpp/reco_io/fuzz:gpu_video_probe_response_cbor_fuzz -- \
+            "$RUNNER_TEMP/reco-response-corpus" \
+            "$GITHUB_WORKSPACE/cpp/reco_io/fuzz/corpus/response" \
+            -runs=10000 \
+            -max_len=262144 \
+            -timeout=10
       - name: Test C++ port with UBSan
         run: >-
           bazel test --config=ubsan

@@ -1037,18 +1037,25 @@ std::optional<std::uint64_t> sample_presentation_stream_time(const std::shared_p
                                           : std::optional<std::uint64_t>(stream_time);
 }
 
-std::optional<InferredFrameRate>
-infer_tail_frame_rate(const std::shared_ptr<ProbeApi>& api, void* pipeline, void* probe_sink,
-                      void* bus, std::uint64_t container_duration_ns,
-                      std::chrono::steady_clock::time_point deadline) {
+enum class TailTimingStatus { Unavailable, Constant, Nonconstant };
+
+struct TailTimingEvidence {
+  TailTimingStatus status = TailTimingStatus::Unavailable;
+  std::optional<InferredFrameRate> frame_rate;
+};
+
+TailTimingEvidence infer_tail_frame_rate(const std::shared_ptr<ProbeApi>& api, void* pipeline,
+                                         void* probe_sink, void* bus,
+                                         std::uint64_t container_duration_ns,
+                                         std::chrono::steady_clock::time_point deadline) {
   if (container_duration_ns <= kTailTimingWindowNs) {
-    return std::nullopt;
+    return {};
   }
   const auto target_ns = container_duration_ns - kTailTimingWindowNs;
   if (target_ns > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ||
       api->element_seek_simple(pipeline, kGstFormatTime, kGstSeekFlagFlushAccurate,
                                static_cast<std::int64_t>(target_ns)) == 0) {
-    return std::nullopt;
+    return {};
   }
 
   TimingScan tail_scan;
@@ -1066,14 +1073,22 @@ infer_tail_frame_rate(const std::shared_ptr<ProbeApi>& api, void* pipeline, void
     }
     const auto stream_time = sample_presentation_stream_time(api, sample);
     if (!stream_time.has_value()) {
-      return std::nullopt;
+      return {};
     }
     if (*stream_time < target_ns) {
       continue;
     }
     observe_timing_sample(api, sample, tail_scan);
   }
-  return infer_constant_frame_rate(tail_scan, false);
+  auto frame_rate = infer_constant_frame_rate(tail_scan, false);
+  if (frame_rate.has_value()) {
+    return {.status = TailTimingStatus::Constant, .frame_rate = std::move(frame_rate)};
+  }
+  return {
+      .status = tail_scan.sample_count >= kTimingAnalysisSamples ? TailTimingStatus::Nonconstant
+                                                                 : TailTimingStatus::Unavailable,
+      .frame_rate = std::nullopt,
+  };
 }
 
 struct FrameSeekResult {
@@ -1423,18 +1438,35 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
     }
   }
   const auto inferred_frame_rate = infer_constant_frame_rate(timing_scan, timing_scan.reached_eos);
-  const auto tail_frame_rate = inferred_frame_rate.has_value() && !timing_scan.reached_eos &&
-                                       queried_container_duration.has_value()
-                                   ? infer_tail_frame_rate(api, pipeline, probe_sink, bus,
-                                                           *queried_container_duration, deadline)
-                                   : std::nullopt;
+  const auto tail_timing = !timing_scan.reached_eos && queried_container_duration.has_value()
+                               ? infer_tail_frame_rate(api, pipeline, probe_sink, bus,
+                                                       *queried_container_duration, deadline)
+                               : TailTimingEvidence{};
+  if (tail_timing.status == TailTimingStatus::Nonconstant) {
+    throw GpuVideoProbeError(
+        "variable frame-rate video is unsupported for indexed GPU calibration sampling");
+  }
   const bool representative_tail_matches =
-      inferred_frame_rate.has_value() && tail_frame_rate.has_value() &&
+      inferred_frame_rate.has_value() && tail_timing.frame_rate.has_value() &&
       frame_rates_are_close(inferred_frame_rate->numerator, inferred_frame_rate->denominator,
-                            tail_frame_rate->numerator, tail_frame_rate->denominator,
+                            tail_timing.frame_rate->numerator, tail_timing.frame_rate->denominator,
                             kCanonicalFrameRateTolerance);
-  if (inferred_frame_rate.has_value() && tail_frame_rate.has_value() &&
+  if (inferred_frame_rate.has_value() && tail_timing.frame_rate.has_value() &&
       !representative_tail_matches) {
+    throw GpuVideoProbeError(
+        "variable frame-rate video is unsupported for indexed GPU calibration sampling");
+  }
+  const bool tail_matches_caps =
+      tail_timing.frame_rate.has_value() && caps_frame_rate_is_plausible &&
+      frame_rates_are_close(tail_timing.frame_rate->numerator, tail_timing.frame_rate->denominator,
+                            static_cast<std::uint32_t>(fps_numerator),
+                            static_cast<std::uint32_t>(fps_denominator),
+                            kCanonicalFrameRateTolerance);
+  const bool prefix_has_dense_nonconstant_timing =
+      !inferred_frame_rate.has_value() &&
+      timing_scan.timed_sample_count == timing_scan.sample_count &&
+      timing_scan.sample_count >= kTimingAnalysisSamples;
+  if (prefix_has_dense_nonconstant_timing && !tail_matches_caps) {
     throw GpuVideoProbeError(
         "variable frame-rate video is unsupported for indexed GPU calibration sampling");
   }
@@ -1443,10 +1475,15 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
           kMaximumSaneFps) {
     throw GpuVideoProbeError("video parser returned an implausible frame rate");
   }
+  const bool bounded_noncanonical_rate_is_conclusive =
+      inferred_frame_rate.has_value() && inferred_frame_rate->requires_complete_stream &&
+      !timing_scan.reached_eos && !caps_frame_rate_is_plausible &&
+      timing_scan.sample_count > kMaximumConflictingMetadataCountSamples;
   const bool inferred_frame_rate_is_no_worse_than_caps =
       inferred_frame_rate.has_value() &&
       inferred_frame_rate_is_eligible(*inferred_frame_rate, timing_scan.reached_eos,
-                                      representative_tail_matches) &&
+                                      representative_tail_matches ||
+                                          bounded_noncanonical_rate_is_conclusive) &&
       (!caps_frame_rate_is_plausible || timing_scan.reached_eos || representative_tail_matches) &&
       inferred_frame_rate_improves_on_caps(*inferred_frame_rate, caps_frame_rate_is_plausible,
                                            fps_numerator, fps_denominator);

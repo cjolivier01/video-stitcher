@@ -48,6 +48,8 @@ public:
 /// selected stream's duration is correlated with bounded seeks over
 /// compressed access-unit timestamps. The parser scans a bounded AU prefix to
 /// EOS when practical; longer streams expose an explicitly estimated count.
+/// Dense timestamp evidence that proves variable frame rate is rejected
+/// because indexed calibration sampling requires a constant cadence.
 /// `worker_path` must be the absolute path of the deployed
 /// `reco_video_probe_worker` executable.
 /// The worker is isolated so a blocked native multimedia call can be killed

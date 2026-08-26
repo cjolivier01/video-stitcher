@@ -435,6 +435,44 @@ private:
   int value_ = -1;
 };
 
+class PosixSpawnFileActions {
+public:
+  explicit PosixSpawnFileActions(std::string_view description) {
+    const auto result = ::posix_spawn_file_actions_init(&value_);
+    if (result != 0) {
+      throw GpuVideoProbeError("failed to initialize " + std::string(description) + ": " +
+                               std::string(std::strerror(result)));
+    }
+  }
+  PosixSpawnFileActions(const PosixSpawnFileActions&) = delete;
+  PosixSpawnFileActions& operator=(const PosixSpawnFileActions&) = delete;
+  ~PosixSpawnFileActions() { (void)::posix_spawn_file_actions_destroy(&value_); }
+
+  posix_spawn_file_actions_t* get() noexcept { return &value_; }
+
+private:
+  posix_spawn_file_actions_t value_{};
+};
+
+class PosixSpawnAttributes {
+public:
+  explicit PosixSpawnAttributes(std::string_view description) {
+    const auto result = ::posix_spawnattr_init(&value_);
+    if (result != 0) {
+      throw GpuVideoProbeError("failed to initialize " + std::string(description) + ": " +
+                               std::string(std::strerror(result)));
+    }
+  }
+  PosixSpawnAttributes(const PosixSpawnAttributes&) = delete;
+  PosixSpawnAttributes& operator=(const PosixSpawnAttributes&) = delete;
+  ~PosixSpawnAttributes() { (void)::posix_spawnattr_destroy(&value_); }
+
+  posix_spawnattr_t* get() noexcept { return &value_; }
+
+private:
+  posix_spawnattr_t value_{};
+};
+
 class ChildProcess {
 public:
   explicit ChildProcess(pid_t value) : value_(value) {}
@@ -632,47 +670,33 @@ ProcessGroupGuard spawn_process_group_guard(const std::string& executable, pid_t
   UniqueFd parent_control(guard_socket[1]);
   make_nonblocking(parent_control.get());
 
-  posix_spawn_file_actions_t actions;
-  const auto actions_result = posix_spawn_file_actions_init(&actions);
-  if (actions_result != 0) {
-    throw GpuVideoProbeError("failed to initialize video probe guard launch: " +
-                             std::string(std::strerror(actions_result)));
-  }
-  const auto destroy_actions = [&actions] { posix_spawn_file_actions_destroy(&actions); };
-  auto action_error = posix_spawn_file_actions_adddup2(&actions, child_control.get(), STDIN_FILENO);
+  PosixSpawnFileActions actions("video probe guard launch");
+  auto action_error =
+      posix_spawn_file_actions_adddup2(actions.get(), child_control.get(), STDIN_FILENO);
   if (action_error == 0) {
-    action_error = posix_spawn_file_actions_adddup2(&actions, child_control.get(), STDOUT_FILENO);
+    action_error =
+        posix_spawn_file_actions_adddup2(actions.get(), child_control.get(), STDOUT_FILENO);
   }
   for (const int descriptor : {child_control.get(), parent_control.get()}) {
     if (action_error == 0 && descriptor != STDIN_FILENO && descriptor != STDOUT_FILENO) {
-      action_error = posix_spawn_file_actions_addclose(&actions, descriptor);
+      action_error = posix_spawn_file_actions_addclose(actions.get(), descriptor);
     }
   }
   if (action_error != 0) {
-    destroy_actions();
     throw GpuVideoProbeError("failed to configure video probe guard launch: " +
                              std::string(std::strerror(action_error)));
   }
 
-  posix_spawnattr_t attributes;
-  const auto attributes_result = posix_spawnattr_init(&attributes);
-  if (attributes_result != 0) {
-    destroy_actions();
-    throw GpuVideoProbeError("failed to initialize video probe guard attributes: " +
-                             std::string(std::strerror(attributes_result)));
-  }
-  const auto destroy_attributes = [&attributes] { posix_spawnattr_destroy(&attributes); };
+  PosixSpawnAttributes attributes("video probe guard attributes");
   short spawn_flags = POSIX_SPAWN_SETPGROUP;
 #if defined(POSIX_SPAWN_CLOEXEC_DEFAULT)
   spawn_flags = static_cast<short>(spawn_flags | POSIX_SPAWN_CLOEXEC_DEFAULT);
 #endif
-  auto attribute_error = posix_spawnattr_setpgroup(&attributes, process_group);
+  auto attribute_error = posix_spawnattr_setpgroup(attributes.get(), process_group);
   if (attribute_error == 0) {
-    attribute_error = posix_spawnattr_setflags(&attributes, spawn_flags);
+    attribute_error = posix_spawnattr_setflags(attributes.get(), spawn_flags);
   }
   if (attribute_error != 0) {
-    destroy_attributes();
-    destroy_actions();
     throw GpuVideoProbeError("failed to isolate video probe guard process: " +
                              std::string(std::strerror(attribute_error)));
   }
@@ -680,10 +704,8 @@ ProcessGroupGuard spawn_process_group_guard(const std::string& executable, pid_t
   char* const arguments[] = {const_cast<char*>(executable.c_str()),
                              const_cast<char*>("--reco-video-probe-guard"), nullptr};
   pid_t guard_pid = -1;
-  const auto spawn_result =
-      ::posix_spawn(&guard_pid, executable.c_str(), &actions, &attributes, arguments, environ);
-  destroy_attributes();
-  destroy_actions();
+  const auto spawn_result = ::posix_spawn(&guard_pid, executable.c_str(), actions.get(),
+                                          attributes.get(), arguments, environ);
   if (spawn_result != 0) {
     throw GpuVideoProbeError("failed to start video probe guard: " +
                              std::string(std::strerror(spawn_result)));
@@ -722,16 +744,12 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   }
 #endif
 
-  posix_spawn_file_actions_t actions;
-  const auto actions_result = posix_spawn_file_actions_init(&actions);
-  if (actions_result != 0) {
-    throw GpuVideoProbeError("failed to initialize video probe worker launch: " +
-                             std::string(std::strerror(actions_result)));
-  }
-  const auto destroy_actions = [&actions] { posix_spawn_file_actions_destroy(&actions); };
-  auto action_error = posix_spawn_file_actions_adddup2(&actions, child_input.get(), STDIN_FILENO);
+  PosixSpawnFileActions actions("video probe worker launch");
+  auto action_error =
+      posix_spawn_file_actions_adddup2(actions.get(), child_input.get(), STDIN_FILENO);
   if (action_error == 0) {
-    action_error = posix_spawn_file_actions_adddup2(&actions, child_output.get(), STDOUT_FILENO);
+    action_error =
+        posix_spawn_file_actions_adddup2(actions.get(), child_output.get(), STDOUT_FILENO);
   }
   bool closes_all_unrelated_descriptors = false;
 #if defined(__linux__)
@@ -739,7 +757,7 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   const auto add_close_from = reinterpret_cast<AddCloseFrom>(
       ::dlsym(RTLD_DEFAULT, "posix_spawn_file_actions_addclosefrom_np"));
   if (action_error == 0 && add_close_from != nullptr) {
-    action_error = add_close_from(&actions, STDERR_FILENO + 1);
+    action_error = add_close_from(actions.get(), STDERR_FILENO + 1);
     closes_all_unrelated_descriptors = action_error == 0;
   }
 #endif
@@ -747,36 +765,26 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
     for (const int descriptor :
          {child_input.get(), parent_input.get(), parent_output.get(), child_output.get()}) {
       if (action_error == 0 && descriptor != STDIN_FILENO && descriptor != STDOUT_FILENO) {
-        action_error = posix_spawn_file_actions_addclose(&actions, descriptor);
+        action_error = posix_spawn_file_actions_addclose(actions.get(), descriptor);
       }
     }
   }
   if (action_error != 0) {
-    destroy_actions();
     throw GpuVideoProbeError("failed to configure video probe worker launch: " +
                              std::string(std::strerror(action_error)));
   }
 
-  posix_spawnattr_t attributes;
-  const auto attributes_result = posix_spawnattr_init(&attributes);
-  if (attributes_result != 0) {
-    destroy_actions();
-    throw GpuVideoProbeError("failed to initialize video probe worker attributes: " +
-                             std::string(std::strerror(attributes_result)));
-  }
-  const auto destroy_attributes = [&attributes] { posix_spawnattr_destroy(&attributes); };
+  PosixSpawnAttributes attributes("video probe worker attributes");
   short spawn_flags = POSIX_SPAWN_SETPGROUP;
 #if defined(POSIX_SPAWN_CLOEXEC_DEFAULT)
   spawn_flags = static_cast<short>(spawn_flags | POSIX_SPAWN_CLOEXEC_DEFAULT);
   closes_all_unrelated_descriptors = true;
 #endif
-  auto attribute_error = posix_spawnattr_setpgroup(&attributes, 0);
+  auto attribute_error = posix_spawnattr_setpgroup(attributes.get(), 0);
   if (attribute_error == 0) {
-    attribute_error = posix_spawnattr_setflags(&attributes, spawn_flags);
+    attribute_error = posix_spawnattr_setflags(attributes.get(), spawn_flags);
   }
   if (attribute_error != 0) {
-    destroy_attributes();
-    destroy_actions();
     throw GpuVideoProbeError("failed to isolate video probe worker process group: " +
                              std::string(std::strerror(attribute_error)));
   }
@@ -795,9 +803,7 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   }
   require_worker_launch_active_locked(*launch_state, deadline);
   const auto spawn_result =
-      ::posix_spawn(&pid, executable.c_str(), &actions, &attributes, arguments, environ);
-  destroy_attributes();
-  destroy_actions();
+      ::posix_spawn(&pid, executable.c_str(), actions.get(), attributes.get(), arguments, environ);
   if (spawn_result != 0) {
     throw GpuVideoProbeError("failed to start video probe worker: " +
                              std::string(std::strerror(spawn_result)));

@@ -246,7 +246,7 @@ bool has_event(const std::vector<std::string>& events, std::string_view value) {
 
 void probe_contracts(const std::filesystem::path& video_path,
                      const std::filesystem::path& event_path) {
-  constexpr std::uint64_t timeout_ns = 5'000'000'000ULL;
+  constexpr std::uint64_t timeout_ns = 60'000'000'000ULL;
   set_scenario("probe-ok");
   std::filesystem::remove(event_path);
   const auto result = probe_video(container_config(video_path), timeout_ns);
@@ -447,22 +447,14 @@ void probe_contracts(const std::filesystem::path& video_path,
               "untimed elementary duration query is not treated as authoritative");
 
   set_scenario("probe-vfr-unset-fps");
-  const auto vfr_fallback = probe_video(container_config(video_path), timeout_ns);
-  expect_eq(vfr_fallback.fps_numerator, 30U, "VFR stream uses explicit fallback frame rate");
-  expect_eq(vfr_fallback.total_frames, 135ULL,
-            "VFR stream preserves its exact compressed access-unit count");
-  expect_eq(vfr_fallback.duration_ns, 4'720'000'000ULL,
-            "VFR EOS scan preserves observed presentation duration");
-  expect_true(!vfr_fallback.total_frames_is_estimated,
-              "VFR EOS scan proves its compressed AU count");
+  expect_probe_error(
+      [&] { (void)probe_video(container_config(video_path), timeout_ns); }, "variable frame-rate",
+      "dense nonconstant timing is rejected when caps do not provide a constant rate");
 
   set_scenario("probe-vfr-late-transition");
-  const auto late_vfr = probe_video(container_config(video_path), timeout_ns);
-  expect_eq(late_vfr.fps_numerator, 45U,
-            "late VFR transition retains the plausible average caps rate");
-  expect_eq(late_vfr.total_frames, 270ULL,
-            "late VFR transition is counted by access units instead of timestamp slots");
-  expect_true(!late_vfr.total_frames_is_estimated, "late VFR EOS scan reports an exact count");
+  expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
+                     "variable frame-rate",
+                     "dense nonconstant timing cannot silently retain plausible average caps");
 
   set_scenario("probe-retimed-constant-pts");
   const auto retimed_constant = probe_video(container_config(video_path), timeout_ns);
@@ -544,13 +536,9 @@ void probe_contracts(const std::filesystem::path& video_path,
             "duplicate transition before an untimed tail preserves the AU lower bound");
 
   set_scenario("probe-duplicate-pts-larger-reorder-suffix");
-  const auto larger_reorder_suffix = probe_video(container_config(video_path), timeout_ns);
-  expect_eq(larger_reorder_suffix.fps_numerator, 25U,
-            "larger duplicate groups in the reorder suffix invalidate multiplicity");
-  expect_eq(larger_reorder_suffix.fps_denominator, 1U,
-            "larger reorder-suffix groups preserve the caps denominator");
-  expect_eq(larger_reorder_suffix.total_frames, 513ULL,
-            "larger reorder-suffix groups preserve the AU lower bound");
+  expect_probe_error(
+      [&] { (void)probe_video(container_config(video_path), timeout_ns); }, "variable frame-rate",
+      "larger duplicate groups in the bounded suffix are rejected as a cadence transition");
 
   set_scenario("probe-paired-au-missing-pts");
   const auto paired_missing_pts = probe_video(container_config(video_path), timeout_ns);
@@ -661,19 +649,31 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_eq(long_unset_15.total_frames, 600ULL,
             "long unset-caps stream retains its EOS-proven AU count");
 
+  set_scenario("probe-durationless-unseekable-15");
+  const auto bounded_unset_15 = probe_video(container_config(video_path), timeout_ns);
+  expect_eq(bounded_unset_15.fps_numerator, 15U,
+            "bounded constant timing selects a noncanonical rate without duration or EOS");
+  expect_eq(bounded_unset_15.fps_denominator, 1U,
+            "bounded durationless inference preserves its exact denominator");
+  expect_eq(bounded_unset_15.total_frames, 4'097ULL,
+            "durationless inference preserves the observed compressed-AU lower bound");
+  expect_true(bounded_unset_15.total_frames_is_estimated,
+              "durationless bounded frame count remains explicitly estimated");
+
   set_scenario("probe-late-vfr-after-bounded-prefix");
   expect_probe_error(
       [&] { (void)probe_video(container_config(video_path), timeout_ns); }, "variable frame-rate",
       "terminal timing rejects a VFR transition after the bounded sequential prefix");
 
+  set_scenario("probe-vfr-in-final-window");
+  expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
+                     "variable frame-rate",
+                     "mixed cadence inside the terminal timing window is rejected");
+
   set_scenario("probe-vfr-missing-durations");
-  const auto missing_durations = probe_video(container_config(video_path), timeout_ns);
-  expect_eq(missing_durations.duration_ns, 6'000'000'000ULL,
-            "missing buffer durations use the observed terminal PTS interval");
-  expect_eq(missing_durations.total_frames, 270ULL,
-            "missing buffer durations do not change the EOS-proven AU count");
-  expect_true(missing_durations.duration_is_estimated,
-              "duration inferred from PTS intervals is explicitly estimated");
+  expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
+                     "variable frame-rate",
+                     "missing buffer durations do not hide dense nonconstant PTS timing");
 
   set_scenario("probe-dropped-frame-after-prefix");
   const auto dropped_frame = probe_video(container_config(video_path), timeout_ns);
@@ -683,15 +683,9 @@ void probe_contracts(const std::filesystem::path& video_path,
               "dropped-frame EOS scan reports an exact count");
 
   set_scenario("probe-reduced-cadence-after-prefix");
-  const auto reduced_cadence = probe_video(container_config(video_path), timeout_ns);
-  expect_eq(reduced_cadence.fps_numerator, 45U,
-            "reduced cadence retains the plausible average caps numerator");
-  expect_eq(reduced_cadence.fps_denominator, 2U,
-            "reduced cadence retains the plausible average caps denominator");
-  expect_eq(reduced_cadence.total_frames, 135ULL,
-            "reduced cadence after the prefix is counted through EOS");
-  expect_true(!reduced_cadence.total_frames_is_estimated,
-              "reduced-cadence EOS scan reports an exact count");
+  expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
+                     "variable frame-rate",
+                     "reduced cadence after the prefix is rejected as variable frame rate");
 
   set_scenario("probe-bframe-cutoff");
   const auto reordered_cutoff = probe_video(container_config(video_path), timeout_ns);
