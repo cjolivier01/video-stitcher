@@ -778,8 +778,7 @@ std::optional<InferredFrameRate> infer_constant_frame_rate(const TimingScan& sca
   }
   const auto unique_end = std::unique(times.begin(), stored_end);
   const auto stored_unique_count = static_cast<std::size_t>(unique_end - times.begin());
-  const auto unique_count =
-      complete_stream ? stored_unique_count : std::min(stored_unique_count, kTimingAnalysisSamples);
+  const auto unique_count = stored_unique_count;
   if (unique_count < 3 || duplicate_timestamp_multiplicity == 0) {
     return std::nullopt;
   }

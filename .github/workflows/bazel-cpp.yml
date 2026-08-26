@@ -14,10 +14,10 @@ jobs:
         include:
           - os: ubuntu-latest
             bazel_args: ""
-            test_target: //cpp/...
+            test_target: //cpp/tests:all //cpp/reco_io:gpu_video_probe_protocol_tests
           - os: macos-latest
             bazel_args: ""
-            test_target: //cpp/...
+            test_target: //cpp/tests:all //cpp/reco_io:gpu_video_probe_protocol_tests
           - os: windows-latest
             bazel_args: --cxxopt=/std:c++20 --host_cxxopt=/std:c++20
             test_target: //cpp/reco_io:gpu_video_probe_protocol_tests //cpp/tests:reco_io_gpu_video_probe_tests

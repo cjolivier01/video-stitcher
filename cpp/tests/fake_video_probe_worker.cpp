@@ -1,4 +1,6 @@
+#include <array>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -7,6 +9,7 @@
 #include <limits>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -18,6 +21,48 @@
 #include <filesystem>
 #include <unistd.h>
 #endif
+
+namespace {
+
+constexpr std::size_t kMaximumFrameBytes = 256U * 1024U;
+constexpr std::size_t kFrameHeaderBytes = sizeof(std::uint32_t);
+using FrameHeader = std::array<char, kFrameHeaderBytes>;
+
+FrameHeader frame_header(std::size_t size) {
+  const auto value = static_cast<std::uint32_t>(size);
+  return {static_cast<char>((value >> 24U) & 0xFFU), static_cast<char>((value >> 16U) & 0xFFU),
+          static_cast<char>((value >> 8U) & 0xFFU), static_cast<char>(value & 0xFFU)};
+}
+
+bool read_exact(char* destination, std::size_t size) {
+  std::cin.read(destination, static_cast<std::streamsize>(size));
+  return std::cin.gcount() == static_cast<std::streamsize>(size);
+}
+
+bool read_request() {
+  FrameHeader header{};
+  if (!read_exact(header.data(), header.size())) {
+    return false;
+  }
+  const auto byte = [](char value) {
+    return static_cast<std::uint32_t>(static_cast<unsigned char>(value));
+  };
+  const auto size = (byte(header[0]) << 24U) | (byte(header[1]) << 16U) | (byte(header[2]) << 8U) |
+                    byte(header[3]);
+  if (size == 0 || size > kMaximumFrameBytes) {
+    return false;
+  }
+  std::string request(size, '\0');
+  return read_exact(request.data(), request.size());
+}
+
+void write_frame(std::string_view payload) {
+  const auto header = frame_header(payload.size());
+  std::cout.write(header.data(), static_cast<std::streamsize>(header.size()));
+  std::cout.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+}
+
+} // namespace
 
 int main(int argc, char** argv) {
 #if defined(_WIN32)
@@ -60,13 +105,31 @@ int main(int argc, char** argv) {
     return EXIT_SUCCESS;
   }
   if (scenario != nullptr && std::strcmp(scenario, "block-input") != 0) {
-    const std::string ignored_request(std::istreambuf_iterator<char>(std::cin), {});
-    (void)ignored_request;
+    if (!read_request()) {
+      return EXIT_FAILURE;
+    }
     if (std::strcmp(scenario, "crash") == 0) {
       return 3;
     }
     if (std::strcmp(scenario, "malformed-response") == 0) {
-      std::cout << "not CBOR";
+      write_frame("not CBOR");
+      return EXIT_SUCCESS;
+    }
+    if (std::strcmp(scenario, "deep-response") == 0) {
+      std::string nested(4'096, static_cast<char>(0x81));
+      nested.push_back(static_cast<char>(0xF6));
+      write_frame(nested);
+      return EXIT_SUCCESS;
+    }
+    if (std::strcmp(scenario, "truncated-frame") == 0) {
+      const auto header = frame_header(16);
+      std::cout.write(header.data(), static_cast<std::streamsize>(header.size()));
+      std::cout << "short";
+      return EXIT_SUCCESS;
+    }
+    if (std::strcmp(scenario, "oversized-frame") == 0) {
+      const auto header = frame_header(kMaximumFrameBytes + 1U);
+      std::cout.write(header.data(), static_cast<std::streamsize>(header.size()));
       return EXIT_SUCCESS;
     }
     nlohmann::json response;
@@ -105,8 +168,10 @@ int main(int argc, char** argv) {
                   {"total_frames_is_estimated", false}};
     }
     const auto encoded = nlohmann::json::to_cbor(response);
-    std::cout.write(reinterpret_cast<const char*>(encoded.data()),
-                    static_cast<std::streamsize>(encoded.size()));
+    write_frame({reinterpret_cast<const char*>(encoded.data()), encoded.size()});
+    if (std::strcmp(scenario, "trailing-response") == 0) {
+      std::cout << "trailing";
+    }
     return EXIT_SUCCESS;
   }
   std::this_thread::sleep_for(std::chrono::seconds(30));

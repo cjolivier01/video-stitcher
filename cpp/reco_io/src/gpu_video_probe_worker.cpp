@@ -1,7 +1,6 @@
 #include "gpu_video_probe_internal.hpp"
 #include "gpu_video_probe_protocol.hpp"
 
-#include <array>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -21,24 +20,27 @@ namespace reco::io::detail {
 namespace {
 
 std::string read_request() {
-  std::string request;
-  std::array<char, 4096> buffer{};
-  while (std::cin) {
-    std::cin.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
-    const auto count = std::cin.gcount();
-    if (count <= 0) {
-      break;
+  const auto read_exact = [](char* destination, std::size_t size) {
+    std::cin.read(destination, static_cast<std::streamsize>(size));
+    if (std::cin.gcount() != static_cast<std::streamsize>(size)) {
+      throw GpuVideoProbeError("video probe worker request has a truncated IPC frame");
     }
-    const auto size = static_cast<std::size_t>(count);
-    if (request.size() > kMaximumProbeIpcBytes - size) {
-      throw GpuVideoProbeError("video probe worker request exceeds the IPC size limit");
-    }
-    request.append(buffer.data(), size);
-  }
-  if (std::cin.bad()) {
-    throw GpuVideoProbeError("failed to read video probe worker request");
-  }
+  };
+  ProbeIpcFrameHeader header{};
+  read_exact(header.data(), header.size());
+  std::string request(decode_probe_ipc_frame_header(header), '\0');
+  read_exact(request.data(), request.size());
   return request;
+}
+
+void write_response(std::string_view response) {
+  const auto header = encode_probe_ipc_frame_header(response.size());
+  std::cout.write(header.data(), static_cast<std::streamsize>(header.size()));
+  std::cout.write(response.data(), static_cast<std::streamsize>(response.size()));
+  std::cout.flush();
+  if (!std::cout) {
+    throw GpuVideoProbeError("failed to write video probe worker response");
+  }
 }
 
 void start_parent_liveness_watch(std::uint64_t expected_parent_pid) {
@@ -75,9 +77,12 @@ int run_gpu_video_probe_worker(std::uint64_t expected_parent_pid) {
   } catch (...) {
     response = encode_probe_failure("worker_error", "unknown video probe worker failure");
   }
-  std::cout << response;
-  std::cout.flush();
-  return std::cout ? 0 : 2;
+  try {
+    write_response(response);
+    return 0;
+  } catch (...) {
+    return 2;
+  }
 }
 
 } // namespace reco::io::detail

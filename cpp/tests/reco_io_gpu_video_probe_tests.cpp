@@ -20,10 +20,10 @@
 #include <vector>
 
 #if !defined(_WIN32)
+#include <csignal>
 #include <sys/wait.h>
 #endif
 #if defined(__linux__)
-#include <csignal>
 #include <fcntl.h>
 #include <unistd.h>
 #endif
@@ -503,6 +503,15 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_eq(bounded_caps_underestimate.total_frames, 600ULL,
             "bounded timing and container duration recover the complete frame estimate");
 
+  set_scenario("probe-container-rate-over-vui");
+  const auto container_rate = probe_video(container_config(video_path), timeout_ns);
+  expect_eq(container_rate.fps_numerator, 15U,
+            "constant container timestamps override nearby bitstream VUI caps");
+  expect_eq(container_rate.fps_denominator, 1U,
+            "container timing correction remains an exact rational");
+  expect_eq(container_rate.total_frames, 600ULL,
+            "container frame rate preserves the 600-frame duration count");
+
   set_scenario("probe-clustered-missing-pts");
   const auto clustered_missing_pts = probe_video(container_config(video_path), timeout_ns);
   expect_eq(clustered_missing_pts.fps_numerator, 30U,
@@ -808,9 +817,13 @@ void worker_ipc_failures_are_bounded(const std::filesystem::path& video_path) {
       },
       "video probe worker", "closed worker input is an exception rather than process SIGPIPE");
 
-  const std::array<std::pair<std::string_view, std::string_view>, 7> invalid_workers{{
+  const std::array<std::pair<std::string_view, std::string_view>, 11> invalid_workers{{
       {"crash", "exited abnormally"},
       {"malformed-response", "not valid CBOR"},
+      {"deep-response", "nesting"},
+      {"truncated-frame", "truncated IPC frame"},
+      {"oversized-frame", "IPC frame length"},
+      {"trailing-response", "trailing IPC bytes"},
       {"wrong-version", "unsupported protocol version"},
       {"wrapped-version", "out-of-range protocol_version"},
       {"invalid-metadata", "invalid metadata"},
@@ -826,6 +839,36 @@ void worker_ipc_failures_are_bounded(const std::filesystem::path& video_path) {
         },
         fragment, std::string("fake worker response: ") + std::string(scenario));
   }
+}
+
+void auto_reaped_workers_are_supported(const std::filesystem::path& video_path) {
+#if !defined(_WIN32)
+  struct sigaction ignore_action{};
+  struct sigaction previous_action{};
+  ignore_action.sa_handler = SIG_IGN;
+  sigemptyset(&ignore_action.sa_mask);
+  if (sigaction(SIGCHLD, &ignore_action, &previous_action) != 0) {
+    expect_true(false, "SIGCHLD auto-reap policy installs");
+    return;
+  }
+
+  bool probe_succeeded = false;
+  try {
+    set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+    probe_succeeded = reco::io::probe_gpu_video(container_config(video_path),
+                                                fake_probe_worker_path, 5'000'000'000ULL)
+                          .width == 854U;
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: auto-reaped worker probe threw: " << error.what() << '\n';
+    ++failures;
+  }
+  if (sigaction(SIGCHLD, &previous_action, nullptr) != 0) {
+    expect_true(false, "SIGCHLD policy restores");
+  }
+  expect_true(probe_succeeded, "auto-reaped worker returns its framed response");
+#else
+  (void)video_path;
+#endif
 }
 
 void unrelated_descriptors_are_not_inherited(const std::filesystem::path& video_path) {
@@ -973,6 +1016,7 @@ int main() {
   non_utf8_path_round_trips();
   windows_unicode_path_round_trips();
   worker_ipc_failures_are_bounded(video_path);
+  auto_reaped_workers_are_supported(video_path);
   unrelated_descriptors_are_not_inherited(video_path);
   parent_death_reclaims_worker(video_path);
   expect_no_unreaped_children();

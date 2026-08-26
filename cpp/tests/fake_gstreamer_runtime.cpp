@@ -208,6 +208,9 @@ FakeCaps parser_sample_caps() {
   } else if (scenario() == "probe-inexact-caps-fps") {
     caps.fps_numerator = 59;
     caps.fps_denominator = 2;
+  } else if (scenario() == "probe-container-rate-over-vui") {
+    caps.fps_numerator = 15'000;
+    caps.fps_denominator = 1'001;
   } else if (scenario() == "probe-reordered-periodic-missing-pts" ||
              scenario() == "probe-bounded-caps-underestimate" ||
              scenario() == "probe-long-reordered-periodic-missing-pts") {
@@ -950,6 +953,9 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     if (current_scenario == "probe-inexact-caps-fps") {
       timing_caps.fps_numerator = 30;
       timing_caps.fps_denominator = 1;
+    } else if (current_scenario == "probe-container-rate-over-vui") {
+      timing_caps.fps_numerator = 15;
+      timing_caps.fps_denominator = 1;
     } else if (current_scenario == "probe-bad-fps" ||
                current_scenario == "probe-unset-fps-inferred" ||
                current_scenario == "probe-vfr-unset-fps" ||
@@ -989,6 +995,7 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
         : current_scenario == "probe-reordered-untimed-prefix"              ? 24'000'000'000ULL
         : current_scenario == "probe-one-frame-rounding"                    ? 33'333'333ULL
         : current_scenario == "probe-inexact-caps-fps"                      ? 2'000'000'000ULL
+        : current_scenario == "probe-container-rate-over-vui"               ? 40'000'000'000ULL
         : current_scenario == "probe-short-quantized-exact-30"              ? 100'000'000ULL
         : current_scenario == "probe-short-quantized-exact-5997"            ? 50'000'000ULL
         : current_scenario == "probe-unset-fps-inferred"                    ? 4'000'000'000ULL

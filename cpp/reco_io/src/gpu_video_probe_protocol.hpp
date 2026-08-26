@@ -2,6 +2,8 @@
 
 #include "reco/io/gpu_video_probe.hpp"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -9,11 +11,17 @@
 namespace reco::io::detail {
 
 constexpr std::size_t kMaximumProbeIpcBytes = 256U * 1024U;
+constexpr std::size_t kProbeIpcFrameHeaderBytes = sizeof(std::uint32_t);
+
+using ProbeIpcFrameHeader = std::array<char, kProbeIpcFrameHeaderBytes>;
 
 struct ProbeWorkerRequest {
   GpuFileDecodeConfig config;
   std::uint64_t timeout_ns = 0;
 };
+
+[[nodiscard]] ProbeIpcFrameHeader encode_probe_ipc_frame_header(std::size_t payload_size);
+[[nodiscard]] std::size_t decode_probe_ipc_frame_header(const ProbeIpcFrameHeader& header);
 
 [[nodiscard]] std::string encode_probe_request(const GpuFileDecodeConfig& config,
                                                std::uint64_t timeout_ns);

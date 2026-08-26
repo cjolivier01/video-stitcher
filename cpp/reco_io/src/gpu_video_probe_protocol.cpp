@@ -15,6 +15,7 @@ namespace reco::io::detail {
 namespace {
 
 constexpr std::size_t kMaximumErrorMessageBytes = 1024;
+constexpr std::size_t kMaximumCborNestingDepth = 32;
 constexpr std::uint32_t kProbeProtocolVersion = 1;
 constexpr double kMaximumSaneFps = 1000.0;
 constexpr std::uint32_t kMaximumGpuVideoDimension = 65'536;
@@ -42,10 +43,97 @@ std::optional<GpuDecodeContainer> decode_container(int value) {
   return static_cast<GpuDecodeContainer>(value);
 }
 
+[[noreturn]] void throw_invalid_cbor(std::string_view description, std::string_view reason) {
+  throw GpuVideoProbeError(std::string(description) + " is not valid CBOR: " + std::string(reason));
+}
+
+std::uint64_t read_cbor_argument(std::string_view payload, std::size_t& offset,
+                                 unsigned char additional, std::string_view description) {
+  if (additional <= 23U) {
+    return additional;
+  }
+  std::size_t byte_count = 0;
+  switch (additional) {
+  case 24U:
+    byte_count = 1;
+    break;
+  case 25U:
+    byte_count = 2;
+    break;
+  case 26U:
+    byte_count = 4;
+    break;
+  case 27U:
+    byte_count = 8;
+    break;
+  default:
+    throw_invalid_cbor(description, "indefinite or reserved item length");
+  }
+  if (byte_count > payload.size() - offset) {
+    throw_invalid_cbor(description, "truncated item argument");
+  }
+  std::uint64_t value = 0;
+  for (std::size_t index = 0; index < byte_count; ++index) {
+    value =
+        (value << 8U) | static_cast<std::uint64_t>(static_cast<unsigned char>(payload[offset++]));
+  }
+  return value;
+}
+
+void validate_cbor_structure(std::string_view payload, std::string_view description) {
+  std::vector<std::uint64_t> remaining_items{1};
+  std::size_t offset = 0;
+  while (!remaining_items.empty()) {
+    if (remaining_items.back() == 0) {
+      remaining_items.pop_back();
+      continue;
+    }
+    if (offset >= payload.size()) {
+      throw_invalid_cbor(description, "truncated container");
+    }
+    --remaining_items.back();
+    const auto initial = static_cast<unsigned char>(payload[offset++]);
+    const auto major = static_cast<unsigned char>(initial >> 5U);
+    const auto additional = static_cast<unsigned char>(initial & 0x1FU);
+    const auto argument = read_cbor_argument(payload, offset, additional, description);
+
+    if (major == 2U || major == 3U) {
+      if (argument > payload.size() - offset) {
+        throw_invalid_cbor(description, "truncated string");
+      }
+      offset += static_cast<std::size_t>(argument);
+      continue;
+    }
+    if (major == 4U || major == 5U) {
+      if (major == 5U && argument > std::numeric_limits<std::uint64_t>::max() / 2U) {
+        throw_invalid_cbor(description, "map length overflow");
+      }
+      const auto child_items = major == 5U ? argument * 2U : argument;
+      if (child_items != 0) {
+        if (remaining_items.size() > kMaximumCborNestingDepth) {
+          throw_invalid_cbor(description, "nesting exceeds the protocol limit");
+        }
+        remaining_items.push_back(child_items);
+      }
+      continue;
+    }
+    if (major == 6U) {
+      throw_invalid_cbor(description, "semantic tags are not permitted");
+    }
+    if (major > 7U) {
+      throw_invalid_cbor(description, "unknown major type");
+    }
+  }
+  if (offset != payload.size()) {
+    throw_invalid_cbor(description, "trailing data");
+  }
+}
+
 nlohmann::json parse_payload(std::string_view payload, std::string_view description) {
   if (payload.empty() || payload.size() > kMaximumProbeIpcBytes) {
     throw GpuVideoProbeError(std::string(description) + " has an invalid size");
   }
+  validate_cbor_structure(payload, description);
   try {
     return nlohmann::json::from_cbor(payload.begin(), payload.end(), true, true);
   } catch (const nlohmann::json::exception& error) {
@@ -127,6 +215,27 @@ Value required_value(const nlohmann::json& json, std::string_view key,
 }
 
 } // namespace
+
+ProbeIpcFrameHeader encode_probe_ipc_frame_header(std::size_t payload_size) {
+  if (payload_size == 0 || payload_size > kMaximumProbeIpcBytes) {
+    throw GpuVideoProbeError("video probe worker IPC frame length is invalid");
+  }
+  const auto size = static_cast<std::uint32_t>(payload_size);
+  return {static_cast<char>((size >> 24U) & 0xFFU), static_cast<char>((size >> 16U) & 0xFFU),
+          static_cast<char>((size >> 8U) & 0xFFU), static_cast<char>(size & 0xFFU)};
+}
+
+std::size_t decode_probe_ipc_frame_header(const ProbeIpcFrameHeader& header) {
+  const auto byte = [](char value) {
+    return static_cast<std::uint32_t>(static_cast<unsigned char>(value));
+  };
+  const auto size = (byte(header[0]) << 24U) | (byte(header[1]) << 16U) | (byte(header[2]) << 8U) |
+                    byte(header[3]);
+  if (size == 0 || size > kMaximumProbeIpcBytes) {
+    throw GpuVideoProbeError("video probe worker IPC frame length is invalid");
+  }
+  return size;
+}
 
 std::string encode_probe_request(const GpuFileDecodeConfig& config, std::uint64_t timeout_ns) {
   const nlohmann::json request{{"protocol_version", kProbeProtocolVersion},

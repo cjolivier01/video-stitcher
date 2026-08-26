@@ -165,42 +165,63 @@ std::wstring utf8_to_wide(std::string_view value) {
   return result;
 }
 
-void write_request(HANDLE output, std::string_view request) {
+void write_all(HANDLE output, std::string_view payload, std::string_view description) {
   std::size_t offset = 0;
-  while (offset < request.size()) {
+  while (offset < payload.size()) {
     const auto remaining =
-        std::min<std::size_t>(request.size() - offset, std::numeric_limits<DWORD>::max());
+        std::min<std::size_t>(payload.size() - offset, std::numeric_limits<DWORD>::max());
     DWORD written = 0;
-    if (WriteFile(output, request.data() + offset, static_cast<DWORD>(remaining), &written,
+    if (WriteFile(output, payload.data() + offset, static_cast<DWORD>(remaining), &written,
                   nullptr) == 0 ||
         written == 0) {
-      throw GpuVideoProbeError("failed to write video probe worker request (Windows error " +
-                               std::to_string(GetLastError()) + ")");
+      throw GpuVideoProbeError("failed to write video probe worker " + std::string(description) +
+                               " (Windows error " + std::to_string(GetLastError()) + ")");
     }
     offset += written;
   }
 }
 
-std::string read_response(HANDLE input) {
-  std::string response;
-  std::array<char, 4096> buffer{};
-  while (true) {
-    DWORD received = 0;
-    if (ReadFile(input, buffer.data(), static_cast<DWORD>(buffer.size()), &received, nullptr) ==
-        0) {
-      if (GetLastError() == ERROR_BROKEN_PIPE) {
-        break;
+void write_request(HANDLE output, std::string_view request) {
+  const auto header = detail::encode_probe_ipc_frame_header(request.size());
+  write_all(output, std::string_view(header.data(), header.size()), "request frame header");
+  write_all(output, request, "request");
+}
+
+void read_exact(HANDLE input, char* destination, std::size_t size,
+                std::chrono::steady_clock::time_point deadline) {
+  std::size_t offset = 0;
+  while (offset < size) {
+    DWORD available = 0;
+    if (PeekNamedPipe(input, nullptr, 0, nullptr, &available, nullptr) == 0) {
+      throw GpuVideoProbeError("video probe worker response has a truncated IPC frame");
+    }
+    if (available == 0) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        throw_worker_timeout();
       }
-      throw GpuVideoProbeError("failed to read video probe worker response (Windows error " +
-                               std::to_string(GetLastError()) + ")");
+      std::this_thread::sleep_for(kProcessPollInterval);
+      continue;
     }
-    if (received == 0) {
-      break;
+    const auto remaining = std::min<std::size_t>(size - offset, available);
+    DWORD received = 0;
+    if (ReadFile(input, destination + offset, static_cast<DWORD>(remaining), &received, nullptr) ==
+            0 ||
+        received == 0) {
+      throw GpuVideoProbeError("video probe worker response has a truncated IPC frame");
     }
-    if (response.size() > detail::kMaximumProbeIpcBytes - received) {
-      throw GpuVideoProbeError("video probe worker response exceeds the IPC size limit");
-    }
-    response.append(buffer.data(), received);
+    offset += received;
+  }
+}
+
+std::string read_response(HANDLE input, std::chrono::steady_clock::time_point deadline) {
+  detail::ProbeIpcFrameHeader header{};
+  read_exact(input, header.data(), header.size(), deadline);
+  std::string response(detail::decode_probe_ipc_frame_header(header), '\0');
+  read_exact(input, response.data(), response.size(), deadline);
+
+  DWORD trailing = 0;
+  if (PeekNamedPipe(input, nullptr, 0, nullptr, &trailing, nullptr) != 0 && trailing != 0) {
+    throw GpuVideoProbeError("video probe worker response has trailing IPC bytes");
   }
   return response;
 }
@@ -308,6 +329,7 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
       job.reset();
     }
     (void)WaitForSingleObject(process.get(), INFINITE);
+    (void)CancelSynchronousIo(writer.native_handle());
     writer.join();
   };
 
@@ -338,7 +360,7 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   if (GetExitCodeProcess(process.get(), &exit_code) == 0 || exit_code != 0) {
     throw GpuVideoProbeError("video probe worker exited abnormally");
   }
-  return read_response(parent_stdout.get());
+  return read_response(parent_stdout.get(), deadline);
 }
 
 #else
@@ -462,11 +484,11 @@ void create_socket_pair(int descriptors[2], std::string_view description) {
   }
 }
 
-void write_request(int output, std::string_view request,
-                   std::chrono::steady_clock::time_point deadline) {
+void write_all(int output, std::string_view payload,
+               std::chrono::steady_clock::time_point deadline) {
   std::size_t offset = 0;
-  while (offset < request.size()) {
-    const auto written = ::send(output, request.data() + offset, request.size() - offset,
+  while (offset < payload.size()) {
+    const auto written = ::send(output, payload.data() + offset, payload.size() - offset,
 #if defined(MSG_NOSIGNAL)
                                 MSG_NOSIGNAL
 #else
@@ -488,11 +510,18 @@ void write_request(int output, std::string_view request,
   }
 }
 
-std::string read_response(int input, std::chrono::steady_clock::time_point deadline) {
-  std::string response;
-  std::array<char, 4096> buffer{};
-  while (true) {
-    const auto received = ::recv(input, buffer.data(), buffer.size(), 0);
+void write_request(int output, std::string_view request,
+                   std::chrono::steady_clock::time_point deadline) {
+  const auto header = detail::encode_probe_ipc_frame_header(request.size());
+  write_all(output, std::string_view(header.data(), header.size()), deadline);
+  write_all(output, request, deadline);
+}
+
+void read_exact(int input, char* destination, std::size_t size,
+                std::chrono::steady_clock::time_point deadline) {
+  std::size_t offset = 0;
+  while (offset < size) {
+    const auto received = ::recv(input, destination + offset, size - offset, 0);
     if (received < 0 && errno == EINTR) {
       continue;
     }
@@ -505,13 +534,26 @@ std::string read_response(int input, std::chrono::steady_clock::time_point deadl
                                std::string(std::strerror(errno)));
     }
     if (received == 0) {
-      break;
+      throw GpuVideoProbeError("video probe worker response has a truncated IPC frame");
     }
-    const auto size = static_cast<std::size_t>(received);
-    if (response.size() > detail::kMaximumProbeIpcBytes - size) {
-      throw GpuVideoProbeError("video probe worker response exceeds the IPC size limit");
-    }
-    response.append(buffer.data(), size);
+    offset += static_cast<std::size_t>(received);
+  }
+}
+
+std::string read_response(int input, std::chrono::steady_clock::time_point deadline) {
+  detail::ProbeIpcFrameHeader header{};
+  read_exact(input, header.data(), header.size(), deadline);
+  std::string response(detail::decode_probe_ipc_frame_header(header), '\0');
+  read_exact(input, response.data(), response.size(), deadline);
+
+  char trailing = '\0';
+  const auto trailing_size = ::recv(input, &trailing, 1, MSG_PEEK);
+  if (trailing_size > 0) {
+    throw GpuVideoProbeError("video probe worker response has trailing IPC bytes");
+  }
+  if (trailing_size < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+    throw GpuVideoProbeError("failed to inspect video probe worker response: " +
+                             std::string(std::strerror(errno)));
   }
   return response;
 }
@@ -618,10 +660,16 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   parent_input.reset();
 
   int status = 0;
+  bool has_wait_status = false;
   while (true) {
     const auto wait_result = ::waitpid(child.get(), &status, WNOHANG);
     if (wait_result == child.get()) {
       (void)::kill(-child.get(), SIGKILL);
+      child.release();
+      has_wait_status = true;
+      break;
+    }
+    if (wait_result < 0 && errno == ECHILD) {
       child.release();
       break;
     }
@@ -638,7 +686,7 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
     }
     std::this_thread::sleep_for(kProcessPollInterval);
   }
-  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+  if (has_wait_status && (!WIFEXITED(status) || WEXITSTATUS(status) != 0)) {
     throw GpuVideoProbeError("video probe worker exited abnormally");
   }
   return read_response(parent_output.get(), deadline);

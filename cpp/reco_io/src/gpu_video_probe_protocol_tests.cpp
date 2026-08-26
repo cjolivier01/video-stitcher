@@ -1,5 +1,6 @@
 #include "gpu_video_probe_protocol.hpp"
 
+#include <array>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
@@ -98,10 +99,49 @@ void response_numeric_domains_are_enforced() {
       "invalid metadata", "impossible average frame counts are rejected");
 }
 
+void ipc_frame_lengths_are_enforced() {
+  const auto one_byte = reco::io::detail::encode_probe_ipc_frame_header(1);
+  if (one_byte != reco::io::detail::ProbeIpcFrameHeader{0, 0, 0, 1} ||
+      reco::io::detail::decode_probe_ipc_frame_header(one_byte) != 1) {
+    std::cerr << "FAIL: one-byte IPC frame length round trip\n";
+    ++failures;
+  }
+
+  const auto maximum =
+      reco::io::detail::encode_probe_ipc_frame_header(reco::io::detail::kMaximumProbeIpcBytes);
+  if (reco::io::detail::decode_probe_ipc_frame_header(maximum) !=
+      reco::io::detail::kMaximumProbeIpcBytes) {
+    std::cerr << "FAIL: maximum IPC frame length round trip\n";
+    ++failures;
+  }
+
+  expect_probe_error([] { (void)reco::io::detail::encode_probe_ipc_frame_header(0); },
+                     "frame length", "empty IPC frame rejected");
+  expect_probe_error(
+      [] {
+        (void)reco::io::detail::encode_probe_ipc_frame_header(
+            reco::io::detail::kMaximumProbeIpcBytes + 1U);
+      },
+      "frame length", "oversized IPC frame rejected");
+  expect_probe_error([] { (void)reco::io::detail::decode_probe_ipc_frame_header({0, 0, 0, 0}); },
+                     "frame length", "zero wire IPC frame rejected");
+  expect_probe_error([] { (void)reco::io::detail::decode_probe_ipc_frame_header({0, 4, 0, 1}); },
+                     "frame length", "oversized wire IPC frame rejected");
+}
+
+void cbor_nesting_is_bounded_before_parsing() {
+  std::string nested(64, static_cast<char>(0x81));
+  nested.push_back(static_cast<char>(0xF6));
+  expect_probe_error([&] { (void)reco::io::detail::decode_probe_response(nested); }, "nesting",
+                     "deep CBOR response rejected before recursive parsing");
+}
+
 } // namespace
 
 int main() {
   request_numeric_domains_are_enforced();
   response_numeric_domains_are_enforced();
+  ipc_frame_lengths_are_enforced();
+  cbor_nesting_is_bounded_before_parsing();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
