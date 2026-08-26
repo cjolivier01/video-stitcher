@@ -99,7 +99,10 @@ cc_binary(
     name = "fake_video_probe_worker",
     testonly = True,
     srcs = ["fake_video_probe_worker.cpp"],
-    deps = ["@nlohmann_json//:json"],
+    deps = [
+        "//cpp/reco_io",
+        "@nlohmann_json//:json",
+    ],
 )
 
 cc_test(

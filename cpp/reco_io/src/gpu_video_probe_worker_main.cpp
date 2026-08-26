@@ -26,6 +26,8 @@ namespace reco::io::detail {
 int run_gpu_video_probe_worker();
 #if defined(_WIN32)
 int run_gpu_video_probe_guardian();
+#else
+int run_gpu_video_probe_guardian(const char* executable, std::uint64_t pre_worker_report_delay_ns);
 #endif
 } // namespace reco::io::detail
 
@@ -102,6 +104,17 @@ int main(int argc, char** argv) {
 #if defined(_WIN32)
   if (argc == 2 && std::strcmp(argv[1], "--reco-video-probe-guardian") == 0) {
     return reco::io::detail::run_gpu_video_probe_guardian();
+  }
+#else
+  if (argc == 3 && std::strcmp(argv[1], "--reco-video-probe-guardian") == 0) {
+    const std::string_view delay_value(argv[2]);
+    std::uint64_t delay_ns = 0;
+    const auto [end, error] =
+        std::from_chars(delay_value.data(), delay_value.data() + delay_value.size(), delay_ns);
+    if (error != std::errc{} || end != delay_value.data() + delay_value.size()) {
+      return 2;
+    }
+    return reco::io::detail::run_gpu_video_probe_guardian(argv[0], delay_ns);
   }
 #endif
   if (argc < 2 || std::strcmp(argv[1], "--reco-video-probe-worker") != 0) {

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -34,6 +35,7 @@ constexpr DWORD_PTR kProcThreadAttributeJobList = ProcThreadAttributeValue(13, F
 #include <cstring>
 #include <fcntl.h>
 #include <poll.h>
+#include <spawn.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -64,6 +66,11 @@ extern char** environ;
 #endif
 
 namespace reco::io {
+#if !defined(_WIN32)
+namespace detail {
+int run_gpu_video_probe_guardian(const char* executable, std::uint64_t pre_worker_report_delay_ns);
+} // namespace detail
+#endif
 namespace {
 
 constexpr std::uint64_t kNanosecondsPerSecond = 1'000'000'000ULL;
@@ -658,6 +665,89 @@ UniqueFd duplicate_for_guardian(int descriptor) {
   return UniqueFd(duplicate);
 }
 
+pid_t spawn_guardian_process(const std::string& executable, int control_descriptor,
+                             int worker_input_descriptor, int worker_output_descriptor,
+                             std::chrono::nanoseconds pre_worker_report_delay) {
+  posix_spawn_file_actions_t actions{};
+  const auto actions_error = ::posix_spawn_file_actions_init(&actions);
+  if (actions_error != 0) {
+    throw GpuVideoProbeError("failed to initialize video probe guardian launch actions: " +
+                             std::string(std::strerror(actions_error)));
+  }
+  struct DestroyActions {
+    posix_spawn_file_actions_t* actions;
+    ~DestroyActions() { (void)::posix_spawn_file_actions_destroy(actions); }
+  } destroy_actions{&actions};
+
+  for (const auto [source, destination] :
+       {std::pair(control_descriptor, STDIN_FILENO), std::pair(control_descriptor, STDOUT_FILENO),
+        std::pair(worker_input_descriptor, kGuardianWorkerInput),
+        std::pair(worker_output_descriptor, kGuardianWorkerOutput)}) {
+    const auto error = ::posix_spawn_file_actions_adddup2(&actions, source, destination);
+    if (error != 0) {
+      throw GpuVideoProbeError("failed to configure video probe guardian descriptors: " +
+                               std::string(std::strerror(error)));
+    }
+  }
+
+  posix_spawnattr_t attributes{};
+  const auto attributes_error = ::posix_spawnattr_init(&attributes);
+  if (attributes_error != 0) {
+    throw GpuVideoProbeError("failed to initialize video probe guardian launch attributes: " +
+                             std::string(std::strerror(attributes_error)));
+  }
+  struct DestroyAttributes {
+    posix_spawnattr_t* attributes;
+    ~DestroyAttributes() { (void)::posix_spawnattr_destroy(attributes); }
+  } destroy_attributes{&attributes};
+
+  sigset_t empty_mask{};
+  (void)::sigemptyset(&empty_mask);
+  const short flags = POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK;
+  const auto flags_error = ::posix_spawnattr_setflags(&attributes, flags);
+  const auto group_error = ::posix_spawnattr_setpgroup(&attributes, 0);
+  const auto mask_error = ::posix_spawnattr_setsigmask(&attributes, &empty_mask);
+  if (flags_error != 0 || group_error != 0 || mask_error != 0) {
+    const auto error =
+        flags_error != 0 ? flags_error : (group_error != 0 ? group_error : mask_error);
+    throw GpuVideoProbeError("failed to configure video probe guardian launch attributes: " +
+                             std::string(std::strerror(error)));
+  }
+
+  std::array<char, 32> delay_text{};
+  const auto delay_count = static_cast<std::uint64_t>(pre_worker_report_delay.count());
+  const auto [delay_end, delay_error] =
+      std::to_chars(delay_text.data(), delay_text.data() + delay_text.size() - 1, delay_count);
+  if (delay_error != std::errc{}) {
+    throw GpuVideoProbeError("failed to encode video probe guardian delay");
+  }
+  *delay_end = '\0';
+  char* const arguments[] = {const_cast<char*>(executable.c_str()),
+                             const_cast<char*>("--reco-video-probe-guardian"), delay_text.data(),
+                             nullptr};
+  std::vector<std::string> environment_storage;
+  for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
+    if (std::string_view(*entry).rfind("RECO_VIDEO_PROBE_GUARDIAN_PROCESS=", 0) != 0) {
+      environment_storage.emplace_back(*entry);
+    }
+  }
+  environment_storage.emplace_back("RECO_VIDEO_PROBE_GUARDIAN_PROCESS=1");
+  std::vector<char*> guardian_environment;
+  guardian_environment.reserve(environment_storage.size() + 1U);
+  for (auto& entry : environment_storage) {
+    guardian_environment.push_back(entry.data());
+  }
+  guardian_environment.push_back(nullptr);
+  pid_t guardian_pid = -1;
+  const auto spawn_error = ::posix_spawn(&guardian_pid, executable.c_str(), &actions, &attributes,
+                                         arguments, guardian_environment.data());
+  if (spawn_error != 0) {
+    throw GpuVideoProbeError("failed to start video probe worker guardian: " +
+                             std::string(std::strerror(spawn_error)));
+  }
+  return guardian_pid;
+}
+
 void kill_worker_process_group(pid_t worker_pid) {
   if (worker_pid <= 0) {
     return;
@@ -839,7 +929,7 @@ bool guardian_limit_worker_address_space() {
   if (limit == 0) {
     return false;
   }
-  const struct rlimit bounded{.rlim_cur = limit, .rlim_max = current.rlim_max};
+  const struct rlimit bounded{.rlim_cur = limit, .rlim_max = limit};
   return ::setrlimit(RLIMIT_AS, &bounded) == 0;
 #endif
 }
@@ -869,23 +959,25 @@ bool guardian_worker_within_memory_limit(pid_t worker_pid) {
 }
 #endif
 
-void guardian_terminate_worker(pid_t worker_pid) {
+void guardian_terminate_worker(pid_t worker_pid, pid_t watchdog_pid = -1) {
   kill_worker_process_group(worker_pid);
-  if (worker_pid <= 0) {
-    return;
-  }
   constexpr auto kGuardianReapAttempts = 25;
   constexpr timespec kReapPause{.tv_sec = 0, .tv_nsec = 2'000'000};
-  for (int attempt = 0; attempt < kGuardianReapAttempts; ++attempt) {
-    int status = 0;
-    const auto result = ::waitpid(worker_pid, &status, WNOHANG);
-    if (result == worker_pid || (result < 0 && errno == ECHILD)) {
-      return;
+  for (const auto pid : {worker_pid, watchdog_pid}) {
+    if (pid <= 0) {
+      continue;
     }
-    if (result < 0 && errno != EINTR) {
-      return;
+    for (int attempt = 0; attempt < kGuardianReapAttempts; ++attempt) {
+      int status = 0;
+      const auto result = ::waitpid(pid, &status, WNOHANG);
+      if (result == pid || (result < 0 && errno == ECHILD)) {
+        break;
+      }
+      if (result < 0 && errno != EINTR) {
+        break;
+      }
+      (void)::nanosleep(&kReapPause, nullptr);
     }
-    (void)::nanosleep(&kReapPause, nullptr);
   }
 }
 
@@ -913,7 +1005,8 @@ std::size_t format_guardian_parent_argument(char* destination, std::size_t capac
                                      int worker_input_descriptor, int worker_output_descriptor,
                                      long maximum_descriptor,
                                      std::chrono::nanoseconds pre_worker_report_delay) {
-  if (::setpgid(0, 0) != 0 || ::dup2(control_descriptor, STDIN_FILENO) < 0 ||
+  if (::unsetenv("RECO_VIDEO_PROBE_GUARDIAN_PROCESS") != 0 || ::setpgid(0, 0) != 0 ||
+      ::dup2(control_descriptor, STDIN_FILENO) < 0 ||
       ::dup2(control_descriptor, STDOUT_FILENO) < 0 ||
       ::dup2(worker_input_descriptor, kGuardianWorkerInput) < 0 ||
       ::dup2(worker_output_descriptor, kGuardianWorkerOutput) < 0) {
@@ -937,21 +1030,35 @@ std::size_t format_guardian_parent_argument(char* destination, std::size_t capac
     guardian_exit(0);
   }
 
+  if (!guardian_limit_worker_address_space()) {
+    guardian_exit(2);
+  }
   int start_gate[2] = {-1, -1};
-  if (::pipe(start_gate) != 0) {
+  int lifetime_gate[2] = {-1, -1};
+  int watchdog_gate[2] = {-1, -1};
+  if (::pipe(start_gate) != 0 || ::pipe(lifetime_gate) != 0 || ::pipe(watchdog_gate) != 0) {
+    (void)::close(start_gate[0]);
+    (void)::close(start_gate[1]);
+    (void)::close(lifetime_gate[0]);
+    (void)::close(lifetime_gate[1]);
+    (void)::close(watchdog_gate[0]);
+    (void)::close(watchdog_gate[1]);
     guardian_exit(2);
   }
   const auto guardian_pid = ::getpid();
   const auto worker_pid = ::fork();
   if (worker_pid == 0) {
     (void)::close(start_gate[1]);
+    (void)::close(lifetime_gate[0]);
+    (void)::close(lifetime_gate[1]);
+    (void)::close(watchdog_gate[0]);
+    (void)::close(watchdog_gate[1]);
 #if defined(__linux__)
     if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || ::getppid() != guardian_pid) {
       guardian_exit(127);
     }
 #endif
-    if (!guardian_limit_worker_address_space() || ::setpgid(0, 0) != 0 ||
-        ::dup2(kGuardianWorkerInput, STDIN_FILENO) < 0 ||
+    if (::setpgid(0, 0) != 0 || ::dup2(kGuardianWorkerInput, STDIN_FILENO) < 0 ||
         ::dup2(kGuardianWorkerOutput, STDOUT_FILENO) < 0) {
       guardian_exit(127);
     }
@@ -979,17 +1086,67 @@ std::size_t format_guardian_parent_argument(char* destination, std::size_t capac
   (void)::close(start_gate[0]);
   if (worker_pid < 0) {
     (void)::close(start_gate[1]);
+    (void)::close(lifetime_gate[0]);
+    (void)::close(lifetime_gate[1]);
+    (void)::close(watchdog_gate[0]);
+    (void)::close(watchdog_gate[1]);
     guardian_exit(2);
   }
-  (void)::setpgid(worker_pid, worker_pid);
+  if (::setpgid(worker_pid, worker_pid) != 0) {
+    (void)::close(start_gate[1]);
+    (void)::close(lifetime_gate[0]);
+    (void)::close(lifetime_gate[1]);
+    (void)::close(watchdog_gate[0]);
+    (void)::close(watchdog_gate[1]);
+    guardian_terminate_worker(worker_pid);
+    guardian_exit(2);
+  }
   (void)::close(kGuardianWorkerInput);
   (void)::close(kGuardianWorkerOutput);
+
+  const auto watchdog_pid = ::fork();
+  if (watchdog_pid == 0) {
+    (void)::close(start_gate[1]);
+    (void)::close(lifetime_gate[1]);
+    (void)::close(watchdog_gate[1]);
+    if (::dup2(lifetime_gate[0], STDIN_FILENO) < 0 || ::dup2(watchdog_gate[0], STDOUT_FILENO) < 0) {
+      guardian_exit(127);
+    }
+    guardian_close_from(STDERR_FILENO + 1, maximum_descriptor);
+    char ready = '\0';
+    ssize_t ready_size = -1;
+    do {
+      ready_size = ::read(STDOUT_FILENO, &ready, 1);
+    } while (ready_size < 0 && errno == EINTR);
+    if (ready_size != 1 || ready != kGuardianRelease) {
+      guardian_exit(127);
+    }
+    char lifetime = '\0';
+    ssize_t lifetime_size = -1;
+    do {
+      lifetime_size = ::read(STDIN_FILENO, &lifetime, 1);
+    } while (lifetime_size < 0 && errno == EINTR);
+    (void)::kill(0, SIGKILL);
+    guardian_exit(127);
+  }
+  (void)::close(lifetime_gate[0]);
+  (void)::close(watchdog_gate[0]);
+  if (watchdog_pid < 0 || ::setpgid(watchdog_pid, worker_pid) != 0 ||
+      !guardian_pipe_write(watchdog_gate[1], kGuardianRelease)) {
+    (void)::close(start_gate[1]);
+    (void)::close(lifetime_gate[1]);
+    (void)::close(watchdog_gate[1]);
+    guardian_terminate_worker(worker_pid, watchdog_pid);
+    guardian_exit(2);
+  }
+  (void)::close(watchdog_gate[1]);
   const auto encoded_worker_pid = static_cast<std::uint64_t>(worker_pid);
   if (!guardian_sleep(pre_worker_report_delay) ||
       !guardian_write(STDOUT_FILENO, &kGuardianStarted, 1) ||
       !guardian_write(STDOUT_FILENO, &encoded_worker_pid, sizeof(encoded_worker_pid))) {
     (void)::close(start_gate[1]);
-    guardian_terminate_worker(worker_pid);
+    (void)::close(lifetime_gate[1]);
+    guardian_terminate_worker(worker_pid, watchdog_pid);
     guardian_exit(2);
   }
 
@@ -1000,7 +1157,8 @@ std::size_t format_guardian_parent_argument(char* destination, std::size_t capac
   if (received != 1 || command != kGuardianRelease ||
       !guardian_pipe_write(start_gate[1], kGuardianRelease)) {
     (void)::close(start_gate[1]);
-    guardian_terminate_worker(worker_pid);
+    (void)::close(lifetime_gate[1]);
+    guardian_terminate_worker(worker_pid, watchdog_pid);
     guardian_exit(received == 1 && command == kGuardianTerminate ? 0 : 2);
   }
   (void)::close(start_gate[1]);
@@ -1008,16 +1166,38 @@ std::size_t format_guardian_parent_argument(char* destination, std::size_t capac
   int worker_status = 0;
   bool memory_termination_sent = false;
   while (true) {
-    const auto wait_result = ::waitpid(worker_pid, &worker_status, WNOHANG);
-    if (wait_result == worker_pid) {
+    siginfo_t worker_info{};
+    const auto wait_result =
+        ::waitid(P_PID, static_cast<id_t>(worker_pid), &worker_info, WEXITED | WNOHANG | WNOWAIT);
+    if (wait_result == 0 && worker_info.si_pid == worker_pid) {
+      // Keep the zombie leader, and therefore its PID/process-group identity,
+      // reserved until all descendants have been signaled.
+      kill_worker_descendants(worker_pid);
+      while (::waitpid(worker_pid, &worker_status, 0) < 0 && errno == EINTR) {
+      }
+      int watchdog_status = 0;
+      while (::waitpid(watchdog_pid, &watchdog_status, 0) < 0 && errno == EINTR) {
+      }
       break;
     }
     if (wait_result < 0 && errno == ECHILD) {
+      kill_worker_descendants(worker_pid);
+      int watchdog_status = 0;
+      while (::waitpid(watchdog_pid, &watchdog_status, 0) < 0 && errno == EINTR) {
+      }
       worker_status = 0;
       break;
     }
     if (wait_result < 0 && errno != EINTR) {
-      guardian_terminate_worker(worker_pid);
+      guardian_terminate_worker(worker_pid, watchdog_pid);
+      guardian_exit(2);
+    }
+    siginfo_t watchdog_info{};
+    const auto watchdog_wait = ::waitid(P_PID, static_cast<id_t>(watchdog_pid), &watchdog_info,
+                                        WEXITED | WNOHANG | WNOWAIT);
+    if ((watchdog_wait == 0 && watchdog_info.si_pid == watchdog_pid) ||
+        (watchdog_wait < 0 && errno != EINTR)) {
+      guardian_terminate_worker(worker_pid, watchdog_pid);
       guardian_exit(2);
     }
 #if defined(__APPLE__)
@@ -1034,7 +1214,7 @@ std::size_t format_guardian_parent_argument(char* destination, std::size_t capac
       continue;
     }
     if (poll_result < 0) {
-      guardian_terminate_worker(worker_pid);
+      guardian_terminate_worker(worker_pid, watchdog_pid);
       guardian_exit(2);
     }
     if (poll_result > 0) {
@@ -1043,13 +1223,13 @@ std::size_t format_guardian_parent_argument(char* destination, std::size_t capac
         received = ::recv(STDIN_FILENO, &command, 1, 0);
       } while (received < 0 && errno == EINTR);
       if (received != 1 || command == kGuardianTerminate) {
-        guardian_terminate_worker(worker_pid);
+        guardian_terminate_worker(worker_pid, watchdog_pid);
         guardian_exit(0);
       }
     }
   }
 
-  kill_worker_descendants(worker_pid);
+  (void)::close(lifetime_gate[1]);
   if (!guardian_write(STDOUT_FILENO, &kGuardianExited, 1) ||
       !guardian_write(STDOUT_FILENO, &worker_status, sizeof(worker_status))) {
     guardian_exit(2);
@@ -1160,25 +1340,10 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   auto guard_control = duplicate_for_guardian(child_control.get());
   auto guard_input = duplicate_for_guardian(child_input.get());
   auto guard_output = duplicate_for_guardian(child_output.get());
-#if defined(__APPLE__)
-  if (apple_proc_pid_rusage() == nullptr) {
-    throw GpuVideoProbeError("failed to load the macOS worker memory monitor");
-  }
-#endif
-  const auto maximum_descriptor = descriptor_scan_limit();
-  if (maximum_descriptor < kGuardianFirstUnusedDescriptor) {
-    throw GpuVideoProbeError("failed to determine the video probe guardian descriptor limit");
-  }
   wait_for_worker_launch_delay(pre_worker_spawn_delay, deadline);
-  const auto guardian_pid = ::fork();
-  if (guardian_pid == 0) {
-    run_guardian_child(executable.c_str(), guard_control.get(), guard_input.get(),
-                       guard_output.get(), maximum_descriptor, pre_worker_report_delay);
-  }
-  if (guardian_pid < 0) {
-    throw GpuVideoProbeError("failed to start video probe guardian: " +
-                             std::string(std::strerror(errno)));
-  }
+  const auto guardian_pid =
+      spawn_guardian_process(executable, guard_control.get(), guard_input.get(), guard_output.get(),
+                             pre_worker_report_delay);
   GuardianProcess guardian(guardian_pid, std::move(parent_control), cleanup_deadline);
   child_input.reset();
   child_output.reset();
@@ -1273,6 +1438,28 @@ GpuVideoProbe probe_gpu_video_with_delays(const GpuFileDecodeConfig& config,
 }
 
 } // namespace
+
+#if !defined(_WIN32)
+int detail::run_gpu_video_probe_guardian(const char* executable,
+                                         std::uint64_t pre_worker_report_delay_ns) {
+  if (executable == nullptr || executable[0] == '\0' ||
+      pre_worker_report_delay_ns >
+          static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+    return 2;
+  }
+#if defined(__APPLE__)
+  if (apple_proc_pid_rusage() == nullptr) {
+    return 2;
+  }
+#endif
+  const auto maximum_descriptor = descriptor_scan_limit();
+  if (maximum_descriptor < kGuardianFirstUnusedDescriptor) {
+    return 2;
+  }
+  run_guardian_child(executable, STDIN_FILENO, kGuardianWorkerInput, kGuardianWorkerOutput,
+                     maximum_descriptor, std::chrono::nanoseconds(pre_worker_report_delay_ns));
+}
+#endif
 
 GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config,
                               const std::filesystem::path& worker_path, std::uint64_t timeout_ns) {

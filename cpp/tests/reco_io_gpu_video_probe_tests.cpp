@@ -29,6 +29,9 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/resource.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 #include <sys/wait.h>
 #include <unistd.h>
 #else
@@ -1496,6 +1499,118 @@ void caller_death_reclaims_worker_and_descendant(const std::filesystem::path& vi
 #endif
 }
 
+void guardian_death_after_worker_release_reclaims_group(const std::filesystem::path& video_path) {
+#if !defined(_WIN32)
+  const auto guardian_marker =
+      video_path.parent_path() / (video_path.filename().string() + ".released-guardian");
+  const auto worker_marker =
+      video_path.parent_path() / (video_path.filename().string() + ".released-worker");
+  const auto descendant_marker =
+      video_path.parent_path() / (video_path.filename().string() + ".released-descendant");
+  std::filesystem::remove(guardian_marker);
+  std::filesystem::remove(worker_marker);
+  std::filesystem::remove(descendant_marker);
+  set_environment("RECO_FAKE_PROBE_GUARDIAN_PID_PATH", guardian_marker.string());
+  set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", worker_marker.string());
+  set_environment("RECO_FAKE_PROBE_DESCENDANT_PATH", descendant_marker.string());
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "block-input-with-descendant");
+
+  bool probe_failed = false;
+  std::thread probe([&] {
+    try {
+      (void)reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
+                                      30'000'000'000ULL);
+    } catch (...) {
+      probe_failed = true;
+    }
+  });
+  const auto marker_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  const auto guardian = wait_for_process_marker(guardian_marker, marker_deadline);
+  const auto worker = wait_for_process_marker(worker_marker, marker_deadline);
+  const auto descendant = wait_for_process_marker(descendant_marker, marker_deadline);
+  expect_true(guardian.has_value(), "released worker guardian records its process ID");
+  expect_true(worker.has_value(), "released worker records its process ID");
+  expect_true(descendant.has_value(), "released worker descendant records its process ID");
+#if defined(__linux__) && defined(SYS_pidfd_open)
+  const auto open_pidfd = [](const std::optional<std::uint64_t>& process_id) {
+    if (!process_id.has_value() ||
+        *process_id > static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max())) {
+      return -1;
+    }
+    return static_cast<int>(::syscall(SYS_pidfd_open, static_cast<pid_t>(*process_id), 0U));
+  };
+  const int worker_pidfd = open_pidfd(worker);
+  const int descendant_pidfd = open_pidfd(descendant);
+#else
+  constexpr int worker_pidfd = -1;
+  constexpr int descendant_pidfd = -1;
+#endif
+  if (guardian.has_value() &&
+      *guardian <= static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max())) {
+    (void)::kill(static_cast<pid_t>(*guardian), SIGKILL);
+  }
+  probe.join();
+  expect_true(probe_failed, "guardian loss fails the active probe call");
+
+  const auto expect_exit = [](const std::optional<std::uint64_t>& process_id, int pidfd,
+                              std::string_view message) {
+    if (!process_id.has_value() ||
+        *process_id > static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max())) {
+      return;
+    }
+    const auto pid = static_cast<pid_t>(*process_id);
+    bool exited = false;
+#if defined(__linux__) && defined(SYS_pidfd_open)
+    if (pidfd >= 0) {
+      pollfd descriptor{.fd = pidfd, .events = POLLIN, .revents = 0};
+      int poll_result = -1;
+      do {
+        poll_result = ::poll(&descriptor, 1, 5'000);
+      } while (poll_result < 0 && errno == EINTR);
+      exited = poll_result == 1 && (descriptor.revents & POLLIN) != 0;
+      (void)::close(pidfd);
+    }
+#endif
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!exited && pidfd < 0 && std::chrono::steady_clock::now() < deadline) {
+      errno = 0;
+      if (::kill(pid, 0) != 0 && errno == ESRCH) {
+        exited = true;
+        break;
+      }
+#if defined(__linux__)
+      std::ifstream status(std::filesystem::path("/proc") / std::to_string(pid) / "stat");
+      std::string pid_text;
+      std::string command;
+      char state = '\0';
+      if (status >> pid_text >> command >> state && state == 'Z') {
+        exited = true;
+        break;
+      }
+#endif
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    expect_true(exited, message);
+    if (!exited) {
+      (void)::kill(pid, SIGKILL);
+    }
+  };
+  expect_exit(worker, worker_pidfd, "worker exits when its released guardian dies");
+  expect_exit(descendant, descendant_pidfd,
+              "worker descendant exits when its released guardian dies");
+
+  set_environment("RECO_FAKE_PROBE_GUARDIAN_PID_PATH", "");
+  set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", "");
+  set_environment("RECO_FAKE_PROBE_DESCENDANT_PATH", "");
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+  std::filesystem::remove(guardian_marker);
+  std::filesystem::remove(worker_marker);
+  std::filesystem::remove(descendant_marker);
+#else
+  (void)video_path;
+#endif
+}
+
 void caller_death_before_worker_main(const std::filesystem::path& video_path) {
 #if defined(_WIN32)
   const auto worker_marker =
@@ -1981,6 +2096,7 @@ int main(int argc, char** argv) {
   guardian_death_before_pid_report_reclaims_worker(video_path);
   auto_reaped_workers_are_supported(video_path);
   windows_job_reclaims_worker_descendants(video_path);
+  guardian_death_after_worker_release_reclaims_group(video_path);
   unrelated_descriptors_are_not_inherited(video_path);
   lowered_file_limit_does_not_leak_high_descriptors(video_path);
   worker_address_space_is_limited(video_path);

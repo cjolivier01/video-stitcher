@@ -29,6 +29,12 @@
 #include <unistd.h>
 #endif
 
+namespace reco::io::detail {
+#if !defined(_WIN32)
+int run_gpu_video_probe_guardian(const char* executable, std::uint64_t pre_worker_report_delay_ns);
+#endif
+} // namespace reco::io::detail
+
 namespace {
 
 class PreMainWorkerBlock {
@@ -36,8 +42,10 @@ public:
   PreMainWorkerBlock() {
     const char* scenario = std::getenv("RECO_FAKE_PROBE_WORKER_SCENARIO");
     const char* marker_path = std::getenv("RECO_FAKE_PROBE_WORKER_PID_PATH");
+    const char* guardian_process = std::getenv("RECO_VIDEO_PROBE_GUARDIAN_PROCESS");
     if (scenario == nullptr || std::strcmp(scenario, "pre-main-block") != 0 ||
-        marker_path == nullptr || marker_path[0] == '\0') {
+        marker_path == nullptr || marker_path[0] == '\0' ||
+        (guardian_process != nullptr && std::strcmp(guardian_process, "1") == 0)) {
       return;
     }
 #if defined(_WIN32)
@@ -298,6 +306,18 @@ int main(int argc, char** argv) {
     return EXIT_SUCCESS;
   }
 #if !defined(_WIN32)
+  if (argc == 3 && std::strcmp(argv[1], "--reco-video-probe-guardian") == 0) {
+    const std::string_view delay_value(argv[2]);
+    std::uint64_t delay_ns = 0;
+    const auto [end, error] =
+        std::from_chars(delay_value.data(), delay_value.data() + delay_value.size(), delay_ns);
+    if (error != std::errc{} || end != delay_value.data() + delay_value.size() ||
+        !write_process_marker("RECO_FAKE_PROBE_GUARDIAN_PID_PATH",
+                              static_cast<std::uint64_t>(::getpid()))) {
+      return EXIT_FAILURE;
+    }
+    return reco::io::detail::run_gpu_video_probe_guardian(argv[0], delay_ns);
+  }
   if (argc == 2 && std::strcmp(argv[1], "--reco-video-probe-guard") == 0) {
     return run_process_group_guard();
   }
@@ -316,8 +336,19 @@ int main(int argc, char** argv) {
   }
 #if !defined(_WIN32)
   const auto parent_argument = std::string_view(argv[2]);
-  if (parent_argument.size() >= 2 && parent_argument.substr(parent_argument.size() - 2) == ":0" &&
-      !close_unrelated_descriptors()) {
+  const auto separator = parent_argument.find(':');
+  std::uint64_t expected_parent = 0;
+  const auto [parent_end, parent_error] =
+      std::from_chars(parent_argument.data(),
+                      separator == std::string_view::npos ? parent_argument.data()
+                                                          : parent_argument.data() + separator,
+                      expected_parent);
+  const bool valid_parent =
+      separator != std::string_view::npos && separator + 2 == parent_argument.size() &&
+      (parent_argument[separator + 1] == '0' || parent_argument[separator + 1] == '1') &&
+      parent_error == std::errc{} && parent_end == parent_argument.data() + separator &&
+      expected_parent == static_cast<std::uint64_t>(::getppid());
+  if (!valid_parent || (parent_argument[separator + 1] == '0' && !close_unrelated_descriptors())) {
     return EXIT_FAILURE;
   }
 #endif
@@ -333,8 +364,15 @@ int main(int argc, char** argv) {
     struct rlimit address_space{};
     constexpr rlim_t kExpectedMaximum = 512ULL * 1024ULL * 1024ULL;
     if (::getrlimit(RLIMIT_AS, &address_space) != 0 || address_space.rlim_cur == RLIM_INFINITY ||
-        address_space.rlim_cur > kExpectedMaximum) {
+        address_space.rlim_cur > kExpectedMaximum ||
+        address_space.rlim_max != address_space.rlim_cur) {
       return 5;
+    }
+    const struct rlimit raised{.rlim_cur = address_space.rlim_cur,
+                               .rlim_max = address_space.rlim_max + 1U};
+    errno = 0;
+    if (::setrlimit(RLIMIT_AS, &raised) == 0 || errno != EPERM) {
+      return 6;
     }
   }
 #else
