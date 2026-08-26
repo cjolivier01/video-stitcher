@@ -14,13 +14,13 @@ jobs:
         include:
           - os: ubuntu-latest
             bazel_args: ""
-            test_target: //cpp/tests:all //cpp/reco_io:gpu_video_probe_protocol_tests
+            test_target: "//cpp/tests:all //cpp/reco_io:gpu_video_probe_protocol_tests"
           - os: macos-latest
             bazel_args: ""
-            test_target: //cpp/tests:all //cpp/reco_io:gpu_video_probe_protocol_tests
+            test_target: "//cpp/tests:all //cpp/reco_io:gpu_video_probe_protocol_tests"
           - os: windows-latest
-            bazel_args: --cxxopt=/std:c++20 --host_cxxopt=/std:c++20
-            test_target: //cpp/reco_io:gpu_video_probe_protocol_tests //cpp/tests:reco_io_gpu_video_probe_tests
+            bazel_args: "--cxxopt=/std:c++20 --host_cxxopt=/std:c++20"
+            test_target: "//cpp/reco_io:gpu_video_probe_protocol_tests //cpp/tests:reco_io_gpu_video_probe_tests"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
