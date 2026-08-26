@@ -422,7 +422,7 @@ int main(int argc, char** argv) {
     }
     nlohmann::json response;
     if (std::strcmp(scenario, "wrong-version") == 0) {
-      response = {{"protocol_version", 2}, {"ok", false}};
+      response = {{"protocol_version", 1}, {"ok", false}};
     } else if (std::strcmp(scenario, "wrapped-version") == 0) {
       response = {{"protocol_version", std::numeric_limits<std::uint64_t>::max()}, {"ok", false}};
     } else if (std::strcmp(scenario, "valid-metadata") == 0 ||
@@ -435,7 +435,7 @@ int main(int argc, char** argv) {
                std::strcmp(scenario, "oversized-metadata") == 0) {
       const bool negative = std::strcmp(scenario, "negative-metadata") == 0;
       const bool oversized = std::strcmp(scenario, "oversized-metadata") == 0;
-      response = {{"protocol_version", 1},
+      response = {{"protocol_version", 2},
                   {"ok", true},
                   {"width",
                    negative ? nlohmann::json(-2)
@@ -456,7 +456,8 @@ int main(int argc, char** argv) {
                   {"duration_ns", negative ? nlohmann::json(-1) : nlohmann::json(1'000'000'000)},
                   {"total_frames", negative ? nlohmann::json(-1) : nlohmann::json(30)},
                   {"duration_is_estimated", false},
-                  {"total_frames_is_estimated", false}};
+                  {"total_frames_is_estimated", false},
+                  {"indexed_sampling_cadence_verified", true}};
     }
     const auto encoded = nlohmann::json::to_cbor(response);
     write_frame({reinterpret_cast<const char*>(encoded.data()), encoded.size()});

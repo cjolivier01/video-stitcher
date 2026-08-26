@@ -34,6 +34,10 @@ struct GpuVideoProbe {
   /// Whether `total_frames` comes from bounded duration/timestamp correlation
   /// instead of an EOS-proven compressed access-unit count.
   bool total_frames_is_estimated = false;
+  /// True only when every selected-stream presentation timestamp was checked
+  /// against one constant cadence. Callers must require this before converting
+  /// calibration timestamps to frame indices.
+  bool indexed_sampling_cadence_verified = false;
 };
 
 /// Failure while probing a GPU-decodable video without materializing frames.
@@ -45,19 +49,24 @@ public:
 /// Uses the production GStreamer demux/parser topology to probe a local input.
 ///
 /// The pipeline stops before NVDEC and never produces a decoded frame. The
-/// selected stream's duration is correlated with bounded seeks over
-/// compressed access-unit timestamps. The parser scans a bounded AU prefix to
-/// EOS when practical; longer streams expose an explicitly estimated count.
+/// selected stream's duration is correlated with bounded seeks over compressed
+/// access-unit timestamps. Dense timestamp streams are scanned to EOS and
+/// report an exact AU count. Sparse or incomplete timing keeps counting
+/// bounded and exposes an explicitly estimated count for longer streams.
 /// Dense timestamp evidence that proves variable frame rate is rejected
 /// because indexed calibration sampling requires a constant cadence.
+/// Sparse or incomplete timestamp evidence is returned with
+/// `indexed_sampling_cadence_verified == false` and must not drive frame-index
+/// selection without an additional cadence proof at the sampling boundary.
 /// `worker_path` must be the absolute path of the deployed
 /// `reco_video_probe_worker` executable.
 /// The worker is isolated so a blocked native multimedia call can be killed
-/// with its process-owned resources. The timeout covers worker launch, IPC,
-/// probing, termination, and reaping. Worker executable loading occurs behind
-/// a guardian boundary, and a bounded part of the timeout is reserved for
-/// deterministic process cleanup. It must be between one second and one hour,
-/// inclusive.
+/// with its process-owned resources. Once the operating-system process-creation
+/// call returns, the timeout covers guardian/worker loading, IPC, probing,
+/// termination, and reaping, with a bounded cleanup reserve. Kernel process
+/// creation itself is synchronous and cannot be preempted by this API, so
+/// `worker_path` should name a trusted local executable. The timeout must be
+/// between one second and one hour, inclusive.
 [[nodiscard]] GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config,
                                             const std::filesystem::path& worker_path,
                                             std::uint64_t timeout_ns);

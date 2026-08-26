@@ -16,12 +16,14 @@ namespace {
 
 constexpr std::size_t kMaximumErrorMessageBytes = 1024;
 constexpr std::size_t kMaximumCborNestingDepth = 32;
-constexpr std::uint32_t kProbeProtocolVersion = 1;
+constexpr std::uint32_t kProbeProtocolVersion = 2;
 constexpr double kMaximumSaneFps = 1000.0;
 constexpr std::uint32_t kMaximumGpuVideoDimension = 8'192;
 constexpr std::uint64_t kMaximumNv12FrameBytes = 8'192ULL * 8'192ULL * 3ULL / 2ULL;
 constexpr std::uint64_t kNanosecondsPerSecond = 1'000'000'000ULL;
 constexpr std::uint64_t kExactFrameCountTolerance = 1;
+constexpr std::uint64_t kEstimatedFrameCountRatio = 16;
+constexpr std::uint64_t kEstimatedFrameCountSlack = 64;
 
 struct DivisionResult {
   std::uint64_t quotient;
@@ -104,6 +106,23 @@ bool exact_frame_count_is_consistent(const GpuVideoProbe& probe) {
   const auto difference = probe.total_frames > *expected ? probe.total_frames - *expected
                                                          : *expected - probe.total_frames;
   return difference <= kExactFrameCountTolerance;
+}
+
+bool estimated_frame_count_is_plausible(const GpuVideoProbe& probe) {
+  const auto expected =
+      rounded_frame_count(probe.duration_ns, probe.fps_numerator, probe.fps_denominator);
+  if (!expected.has_value()) {
+    return false;
+  }
+  const auto divided_lower = *expected / kEstimatedFrameCountRatio;
+  const auto lower =
+      divided_lower > kEstimatedFrameCountSlack ? divided_lower - kEstimatedFrameCountSlack : 0U;
+  const auto multiplied_upper =
+      *expected > (std::numeric_limits<std::uint64_t>::max() - kEstimatedFrameCountSlack) /
+                      kEstimatedFrameCountRatio
+          ? std::numeric_limits<std::uint64_t>::max()
+          : *expected * kEstimatedFrameCountRatio + kEstimatedFrameCountSlack;
+  return probe.total_frames >= lower && probe.total_frames <= multiplied_upper;
 }
 
 bool gpu_geometry_is_valid(std::uint32_t width, std::uint32_t height) {
@@ -378,17 +397,18 @@ ProbeWorkerRequest decode_probe_request(std::string_view payload) {
 }
 
 std::string encode_probe_success(const GpuVideoProbe& probe) {
-  return serialize_payload(
-      nlohmann::json{{"protocol_version", kProbeProtocolVersion},
-                     {"ok", true},
-                     {"width", probe.width},
-                     {"height", probe.height},
-                     {"fps_numerator", probe.fps_numerator},
-                     {"fps_denominator", probe.fps_denominator},
-                     {"duration_ns", probe.duration_ns},
-                     {"total_frames", probe.total_frames},
-                     {"duration_is_estimated", probe.duration_is_estimated},
-                     {"total_frames_is_estimated", probe.total_frames_is_estimated}});
+  return serialize_payload(nlohmann::json{
+      {"protocol_version", kProbeProtocolVersion},
+      {"ok", true},
+      {"width", probe.width},
+      {"height", probe.height},
+      {"fps_numerator", probe.fps_numerator},
+      {"fps_denominator", probe.fps_denominator},
+      {"duration_ns", probe.duration_ns},
+      {"total_frames", probe.total_frames},
+      {"duration_is_estimated", probe.duration_is_estimated},
+      {"total_frames_is_estimated", probe.total_frames_is_estimated},
+      {"indexed_sampling_cadence_verified", probe.indexed_sampling_cadence_verified}});
 }
 
 std::string encode_probe_failure(std::string_view kind, std::string_view message) {
@@ -434,6 +454,8 @@ GpuVideoProbe decode_probe_response(std::string_view payload) {
       required_value<bool>(response, "duration_is_estimated", "video probe worker response");
   probe.total_frames_is_estimated =
       required_value<bool>(response, "total_frames_is_estimated", "video probe worker response");
+  probe.indexed_sampling_cadence_verified = required_value<bool>(
+      response, "indexed_sampling_cadence_verified", "video probe worker response");
   if (!gpu_geometry_is_valid(probe.width, probe.height) || probe.fps_numerator == 0 ||
       probe.fps_denominator == 0 || probe.duration_ns == 0 || probe.total_frames == 0) {
     throw GpuVideoProbeError("video probe worker returned invalid metadata");
@@ -450,6 +472,10 @@ GpuVideoProbe decode_probe_response(std::string_view payload) {
   if (!probe.duration_is_estimated && !probe.total_frames_is_estimated &&
       !exact_frame_count_is_consistent(probe)) {
     throw GpuVideoProbeError("video probe worker returned inconsistent exact metadata");
+  }
+  if ((probe.duration_is_estimated || probe.total_frames_is_estimated) &&
+      !estimated_frame_count_is_plausible(probe)) {
+    throw GpuVideoProbeError("video probe worker returned implausible estimated metadata");
   }
   return probe;
 }

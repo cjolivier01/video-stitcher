@@ -259,6 +259,8 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_eq(result.total_frames, 300ULL, "EOS scan preserves the exact access-unit count");
   expect_true(!result.duration_is_estimated, "known duration is not estimated");
   expect_true(!result.total_frames_is_estimated, "EOS-proven frame count is exact");
+  expect_true(result.indexed_sampling_cadence_verified,
+              "dense full-stream timing is safe for indexed calibration sampling");
 
   const auto events = read_events(event_path);
   expect_true(has_event(events, "parse-probe"), "probe constructs parser-only pipeline");
@@ -283,13 +285,13 @@ void probe_contracts(const std::filesystem::path& video_path,
 
   set_scenario("probe-duration-unknown");
   const auto unknown_duration = probe_video(container_config(video_path), timeout_ns);
-  expect_eq(unknown_duration.duration_ns, 60'000'000'000ULL,
-            "unknown duration uses Rust-compatible estimate");
-  expect_eq(unknown_duration.total_frames, 1'798ULL,
-            "fallback frame count uses exact rational arithmetic");
+  expect_eq(unknown_duration.duration_ns, 200'033'166'667ULL,
+            "unknown duration covers the EOS-proven compressed AU count");
+  expect_eq(unknown_duration.total_frames, 5'995ULL,
+            "unknown container duration retains the full-stream exact count");
   expect_true(unknown_duration.duration_is_estimated, "unknown duration is marked estimated");
-  expect_true(unknown_duration.total_frames_is_estimated,
-              "unknown long-stream frame count is marked estimated");
+  expect_true(!unknown_duration.total_frames_is_estimated,
+              "dense EOS-proven frame count is exact despite unknown duration metadata");
 
   set_scenario("probe-duration-zero");
   expect_true(probe_video(container_config(video_path), timeout_ns).duration_is_estimated,
@@ -304,8 +306,9 @@ void probe_contracts(const std::filesystem::path& video_path,
             "integral rational frame count is not rounded down");
 
   set_scenario("probe-frame-count-overflow");
-  expect_eq(probe_video(container_config(video_path), timeout_ns).total_frames, 276'424'736'369ULL,
-            "large duration remains exact without intermediate overflow");
+  expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
+                     "full cadence validation limit",
+                     "impractically large streams fail closed instead of skipping cadence proof");
 
   set_scenario("probe-duration-mismatch");
   const auto selected_duration = probe_video(container_config(video_path), timeout_ns);
@@ -324,6 +327,14 @@ void probe_contracts(const std::filesystem::path& video_path,
               "timing windows use the selected video duration instead of a longer container track");
   expect_eq(long_selected_stream.total_frames, 5'995ULL,
             "long selected-stream correlation excludes trailing unrelated tracks");
+
+  set_scenario("probe-container-duration-underestimate");
+  const auto underestimated_container = probe_video(container_config(video_path), timeout_ns);
+  expect_true(underestimated_container.duration_ns > 199'000'000'000ULL &&
+                  underestimated_container.duration_ns < 201'000'000'000ULL,
+              "selected-stream search expands beyond an underestimated container duration");
+  expect_eq(underestimated_container.total_frames, 6'000ULL,
+            "expanded selected-stream search recovers frames past the container bound");
 
   set_scenario("probe-delayed-stream");
   const auto delayed_stream = probe_video(container_config(video_path), timeout_ns);
@@ -356,6 +367,11 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_eq(sample_caps.fps_numerator, 24U,
             "metadata frame rate remains correlated with the selected sample");
 
+  set_scenario("probe-dynamic-resolution");
+  expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
+                     "changed codec, geometry, or timing caps",
+                     "midstream parser geometry changes are rejected");
+
   set_scenario("probe-unknown-pts");
   const auto unknown_pts = probe_video(container_config(video_path), timeout_ns);
   expect_eq(unknown_pts.duration_ns, 1'000'000'000ULL,
@@ -375,6 +391,15 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_eq(inferred_fps.fps_denominator, 1U, "inferred constant frame rate is reduced exactly");
   expect_eq(inferred_fps.total_frames, 60ULL, "inexact container caps do not lose a proven frame");
 
+  set_scenario("probe-cadence-proof-rate-mismatch");
+  const auto corrected_drifting_caps = probe_video(container_config(video_path), timeout_ns);
+  expect_eq(corrected_drifting_caps.fps_numerator, 30U,
+            "full-stream phase validation replaces parser caps with cumulative drift");
+  expect_eq(corrected_drifting_caps.fps_denominator, 1U,
+            "the phase-verified inferred rate remains exact");
+  expect_true(corrected_drifting_caps.indexed_sampling_cadence_verified,
+              "the returned corrected rate carries its full-stream cadence proof");
+
   set_scenario("probe-short-quantized-exact-30");
   const auto short_exact_30 = probe_video(container_config(video_path), timeout_ns);
   expect_eq(short_exact_30.fps_numerator, 30U,
@@ -382,6 +407,8 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_eq(short_exact_30.fps_denominator, 1U,
             "short quantized timing preserves an exact caps denominator");
   expect_eq(short_exact_30.total_frames, 3ULL, "short quantized timing retains the exact AU count");
+  expect_true(short_exact_30.indexed_sampling_cadence_verified,
+              "short quantized timing can certify the retained caps rate");
 
   set_scenario("probe-short-quantized-exact-5997");
   const auto short_exact_5997 = probe_video(container_config(video_path), timeout_ns);
@@ -391,6 +418,8 @@ void probe_contracts(const std::filesystem::path& video_path,
             "short quantized near-canonical timing preserves the exact caps denominator");
   expect_eq(short_exact_5997.total_frames, 3ULL,
             "short near-canonical timing retains the exact AU count");
+  expect_true(short_exact_5997.indexed_sampling_cadence_verified,
+              "short near-canonical timing can certify the retained caps rate");
 
   set_scenario("probe-long-unknown-pts");
   const auto long_unknown_pts = probe_video(container_config(video_path), timeout_ns);
@@ -421,6 +450,8 @@ void probe_contracts(const std::filesystem::path& video_path,
               "long untimed-prefix duration remains explicitly estimated");
   expect_true(long_mixed_prefix.total_frames_is_estimated,
               "bounded long untimed-prefix count remains explicitly estimated");
+  expect_true(!long_mixed_prefix.indexed_sampling_cadence_verified,
+              "incomplete PTS evidence is not exposed as an indexed-sampling cadence proof");
 
   set_scenario("probe-reordered-untimed-prefix");
   const auto reordered_untimed_prefix = probe_video(container_config(video_path), timeout_ns);
@@ -458,6 +489,11 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_probe_error(
       [&] { (void)probe_video(container_config(video_path), timeout_ns); }, "variable frame-rate",
       "dense nonconstant timing is rejected when caps do not provide a constant rate");
+
+  set_scenario("probe-short-vfr");
+  expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
+                     "variable frame-rate",
+                     "short EOS-complete nonconstant timing cannot retain plausible caps");
 
   set_scenario("probe-vfr-late-transition");
   expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
@@ -655,12 +691,12 @@ void probe_contracts(const std::filesystem::path& video_path,
             "bounded constant timing selects a noncanonical rate without duration or EOS");
   expect_eq(bounded_unset_15.fps_denominator, 1U,
             "bounded durationless inference preserves its exact denominator");
-  expect_eq(bounded_unset_15.total_frames, 4'097ULL,
-            "durationless inference preserves the observed compressed-AU lower bound");
-  expect_eq(bounded_unset_15.duration_ns, 273'133'333'334ULL,
-            "durationless inference covers its observed compressed-AU lower bound");
-  expect_true(bounded_unset_15.total_frames_is_estimated,
-              "durationless bounded frame count remains explicitly estimated");
+  expect_eq(bounded_unset_15.total_frames, 9'000ULL,
+            "durationless inference retains the EOS-proven compressed-AU count");
+  expect_eq(bounded_unset_15.duration_ns, 600'000'000'000ULL,
+            "durationless inference covers its exact compressed-AU count");
+  expect_true(!bounded_unset_15.total_frames_is_estimated,
+              "durationless dense full-stream frame count is exact");
 
   set_scenario("probe-late-vfr-after-bounded-prefix");
   expect_probe_error(
@@ -681,6 +717,11 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
                      "variable frame-rate",
                      "a middle 30-to-15-to-30 cadence change is rejected by interior sampling");
+
+  set_scenario("probe-vfr-between-windows");
+  expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
+                     "variable frame-rate",
+                     "full-stream cadence validation covers regions between fixed seek windows");
 
   set_scenario("probe-interior-seek-gap");
   expect_probe_error(
@@ -761,10 +802,10 @@ void probe_contracts(const std::filesystem::path& video_path,
 
   set_scenario("probe-estimated-count-lower-bound");
   const auto lower_bound = probe_video(container_config(video_path), timeout_ns);
-  expect_eq(lower_bound.total_frames, 4'097ULL,
-            "adaptive estimated count cannot fall below observed compressed AUs");
-  expect_true(lower_bound.total_frames_is_estimated,
-              "bounded lower-bound count remains explicitly estimated");
+  expect_eq(lower_bound.total_frames, 6'000ULL,
+            "expanded selected-stream search agrees with the complete sequential count");
+  expect_true(!lower_bound.total_frames_is_estimated,
+              "full-stream cadence scan proves the recovered compressed-AU count");
 
   set_scenario("probe-seek-unsupported");
   expect_probe_error(
@@ -776,8 +817,8 @@ void probe_contracts(const std::filesystem::path& video_path,
   const auto seek_preroll = probe_video(container_config(video_path), timeout_ns);
   expect_eq(seek_preroll.total_frames, 5'995ULL,
             "seek preroll outside the active segment is ignored");
-  expect_true(seek_preroll.total_frames_is_estimated,
-              "bounded-seek count remains explicitly estimated");
+  expect_true(!seek_preroll.total_frames_is_estimated,
+              "full sequential cadence scan proves the seek-preroll frame count");
   expect_true(seek_preroll.duration_is_estimated,
               "bounded terminal seek duration remains explicitly estimated");
 
@@ -785,8 +826,8 @@ void probe_contracts(const std::filesystem::path& video_path,
   const auto unknown_pts_preroll = probe_video(container_config(video_path), timeout_ns);
   expect_eq(unknown_pts_preroll.total_frames, 5'995ULL,
             "PTS-less seek preroll is skipped before duration correlation");
-  expect_true(unknown_pts_preroll.total_frames_is_estimated,
-              "PTS-less seek-preroll count remains explicitly estimated");
+  expect_true(!unknown_pts_preroll.total_frames_is_estimated,
+              "full sequential cadence scan proves the PTS-less seek-preroll frame count");
   expect_true(unknown_pts_preroll.duration_is_estimated,
               "PTS-less seek-preroll duration remains explicitly estimated");
 

@@ -12,6 +12,7 @@
 #include <initializer_list>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <optional>
@@ -20,6 +21,7 @@
 #include <string_view>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -58,6 +60,7 @@ constexpr std::uint64_t kMaximumDecodeReorderFrames = 32;
 // prefix are explicitly marked estimated after duration correlation.
 constexpr std::uint64_t kMaximumExactCountSamples = 512;
 constexpr std::uint64_t kMaximumConflictingMetadataCountSamples = 4096;
+constexpr std::uint64_t kMaximumFullCadenceValidationSamples = 10'000'000;
 constexpr std::uint64_t kTailTimingWindowNs = 5ULL * kNanosecondsPerSecond;
 constexpr std::uint64_t kTimingWindowSeekPrerollNs = kNanosecondsPerSecond;
 // Five seconds at the highest accepted frame rate plus a complete decoder
@@ -602,7 +605,54 @@ struct TimingScan {
   bool reached_eos = false;
 };
 
-void observe_timing_sample(const std::shared_ptr<ProbeApi>& api, void* sample, TimingScan& scan) {
+struct ParserCapsIdentity {
+  std::string codec;
+  std::string stream_format;
+  std::string alignment;
+  int width = 0;
+  int height = 0;
+  std::optional<std::pair<int, int>> frame_rate;
+};
+
+void validate_parser_sample_caps(const std::shared_ptr<ProbeApi>& api, void* sample,
+                                 const ParserCapsIdentity& expected) {
+  void* caps = api->sample_get_caps(sample);
+  void* structure = caps == nullptr ? nullptr : api->caps_get_structure(caps, 0);
+  const char* codec = structure == nullptr ? nullptr : api->structure_get_name(structure);
+  const char* stream_format =
+      structure == nullptr ? nullptr : api->structure_get_string(structure, "stream-format");
+  const char* alignment =
+      structure == nullptr ? nullptr : api->structure_get_string(structure, "alignment");
+  int parsed = 0;
+  int width = 0;
+  int height = 0;
+  int fps_numerator = 0;
+  int fps_denominator = 0;
+  const bool has_frame_rate =
+      structure != nullptr &&
+      api->structure_get_fraction(structure, "framerate", &fps_numerator, &fps_denominator) != 0 &&
+      fps_numerator > 0 && fps_denominator > 0;
+  const bool frame_rate_matches =
+      has_frame_rate == expected.frame_rate.has_value() &&
+      (!has_frame_rate ||
+       static_cast<std::int64_t>(fps_numerator) * expected.frame_rate->second ==
+           static_cast<std::int64_t>(expected.frame_rate->first) * fps_denominator);
+  if (structure == nullptr || codec == nullptr || stream_format == nullptr ||
+      alignment == nullptr || api->structure_get_boolean(structure, "parsed", &parsed) == 0 ||
+      parsed == 0 || api->structure_get_int(structure, "width", &width) == 0 ||
+      api->structure_get_int(structure, "height", &height) == 0 || codec != expected.codec ||
+      stream_format != expected.stream_format || alignment != expected.alignment ||
+      width != expected.width || height != expected.height || !frame_rate_matches) {
+    throw GpuVideoProbeError(
+        "video parser changed codec, geometry, or timing caps during the selected stream");
+  }
+}
+
+void observe_timing_sample(const std::shared_ptr<ProbeApi>& api, void* sample, TimingScan& scan,
+                           const ParserCapsIdentity* expected_caps = nullptr) {
+  if (expected_caps != nullptr) {
+    validate_parser_sample_caps(api, sample, *expected_caps);
+  }
   const auto* buffer = static_cast<const GstBufferAbi*>(api->sample_get_buffer(sample));
   if (buffer == nullptr) {
     throw GpuVideoProbeError("GStreamer parser-only probe returned a sample without a buffer");
@@ -647,6 +697,105 @@ void observe_timing_sample(const std::shared_ptr<ProbeApi>& api, void* sample, T
     scan.final_frame_duration = buffer->duration;
   }
 }
+
+class DenseCadenceValidator {
+public:
+  DenseCadenceValidator(std::uint32_t fps_numerator, std::uint32_t fps_denominator)
+      : fps_numerator_(fps_numerator), fps_denominator_(fps_denominator) {}
+
+  void observe(std::uint64_t stream_time, std::uint64_t sample_index) {
+    if (finalized_time_.has_value() && stream_time <= *finalized_time_) {
+      fail("presentation timestamps exceed the supported decode reorder depth");
+    }
+    auto& group = pending_[stream_time];
+    ++group.count;
+    group.latest_sample_index = std::max(group.latest_sample_index, sample_index);
+    while (!pending_.empty()) {
+      const auto& first = pending_.begin()->second;
+      if (sample_index <= first.latest_sample_index ||
+          sample_index - first.latest_sample_index <= kTimingReorderLookahead) {
+        break;
+      }
+      finalize_first();
+    }
+  }
+
+  void finish() {
+    while (!pending_.empty()) {
+      finalize_first();
+    }
+    if (previous_group_count_.has_value() && previous_grid_step_.has_value() &&
+        *previous_group_count_ != *previous_grid_step_) {
+      fail("the terminal timestamp group is incomplete");
+    }
+  }
+
+private:
+  struct PendingGroup {
+    std::size_t count = 0;
+    std::uint64_t latest_sample_index = 0;
+  };
+
+  [[noreturn]] static void fail(std::string_view detail) {
+    throw GpuVideoProbeError(
+        "variable frame-rate video is unsupported for indexed GPU calibration sampling (" +
+        std::string(detail) + ")");
+  }
+
+  void finalize_first() {
+    auto first = pending_.begin();
+    const auto stream_time = first->first;
+    const auto group_count = first->second.count;
+    pending_.erase(first);
+
+    if (origin_time_.has_value()) {
+      if (stream_time <= *previous_time_) {
+        fail("presentation timestamps are not strictly ordered");
+      }
+      const auto offset_ns = stream_time - *origin_time_;
+      const auto frame_position = static_cast<long double>(offset_ns) * fps_numerator_ /
+                                  (kNanosecondsPerSecond * fps_denominator_);
+      const auto rounded_position = std::round(frame_position);
+      if (rounded_position < 1.0L ||
+          std::abs(frame_position - rounded_position) > kMaximumTimestampPhaseResidualFrames ||
+          rounded_position > static_cast<long double>(std::numeric_limits<std::uint64_t>::max())) {
+        fail("timestamps do not fit one constant frame grid");
+      }
+      const auto grid_position = static_cast<std::uint64_t>(rounded_position);
+      if (!previous_grid_position_.has_value() || grid_position <= *previous_grid_position_) {
+        fail("presentation timestamps do not advance on the frame grid");
+      }
+      const auto grid_step = grid_position - *previous_grid_position_;
+      if (!previous_group_count_.has_value() || *previous_group_count_ != grid_step) {
+        fail("timestamp cadence contains missing or duplicated frame periods");
+      }
+      previous_grid_position_ = grid_position;
+      previous_grid_step_ = grid_step;
+    } else {
+      origin_time_ = stream_time;
+      previous_grid_position_ = 0;
+    }
+    previous_time_ = stream_time;
+    finalized_time_ = stream_time;
+    previous_group_count_ = group_count;
+  }
+
+  std::uint32_t fps_numerator_ = 0;
+  std::uint32_t fps_denominator_ = 0;
+  std::map<std::uint64_t, PendingGroup> pending_;
+  std::optional<std::uint64_t> origin_time_;
+  std::optional<std::uint64_t> previous_time_;
+  std::optional<std::uint64_t> finalized_time_;
+  std::optional<std::size_t> previous_group_count_;
+  std::optional<std::uint64_t> previous_grid_position_;
+  std::optional<std::uint64_t> previous_grid_step_;
+};
+
+struct CadenceValidationCandidate {
+  std::pair<std::uint32_t, std::uint32_t> rate;
+  DenseCadenceValidator validator;
+  std::optional<std::string> failure;
+};
 
 struct InferredFrameRate {
   std::uint32_t numerator = 0;
@@ -1118,7 +1267,8 @@ struct TimingWindowEvidence {
 TimingWindowEvidence infer_timing_window(const std::shared_ptr<ProbeApi>& api, void* pipeline,
                                          void* probe_sink, void* bus, std::uint64_t start_ns,
                                          std::optional<std::uint64_t> end_ns, bool require_eos,
-                                         std::chrono::steady_clock::time_point deadline) {
+                                         std::chrono::steady_clock::time_point deadline,
+                                         const ParserCapsIdentity& expected_caps) {
   const auto seek_ns =
       start_ns > kTimingWindowSeekPrerollNs ? start_ns - kTimingWindowSeekPrerollNs : 0;
   if (seek_ns > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ||
@@ -1149,7 +1299,7 @@ TimingWindowEvidence infer_timing_window(const std::shared_ptr<ProbeApi>& api, v
       }
       window_started = true;
     }
-    observe_timing_sample(api, sample, window_scan);
+    observe_timing_sample(api, sample, window_scan, &expected_caps);
     if (!end_ns.has_value()) {
       continue;
     }
@@ -1205,7 +1355,8 @@ FrameSeekResult seek_compressed_frame(const std::shared_ptr<ProbeApi>& api, void
                                       std::uint64_t frame_index, std::uint32_t fps_numerator,
                                       std::uint32_t fps_denominator,
                                       std::size_t timestamp_multiplicity,
-                                      std::chrono::steady_clock::time_point deadline) {
+                                      std::chrono::steady_clock::time_point deadline,
+                                      const ParserCapsIdentity& expected_caps) {
   const auto relative_target_ns = frame_timestamp_ns(frame_index, fps_numerator, fps_denominator);
   if (relative_target_ns > std::numeric_limits<std::uint64_t>::max() - stream_origin_ns) {
     return {.usable = false};
@@ -1241,6 +1392,7 @@ FrameSeekResult seek_compressed_frame(const std::shared_ptr<ProbeApi>& api, void
     if (sample == nullptr) {
       return {.usable = true, .available = false};
     }
+    validate_parser_sample_caps(api, sample, expected_caps);
 
     const auto* buffer = static_cast<const GstBufferAbi*>(api->sample_get_buffer(sample));
     if (buffer == nullptr) {
@@ -1275,12 +1427,11 @@ FrameSeekResult seek_compressed_frame(const std::shared_ptr<ProbeApi>& api, void
   }
 }
 
-std::optional<SelectedStreamProbe>
-selected_stream_duration(const std::shared_ptr<ProbeApi>& api, void* pipeline, void* probe_sink,
-                         void* bus, std::uint64_t container_duration_ns,
-                         std::uint64_t stream_origin_ns, std::uint32_t fps_numerator,
-                         std::uint32_t fps_denominator, std::size_t timestamp_multiplicity,
-                         std::chrono::steady_clock::time_point deadline) {
+std::optional<SelectedStreamProbe> selected_stream_duration(
+    const std::shared_ptr<ProbeApi>& api, void* pipeline, void* probe_sink, void* bus,
+    std::uint64_t container_duration_ns, std::uint64_t stream_origin_ns,
+    std::uint32_t fps_numerator, std::uint32_t fps_denominator, std::size_t timestamp_multiplicity,
+    std::chrono::steady_clock::time_point deadline, const ParserCapsIdentity& expected_caps) {
   const auto duration_frame_ceiling =
       frame_count_ceiling_for_duration(container_duration_ns, fps_numerator, fps_denominator);
   if (duration_frame_ceiling == std::numeric_limits<std::uint64_t>::max()) {
@@ -1289,21 +1440,36 @@ selected_stream_duration(const std::shared_ptr<ProbeApi>& api, void* pipeline, v
   if (timestamp_multiplicity > std::numeric_limits<std::uint64_t>::max() - duration_frame_ceiling) {
     return std::nullopt;
   }
-  const auto search_frame_limit = duration_frame_ceiling + timestamp_multiplicity;
-  const auto maximum_stream_span_ns =
-      minimum_duration_for_frame_count(search_frame_limit, fps_numerator, fps_denominator);
-  if (maximum_stream_span_ns == std::numeric_limits<std::uint64_t>::max()) {
-    return std::nullopt;
-  }
+  const auto initial_search_frame_limit = duration_frame_ceiling + timestamp_multiplicity;
 
   std::uint64_t first = 0;
-  std::uint64_t last = search_frame_limit;
+  std::uint64_t last = initial_search_frame_limit;
   std::optional<std::pair<std::uint64_t, FrameSeekResult>> final_available_frame;
+  while (true) {
+    const auto result =
+        seek_compressed_frame(api, pipeline, probe_sink, bus, stream_origin_ns, last, fps_numerator,
+                              fps_denominator, timestamp_multiplicity, deadline, expected_caps);
+    if (!result.usable) {
+      return std::nullopt;
+    }
+    if (!result.available) {
+      break;
+    }
+    final_available_frame = std::pair(last, result);
+    if (last == std::numeric_limits<std::uint64_t>::max()) {
+      return std::nullopt;
+    }
+    first = last + 1U;
+    const auto expanded = last > std::numeric_limits<std::uint64_t>::max() / 2U
+                              ? std::numeric_limits<std::uint64_t>::max()
+                              : last * 2U;
+    last = std::max(expanded, first);
+  }
   while (first < last) {
     const auto candidate = first + (last - first) / 2;
-    const auto result =
-        seek_compressed_frame(api, pipeline, probe_sink, bus, stream_origin_ns, candidate,
-                              fps_numerator, fps_denominator, timestamp_multiplicity, deadline);
+    const auto result = seek_compressed_frame(api, pipeline, probe_sink, bus, stream_origin_ns,
+                                              candidate, fps_numerator, fps_denominator,
+                                              timestamp_multiplicity, deadline, expected_caps);
     if (!result.usable) {
       return std::nullopt;
     }
@@ -1319,9 +1485,6 @@ selected_stream_duration(const std::shared_ptr<ProbeApi>& api, void* pipeline, v
   if (first == 0) {
     throw GpuVideoProbeError("video parser found no frames in the selected stream");
   }
-  if (first == search_frame_limit) {
-    return std::nullopt;
-  }
   if (!final_available_frame.has_value() || final_available_frame->first != first - 1) {
     throw GpuVideoProbeError("video parser could not correlate the selected stream duration");
   }
@@ -1333,6 +1496,9 @@ selected_stream_duration(const std::shared_ptr<ProbeApi>& api, void* pipeline, v
   if (frame_end <= stream_origin_ns) {
     return std::nullopt;
   }
+  const auto maximum_count = add_saturating(first, timestamp_multiplicity);
+  const auto maximum_stream_span_ns =
+      minimum_duration_for_frame_count(maximum_count, fps_numerator, fps_denominator);
   auto stream_duration_ns = std::min(frame_end - stream_origin_ns, maximum_stream_span_ns);
   const auto minimum_boundary_duration =
       minimum_duration_for_frame_count(first, fps_numerator, fps_denominator);
@@ -1481,9 +1647,18 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
       has_caps_frame_rate ? static_cast<double>(fps_numerator) / fps_denominator : 0.0;
   const bool caps_frame_rate_is_plausible =
       std::isfinite(caps_fps) && caps_fps > 0.0 && caps_fps <= kMaximumSaneFps;
+  const ParserCapsIdentity expected_caps{
+      .codec = codec_caps,
+      .stream_format = stream_format,
+      .alignment = alignment,
+      .width = width,
+      .height = height,
+      .frame_rate = has_caps_frame_rate ? std::optional(std::pair(fps_numerator, fps_denominator))
+                                        : std::nullopt,
+  };
 
   TimingScan timing_scan;
-  observe_timing_sample(api, initial_sample, timing_scan);
+  observe_timing_sample(api, initial_sample, timing_scan, &expected_caps);
   initial_sample_owner.reset();
   while (timing_scan.sample_count <= kMaximumExactCountSamples) {
     void* sample = pull_compressed_sample(
@@ -1494,7 +1669,7 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
       timing_scan.reached_eos = true;
       break;
     }
-    observe_timing_sample(api, sample, timing_scan);
+    observe_timing_sample(api, sample, timing_scan, &expected_caps);
   }
   std::optional<std::uint64_t> queried_container_duration;
   if (!timing_scan.reached_eos) {
@@ -1531,7 +1706,7 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
         timing_scan.reached_eos = true;
         break;
       }
-      observe_timing_sample(api, sample, timing_scan);
+      observe_timing_sample(api, sample, timing_scan, &expected_caps);
     }
   }
   const auto inferred_frame_rate = infer_constant_frame_rate(
@@ -1543,13 +1718,126 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
   }
   const bool prefix_has_dense_nonconstant_timing =
       !inferred_frame_rate.has_value() &&
-      timing_scan.timed_sample_count == timing_scan.sample_count &&
-      timing_scan.sample_count >= kTimingAnalysisSamples;
+      timing_scan.timed_sample_count == timing_scan.sample_count && timing_scan.sample_count >= 3;
   if (prefix_has_dense_nonconstant_timing) {
     throw GpuVideoProbeError(
         "variable frame-rate video is unsupported for indexed GPU calibration sampling "
         "(dense prefix timing is nonconstant)");
   }
+
+  std::vector<CadenceValidationCandidate> cadence_candidates;
+  const auto add_cadence_candidate = [&](std::uint32_t numerator, std::uint32_t denominator) {
+    if (std::none_of(cadence_candidates.begin(), cadence_candidates.end(),
+                     [numerator, denominator](const auto& candidate) {
+                       return frame_rates_are_identical(candidate.rate.first, candidate.rate.second,
+                                                        numerator, denominator);
+                     })) {
+      cadence_candidates.push_back({.rate = {numerator, denominator},
+                                    .validator = DenseCadenceValidator(numerator, denominator),
+                                    .failure = std::nullopt});
+    }
+  };
+  if (inferred_frame_rate.has_value()) {
+    add_cadence_candidate(inferred_frame_rate->numerator, inferred_frame_rate->denominator);
+  }
+  if (caps_frame_rate_is_plausible) {
+    add_cadence_candidate(static_cast<std::uint32_t>(fps_numerator),
+                          static_cast<std::uint32_t>(fps_denominator));
+  }
+  std::vector<std::pair<std::uint32_t, std::uint32_t>> cadence_verified_rates;
+  std::optional<std::uint64_t> full_cadence_sample_count;
+  if (!cadence_candidates.empty() && timing_scan.timed_sample_count == timing_scan.sample_count) {
+    if (queried_container_duration.has_value() &&
+        std::any_of(
+            cadence_candidates.begin(), cadence_candidates.end(), [&](const auto& candidate) {
+              return frame_count_ceiling_for_duration(*queried_container_duration,
+                                                      candidate.rate.first, candidate.rate.second) >
+                     kMaximumFullCadenceValidationSamples;
+            })) {
+      throw GpuVideoProbeError(
+          "video parser could not verify constant frame timing because the selected stream "
+          "exceeds the full cadence validation limit");
+    }
+    const auto validate_cadence_sample = [&](std::uint64_t stream_time,
+                                             std::uint64_t sample_index) {
+      for (auto& candidate : cadence_candidates) {
+        if (candidate.failure.has_value()) {
+          continue;
+        }
+        try {
+          candidate.validator.observe(stream_time, sample_index);
+        } catch (const GpuVideoProbeError& error) {
+          candidate.failure = error.what();
+        }
+      }
+      const auto first_live_candidate =
+          std::find_if(cadence_candidates.begin(), cadence_candidates.end(),
+                       [](const auto& candidate) { return !candidate.failure.has_value(); });
+      if (first_live_candidate == cadence_candidates.end()) {
+        throw GpuVideoProbeError(*cadence_candidates.front().failure);
+      }
+    };
+    for (std::size_t index = 0; index < timing_scan.stored_timing_count; ++index) {
+      validate_cadence_sample(timing_scan.stream_times[index],
+                              timing_scan.timed_sample_indices[index]);
+    }
+    auto validation_sample_count = timing_scan.sample_count;
+    if (!timing_scan.reached_eos) {
+      while (true) {
+        void* sample = pull_compressed_sample(
+            api, probe_sink, bus, deadline,
+            "GStreamer parser-only probe timed out while verifying full-stream frame cadence");
+        initial_sample_owner.reset(sample);
+        if (sample == nullptr) {
+          break;
+        }
+        validate_parser_sample_caps(api, sample, expected_caps);
+        const auto stream_time = sample_presentation_stream_time(api, sample);
+        if (!stream_time.has_value()) {
+          throw GpuVideoProbeError(
+              "variable frame-rate video is unsupported for indexed GPU calibration sampling "
+              "(full-stream cadence becomes untimed)");
+        }
+        if (validation_sample_count >= kMaximumFullCadenceValidationSamples) {
+          throw GpuVideoProbeError(
+              "video parser could not verify constant frame timing because the selected stream "
+              "exceeds the full cadence validation limit");
+        }
+        validate_cadence_sample(*stream_time, validation_sample_count++);
+      }
+    }
+    if (validation_sample_count >= 3) {
+      for (auto& candidate : cadence_candidates) {
+        if (!candidate.failure.has_value()) {
+          try {
+            candidate.validator.finish();
+          } catch (const GpuVideoProbeError& error) {
+            candidate.failure = error.what();
+          }
+        }
+        if (!candidate.failure.has_value()) {
+          cadence_verified_rates.push_back(candidate.rate);
+        }
+      }
+      if (cadence_verified_rates.empty()) {
+        const auto failure =
+            std::find_if(cadence_candidates.begin(), cadence_candidates.end(),
+                         [](const auto& candidate) { return candidate.failure.has_value(); });
+        throw GpuVideoProbeError(
+            failure == cadence_candidates.end()
+                ? "video parser could not verify constant full-stream frame timing"
+                : *failure->failure);
+      }
+      full_cadence_sample_count = validation_sample_count;
+    }
+  }
+  const auto cadence_rate_is_verified = [&](std::uint32_t numerator, std::uint32_t denominator) {
+    return std::any_of(cadence_verified_rates.begin(), cadence_verified_rates.end(),
+                       [numerator, denominator](const auto& rate) {
+                         return frame_rates_are_identical(rate.first, rate.second, numerator,
+                                                          denominator);
+                       });
+  };
 
   TimingWindowEvidence tail_timing;
   bool selected_stream_probe_attempted = false;
@@ -1583,7 +1871,7 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
       correlated_selected_stream = selected_stream_duration(
           api, pipeline, probe_sink, bus, *queried_container_duration,
           *timing_scan.first_stream_time, correlated_fps_numerator, correlated_fps_denominator,
-          correlated_timestamp_multiplicity, deadline);
+          correlated_timestamp_multiplicity, deadline, expected_caps);
       if (correlated_selected_stream.has_value()) {
         timing_range_start_ns = *timing_scan.first_stream_time;
         timing_range_end_ns =
@@ -1632,16 +1920,16 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
                                 : timing_range_start_ns;
       const auto end_ns =
           std::min(add_saturating(start_ns, kTailTimingWindowNs), timing_range_end_ns);
-      validate_window(
-          infer_timing_window(api, pipeline, probe_sink, bus, start_ns, end_ns, false, deadline),
-          start_ns);
+      validate_window(infer_timing_window(api, pipeline, probe_sink, bus, start_ns, end_ns, false,
+                                          deadline, expected_caps),
+                      start_ns);
     }
 
     const auto tail_start_ns = timing_range_duration_ns > kTailTimingWindowNs
                                    ? timing_range_end_ns - kTailTimingWindowNs
                                    : timing_range_start_ns;
     tail_timing = infer_timing_window(api, pipeline, probe_sink, bus, tail_start_ns, std::nullopt,
-                                      true, deadline);
+                                      true, deadline, expected_caps);
     validate_window(tail_timing, tail_start_ns);
   }
   const bool representative_tail_matches =
@@ -1658,14 +1946,26 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
       inferred_frame_rate.has_value() && inferred_frame_rate->requires_complete_stream &&
       !timing_scan.reached_eos && !caps_frame_rate_is_plausible &&
       timing_scan.sample_count > kMaximumConflictingMetadataCountSamples;
+  const bool inferred_frame_rate_has_full_cadence_proof =
+      inferred_frame_rate.has_value() &&
+      cadence_rate_is_verified(inferred_frame_rate->numerator, inferred_frame_rate->denominator);
+  const bool caps_frame_rate_has_full_cadence_proof =
+      caps_frame_rate_is_plausible &&
+      cadence_rate_is_verified(static_cast<std::uint32_t>(fps_numerator),
+                               static_cast<std::uint32_t>(fps_denominator));
+  const bool full_cadence_validation_completed = !cadence_verified_rates.empty();
   const bool inferred_frame_rate_is_no_worse_than_caps =
       inferred_frame_rate.has_value() &&
+      (!full_cadence_validation_completed || inferred_frame_rate_has_full_cadence_proof) &&
       inferred_frame_rate_is_eligible(*inferred_frame_rate, timing_scan.reached_eos,
                                       representative_tail_matches ||
-                                          bounded_noncanonical_rate_is_conclusive) &&
-      (!caps_frame_rate_is_plausible || timing_scan.reached_eos || representative_tail_matches) &&
-      inferred_frame_rate_improves_on_caps(*inferred_frame_rate, caps_frame_rate_is_plausible,
-                                           fps_numerator, fps_denominator);
+                                          bounded_noncanonical_rate_is_conclusive ||
+                                          inferred_frame_rate_has_full_cadence_proof) &&
+      (!caps_frame_rate_is_plausible || timing_scan.reached_eos || representative_tail_matches ||
+       inferred_frame_rate_has_full_cadence_proof) &&
+      (!caps_frame_rate_has_full_cadence_proof ||
+       inferred_frame_rate_improves_on_caps(*inferred_frame_rate, caps_frame_rate_is_plausible,
+                                            fps_numerator, fps_denominator));
   const bool prefer_inferred_frame_rate = inferred_frame_rate_is_no_worse_than_caps;
   const bool inferred_frame_rate_replaces_caps =
       prefer_inferred_frame_rate &&
@@ -1689,6 +1989,7 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
 
   const auto fps_num = static_cast<std::uint32_t>(fps_numerator);
   const auto fps_den = static_cast<std::uint32_t>(fps_denominator);
+  const bool indexed_sampling_cadence_verified = cadence_rate_is_verified(fps_num, fps_den);
   const auto timestamp_multiplicity =
       inferred_frame_rate.has_value() &&
               frame_rates_are_close(fps_num, fps_den, inferred_frame_rate->numerator,
@@ -1731,7 +2032,7 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
       duration_is_estimated = true;
     }
   } else {
-    total_frames_is_estimated = true;
+    total_frames_is_estimated = !full_cadence_sample_count.has_value();
     duration_is_estimated = !queried_container_duration.has_value();
     duration_ns = duration_is_estimated ? kFallbackDurationSeconds * kNanosecondsPerSecond
                                         : *queried_container_duration;
@@ -1744,7 +2045,7 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
               ? correlated_selected_stream
               : selected_stream_duration(api, pipeline, probe_sink, bus, duration_ns,
                                          *timing_scan.first_stream_time, fps_num, fps_den,
-                                         timestamp_multiplicity, deadline);
+                                         timestamp_multiplicity, deadline, expected_caps);
       if (selected_duration.has_value()) {
         const auto untimed_prefix =
             infer_untimed_presentation_prefix(timing_scan, fps_num, fps_den);
@@ -1768,7 +2069,8 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
       duration_ns =
           std::max(duration_ns, minimum_duration_for_frame_count(total_frames, fps_num, fps_den));
     }
-    total_frames = correlated_frame_count.value_or(total_frames);
+    total_frames =
+        full_cadence_sample_count.value_or(correlated_frame_count.value_or(total_frames));
     total_frames = std::max(total_frames, timing_scan.sample_count);
     duration_ns =
         std::max(duration_ns, minimum_duration_for_frame_count(total_frames, fps_num, fps_den));
@@ -1781,7 +2083,8 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
           .duration_ns = duration_ns,
           .total_frames = total_frames,
           .duration_is_estimated = duration_is_estimated,
-          .total_frames_is_estimated = total_frames_is_estimated};
+          .total_frames_is_estimated = total_frames_is_estimated,
+          .indexed_sampling_cadence_verified = indexed_sampling_cadence_verified};
 }
 
 } // namespace reco::io

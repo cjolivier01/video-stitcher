@@ -18,7 +18,7 @@ std::string encode(const nlohmann::json& value) {
 }
 
 nlohmann::json valid_request() {
-  return {{"protocol_version", 1U},
+  return {{"protocol_version", 2U},
           {"path", nlohmann::json::binary({0x76, 0x69, 0x64, 0x65, 0x6f})},
           {"codec", 0},
           {"elementary_stream", false},
@@ -55,7 +55,7 @@ template <typename Function> void expect_success(Function&& function, std::strin
 }
 
 nlohmann::json valid_response() {
-  return {{"protocol_version", 1U},
+  return {{"protocol_version", 2U},
           {"ok", true},
           {"width", 1920U},
           {"height", 1080U},
@@ -64,10 +64,17 @@ nlohmann::json valid_response() {
           {"duration_ns", 1'000'000'000ULL},
           {"total_frames", 30ULL},
           {"duration_is_estimated", false},
-          {"total_frames_is_estimated", false}};
+          {"total_frames_is_estimated", false},
+          {"indexed_sampling_cadence_verified", true}};
 }
 
 void request_numeric_domains_are_enforced() {
+  auto previous_protocol = valid_request();
+  previous_protocol["protocol_version"] = 1U;
+  expect_probe_error(
+      [&] { (void)reco::io::detail::decode_probe_request(encode(previous_protocol)); },
+      "unsupported protocol version", "previous request schema is rejected explicitly");
+
   for (const auto& [key, value] : std::initializer_list<std::pair<std::string, nlohmann::json>>{
            {"protocol_version", std::numeric_limits<std::uint64_t>::max()},
            {"codec", std::numeric_limits<std::uint64_t>::max()},
@@ -88,6 +95,18 @@ void request_numeric_domains_are_enforced() {
 
 void response_numeric_domains_are_enforced() {
   const auto base = valid_response();
+  auto previous_protocol = base;
+  previous_protocol["protocol_version"] = 1U;
+  expect_probe_error(
+      [&] { (void)reco::io::detail::decode_probe_response(encode(previous_protocol)); },
+      "unsupported protocol version", "previous response schema is rejected explicitly");
+
+  auto missing_cadence_proof = base;
+  missing_cadence_proof.erase("indexed_sampling_cadence_verified");
+  expect_probe_error(
+      [&] { (void)reco::io::detail::decode_probe_response(encode(missing_cadence_proof)); },
+      "indexed_sampling_cadence_verified", "cadence proof is mandatory in protocol version 2");
+
   for (const auto& [key, value] : std::initializer_list<std::pair<std::string, nlohmann::json>>{
            {"protocol_version", std::numeric_limits<std::uint64_t>::max()},
            {"width", -2},
@@ -129,12 +148,22 @@ void exact_response_metadata_must_be_consistent() {
 
   auto estimated = contradiction;
   estimated["duration_is_estimated"] = true;
-  expect_success([&] { (void)reco::io::detail::decode_probe_response(encode(estimated)); },
-                 "response with estimated duration bypasses exact consistency validation");
+  expect_probe_error([&] { (void)reco::io::detail::decode_probe_response(encode(estimated)); },
+                     "implausible estimated metadata",
+                     "estimated duration cannot bypass bounded plausibility validation");
   estimated["duration_is_estimated"] = false;
   estimated["total_frames_is_estimated"] = true;
-  expect_success([&] { (void)reco::io::detail::decode_probe_response(encode(estimated)); },
-                 "response with estimated frame count bypasses exact consistency validation");
+  expect_probe_error([&] { (void)reco::io::detail::decode_probe_response(encode(estimated)); },
+                     "implausible estimated metadata",
+                     "estimated frame count cannot bypass bounded plausibility validation");
+
+  auto plausible_estimate = valid_response();
+  plausible_estimate["duration_ns"] = 10'000'000'000ULL;
+  plausible_estimate["total_frames"] = 240ULL;
+  plausible_estimate["duration_is_estimated"] = true;
+  plausible_estimate["total_frames_is_estimated"] = true;
+  expect_success([&] { (void)reco::io::detail::decode_probe_response(encode(plausible_estimate)); },
+                 "bounded estimated metadata remains accepted");
 
   auto boundary = valid_response();
   boundary["fps_numerator"] = 100U;
