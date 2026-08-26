@@ -227,6 +227,18 @@ void runahead_caps_are_correlated_by_timestamp() {
   }
 }
 
+void duplicate_pts_at_geometry_transition_is_ambiguous() {
+  set_scenario("duplicate-transition-pts");
+  auto source =
+      open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+
+  const auto first = source->read();
+  expect_true(first.frame.has_value(), "duplicate-transition first old-geometry frame returned");
+  expect_gpu_decode_error([&] { (void)source->read(); },
+                          "timestamp is ambiguous at a geometry transition",
+                          "duplicate PTS cannot relabel an old allocation with new geometry");
+}
+
 void stale_parser_caps_reject_allocation_changes() {
   set_scenario("caps-runahead-stale-caps");
   auto source =
@@ -414,6 +426,7 @@ int main() {
   production_source_retains_mapped_sample();
   padded_sink_caps_preserve_predecoder_dimensions();
   runahead_caps_are_correlated_by_timestamp();
+  duplicate_pts_at_geometry_transition_is_ambiguous();
   stale_parser_caps_reject_allocation_changes();
   dropped_samples_do_not_accumulate_geometry_records();
   first_frame_rejects_grossly_stale_geometry();

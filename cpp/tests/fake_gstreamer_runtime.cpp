@@ -167,7 +167,8 @@ FakeSample* make_sample(std::uint32_t sample_index = 0) {
   if (scenario() == "unknown-time" || scenario() == "caps-runahead-unknown-time") {
     sample->buffer.pts = std::numeric_limits<std::uint64_t>::max();
     sample->buffer.duration = std::numeric_limits<std::uint64_t>::max();
-  } else if (scenario() == "caps-runahead" || scenario() == "caps-runahead-stale-caps") {
+  } else if (scenario() == "caps-runahead" || scenario() == "caps-runahead-stale-caps" ||
+             scenario() == "duplicate-transition-pts") {
     sample->buffer.pts = (static_cast<std::uint64_t>(sample_index) + 1U) * 1'000'000'000ULL;
   }
 
@@ -384,6 +385,16 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
   auto* sink = static_cast<FakeSink*>(sink_pointer);
   const auto current = sink->pull_count++;
   const auto current_scenario = scenario();
+  if (current_scenario == "duplicate-transition-pts" && current < 2) {
+    auto* sample = make_sample(current);
+    push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, 1280, 720);
+    if (current == 1) {
+      GstBufferAbi next_buffer;
+      next_buffer.pts = sample->buffer.pts;
+      push_predecoder_buffer(sink->pipeline->display_pad, next_buffer, 1100, 720);
+    }
+    return sample;
+  }
   if (current_scenario == "drop-runahead" && current == 0) {
     auto* sample = make_sample(current);
     for (std::uint64_t index = 0; index < 5'000; ++index) {

@@ -467,7 +467,9 @@ public:
     const auto pts_ns = gst_buffer.pts == kGstClockTimeNone
                             ? std::nullopt
                             : std::optional<std::uint64_t>(gst_buffer.pts);
-    const auto [visible_width, visible_height] = take_visible_dimensions(pts_ns);
+    const auto allocation_dimensions = std::pair(nvmm.width, nvmm.height);
+    const auto [visible_width, visible_height] =
+        take_visible_dimensions(pts_ns, allocation_dimensions);
     GpuDecodedFrame frame{
         .nvmm = nvmm,
         .visible_width = visible_width,
@@ -488,7 +490,6 @@ public:
       throw GpuDecodeError(
           "GStreamer NVMM allocation dimensions are inconsistent with visible geometry");
     }
-    const auto allocation_dimensions = std::pair(nvmm.width, nvmm.height);
     const auto current_visible_dimensions = std::pair(visible_width, visible_height);
     if (previous_allocation_dimensions_.has_value() &&
         *previous_allocation_dimensions_ != allocation_dimensions &&
@@ -576,7 +577,8 @@ private:
   }
 
   [[nodiscard]] std::pair<std::uint32_t, std::uint32_t>
-  take_visible_dimensions(std::optional<std::uint64_t> pts_ns) {
+  take_visible_dimensions(std::optional<std::uint64_t> pts_ns,
+                          const std::pair<std::uint32_t, std::uint32_t>& allocation_dimensions) {
     std::lock_guard lock(geometry_mutex_);
     switch (geometry_probe_failure_.load(std::memory_order_acquire)) {
     case GeometryProbeFailure::None:
@@ -631,6 +633,12 @@ private:
       if (selected == geometry_transitions_.end()) {
         throw GpuDecodeError(
             "GStreamer decoded frame timestamp precedes known pre-decoder geometry");
+      }
+      if (selected != geometry_transitions_.begin() && selected->pts_ns == pts_ns &&
+          (!previous_allocation_dimensions_.has_value() ||
+           *previous_allocation_dimensions_ == allocation_dimensions)) {
+        throw GpuDecodeError(
+            "GStreamer decoded frame timestamp is ambiguous at a geometry transition");
       }
     }
 
