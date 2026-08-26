@@ -39,6 +39,10 @@ constexpr DWORD_PTR kProcThreadAttributeJobList = ProcThreadAttributeValue(13, F
 #include <sys/wait.h>
 #include <unistd.h>
 
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
+
 #if defined(__linux__)
 #include <sys/prctl.h>
 #include <sys/syscall.h>
@@ -780,10 +784,6 @@ bool guardian_sleep(std::chrono::nanoseconds delay) {
 }
 
 void guardian_close_from(int descriptor, long maximum_descriptor) {
-#if defined(__APPLE__)
-  (void)::closefrom(descriptor);
-  return;
-#endif
 #if defined(__linux__) && defined(SYS_close_range)
   if (::syscall(SYS_close_range, static_cast<unsigned int>(descriptor),
                 std::numeric_limits<unsigned int>::max(), 0U) == 0) {
@@ -798,6 +798,24 @@ void guardian_close_from(int descriptor, long maximum_descriptor) {
   for (long value = descriptor; value < maximum_descriptor; ++value) {
     (void)::close(static_cast<int>(value));
   }
+}
+
+long descriptor_scan_limit() {
+  long maximum = ::sysconf(_SC_OPEN_MAX);
+  struct rlimit limits{};
+  if (::getrlimit(RLIMIT_NOFILE, &limits) == 0 && limits.rlim_max != RLIM_INFINITY &&
+      limits.rlim_max <= static_cast<rlim_t>(std::numeric_limits<long>::max())) {
+    maximum = std::max(maximum, static_cast<long>(limits.rlim_max));
+  }
+#if defined(__APPLE__)
+  int kernel_maximum = 0;
+  std::size_t size = sizeof(kernel_maximum);
+  if (::sysctlbyname("kern.maxfilesperproc", &kernel_maximum, &size, nullptr, 0) == 0 &&
+      kernel_maximum > 0) {
+    maximum = std::max(maximum, static_cast<long>(kernel_maximum));
+  }
+#endif
+  return maximum;
 }
 
 bool guardian_limit_worker_address_space() {
@@ -1106,7 +1124,7 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   auto guard_control = duplicate_for_guardian(child_control.get());
   auto guard_input = duplicate_for_guardian(child_input.get());
   auto guard_output = duplicate_for_guardian(child_output.get());
-  const auto maximum_descriptor = ::sysconf(_SC_OPEN_MAX);
+  const auto maximum_descriptor = descriptor_scan_limit();
   if (maximum_descriptor < kGuardianFirstUnusedDescriptor) {
     throw GpuVideoProbeError("failed to determine the video probe guardian descriptor limit");
   }

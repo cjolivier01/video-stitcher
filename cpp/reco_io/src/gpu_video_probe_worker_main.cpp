@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cerrno>
 #include <charconv>
 #include <cstdint>
@@ -14,7 +15,11 @@
 #else
 #include <dirent.h>
 #include <fcntl.h>
+#include <sys/resource.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 #endif
 
 namespace reco::io::detail {
@@ -27,13 +32,32 @@ int run_gpu_video_probe_guardian();
 #if !defined(_WIN32)
 namespace {
 
-bool close_unrelated_descriptors() {
+long descriptor_scan_limit() {
+  long maximum = ::sysconf(_SC_OPEN_MAX);
+  struct rlimit limits{};
+  if (::getrlimit(RLIMIT_NOFILE, &limits) == 0 && limits.rlim_max != RLIM_INFINITY &&
+      limits.rlim_max <= static_cast<rlim_t>(std::numeric_limits<long>::max())) {
+    maximum = std::max(maximum, static_cast<long>(limits.rlim_max));
+  }
 #if defined(__APPLE__)
-  (void)::closefrom(3);
-  return true;
+  int kernel_maximum = 0;
+  std::size_t size = sizeof(kernel_maximum);
+  if (::sysctlbyname("kern.maxfilesperproc", &kernel_maximum, &size, nullptr, 0) == 0 &&
+      kernel_maximum > 0) {
+    maximum = std::max(maximum, static_cast<long>(kernel_maximum));
+  }
 #endif
-#if defined(__linux__)
-  if (auto* directory = ::opendir("/proc/self/fd"); directory != nullptr) {
+  return maximum;
+}
+
+bool close_unrelated_descriptors() {
+#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__)
+  constexpr const char* kDescriptorDirectory = "/dev/fd";
+#else
+  constexpr const char* kDescriptorDirectory = "/proc/self/fd";
+#endif
+  if (auto* directory = ::opendir(kDescriptorDirectory); directory != nullptr) {
     const auto directory_descriptor = ::dirfd(directory);
     std::vector<int> descriptors;
     while (const auto* entry = ::readdir(directory)) {
@@ -59,7 +83,7 @@ bool close_unrelated_descriptors() {
     return true;
   }
 #endif
-  const auto maximum_descriptor = ::sysconf(_SC_OPEN_MAX);
+  const auto maximum_descriptor = descriptor_scan_limit();
   if (maximum_descriptor < 0) {
     return false;
   }
