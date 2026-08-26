@@ -208,6 +208,39 @@ void start_parent_liveness_watch(const char* parent_argument) {
     std::_Exit(EXIT_FAILURE);
   }).detach();
 }
+#else
+bool parse_handle(const char* value, HANDLE& handle) {
+  const std::string_view text(value);
+  std::uint64_t parsed = 0;
+  const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), parsed);
+  if (error != std::errc{} || end != text.data() + text.size() || parsed == 0 ||
+      parsed > std::numeric_limits<std::uintptr_t>::max()) {
+    return false;
+  }
+  handle = reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(parsed));
+  DWORD flags = 0;
+  return GetHandleInformation(handle, &flags) != 0;
+}
+
+bool start_parent_liveness_watch(const char* parent_argument, const char* job_argument) {
+  HANDLE parent = nullptr;
+  HANDLE job = nullptr;
+  if (!parse_handle(parent_argument, parent) || !parse_handle(job_argument, job)) {
+    return false;
+  }
+  try {
+    std::thread([parent, job] {
+      if (WaitForSingleObject(parent, INFINITE) != WAIT_OBJECT_0 ||
+          TerminateJobObject(job, 3) == 0) {
+        (void)TerminateProcess(GetCurrentProcess(), 3);
+        std::_Exit(EXIT_FAILURE);
+      }
+    }).detach();
+  } catch (...) {
+    return false;
+  }
+  return true;
+}
 #endif
 
 } // namespace
@@ -223,7 +256,7 @@ int main(int argc, char** argv) {
   }
 #endif
 #if defined(_WIN32)
-  constexpr int kExpectedArguments = 2;
+  constexpr int kExpectedArguments = 4;
 #else
   constexpr int kExpectedArguments = 3;
 #endif
@@ -239,6 +272,9 @@ int main(int argc, char** argv) {
 #endif
 #if defined(_WIN32)
   if (_setmode(_fileno(stdin), _O_BINARY) == -1 || _setmode(_fileno(stdout), _O_BINARY) == -1) {
+    return EXIT_FAILURE;
+  }
+  if (!start_parent_liveness_watch(argv[2], argv[3])) {
     return EXIT_FAILURE;
   }
 #endif

@@ -15,7 +15,12 @@
 #include <thread>
 #include <vector>
 
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <dirent.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -126,10 +131,27 @@ void write_response(std::string_view response) {
   }
 }
 
-void start_parent_liveness_watch(std::uint64_t expected_parent_pid) {
+void start_parent_liveness_watch(std::uint64_t expected_parent_pid,
+                                 std::uintptr_t parent_liveness_handle, std::uintptr_t job_handle) {
 #if defined(_WIN32)
   (void)expected_parent_pid;
+  const auto parent = reinterpret_cast<HANDLE>(parent_liveness_handle);
+  const auto job = reinterpret_cast<HANDLE>(job_handle);
+  DWORD parent_flags = 0;
+  DWORD job_flags = 0;
+  if (GetHandleInformation(parent, &parent_flags) == 0 ||
+      GetHandleInformation(job, &job_flags) == 0) {
+    throw GpuVideoProbeError("video probe worker received invalid lifecycle handles");
+  }
+  std::thread([parent, job] {
+    if (WaitForSingleObject(parent, INFINITE) != WAIT_OBJECT_0 || TerminateJobObject(job, 3) == 0) {
+      (void)TerminateProcess(GetCurrentProcess(), 3);
+      std::_Exit(3);
+    }
+  }).detach();
 #else
+  (void)parent_liveness_handle;
+  (void)job_handle;
   std::thread([expected_parent_pid] {
     while (true) {
       if (static_cast<std::uint64_t>(::getppid()) != expected_parent_pid) {
@@ -148,10 +170,11 @@ void start_parent_liveness_watch(std::uint64_t expected_parent_pid) {
 int run_gpu_video_probe_guard() { return run_process_group_guard(); }
 #endif
 
-int run_gpu_video_probe_worker(std::uint64_t expected_parent_pid) {
+int run_gpu_video_probe_worker(std::uint64_t expected_parent_pid,
+                               std::uintptr_t parent_liveness_handle, std::uintptr_t job_handle) {
   std::string response;
   try {
-    start_parent_liveness_watch(expected_parent_pid);
+    start_parent_liveness_watch(expected_parent_pid, parent_liveness_handle, job_handle);
     const auto payload = read_request();
     const auto request = decode_probe_request(payload);
     response = encode_probe_success(probe_gpu_video_in_process(request.config, request.timeout_ns));

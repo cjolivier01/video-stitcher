@@ -305,9 +305,22 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
     throw GpuVideoProbeError("failed to configure video probe worker Job");
   }
 
+  HANDLE parent_liveness_raw = nullptr;
+  if (DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(),
+                      &parent_liveness_raw, SYNCHRONIZE, TRUE, 0) == 0) {
+    throw GpuVideoProbeError("failed to duplicate the video probe caller process handle");
+  }
+  UniqueHandle parent_liveness(parent_liveness_raw);
+  HANDLE child_job_raw = nullptr;
+  if (DuplicateHandle(GetCurrentProcess(), job.get(), GetCurrentProcess(), &child_job_raw,
+                      JOB_OBJECT_TERMINATE, TRUE, 0) == 0) {
+    throw GpuVideoProbeError("failed to duplicate the video probe worker Job handle");
+  }
+  UniqueHandle child_job(child_job_raw);
+
   StartupAttributeList attributes(2);
-  std::array<HANDLE, 3> inherited_handles{child_stdin.get(), child_stdout.get(),
-                                          child_stderr.get()};
+  std::array<HANDLE, 5> inherited_handles{child_stdin.get(), child_stdout.get(), child_stderr.get(),
+                                          parent_liveness.get(), child_job.get()};
   if (UpdateProcThreadAttribute(attributes.get(), 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
                                 inherited_handles.data(), sizeof(inherited_handles), nullptr,
                                 nullptr) == 0) {
@@ -324,7 +337,9 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   const std::string utf8_path(reinterpret_cast<const char*>(encoded_path.data()),
                               encoded_path.size());
   const auto application = utf8_to_wide(utf8_path);
-  auto command_line = L"\"" + application + L"\" --reco-video-probe-worker";
+  auto command_line = L"\"" + application + L"\" --reco-video-probe-worker " +
+                      std::to_wstring(reinterpret_cast<std::uintptr_t>(parent_liveness.get())) +
+                      L" " + std::to_wstring(reinterpret_cast<std::uintptr_t>(child_job.get()));
   STARTUPINFOEXW startup{};
   startup.StartupInfo.cb = sizeof(startup);
   startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
@@ -339,29 +354,32 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   }
   require_worker_launch_active_locked(*launch_state, deadline);
   if (CreateProcessW(application.c_str(), command_line.data(), nullptr, nullptr, TRUE,
-                     CREATE_NO_WINDOW | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT, nullptr,
-                     nullptr, &startup.StartupInfo, &process_info) == 0) {
+                     CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr,
+                     &startup.StartupInfo, &process_info) == 0) {
     throw GpuVideoProbeError("failed to start video probe worker (Windows error " +
                              std::to_string(GetLastError()) + ")");
   }
   UniqueHandle process(process_info.hProcess);
   UniqueHandle thread(process_info.hThread);
-  if (std::chrono::steady_clock::now() >= deadline) {
-    (void)TerminateJobObject(job.get(), 1);
+  thread.reset();
+  parent_liveness.reset();
+  child_job.reset();
+  const auto terminate_worker = [&] {
+    if (TerminateJobObject(job.get(), 1) == 0) {
+      (void)TerminateProcess(process.get(), 1);
+    }
     (void)WaitForSingleObject(process.get(), INFINITE);
+    job.reset();
+  };
+  if (std::chrono::steady_clock::now() >= deadline) {
+    terminate_worker();
     throw_worker_timeout();
   }
-  if (ResumeThread(thread.get()) == std::numeric_limits<DWORD>::max()) {
-    TerminateJobObject(job.get(), 1);
-    throw GpuVideoProbeError("failed to resume video probe worker process");
-  }
-  thread.reset();
   child_stdin.reset();
   child_stdout.reset();
   child_stderr.reset();
   if (std::chrono::steady_clock::now() >= deadline) {
-    (void)TerminateJobObject(job.get(), 1);
-    (void)WaitForSingleObject(process.get(), INFINITE);
+    terminate_worker();
     throw_worker_timeout();
   }
   std::exception_ptr write_error;
@@ -375,10 +393,7 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   launch_lock.unlock();
 
   const auto terminate_and_join = [&] {
-    if (TerminateJobObject(job.get(), 1) == 0) {
-      job.reset();
-    }
-    (void)WaitForSingleObject(process.get(), INFINITE);
+    terminate_worker();
     (void)CancelSynchronousIo(writer.native_handle());
     writer.join();
   };
@@ -401,8 +416,10 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
     terminate_and_join();
     throw GpuVideoProbeError("failed while waiting for video probe worker");
   }
-  job.reset();
   writer.join();
+  if (TerminateJobObject(job.get(), 1) == 0) {
+    job.reset();
+  }
   if (write_error != nullptr) {
     std::rethrow_exception(write_error);
   }
