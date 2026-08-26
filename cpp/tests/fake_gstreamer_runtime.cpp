@@ -820,6 +820,11 @@ RECO_FAKE_EXPORT GListAbi* gst_discoverer_info_get_video_streams(void*) {
     first_info->fps_denominator = 0;
   } else if (scenario() == "probe-bad-dimensions") {
     first_info->width = 0;
+  } else if (scenario() == "probe-odd-dimensions") {
+    first_info->width = 853;
+  } else if (scenario() == "probe-high-fps") {
+    first_info->fps_numerator = 90'000;
+    first_info->fps_denominator = 1;
   }
 
   if (scenario() == "probe-multiple" || scenario() == "probe-image-then-video") {

@@ -202,10 +202,16 @@ void invalid_inputs_fail(const std::filesystem::path& video_path) {
 
   set_scenario("probe-bad-fps");
   expect_probe_error([&] { (void)probe_gpu_video(config_for(video_path), timeout_ns); },
-                     "invalid frame rate", "invalid FPS rejected");
+                     "invalid frame rate", "zero-denominator FPS rejected");
+  set_scenario("probe-high-fps");
+  expect_probe_error([&] { (void)probe_gpu_video(config_for(video_path), timeout_ns); },
+                     "implausible frame rate", "time-base artifact FPS rejected");
   set_scenario("probe-bad-dimensions");
   expect_probe_error([&] { (void)probe_gpu_video(config_for(video_path), timeout_ns); },
                      "zero frame dimensions", "invalid dimensions rejected");
+  set_scenario("probe-odd-dimensions");
+  expect_probe_error([&] { (void)probe_gpu_video(config_for(video_path), timeout_ns); },
+                     "incompatible with NV12", "odd dimensions rejected");
 }
 
 } // namespace

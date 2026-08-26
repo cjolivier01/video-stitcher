@@ -23,6 +23,7 @@ namespace {
 constexpr std::uint64_t kClockTimeNone = std::numeric_limits<std::uint64_t>::max();
 constexpr std::uint64_t kNanosecondsPerSecond = 1'000'000'000ULL;
 constexpr std::uint64_t kFallbackDurationSeconds = 60;
+constexpr double kMaximumSaneFps = 1000.0;
 constexpr int kDiscovererOk = 0;
 constexpr int kDiscovererMissingPlugins = 5;
 
@@ -357,12 +358,15 @@ GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config, std::uint64_t t
   if (width == 0 || height == 0) {
     throw GpuVideoProbeError("video discovery returned zero frame dimensions");
   }
+  if ((width % 2U) != 0 || (height % 2U) != 0) {
+    throw GpuVideoProbeError("video discovery returned dimensions incompatible with NV12");
+  }
   if (fps_numerator == 0 || fps_denominator == 0) {
     throw GpuVideoProbeError("video discovery returned an invalid frame rate");
   }
   const double fps = static_cast<double>(fps_numerator) / fps_denominator;
-  if (!std::isfinite(fps) || fps <= 0.0) {
-    throw GpuVideoProbeError("video discovery returned a non-finite frame rate");
+  if (!std::isfinite(fps) || fps <= 0.0 || fps > kMaximumSaneFps) {
+    throw GpuVideoProbeError("video discovery returned an implausible frame rate");
   }
 
   const auto discovered_duration = api->info_get_duration(info);
