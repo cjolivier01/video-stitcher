@@ -163,6 +163,7 @@ std::string build_gstreamer_gpu_file_decode_pipeline(const GpuFileDecodeConfig& 
            << " ! nvv4l2decoder"
            << " ! nvvideoconvert compute-hw=1 bl-output=false disable-passthrough=true"
            << " ! video/x-raw(memory:NVMM),format=NV12"
+           << " ! identity name=output_info silent=true"
            << " ! appsink name=sink emit-signals=false sync=false max-buffers="
            << config.max_buffers << " drop=" << (config.drop ? "true" : "false");
   return pipeline.str();

@@ -56,6 +56,8 @@ struct GstBufferAbi {
   std::uint64_t duration = 33'333'333;
   std::uint64_t offset = 0;
   std::uint64_t offset_end = 0;
+  void* qdata = nullptr;
+  void (*qdata_destroy)(void*) = nullptr;
 };
 
 enum class ObjectKind {
@@ -63,6 +65,7 @@ enum class ObjectKind {
   Sink,
   Bus,
   DisplayInfo,
+  OutputInfo,
   Pad,
 };
 
@@ -94,6 +97,12 @@ struct FakeDisplayInfo : FakeObject {
   FakePipeline* pipeline = nullptr;
 };
 
+struct FakeOutputInfo : FakeObject {
+  explicit FakeOutputInfo(FakePipeline* owner)
+      : FakeObject(ObjectKind::OutputInfo), pipeline(owner) {}
+  FakePipeline* pipeline = nullptr;
+};
+
 struct FakePad : FakeObject {
   FakePad() : FakeObject(ObjectKind::Pad) {}
   FakePadProbeCallback callback = nullptr;
@@ -102,11 +111,13 @@ struct FakePad : FakeObject {
   unsigned long probe_id = 0;
   std::uint32_t current_width = 1280;
   std::uint32_t current_height = 720;
+  bool output = false;
 };
 
 struct FakePipeline : FakeObject {
   FakePipeline() : FakeObject(ObjectKind::Pipeline) {}
   FakePad* display_pad = nullptr;
+  FakePad* output_pad = nullptr;
 };
 
 constexpr std::uint64_t kFakeCapsMagic = 0x5245434f43415053ULL;
@@ -120,13 +131,20 @@ struct FakeCaps {
 struct FakeMessage {};
 
 struct FakePadProbeInfo {
-  void* buffer = nullptr;
+  std::int32_t type = 0;
+#if INTPTR_MAX == INT64_MAX
+  std::int32_t padding = 0;
+#endif
+  std::uintptr_t id = 0;
+  void* data = nullptr;
 };
 
 struct FakeSample {
   GstBufferAbi buffer;
   abi::SurfaceParams params;
   abi::Surface surface;
+  FakePipeline* pipeline = nullptr;
+  bool post_pull_runahead_emitted = false;
 };
 
 std::mutex event_mutex;
@@ -177,6 +195,8 @@ FakeSample* make_sample(std::uint32_t sample_index = 0) {
              scenario() == "nonmonotonic-duplicate-transition" ||
              scenario() == "nonmonotonic-unique-transition") {
     sample->buffer.pts = 2'000'000'000ULL;
+  } else if (scenario() == "retired-pts-reuse") {
+    sample->buffer.pts = sample_index == 1 ? 2'000'000'000ULL : 1'000'000'000ULL;
   }
 
   sample->params.width =
@@ -227,6 +247,10 @@ std::uint32_t predecoder_width(std::uint32_t sample_index) {
   if (scenario() == "same-allocation-runahead" || scenario() == "drop-transition-first") {
     return sample_index == 0 ? 1100 : 1200;
   }
+  if (scenario() == "retired-pts-reuse") {
+    constexpr std::array<std::uint32_t, 3> widths{1100, 1200, 1160};
+    return widths.at(sample_index);
+  }
   return 1280;
 }
 
@@ -244,8 +268,30 @@ void push_predecoder_buffer(FakePad* pad, GstBufferAbi& buffer, std::uint32_t wi
   }
   pad->current_width = width;
   pad->current_height = height;
-  FakePadProbeInfo info{.buffer = &buffer};
+  FakePadProbeInfo info{.data = &buffer};
   (void)pad->callback(pad, &info, pad->callback_data);
+}
+
+void push_output_buffer(FakePad* pad, GstBufferAbi& buffer) {
+  if (pad == nullptr || pad->callback == nullptr) {
+    return;
+  }
+  FakePadProbeInfo info{.data = &buffer};
+  (void)pad->callback(pad, &info, pad->callback_data);
+}
+
+void release_buffer_qdata(GstBufferAbi& buffer) {
+  if (buffer.qdata_destroy != nullptr) {
+    buffer.qdata_destroy(buffer.qdata);
+  }
+  buffer.qdata = nullptr;
+  buffer.qdata_destroy = nullptr;
+}
+
+FakeSample* deliver_output(FakeSink* sink, FakeSample* sample) {
+  sample->pipeline = sink->pipeline;
+  push_output_buffer(sink->pipeline->output_pad, sample->buffer);
+  return sample;
 }
 
 } // namespace
@@ -286,17 +332,29 @@ RECO_FAKE_EXPORT void* gst_bin_get_by_name(void* pipeline_pointer, const char* n
     record("get-display-info");
     return scenario() == "missing-display-info" ? nullptr : new FakeDisplayInfo(pipeline);
   }
+  if (name != nullptr && std::strcmp(name, "output_info") == 0) {
+    record("get-output-info");
+    return scenario() == "missing-output-info" ? nullptr : new FakeOutputInfo(pipeline);
+  }
   return nullptr;
 }
 
-RECO_FAKE_EXPORT void* gst_element_get_static_pad(void* display_info_pointer, const char* name) {
-  record("get-display-pad");
-  if (name == nullptr || std::strcmp(name, "src") != 0 || scenario() == "missing-display-pad") {
+RECO_FAKE_EXPORT void* gst_element_get_static_pad(void* element_pointer, const char* name) {
+  const auto* element = static_cast<FakeObject*>(element_pointer);
+  const bool output = element->kind == ObjectKind::OutputInfo;
+  record(output ? "get-output-pad" : "get-display-pad");
+  if (name == nullptr || std::strcmp(name, "src") != 0 ||
+      (!output && scenario() == "missing-display-pad") ||
+      (output && scenario() == "missing-output-pad")) {
     return nullptr;
   }
-  auto* display_info = static_cast<FakeDisplayInfo*>(display_info_pointer);
   auto* pad = new FakePad;
-  display_info->pipeline->display_pad = pad;
+  pad->output = output;
+  if (output) {
+    static_cast<FakeOutputInfo*>(element_pointer)->pipeline->output_pad = pad;
+  } else {
+    static_cast<FakeDisplayInfo*>(element_pointer)->pipeline->display_pad = pad;
+  }
   return pad;
 }
 
@@ -338,6 +396,10 @@ RECO_FAKE_EXPORT void gst_object_unref(void* object) {
     record("unref-display-info");
     delete static_cast<FakeDisplayInfo*>(object);
     break;
+  case ObjectKind::OutputInfo:
+    record("unref-output-info");
+    delete static_cast<FakeOutputInfo*>(object);
+    break;
   case ObjectKind::Pad:
     record("unref-display-pad");
     if (static_cast<FakePad*>(object)->probe_id != 0) {
@@ -360,11 +422,12 @@ RECO_FAKE_EXPORT void* gst_pad_get_current_caps(void* pad_pointer) {
 RECO_FAKE_EXPORT unsigned long gst_pad_add_probe(void* pad_pointer, int,
                                                  FakePadProbeCallback callback, void* user_data,
                                                  FakeDestroyNotify destroy_notify) {
-  record("add-display-probe");
-  if (scenario() == "probe-install-error") {
+  auto* pad = static_cast<FakePad*>(pad_pointer);
+  record(pad->output ? "add-output-probe" : "add-display-probe");
+  if ((!pad->output && scenario() == "probe-install-error") ||
+      (pad->output && scenario() == "output-probe-install-error")) {
     return 0;
   }
-  auto* pad = static_cast<FakePad*>(pad_pointer);
   pad->callback = callback;
   pad->callback_data = user_data;
   pad->destroy_notify = destroy_notify;
@@ -373,8 +436,8 @@ RECO_FAKE_EXPORT unsigned long gst_pad_add_probe(void* pad_pointer, int,
 }
 
 RECO_FAKE_EXPORT void gst_pad_remove_probe(void* pad_pointer, unsigned long probe_id) {
-  record("remove-display-probe");
   auto* pad = static_cast<FakePad*>(pad_pointer);
+  record(pad->output ? "remove-output-probe" : "remove-display-probe");
   if (pad->probe_id == probe_id) {
     auto* callback_data = pad->callback_data;
     const auto destroy_notify = pad->destroy_notify;
@@ -383,15 +446,25 @@ RECO_FAKE_EXPORT void gst_pad_remove_probe(void* pad_pointer, unsigned long prob
     pad->destroy_notify = nullptr;
     pad->probe_id = 0;
     if (destroy_notify != nullptr) {
-      record("destroy-display-probe-data");
+      record(pad->output ? "destroy-output-probe-data" : "destroy-display-probe-data");
       destroy_notify(callback_data);
     }
   }
 }
 
-RECO_FAKE_EXPORT void* gst_pad_probe_info_get_buffer(void* info) {
-  return static_cast<FakePadProbeInfo*>(info)->buffer;
+RECO_FAKE_EXPORT void gst_mini_object_set_qdata(void* object, std::uint32_t, void* data,
+                                                FakeDestroyNotify destroy_notify) {
+  auto* buffer = static_cast<GstBufferAbi*>(object);
+  release_buffer_qdata(*buffer);
+  buffer->qdata = data;
+  buffer->qdata_destroy = destroy_notify;
 }
+
+RECO_FAKE_EXPORT void* gst_mini_object_get_qdata(void* object, std::uint32_t) {
+  return static_cast<GstBufferAbi*>(object)->qdata;
+}
+
+RECO_FAKE_EXPORT std::uint32_t g_quark_from_static_string(const char*) { return 1; }
 
 RECO_FAKE_EXPORT void gst_caps_unref(void* caps) {
   record("caps-unref");
@@ -411,16 +484,20 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
       next_buffer.pts = sample->buffer.pts;
       push_predecoder_buffer(sink->pipeline->display_pad, next_buffer, 1100, 720);
     }
-    return sample;
+    return deliver_output(sink, sample);
   }
   if (current_scenario == "drop-runahead" && current == 0) {
     auto* sample = make_sample(current);
-    for (std::uint64_t index = 0; index < 5'000; ++index) {
+    for (std::uint64_t index = 0; index < 4'999; ++index) {
       GstBufferAbi dropped_buffer;
       dropped_buffer.pts = index * 33'333'333ULL;
       push_predecoder_buffer(sink->pipeline->display_pad, dropped_buffer, 1280, 720);
+      push_output_buffer(sink->pipeline->output_pad, dropped_buffer);
+      release_buffer_qdata(dropped_buffer);
     }
-    return sample;
+    sample->buffer.pts = 4'999ULL * 33'333'333ULL;
+    push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, 1280, 720);
+    return deliver_output(sink, sample);
   }
   if (current_scenario == "drop-transition-first" && current == 0) {
     auto* sample = make_sample(current);
@@ -430,7 +507,7 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
                            predecoder_height());
     push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, predecoder_width(1),
                            predecoder_height());
-    return sample;
+    return deliver_output(sink, sample);
   }
   if (current_scenario == "drop-duplicate-transition-first" && current == 0) {
     auto* sample = make_sample(current);
@@ -441,7 +518,7 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     GstBufferAbi next_buffer;
     next_buffer.pts = sample->buffer.pts;
     push_predecoder_buffer(sink->pipeline->display_pad, next_buffer, 1100, 720);
-    return sample;
+    return deliver_output(sink, sample);
   }
   if (current_scenario == "nonmonotonic-duplicate-transition" && current == 0) {
     auto* sample = make_sample(current);
@@ -455,7 +532,7 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     GstBufferAbi next_buffer;
     next_buffer.pts = sample->buffer.pts;
     push_predecoder_buffer(sink->pipeline->display_pad, next_buffer, 1100, 720);
-    return sample;
+    return deliver_output(sink, sample);
   }
   if (current_scenario == "nonmonotonic-unique-transition" && current == 0) {
     auto* sample = make_sample(current);
@@ -469,7 +546,13 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     first_new_buffer.pts = 4'000'000'000ULL;
     push_predecoder_buffer(sink->pipeline->display_pad, first_new_buffer, 1200, 720);
     push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, 1200, 720);
-    return sample;
+    return deliver_output(sink, sample);
+  }
+  if (current_scenario == "retired-pts-reuse" && current < 3) {
+    auto* sample = make_sample(current);
+    push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, predecoder_width(current),
+                           predecoder_height());
+    return deliver_output(sink, sample);
   }
   const bool caps_runahead = current_scenario == "caps-runahead" ||
                              current_scenario == "caps-runahead-unknown-time" ||
@@ -487,19 +570,19 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
       push_predecoder_buffer(sink->pipeline->display_pad, next_buffer, predecoder_width(1),
                              predecoder_height());
     }
-    return sample;
+    return deliver_output(sink, sample);
   }
   if ((current_scenario == "frame-eos" || current_scenario == "unknown-time" ||
        current_scenario == "missing-buffer" || current_scenario == "map-error" ||
        current_scenario == "invalid-surface" || current_scenario == "visible-crop" ||
        current_scenario == "missing-caps" || current_scenario == "missing-caps-structure" ||
        current_scenario == "invalid-caps" || current_scenario == "oversized-caps" ||
-       current_scenario == "drop-stale-caps-first") &&
+       current_scenario == "drop-stale-caps-first" || current_scenario == "post-pull-runahead") &&
       current == 0) {
     auto* sample = make_sample(current);
     push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, predecoder_width(current),
                            predecoder_height());
-    return sample;
+    return deliver_output(sink, sample);
   }
   return nullptr;
 }
@@ -525,7 +608,18 @@ RECO_FAKE_EXPORT void* gst_sample_get_buffer(void* sample) {
   if (scenario() == "missing-buffer") {
     return nullptr;
   }
-  return &static_cast<FakeSample*>(sample)->buffer;
+  auto* fake_sample = static_cast<FakeSample*>(sample);
+  if (scenario() == "post-pull-runahead" && !fake_sample->post_pull_runahead_emitted) {
+    fake_sample->post_pull_runahead_emitted = true;
+    for (std::uint64_t index = 0; index < 5'000; ++index) {
+      GstBufferAbi dropped_buffer;
+      dropped_buffer.pts = 2'000'000'000ULL + index * 33'333'333ULL;
+      push_predecoder_buffer(fake_sample->pipeline->display_pad, dropped_buffer, 1280, 720);
+      push_output_buffer(fake_sample->pipeline->output_pad, dropped_buffer);
+      release_buffer_qdata(dropped_buffer);
+    }
+  }
+  return &fake_sample->buffer;
 }
 
 RECO_FAKE_EXPORT void* gst_sample_get_caps(void* sample) {
@@ -561,7 +655,9 @@ RECO_FAKE_EXPORT int gst_structure_get_int(const void* structure, const char* fi
 
 RECO_FAKE_EXPORT void gst_sample_unref(void* sample) {
   record("sample-unref");
-  delete static_cast<FakeSample*>(sample);
+  auto* fake_sample = static_cast<FakeSample*>(sample);
+  release_buffer_qdata(fake_sample->buffer);
+  delete fake_sample;
 }
 
 RECO_FAKE_EXPORT int gst_buffer_map(void* buffer, GstMapInfoAbi* map, std::uint32_t) {

@@ -153,6 +153,10 @@ void production_source_retains_mapped_sample() {
             "source shutdown removes the geometry callback");
   expect_eq(count_event(events, "destroy-display-probe-data"), 1U,
             "GStreamer owns and destroys the geometry callback state");
+  expect_eq(count_event(events, "remove-output-probe"), 1U,
+            "source shutdown removes the output metadata callback");
+  expect_eq(count_event(events, "destroy-output-probe-data"), 1U,
+            "GStreamer owns and destroys the output callback state");
   expect_eq(count_event(events, "probe-leaked"), 0U,
             "geometry callback does not outlive its source");
   expect_eq(count_event(events, "unmap"), 0U,
@@ -317,6 +321,37 @@ void nonmonotonic_parser_pts_correlate_unique_geometry() {
   }
 }
 
+void retired_pts_do_not_pollute_later_geometry_epochs() {
+  set_scenario("retired-pts-reuse");
+  auto source =
+      open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+
+  constexpr std::array<std::uint32_t, 3> expected_widths{1100, 1200, 1160};
+  for (const auto expected_width : expected_widths) {
+    const auto result = source->read();
+    expect_true(result.frame.has_value(), "retired-PTS geometry frame returned");
+    if (result.frame.has_value()) {
+      expect_eq(result.frame->visible_width, expected_width,
+                "retired PTS does not create a stale geometry candidate");
+    }
+  }
+}
+
+void pulled_sample_metadata_survives_post_pull_runahead() {
+  set_scenario("post-pull-runahead");
+  auto config = valid_config();
+  config.drop = true;
+  auto source =
+      open_gstreamer_gpu_file_decode_source(std::move(config), NvbufSurfaceAbi::DeepStream9_1);
+
+  const auto result = source->read();
+  expect_true(result.frame.has_value(), "post-pull runahead frame returned");
+  if (result.frame.has_value()) {
+    expect_eq(result.frame->visible_width, 1280U,
+              "attached geometry survives 5000 post-pull decoded frames");
+  }
+}
+
 void stale_parser_caps_reject_allocation_changes() {
   set_scenario("caps-runahead-stale-caps");
   auto source =
@@ -448,9 +483,25 @@ void fatal_pipeline_errors_are_latched() {
   expect_eq(count_event(events, "pull"), 1U, "latched bus error prevents later appsink pulls");
 }
 
+void geometry_probe_errors_are_latched_before_further_pulls() {
+  set_scenario("missing-caps");
+  const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
+  std::filesystem::remove(event_path);
+  auto source =
+      open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+
+  expect_gpu_decode_error([&] { (void)source->read(); }, "does not contain negotiated caps",
+                          "first geometry probe failure");
+  expect_gpu_decode_error([&] { (void)source->read(); }, "does not contain negotiated caps",
+                          "latched geometry probe failure");
+  const auto events = read_events(event_path);
+  expect_eq(count_event(events, "pull"), 1U,
+            "latched geometry probe failure prevents further sample pulls");
+}
+
 void runtime_failures_are_reported() {
   for (const auto& [scenario_name, fragment] :
-       std::array<std::pair<std::string_view, std::string_view>, 9>{
+       std::array<std::pair<std::string_view, std::string_view>, 12>{
            {{"old-version", "1.10 or newer"},
             {"init-error", "fake initialization failure"},
             {"parse-error", "fake parse failure"},
@@ -458,6 +509,9 @@ void runtime_failures_are_reported() {
             {"missing-display-info", "does not contain pre-decoder identity"},
             {"missing-display-pad", "does not provide a source pad"},
             {"probe-install-error", "failed to install"},
+            {"missing-output-info", "does not contain output identity"},
+            {"missing-output-pad", "output identity does not provide a source pad"},
+            {"output-probe-install-error", "failed to install GStreamer output"},
             {"missing-bus", "does not provide a message bus"},
             {"state-error", "rejected the PLAYING state"}}}) {
     set_scenario(scenario_name);
@@ -510,12 +564,15 @@ int main() {
   dropped_first_duplicate_pts_at_transition_is_ambiguous();
   nonmonotonic_parser_pts_preserve_duplicate_boundary_evidence();
   nonmonotonic_parser_pts_correlate_unique_geometry();
+  retired_pts_do_not_pollute_later_geometry_epochs();
+  pulled_sample_metadata_survives_post_pull_runahead();
   stale_parser_caps_reject_allocation_changes();
   dropped_samples_do_not_accumulate_geometry_records();
   first_frame_rejects_grossly_stale_geometry();
   unknown_timestamps_are_not_fabricated();
   concurrent_reads_serialize_appsink_access();
   fatal_pipeline_errors_are_latched();
+  geometry_probe_errors_are_latched_before_further_pulls();
   runtime_failures_are_reported();
   std::filesystem::remove(event_path);
 #endif
