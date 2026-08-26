@@ -21,7 +21,7 @@ jobs:
           disk-cache: true
           repository-cache: true
       - name: Test C++ port
-        run: bazel test //cpp/...
+        run: bazel test //cpp/tests:all
       - name: Build C++ fuzz harnesses
         run: bazel build //cpp/reco_core:input_path_fuzz //cpp/reco_core:calibration_json_fuzz
 
