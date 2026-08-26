@@ -119,39 +119,23 @@ std::optional<std::string> validate_gpu_file_decode_config(const GpuFileDecodeCo
 }
 
 std::optional<std::string> validate_gpu_decoded_frame(const GpuDecodedFrame& frame) {
-  if (frame.nvmm.dmabuf_fd < 0) {
-    return "GPU decoded frame must carry a valid NVMM DMA-BUF fd";
-  }
-  if (frame.nvmm.surface_ptr == nullptr) {
-    return "GPU decoded frame must carry a retained NvBufSurface pointer";
-  }
   if (!frame.owner) {
     return "GPU decoded frame must retain its decoder buffer owner";
   }
-  if (frame.nvmm.width == 0 || frame.nvmm.height == 0) {
-    return "GPU decoded frame dimensions must be non-zero";
-  }
-  if (frame.nvmm.y_pitch < frame.nvmm.width || frame.nvmm.uv_pitch < frame.nvmm.width) {
-    return "GPU decoded frame NV12 pitches must cover the frame width";
-  }
-  if (frame.nvmm.uv_offset <= frame.nvmm.y_offset) {
-    return "GPU decoded frame UV plane must follow Y plane";
-  }
-  const std::uint64_t y_end = static_cast<std::uint64_t>(frame.nvmm.y_offset) +
-                              static_cast<std::uint64_t>(frame.nvmm.y_pitch) * frame.nvmm.height;
-  const std::uint64_t uv_rows = (static_cast<std::uint64_t>(frame.nvmm.height) + 1U) / 2U;
-  const std::uint64_t uv_end = static_cast<std::uint64_t>(frame.nvmm.uv_offset) +
-                               static_cast<std::uint64_t>(frame.nvmm.uv_pitch) * uv_rows;
-  if (frame.nvmm.uv_offset < y_end) {
-    return "GPU decoded frame NV12 planes must not overlap";
-  }
-  if (y_end > frame.nvmm.total_size || uv_end > frame.nvmm.total_size) {
-    return "GPU decoded frame NV12 planes exceed the mapped surface size";
+  if (const auto error = validate_nvmm_frame_info(frame.nvmm); error.has_value()) {
+    return "GPU decoded frame is invalid: " + *error;
   }
   if (frame.duration_ns < 0) {
     return "GPU decoded frame duration must be non-negative";
   }
   return std::nullopt;
+}
+
+NvmmCudaFrame map_gpu_decoded_frame_to_cuda(const GpuDecodedFrame& frame) {
+  if (const auto error = validate_gpu_decoded_frame(frame); error.has_value()) {
+    throw std::invalid_argument(*error);
+  }
+  return map_nvmm_frame_to_cuda(frame.nvmm, frame.owner);
 }
 
 std::string build_gstreamer_gpu_file_decode_pipeline(const GpuFileDecodeConfig& config) {
@@ -165,7 +149,9 @@ std::string build_gstreamer_gpu_file_decode_pipeline(const GpuFileDecodeConfig& 
   } else {
     pipeline << gpu_decode_container_demuxer(*config.container) << " ! parsebin";
   }
-  pipeline << " ! nvv4l2decoder ! video/x-raw(memory:NVMM),format=NV12"
+  pipeline << " ! nvv4l2decoder"
+           << " ! nvvideoconvert compute-hw=1 bl-output=false disable-passthrough=true"
+           << " ! video/x-raw(memory:NVMM),format=NV12"
            << " ! appsink name=sink emit-signals=false sync=false max-buffers="
            << config.max_buffers << " drop=" << (config.drop ? "true" : "false");
   return pipeline.str();

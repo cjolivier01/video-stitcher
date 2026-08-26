@@ -139,6 +139,8 @@ std::optional<DynamicLibrary> try_load_first(std::initializer_list<const char*> 
 
 using NppiNv12ToRgb = int (*)(const std::uint8_t* const*, int, std::uint8_t*, int, NppiSize,
                               NppStreamContext);
+using NppiNv12ToRgbColorTwist = int (*)(const std::uint8_t* const*, int*, std::uint8_t*, int,
+                                        NppiSize, const float (*)[4], NppStreamContext);
 using NppiResize = int (*)(const std::uint8_t*, int, NppiSize, NppiRect, std::uint8_t*, int,
                            NppiSize, NppiRect, int, NppStreamContext);
 using NppiMirror = int (*)(const std::uint8_t*, int, std::uint8_t*, int, NppiSize, int,
@@ -161,6 +163,7 @@ struct NppFunctions {
   NppStreamContext stream_ctx;
   std::optional<CudaStreamDestroy> stream_destroy;
   NppiNv12ToRgb nv12_to_rgb = nullptr;
+  NppiNv12ToRgbColorTwist nv12_to_rgb_color_twist = nullptr;
   NppiResize resize_c3 = nullptr;
   NppiResize resize_c4 = nullptr;
   NppiMirror mirror_c3 = nullptr;
@@ -264,6 +267,8 @@ std::unique_ptr<NppFunctions> load_npp() {
   functions->stream_ctx = stream_ctx;
   functions->stream_destroy = stream_destroy;
   functions->nv12_to_rgb = functions->nppicc.symbol<NppiNv12ToRgb>("nppiNV12ToRGB_8u_P2C3R_Ctx");
+  functions->nv12_to_rgb_color_twist =
+      functions->nppicc.symbol<NppiNv12ToRgbColorTwist>("nppiNV12ToRGB_8u_ColorTwist32f_P2C3R_Ctx");
   functions->resize_c3 = functions->nppig.symbol<NppiResize>("nppiResize_8u_C3R_Ctx");
   functions->resize_c4 = functions->nppig.symbol<NppiResize>("nppiResize_8u_C4R_Ctx");
   functions->mirror_c3 = functions->nppig.symbol<NppiMirror>("nppiMirror_8u_C3R_Ctx");
@@ -278,7 +283,7 @@ struct NppState {
 const NppState& npp_state() {
   static const NppState state = [] {
     try {
-      return NppState{.functions = load_npp()};
+      return NppState{.functions = load_npp(), .error = {}};
     } catch (const std::exception& error) {
       return NppState{.functions = nullptr, .error = error.what()};
     }
@@ -380,6 +385,48 @@ void npp_nv12_to_rgb(core::CudaDevicePtr src_y, std::size_t y_pitch, core::CudaD
                 src_ptrs.data(), checked_pitch(y_pitch, "NV12 Y"),
                 reinterpret_cast<std::uint8_t*>(dst), checked_step(width, 3, "RGB"),
                 NppiSize{static_cast<int>(width), static_cast<int>(height)}, functions.stream_ctx));
+}
+
+void npp_nv12_to_rgb(core::CudaDevicePtr src_y, std::size_t y_pitch, core::CudaDevicePtr src_uv,
+                     std::size_t uv_pitch, core::CudaDevicePtr dst, std::uint32_t width,
+                     std::uint32_t height, core::YuvColorMatrix color_matrix,
+                     core::YuvColorRange color_range) {
+  require_ptr(src_y, "NV12 Y source");
+  require_ptr(src_uv, "NV12 UV source");
+  require_ptr(dst, "RGB destination");
+  require_dims(width, height, "NV12");
+  if ((width % 2) != 0 || (height % 2) != 0) {
+    throw std::invalid_argument("NPP NV12 dimensions must be even");
+  }
+  if (y_pitch < width || uv_pitch < width) {
+    throw std::invalid_argument("NPP NV12 pitch is smaller than width");
+  }
+
+  const auto& functions = npp();
+  const std::array<const std::uint8_t*, 2> src_ptrs{
+      reinterpret_cast<const std::uint8_t*>(src_y),
+      reinterpret_cast<const std::uint8_t*>(src_uv),
+  };
+  std::array<int, 2> src_steps{
+      checked_pitch(y_pitch, "NV12 Y"),
+      checked_pitch(uv_pitch, "NV12 UV"),
+  };
+  const auto coefficients = core::yuv_to_rgb_coefficients(color_matrix, color_range);
+  const std::array<std::array<float, 4>, 3> twist{{
+      {coefficients.y_scale, 0.0F, coefficients.red_from_v,
+       coefficients.y_scale * coefficients.y_offset - 128.0F * coefficients.red_from_v},
+      {coefficients.y_scale, coefficients.green_from_u, coefficients.green_from_v,
+       coefficients.y_scale * coefficients.y_offset -
+           128.0F * (coefficients.green_from_u + coefficients.green_from_v)},
+      {coefficients.y_scale, coefficients.blue_from_u, 0.0F,
+       coefficients.y_scale * coefficients.y_offset - 128.0F * coefficients.blue_from_u},
+  }};
+  check_npp("nppiNV12ToRGB_8u_ColorTwist32f_P2C3R_Ctx",
+            functions.nv12_to_rgb_color_twist(
+                src_ptrs.data(), src_steps.data(), reinterpret_cast<std::uint8_t*>(dst),
+                checked_step(width, 3, "RGB"),
+                NppiSize{static_cast<int>(width), static_cast<int>(height)},
+                reinterpret_cast<const float (*)[4]>(twist.data()), functions.stream_ctx));
 }
 
 void npp_resize_c3(core::CudaDevicePtr src, std::uint32_t src_w, std::uint32_t src_h,

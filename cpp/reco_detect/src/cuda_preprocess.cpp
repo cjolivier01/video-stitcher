@@ -254,6 +254,12 @@ constexpr char kNv12ToRgbChwFullrangePtx[] = R"ptx(
     .param .u32 pad_x,
     .param .u32 pad_y,
     .param .f32 scale,
+    .param .f32 y_offset,
+    .param .f32 y_scale,
+    .param .f32 red_from_v,
+    .param .f32 green_from_u,
+    .param .f32 green_from_v,
+    .param .f32 blue_from_u,
     .param .u32 flip180
 )
 {
@@ -333,6 +339,10 @@ constexpr char kNv12ToRgbChwFullrangePtx[] = R"ptx(
     add.u64 %addr, %yp, %addr;
     ld.global.u8 %pix, [%addr];
     cvt.rn.f32.u16 %y00, %pix;
+    ld.param.f32 %t1, [y_offset];
+    add.f32 %y00, %y00, %t1;
+    ld.param.f32 %t1, [y_scale];
+    mul.f32 %y00, %y00, %t1;
 
     ld.param.u64 %uvp, [uv_ptr];
     shr.u32 %tmp, %sy0, 1;
@@ -351,13 +361,13 @@ constexpr char kNv12ToRgbChwFullrangePtx[] = R"ptx(
     sub.f32 %u_val, %u_val, %c128;
     sub.f32 %v_val, %v_val, %c128;
 
-    mov.f32 %t1, 0f3FC9930C;
+    ld.param.f32 %t1, [red_from_v];
     fma.rn.f32 %r, %t1, %v_val, %y00;
-    mov.f32 %t1, 0fBE3FCB92;
+    ld.param.f32 %t1, [green_from_u];
     fma.rn.f32 %g, %t1, %u_val, %y00;
-    mov.f32 %t2, 0fBEEFAACE;
+    ld.param.f32 %t2, [green_from_v];
     fma.rn.f32 %g, %t2, %v_val, %g;
-    mov.f32 %t1, 0f3FED844D;
+    ld.param.f32 %t1, [blue_from_u];
     fma.rn.f32 %b, %t1, %u_val, %y00;
 
     mov.f32 %zero, 0f00000000;
@@ -478,8 +488,7 @@ void launch_p010(CudaBackend& backend, CudaDevicePtr src, CudaDevicePtr dst,
   CudaDevicePtr dst_arg = dst;
   std::uint32_t samples_arg = samples;
   void* args[] = {&src_arg, &dst_arg, &samples_arg};
-  kernel.launch({.grid = {.x = grid, .y = 1, .z = 1}, .block = {.x = block, .y = 1, .z = 1}},
-                args);
+  kernel.launch({.grid = {.x = grid, .y = 1, .z = 1}, .block = {.x = block, .y = 1, .z = 1}}, args);
   kernel.synchronize();
 }
 
@@ -516,9 +525,8 @@ void normalize_hwc_to_chw(CudaBackend& backend, CudaDevicePtr src, CudaDevicePtr
   validate_extent(width, height);
   const auto& kernel = cached_kernel(backend, kNormalizeHwcToChwPtx, "normalize_hwc_to_chw");
   constexpr reco::core::CudaDim3 block{.x = 16, .y = 16, .z = 1};
-  const reco::core::CudaDim3 grid{.x = ceil_div_u32(width, block.x),
-                                  .y = ceil_div_u32(height, block.y),
-                                  .z = 1};
+  const reco::core::CudaDim3 grid{
+      .x = ceil_div_u32(width, block.x), .y = ceil_div_u32(height, block.y), .z = 1};
   CudaDevicePtr src_arg = src;
   CudaDevicePtr dst_arg = dst;
   std::uint32_t width_arg = width;
@@ -534,9 +542,8 @@ void normalize_rgba_to_chw(CudaBackend& backend, CudaDevicePtr src, CudaDevicePt
   validate_extent(width, height);
   const auto& kernel = cached_kernel(backend, kNormalizeRgbaToChwPtx, "normalize_rgba_to_chw");
   constexpr reco::core::CudaDim3 block{.x = 16, .y = 16, .z = 1};
-  const reco::core::CudaDim3 grid{.x = ceil_div_u32(width, block.x),
-                                  .y = ceil_div_u32(height, block.y),
-                                  .z = 1};
+  const reco::core::CudaDim3 grid{
+      .x = ceil_div_u32(width, block.x), .y = ceil_div_u32(height, block.y), .z = 1};
   CudaDevicePtr src_arg = src;
   CudaDevicePtr dst_arg = dst;
   std::uint32_t width_arg = width;
@@ -546,14 +553,14 @@ void normalize_rgba_to_chw(CudaBackend& backend, CudaDevicePtr src, CudaDevicePt
   kernel.synchronize();
 }
 
-void nv12_to_rgb_chw_fullrange(CudaBackend& backend, CudaDevicePtr y, CudaDevicePtr uv,
-                               CudaDevicePtr dst, std::uint32_t y_pitch,
-                               std::uint32_t src_width, std::uint32_t src_height,
-                               std::uint32_t dst_width, std::uint32_t dst_height,
-                               std::uint32_t pad_x, std::uint32_t pad_y, float scale,
-                               int rotation_degrees) {
+void nv12_to_rgb_chw(CudaBackend& backend, CudaDevicePtr y, CudaDevicePtr uv, CudaDevicePtr dst,
+                     std::uint32_t y_pitch, std::uint32_t src_width, std::uint32_t src_height,
+                     std::uint32_t dst_width, std::uint32_t dst_height, std::uint32_t pad_x,
+                     std::uint32_t pad_y, float scale, int rotation_degrees,
+                     core::YuvColorMatrix color_matrix, core::YuvColorRange color_range) {
   if (y == 0 || uv == 0 || dst == 0) {
-    throw std::invalid_argument("CUDA NV12 preprocess requires live source and destination pointers");
+    throw std::invalid_argument(
+        "CUDA NV12 preprocess requires live source and destination pointers");
   }
   validate_extent(src_width, src_height);
   validate_extent(dst_width, dst_height);
@@ -574,9 +581,8 @@ void nv12_to_rgb_chw_fullrange(CudaBackend& backend, CudaDevicePtr y, CudaDevice
   const auto& kernel =
       cached_kernel(backend, kNv12ToRgbChwFullrangePtx, "nv12_to_rgb_chw_fullrange");
   constexpr reco::core::CudaDim3 block{.x = 16, .y = 16, .z = 1};
-  const reco::core::CudaDim3 grid{.x = ceil_div_u32(dst_width, block.x),
-                                  .y = ceil_div_u32(dst_height, block.y),
-                                  .z = 1};
+  const reco::core::CudaDim3 grid{
+      .x = ceil_div_u32(dst_width, block.x), .y = ceil_div_u32(dst_height, block.y), .z = 1};
   CudaDevicePtr y_arg = y;
   CudaDevicePtr uv_arg = uv;
   CudaDevicePtr dst_arg = dst;
@@ -588,11 +594,31 @@ void nv12_to_rgb_chw_fullrange(CudaBackend& backend, CudaDevicePtr y, CudaDevice
   std::uint32_t pad_x_arg = pad_x;
   std::uint32_t pad_y_arg = pad_y;
   float scale_arg = scale;
+  const auto coefficients = core::yuv_to_rgb_coefficients(color_matrix, color_range);
+  float y_offset_arg = coefficients.y_offset;
+  float y_scale_arg = coefficients.y_scale;
+  float red_from_v_arg = coefficients.red_from_v;
+  float green_from_u_arg = coefficients.green_from_u;
+  float green_from_v_arg = coefficients.green_from_v;
+  float blue_from_u_arg = coefficients.blue_from_u;
   std::uint32_t flip_arg = rotation_degrees == 180 ? 1U : 0U;
-  void* args[] = {&y_arg,     &uv_arg,    &dst_arg,   &pitch_arg, &src_w_arg, &src_h_arg,
-                  &dst_w_arg, &dst_h_arg, &pad_x_arg, &pad_y_arg, &scale_arg, &flip_arg};
+  void* args[] = {&y_arg,           &uv_arg,         &dst_arg,          &pitch_arg,
+                  &src_w_arg,       &src_h_arg,      &dst_w_arg,        &dst_h_arg,
+                  &pad_x_arg,       &pad_y_arg,      &scale_arg,        &y_offset_arg,
+                  &y_scale_arg,     &red_from_v_arg, &green_from_u_arg, &green_from_v_arg,
+                  &blue_from_u_arg, &flip_arg};
   kernel.launch({.grid = grid, .block = block}, args);
   kernel.synchronize();
+}
+
+void nv12_to_rgb_chw_fullrange(CudaBackend& backend, CudaDevicePtr y, CudaDevicePtr uv,
+                               CudaDevicePtr dst, std::uint32_t y_pitch, std::uint32_t src_width,
+                               std::uint32_t src_height, std::uint32_t dst_width,
+                               std::uint32_t dst_height, std::uint32_t pad_x, std::uint32_t pad_y,
+                               float scale, int rotation_degrees) {
+  nv12_to_rgb_chw(backend, y, uv, dst, y_pitch, src_width, src_height, dst_width, dst_height, pad_x,
+                  pad_y, scale, rotation_degrees, core::YuvColorMatrix::Bt709,
+                  core::YuvColorRange::Full);
 }
 
 } // namespace reco::detect

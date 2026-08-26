@@ -96,6 +96,32 @@ cc_test(
     ],
 )
 
+cc_binary(
+    name = "libfake_nvbufsurface.so",
+    testonly = True,
+    srcs = ["fake_nvbufsurface.cpp"],
+    linkshared = True,
+    deps = ["//cpp/reco_io"],
+)
+
+cc_binary(
+    name = "libfake_cuda_driver.so",
+    testonly = True,
+    srcs = ["fake_cuda_driver.cpp"],
+    linkshared = True,
+)
+
+cc_test(
+    name = "reco_io_nvmm_cuda_interop_tests",
+    size = "small",
+    srcs = ["reco_io_nvmm_cuda_interop_tests.cpp"],
+    data = [
+        ":libfake_cuda_driver.so",
+        ":libfake_nvbufsurface.so",
+    ],
+    deps = ["//cpp/reco_io"],
+)
+
 cc_test(
     name = "reco_autocam_policy_tests",
     size = "small",

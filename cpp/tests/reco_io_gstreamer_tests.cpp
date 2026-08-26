@@ -64,9 +64,12 @@ void pipeline_builders_match_rust_policy() {
                                                     CapturePlatform::Jetson);
   expect_true(jetson.find("nvarguscamerasrc sensor-id=1") != std::string::npos,
               "Jetson source selected");
-  expect_true(jetson.find("video/x-raw(memory:NVMM)") != std::string::npos,
-              "Jetson NVMM caps preserved");
-  expect_true(jetson.find("format=NV12") != std::string::npos, "Jetson NV12 output");
+  expect_true(jetson.find("nvvideoconvert compute-hw=1 bl-output=false "
+                          "disable-passthrough=true ! "
+                          "video/x-raw(memory:NVMM),format=NV12 ! appsink") != std::string::npos,
+              "Jetson NVMM NV12 caps reach appsink");
+  expect_true(jetson.find("video/x-raw,format=") == std::string::npos,
+              "Jetson pipeline never downloads before appsink");
 
   const auto linux = build_capture_pipeline_string("/dev/video2", 1280, 720, 30,
                                                    CaptureFormat::I420, CapturePlatform::LinuxV4l2);
@@ -95,6 +98,12 @@ void pipeline_builders_match_rust_policy() {
                                             CapturePlatform::Jetson);
       },
       "invalid device rejected before pipeline interpolation");
+  expect_invalid_argument(
+      [] {
+        (void)build_capture_pipeline_string("0", 640, 480, 30, CaptureFormat::I420,
+                                            CapturePlatform::Jetson);
+      },
+      "Jetson capture rejects non-NV12 GPU format");
 }
 
 void runtime_probes_are_stable() {
@@ -149,6 +158,9 @@ void gpu_file_decode_pipeline_preserves_nvmm() {
               "GPU file source is quoted");
   expect_true(pipeline.find("qtdemux ! parsebin ! nvv4l2decoder") != std::string::npos,
               "containerized hardware decode selected");
+  expect_true(pipeline.find("nvvideoconvert compute-hw=1 bl-output=false "
+                            "disable-passthrough=true") != std::string::npos,
+              "GPU decode converts block-linear output to pitch-linear NVMM");
   expect_true(pipeline.find("video/x-raw(memory:NVMM),format=NV12") != std::string::npos,
               "NVMM NV12 caps preserved");
   expect_true(pipeline.find("appsink name=sink") != std::string::npos, "appsink selected");
@@ -185,15 +197,34 @@ void gpu_file_decode_pipeline_preserves_nvmm() {
               "property-looking path remains inside location value");
 
   expect_invalid_argument(
-      [] { (void)build_gstreamer_gpu_file_decode_pipeline({.path = "left.mp4 ! fakesink"}); },
+      [] {
+        (void)build_gstreamer_gpu_file_decode_pipeline({.path = "left.mp4 ! fakesink",
+                                                        .codec = GpuDecodeCodec::H264,
+                                                        .elementary_stream = false,
+                                                        .container = std::nullopt,
+                                                        .max_buffers = 4,
+                                                        .drop = false});
+      },
       "pipeline injection in file path rejected");
   expect_invalid_argument(
       [] {
-        (void)build_gstreamer_gpu_file_decode_pipeline({.path = "left.mp4", .max_buffers = 0});
+        (void)build_gstreamer_gpu_file_decode_pipeline({.path = "left.mp4",
+                                                        .codec = GpuDecodeCodec::H264,
+                                                        .elementary_stream = false,
+                                                        .container = std::nullopt,
+                                                        .max_buffers = 0,
+                                                        .drop = false});
       },
       "zero max buffers rejected");
   expect_invalid_argument(
-      [] { (void)build_gstreamer_gpu_file_decode_pipeline({.path = "left.avi"}); },
+      [] {
+        (void)build_gstreamer_gpu_file_decode_pipeline({.path = "left.avi",
+                                                        .codec = GpuDecodeCodec::H264,
+                                                        .elementary_stream = false,
+                                                        .container = std::nullopt,
+                                                        .max_buffers = 4,
+                                                        .drop = false});
+      },
       "unsupported default container rejected");
 }
 
@@ -206,7 +237,9 @@ GpuDecodedFrame valid_gpu_frame() {
                    .uv_offset = 1920 * 1080,
                    .uv_pitch = 1920,
                    .total_size = 1920 * 1080 + 1920 * 540,
-                   .surface_ptr = reinterpret_cast<void*>(0x1234)},
+                   .surface_ptr = reinterpret_cast<void*>(0x1234),
+                   .memory_type = NvmmMemoryType::SurfaceArray,
+                   .gpu_id = 0},
           .owner = std::make_shared<int>(1),
           .frame_index = 7,
           .pts_ns = 33'333'333,
@@ -235,7 +268,7 @@ void gpu_decode_frame_source_preserves_gpu_residency() {
   expect_true(!eos.frame.has_value(), "EOS has no frame payload");
 
   frame.nvmm.dmabuf_fd = -1;
-  expect_true(validate_gpu_decoded_frame(frame).has_value(), "CPU/host frame rejected");
+  expect_true(validate_gpu_decoded_frame(frame).has_value(), "invalid surface-array fd rejected");
   expect_invalid_argument(
       [&] {
         (void)make_fixture_gpu_file_decode_source(
@@ -260,6 +293,22 @@ void gpu_decode_frame_source_preserves_gpu_residency() {
   frame = valid_gpu_frame();
   frame.owner.reset();
   expect_true(validate_gpu_decoded_frame(frame).has_value(), "missing buffer owner rejected");
+
+  frame = valid_gpu_frame();
+  frame.nvmm.uv_pitch += 128;
+  expect_true(validate_gpu_decoded_frame(frame).has_value(),
+              "unequal CUDA/NPP plane pitches rejected at decode boundary");
+
+  frame = valid_gpu_frame();
+  frame.nvmm.width -= 1;
+  expect_true(validate_gpu_decoded_frame(frame).has_value(), "odd NV12 width rejected");
+
+  frame = valid_gpu_frame();
+  frame.nvmm.memory_type = NvmmMemoryType::CudaDevice;
+  frame.nvmm.dmabuf_fd = -1;
+  frame.nvmm.cuda_base_ptr = 0x10000000;
+  expect_true(!validate_gpu_decoded_frame(frame).has_value(),
+              "dGPU CUDA-device frame accepted without DMA-BUF fd");
 
   frame = valid_gpu_frame();
   frame.nvmm.height = UINT32_MAX;

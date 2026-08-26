@@ -51,15 +51,15 @@ std::optional<std::string> loadable_library(std::initializer_list<const char*> n
 
 RuntimeProbe probe_library(std::initializer_list<const char*> names) {
   if (auto library = loadable_library(names); library.has_value()) {
-    return RuntimeProbe{.available = true, .library = *library};
+    return RuntimeProbe{.available = true, .library = *library, .error = {}};
   }
   std::ostringstream message;
   message << "none of the expected runtime libraries could be loaded";
   return RuntimeProbe{.available = false, .library = {}, .error = message.str()};
 }
 
-RuntimeProbe probe_required_libraries(
-    std::initializer_list<std::initializer_list<const char*>> groups) {
+RuntimeProbe
+probe_required_libraries(std::initializer_list<std::initializer_list<const char*>> groups) {
   std::vector<std::string> loaded;
   std::size_t index = 0;
   for (const auto group : groups) {
@@ -79,7 +79,7 @@ RuntimeProbe probe_required_libraries(
     }
     joined << loaded[i];
   }
-  return RuntimeProbe{.available = true, .library = joined.str()};
+  return RuntimeProbe{.available = true, .library = joined.str(), .error = {}};
 }
 
 bool is_tegra() {
@@ -162,6 +162,9 @@ std::string build_capture_pipeline_string(std::string_view device, std::uint32_t
   if (const auto error = validate_capture_device(device, platform); error.has_value()) {
     throw std::invalid_argument(*error);
   }
+  if (platform == CapturePlatform::Jetson && format != CaptureFormat::Nv12) {
+    throw std::invalid_argument("Jetson GPU capture currently supports NV12 only");
+  }
   const auto fmt = capture_format_name(format);
   std::ostringstream pipeline;
   switch (platform) {
@@ -169,7 +172,8 @@ std::string build_capture_pipeline_string(std::string_view device, std::uint32_t
     pipeline << "nvarguscamerasrc sensor-id=" << device
              << " ! video/x-raw(memory:NVMM),width=" << width << ",height=" << height
              << ",format=NV12,framerate=" << fps
-             << "/1 ! nvvidconv ! video/x-raw,format=" << fmt
+             << "/1 ! nvvideoconvert compute-hw=1 bl-output=false disable-passthrough=true"
+             << " ! video/x-raw(memory:NVMM),format=" << fmt
              << " ! appsink name=sink emit-signals=false sync=false";
     break;
   case CapturePlatform::Macos:
@@ -200,13 +204,11 @@ RuntimeProbe probe_gstreamer_runtime() {
 #if defined(_WIN32)
   return probe_required_libraries({{"gstreamer-1.0-0.dll"}, {"gstapp-1.0-0.dll"}});
 #elif defined(__APPLE__)
-  return probe_required_libraries(
-      {{"libgstreamer-1.0.0.dylib", "libgstreamer-1.0.dylib"},
-       {"libgstapp-1.0.0.dylib", "libgstapp-1.0.dylib"}});
+  return probe_required_libraries({{"libgstreamer-1.0.0.dylib", "libgstreamer-1.0.dylib"},
+                                   {"libgstapp-1.0.0.dylib", "libgstapp-1.0.dylib"}});
 #else
-  return probe_required_libraries(
-      {{"libgstreamer-1.0.so.0", "libgstreamer-1.0.so"},
-       {"libgstapp-1.0.so.0", "libgstapp-1.0.so"}});
+  return probe_required_libraries({{"libgstreamer-1.0.so.0", "libgstreamer-1.0.so"},
+                                   {"libgstapp-1.0.so.0", "libgstapp-1.0.so"}});
 #endif
 }
 

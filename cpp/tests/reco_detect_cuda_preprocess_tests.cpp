@@ -178,10 +178,7 @@ int main() {
     constexpr std::uint32_t width = 2;
     constexpr std::uint32_t height = 2;
     const std::vector<std::uint8_t> rgb{
-        255, 0, 0,
-        0, 128, 0,
-        0, 0, 64,
-        25, 50, 75,
+        255, 0, 0, 0, 128, 0, 0, 0, 64, 25, 50, 75,
     };
     auto rgb_src = backend.allocate(rgb.size());
     auto rgb_dst = backend.allocate(3 * width * height * sizeof(float));
@@ -199,10 +196,7 @@ int main() {
     expect_near(rgb_chw[11], 75.0F / 255.0F, 1.0e-6F, "rgb b3");
 
     const std::vector<std::uint8_t> rgba{
-        255, 0, 0, 7,
-        0, 128, 0, 8,
-        0, 0, 64, 9,
-        25, 50, 75, 10,
+        255, 0, 0, 7, 0, 128, 0, 8, 0, 0, 64, 9, 25, 50, 75, 10,
     };
     auto rgba_src = backend.allocate(rgba.size());
     auto rgba_dst = backend.allocate(3 * width * height * sizeof(float));
@@ -231,14 +225,22 @@ int main() {
       expect_near(nv12_chw[i + 2 * y_plane.size()], expected, 1.0e-5F, "nv12 neutral B");
     }
 
+    const std::vector<std::uint8_t> limited_black_y(4, 16);
+    upload_bytes(backend, limited_black_y, y_buffer);
+    nv12_to_rgb_chw(backend, y_buffer.ptr(), uv_buffer.ptr(), nv12_dst.ptr(), width, width, height,
+                    width, height, 0, 0, 1.0F, 0, YuvColorMatrix::Bt601, YuvColorRange::Limited);
+    const auto limited_black = copy_floats(backend, nv12_dst, 3 * width * height);
+    for (const float channel : limited_black) {
+      expect_near(channel, 0.0F, 1.0e-6F, "limited-range NV12 black level");
+    }
+    upload_bytes(backend, y_plane, y_buffer);
+
     auto rotated_dst = backend.allocate(3 * width * height * sizeof(float));
     nv12_to_rgb_chw_fullrange(backend, y_buffer.ptr(), uv_buffer.ptr(), rotated_dst.ptr(), width,
                               width, height, width, height, 0, 0, 1.0F, 180);
     const auto rotated = copy_floats(backend, rotated_dst, 3 * width * height);
-    expect_near(rotated[0], static_cast<float>(y_plane[3]) / 255.0F, 1.0e-5F,
-                "nv12 rotation R0");
-    expect_near(rotated[3], static_cast<float>(y_plane[0]) / 255.0F, 1.0e-5F,
-                "nv12 rotation R3");
+    expect_near(rotated[0], static_cast<float>(y_plane[3]) / 255.0F, 1.0e-5F, "nv12 rotation R0");
+    expect_near(rotated[3], static_cast<float>(y_plane[0]) / 255.0F, 1.0e-5F, "nv12 rotation R3");
 
     const std::vector<std::uint8_t> chroma_y{120, 120, 120, 120};
     const std::vector<std::uint8_t> chroma_uv{140, 150};
@@ -248,15 +250,24 @@ int main() {
     upload_bytes(backend, chroma_y, chroma_y_buffer);
     upload_bytes(backend, chroma_uv, chroma_uv_buffer);
     nv12_to_rgb_chw_fullrange(backend, chroma_y_buffer.ptr(), chroma_uv_buffer.ptr(),
-                              chroma_dst.ptr(), width, width, height, width, height, 0, 0, 1.0F,
-                              0);
+                              chroma_dst.ptr(), width, width, height, width, height, 0, 0, 1.0F, 0);
     const auto chroma = copy_floats(backend, chroma_dst, 3 * width * height);
-    expect_near(chroma[0], (120.0F + 1.5748F * 22.0F) / 255.0F, 1.0e-5F,
-                "nv12 bt709 R");
+    expect_near(chroma[0], (120.0F + 1.5748F * 22.0F) / 255.0F, 1.0e-5F, "nv12 bt709 R");
     expect_near(chroma[4], (120.0F - 0.1873F * 12.0F - 0.4681F * 22.0F) / 255.0F, 1.0e-5F,
                 "nv12 bt709 G");
-    expect_near(chroma[8], (120.0F + 1.8556F * 12.0F) / 255.0F, 1.0e-5F,
-                "nv12 bt709 B");
+    expect_near(chroma[8], (120.0F + 1.8556F * 12.0F) / 255.0F, 1.0e-5F, "nv12 bt709 B");
+
+    nv12_to_rgb_chw(backend, chroma_y_buffer.ptr(), chroma_uv_buffer.ptr(), chroma_dst.ptr(), width,
+                    width, height, width, height, 0, 0, 1.0F, 0, YuvColorMatrix::Bt2020,
+                    YuvColorRange::Limited);
+    const auto bt2020 = copy_floats(backend, chroma_dst, 3 * width * height);
+    expect_near(bt2020[0], (104.0F * (255.0F / 219.0F) + 1.6787F * 22.0F) / 255.0F, 1.0e-4F,
+                "nv12 bt2020 limited R");
+    expect_near(bt2020[4],
+                (104.0F * (255.0F / 219.0F) - 0.1873F * 12.0F - 0.6504F * 22.0F) / 255.0F, 1.0e-4F,
+                "nv12 bt2020 limited G");
+    expect_near(bt2020[8], (104.0F * (255.0F / 219.0F) + 2.1418F * 12.0F) / 255.0F, 1.0e-4F,
+                "nv12 bt2020 limited B");
   } catch (const std::exception& error) {
     std::cerr << "FAIL: " << error.what() << '\n';
     ++failures;

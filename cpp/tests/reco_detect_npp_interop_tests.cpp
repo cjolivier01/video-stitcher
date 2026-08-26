@@ -1,6 +1,7 @@
 #include "reco/core/cuda_backend.hpp"
 #include "reco/detect/npp_interop.hpp"
 
+#include <array>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -186,6 +187,59 @@ int main() {
                      96, 104, 104, 104, 112, 112, 112, 120, 120, 120, 128, 128, 128, 136, 136, 136,
                  },
                  "nv12 neutral rgb golden");
+
+    const std::vector<std::uint8_t> limited_black_y(nv12_width * nv12_height, 16);
+    upload_bytes(backend, limited_black_y, y_buffer);
+    npp_nv12_to_rgb(y_buffer.ptr(), nv12_width, uv_buffer.ptr(), nv12_width, nv12_rgb.ptr(),
+                    nv12_width, nv12_height, YuvColorMatrix::Bt709, YuvColorRange::Limited);
+    backend.synchronize();
+    expect_bytes(backend, nv12_rgb, std::vector<std::uint8_t>(nv12_width * nv12_height * 3, 0),
+                 "limited-range NV12 black level");
+
+    const std::vector<std::uint8_t> color_y(nv12_width * nv12_height, 120);
+    const std::vector<std::uint8_t> color_uv{
+        140, 150, 140, 150, 140, 150, 140, 150,
+    };
+    upload_bytes(backend, color_y, y_buffer);
+    upload_bytes(backend, color_uv, uv_buffer);
+    npp_nv12_to_rgb(y_buffer.ptr(), nv12_width, uv_buffer.ptr(), nv12_width, nv12_rgb.ptr(),
+                    nv12_width, nv12_height);
+    backend.synchronize();
+    std::vector<std::uint8_t> legacy_expected;
+    legacy_expected.reserve(nv12_width * nv12_height * 3);
+    for (std::size_t pixel = 0; pixel < nv12_width * nv12_height; ++pixel) {
+      legacy_expected.insert(legacy_expected.end(), {145, 102, 144});
+    }
+    expect_bytes(backend, nv12_rgb, legacy_expected, "legacy NV12 conversion");
+
+    struct ColorGolden {
+      YuvColorMatrix matrix;
+      YuvColorRange range;
+      std::array<std::uint8_t, 3> rgb;
+      const char* label;
+    };
+    const std::array color_goldens{
+        ColorGolden{YuvColorMatrix::Bt601, YuvColorRange::Full, {151, 100, 141}, "BT.601 full"},
+        ColorGolden{
+            YuvColorMatrix::Bt601, YuvColorRange::Limited, {156, 99, 145}, "BT.601 limited"},
+        ColorGolden{YuvColorMatrix::Bt709, YuvColorRange::Full, {155, 107, 142}, "BT.709 full"},
+        ColorGolden{
+            YuvColorMatrix::Bt709, YuvColorRange::Limited, {161, 107, 146}, "BT.709 limited"},
+        ColorGolden{YuvColorMatrix::Bt2020, YuvColorRange::Full, {152, 105, 143}, "BT.2020 full"},
+        ColorGolden{
+            YuvColorMatrix::Bt2020, YuvColorRange::Limited, {158, 105, 147}, "BT.2020 limited"},
+    };
+    for (const auto& golden : color_goldens) {
+      npp_nv12_to_rgb(y_buffer.ptr(), nv12_width, uv_buffer.ptr(), nv12_width, nv12_rgb.ptr(),
+                      nv12_width, nv12_height, golden.matrix, golden.range);
+      backend.synchronize();
+      std::vector<std::uint8_t> expected;
+      expected.reserve(nv12_width * nv12_height * 3);
+      for (std::size_t pixel = 0; pixel < nv12_width * nv12_height; ++pixel) {
+        expected.insert(expected.end(), golden.rgb.begin(), golden.rgb.end());
+      }
+      expect_bytes(backend, nv12_rgb, expected, golden.label);
+    }
   } catch (const std::exception& error) {
     std::cerr << "FAIL: " << error.what() << '\n';
     ++failures;

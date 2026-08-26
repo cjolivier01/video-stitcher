@@ -293,6 +293,38 @@ void fake_runtime_cuda_detector_contract() {
   unset_env("RECO_FAKE_ORT_VALIDATE_CUDA_INPUT_ANY");
   expect_eq(detections.size(), 2U, "cuda detector detections");
 
+  set_env("RECO_FAKE_ORT_VALIDATE_CUDA_INPUT_ANY", "1");
+  const auto colorimetry_detections = detector.detect(
+      CameraId::Left, DetectorFrame(GpuNv12Frame{
+                          .y_ptr = y_device.ptr(),
+                          .uv_ptr = uv_device.ptr(),
+                          .y_pitch = 2,
+                          .uv_pitch = 2,
+                          .width = 2,
+                          .height = 2,
+                          .color_matrix = reco::core::YuvColorMatrix::Bt709,
+                          .color_range = reco::core::YuvColorRange::Limited,
+                      }));
+  unset_env("RECO_FAKE_ORT_VALIDATE_CUDA_INPUT_ANY");
+  expect_eq(colorimetry_detections.size(), 2U, "cuda detector accepts colorimetry");
+
+  try {
+    (void)detector.detect(CameraId::Left, DetectorFrame(GpuNv12Frame{
+                                            .y_ptr = y_device.ptr(),
+                                            .uv_ptr = uv_device.ptr(),
+                                            .y_pitch = 2,
+                                            .uv_pitch = 2,
+                                            .width = 2,
+                                            .height = 2,
+                                            .color_matrix = reco::core::YuvColorMatrix::Bt709,
+                                        }));
+    std::cerr << "FAIL: CUDA detector accepted partial colorimetry\n";
+    ++failures;
+  } catch (const DetectorError& error) {
+    expect_true(error.kind() == DetectorErrorKind::InferenceFailed,
+                "cuda detector rejects partial colorimetry");
+  }
+
   try {
     const std::vector<float> chw(1 * 3 * 8 * 8, 0.5F);
     (void)detector.detect(CameraId::Left, DetectorFrame(PreprocessedChwFrame{
