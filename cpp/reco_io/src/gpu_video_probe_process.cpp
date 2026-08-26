@@ -691,9 +691,6 @@ void guardian_close_from(int descriptor, long maximum_descriptor) {
                 std::numeric_limits<unsigned int>::max(), 0U) == 0) {
     return;
   }
-#elif defined(__APPLE__)
-  ::closefrom(descriptor);
-  return;
 #endif
   for (long value = descriptor; value < maximum_descriptor; ++value) {
     (void)::close(static_cast<int>(value));
@@ -752,7 +749,7 @@ std::size_t format_guardian_parent_argument(char* destination, std::size_t capac
   guardian_close_from(kGuardianFirstUnusedDescriptor, maximum_descriptor);
   struct sigaction child_action{};
   child_action.sa_handler = SIG_DFL;
-  (void)::sigemptyset(&child_action.sa_mask);
+  (void)sigemptyset(&child_action.sa_mask);
   if (::sigaction(SIGCHLD, &child_action, nullptr) != 0 ||
       !guardian_write(STDOUT_FILENO, &kGuardianReady, 1)) {
     guardian_exit(2);
