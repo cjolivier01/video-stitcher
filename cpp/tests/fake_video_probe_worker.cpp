@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -104,6 +105,27 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     return EXIT_SUCCESS;
   }
+#if defined(__linux__)
+  if (scenario != nullptr && std::strcmp(scenario, "valid-metadata-with-descendant") == 0) {
+    const char* descendant_path = std::getenv("RECO_FAKE_PROBE_DESCENDANT_PATH");
+    if (descendant_path == nullptr || descendant_path[0] == '\0') {
+      return EXIT_FAILURE;
+    }
+    const auto descendant = fork();
+    if (descendant < 0) {
+      return EXIT_FAILURE;
+    }
+    if (descendant == 0) {
+      std::this_thread::sleep_for(std::chrono::seconds(30));
+      std::_Exit(EXIT_SUCCESS);
+    }
+    std::ofstream output(descendant_path);
+    output << descendant;
+    if (!output) {
+      return EXIT_FAILURE;
+    }
+  }
+#endif
   if (scenario != nullptr && std::strcmp(scenario, "block-input") != 0) {
     if (!read_request()) {
       return EXIT_FAILURE;
@@ -139,6 +161,7 @@ int main(int argc, char** argv) {
       response = {{"protocol_version", std::numeric_limits<std::uint64_t>::max()}, {"ok", false}};
     } else if (std::strcmp(scenario, "valid-metadata") == 0 ||
 #if defined(__linux__)
+               std::strcmp(scenario, "valid-metadata-with-descendant") == 0 ||
                std::strcmp(scenario, "descriptor-isolation") == 0 ||
 #endif
                std::strcmp(scenario, "invalid-metadata") == 0 ||
@@ -148,17 +171,19 @@ int main(int argc, char** argv) {
       const bool oversized = std::strcmp(scenario, "oversized-metadata") == 0;
       response = {{"protocol_version", 1},
                   {"ok", true},
-                  {"width", negative ? nlohmann::json(-2)
-                            : oversized
-                                ? nlohmann::json(std::numeric_limits<std::uint64_t>::max())
-                                : nlohmann::json(
-                                      std::strcmp(scenario, "valid-metadata") == 0 ||
+                  {"width",
+                   negative ? nlohmann::json(-2)
+                   : oversized
+                       ? nlohmann::json(std::numeric_limits<std::uint64_t>::max())
+                       : nlohmann::json(
+                             std::strcmp(scenario, "valid-metadata") == 0 ||
 #if defined(__linux__)
-                                              std::strcmp(scenario, "descriptor-isolation") == 0 ||
+                                     std::strcmp(scenario, "valid-metadata-with-descendant") == 0 ||
+                                     std::strcmp(scenario, "descriptor-isolation") == 0 ||
 #endif
-                                              false
-                                          ? 854
-                                          : 853)},
+                                     false
+                                 ? 854
+                                 : 853)},
                   {"height", 480},
                   {"fps_numerator", 30},
                   {"fps_denominator", 1},

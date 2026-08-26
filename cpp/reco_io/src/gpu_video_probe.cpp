@@ -22,6 +22,9 @@
 #include <utility>
 
 #if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #else
 #include <dlfcn.h>
@@ -57,10 +60,12 @@ constexpr std::uint64_t kMaximumExactCountSamples = 512;
 constexpr std::uint64_t kMaximumConflictingMetadataCountSamples = 4096;
 constexpr std::size_t kStoredTimingSamples = kMaximumConflictingMetadataCountSamples + 1;
 static_assert(kStoredTimingSamples >= kTimingAnalysisSamples + kTimingReorderLookahead);
+constexpr std::size_t kMinimumExactNoncanonicalRateSamples = 128;
 constexpr std::uint32_t kMaximumFrameRateDenominator = 1001;
 constexpr long double kFrameRatePreferenceTolerance = 0.05L;
 constexpr long double kMaximumTimingDeltaVariation = 0.10L;
 constexpr long double kCanonicalFrameRateTolerance = 0.0005L;
+constexpr long double kMaterialGridResidualImprovementFrames = 0.0001L;
 constexpr std::array<std::pair<std::uint32_t, std::uint32_t>, 17> kCanonicalFrameRates{{
     {24'000, 1'001},
     {24, 1},
@@ -597,7 +602,22 @@ struct InferredFrameRate {
   std::size_t timestamp_multiplicity = 1;
   long double observed_fps = 0.0L;
   long double finite_span_fps_uncertainty = 0.0L;
+  bool requires_complete_stream = false;
 };
+
+long double mean_timestamp_grid_residual(
+    const std::array<std::uint64_t, kStoredTimingSamples>& sorted_unique_times,
+    std::size_t unique_count, std::uint32_t numerator, std::uint32_t denominator) {
+  long double total_residual = 0.0L;
+  const auto candidate_fps = static_cast<long double>(numerator) / denominator;
+  for (std::size_t index = 1; index < unique_count; ++index) {
+    const auto delta_ns = sorted_unique_times[index] - sorted_unique_times[index - 1];
+    const auto frame_steps =
+        static_cast<long double>(delta_ns) * candidate_fps / kNanosecondsPerSecond;
+    total_residual += std::abs(frame_steps - std::round(frame_steps));
+  }
+  return total_residual / static_cast<long double>(unique_count - 1);
+}
 
 std::size_t positional_timestamp_multiplicity(
     const TimingScan& scan,
@@ -678,6 +698,7 @@ std::optional<InferredFrameRate> infer_sparse_reordered_frame_rate(
 
   std::optional<std::pair<std::uint32_t, std::uint32_t>> best_rate;
   auto best_error = std::numeric_limits<long double>::infinity();
+  auto best_grid_error = std::numeric_limits<long double>::infinity();
   long double best_interval_count = 0.0L;
   for (const auto& [numerator, denominator] : kCanonicalFrameRates) {
     const auto candidate_fps = static_cast<long double>(numerator) / denominator;
@@ -688,6 +709,7 @@ std::optional<InferredFrameRate> infer_sparse_reordered_frame_rate(
     }
     bool fits_timestamp_grid = true;
     std::size_t unit_interval_count = 0;
+    long double grid_error = 0.0L;
     for (std::size_t index = 1; index < unique_count; ++index) {
       const auto delta_ns = sorted_unique_times[index] - sorted_unique_times[index - 1];
       const auto frame_steps =
@@ -698,6 +720,7 @@ std::optional<InferredFrameRate> infer_sparse_reordered_frame_rate(
         fits_timestamp_grid = false;
         break;
       }
+      grid_error += std::abs(frame_steps - rounded_steps);
       if (rounded_steps == 1.0L) {
         ++unit_interval_count;
       }
@@ -707,9 +730,13 @@ std::optional<InferredFrameRate> infer_sparse_reordered_frame_rate(
       fits_timestamp_grid = false;
     }
     const auto error = std::abs(candidate_fps - observed_fps);
-    if (fits_timestamp_grid && error < best_error) {
+    constexpr long double kGridErrorTieTolerance = 1e-12L;
+    if (fits_timestamp_grid && (grid_error + kGridErrorTieTolerance < best_grid_error ||
+                                (std::abs(grid_error - best_grid_error) <= kGridErrorTieTolerance &&
+                                 error < best_error))) {
       best_rate = std::pair(numerator, denominator);
       best_error = error;
+      best_grid_error = grid_error;
       best_interval_count = candidate_intervals;
     }
   }
@@ -810,15 +837,18 @@ std::optional<InferredFrameRate> infer_constant_frame_rate(const TimingScan& sca
   // Require a rate correction to improve on caps by more than half a frame
   // over the finite observation span.
   const auto finite_span_fps_uncertainty =
-      observed_fps / (2.0L * static_cast<long double>((unique_count - 1) * timestamp_multiplicity));
+      complete_stream && unique_count >= kTimingAnalysisSamples
+          ? 0.0L
+          : observed_fps /
+                (2.0L * static_cast<long double>((unique_count - 1) * timestamp_multiplicity));
+  std::optional<std::pair<std::uint32_t, std::uint32_t>> nearest_canonical_rate;
+  auto nearest_canonical_error = std::numeric_limits<long double>::infinity();
   for (const auto& [numerator, denominator] : kCanonicalFrameRates) {
     const auto canonical_fps = static_cast<long double>(numerator) / denominator;
-    if (std::abs(canonical_fps - observed_fps) <= canonical_fps * kCanonicalFrameRateTolerance) {
-      return InferredFrameRate{.numerator = numerator,
-                               .denominator = denominator,
-                               .timestamp_multiplicity = timestamp_multiplicity,
-                               .observed_fps = observed_fps,
-                               .finite_span_fps_uncertainty = finite_span_fps_uncertainty};
+    const auto error = std::abs(canonical_fps - observed_fps);
+    if (error < nearest_canonical_error) {
+      nearest_canonical_rate = std::pair(numerator, denominator);
+      nearest_canonical_error = error;
     }
   }
   long double best_error = std::numeric_limits<long double>::infinity();
@@ -839,15 +869,73 @@ std::optional<InferredFrameRate> infer_constant_frame_rate(const TimingScan& sca
     }
   }
   const auto tolerance = std::max(1e-6L, observed_fps * 1e-7L);
-  if (best_denominator == 0 || best_error > tolerance) {
-    return std::nullopt;
+  const bool canonical_rate_is_close =
+      nearest_canonical_rate.has_value() &&
+      nearest_canonical_error <= (static_cast<long double>(nearest_canonical_rate->first) /
+                                  nearest_canonical_rate->second) *
+                                     kCanonicalFrameRateTolerance;
+  const auto best_divisor = best_denominator == 0 ? 1U : std::gcd(best_numerator, best_denominator);
+  const auto reduced_best_numerator = best_numerator / best_divisor;
+  const auto reduced_best_denominator = best_denominator / best_divisor;
+  const bool best_rate_is_canonical =
+      best_denominator != 0 &&
+      std::any_of(kCanonicalFrameRates.begin(), kCanonicalFrameRates.end(),
+                  [reduced_best_numerator, reduced_best_denominator](const auto& rate) {
+                    return static_cast<std::uint64_t>(reduced_best_numerator) * rate.second ==
+                           static_cast<std::uint64_t>(rate.first) * reduced_best_denominator;
+                  });
+  bool noncanonical_rate_has_materially_better_grid_fit = false;
+  if (best_denominator != 0 && best_error <= tolerance && !best_rate_is_canonical &&
+      unique_count >= kMinimumExactNoncanonicalRateSamples) {
+    if (!canonical_rate_is_close) {
+      noncanonical_rate_has_materially_better_grid_fit = true;
+    } else {
+      const auto best_grid_residual = mean_timestamp_grid_residual(
+          times, unique_count, reduced_best_numerator, reduced_best_denominator);
+      const auto canonical_grid_residual = mean_timestamp_grid_residual(
+          times, unique_count, nearest_canonical_rate->first, nearest_canonical_rate->second);
+      noncanonical_rate_has_materially_better_grid_fit =
+          best_grid_residual + kMaterialGridResidualImprovementFrames < canonical_grid_residual;
+    }
   }
-  const auto divisor = std::gcd(best_numerator, best_denominator);
-  return InferredFrameRate{.numerator = best_numerator / divisor,
-                           .denominator = best_denominator / divisor,
-                           .timestamp_multiplicity = timestamp_multiplicity,
-                           .observed_fps = observed_fps,
-                           .finite_span_fps_uncertainty = finite_span_fps_uncertainty};
+  if (noncanonical_rate_has_materially_better_grid_fit) {
+    return InferredFrameRate{.numerator = reduced_best_numerator,
+                             .denominator = reduced_best_denominator,
+                             .timestamp_multiplicity = timestamp_multiplicity,
+                             .observed_fps = observed_fps,
+                             .finite_span_fps_uncertainty = finite_span_fps_uncertainty,
+                             .requires_complete_stream = true};
+  }
+  if (canonical_rate_is_close) {
+    return InferredFrameRate{.numerator = nearest_canonical_rate->first,
+                             .denominator = nearest_canonical_rate->second,
+                             .timestamp_multiplicity = timestamp_multiplicity,
+                             .observed_fps = observed_fps,
+                             .finite_span_fps_uncertainty = finite_span_fps_uncertainty};
+  }
+  return std::nullopt;
+}
+
+bool inferred_frame_rate_is_eligible(const InferredFrameRate& inferred, bool complete_stream) {
+  return !inferred.requires_complete_stream || complete_stream;
+}
+
+bool inferred_frame_rate_improves_on_caps(const InferredFrameRate& inferred,
+                                          bool caps_frame_rate_is_plausible, int caps_numerator,
+                                          int caps_denominator) {
+  if (!caps_frame_rate_is_plausible) {
+    return true;
+  }
+  const auto inferred_fps = static_cast<long double>(inferred.numerator) / inferred.denominator;
+  const auto caps_fps = static_cast<long double>(caps_numerator) / caps_denominator;
+  return std::abs(inferred_fps - inferred.observed_fps) + inferred.finite_span_fps_uncertainty <
+         std::abs(caps_fps - inferred.observed_fps);
+}
+
+bool frame_rates_are_identical(std::uint32_t first_numerator, std::uint32_t first_denominator,
+                               std::uint32_t second_numerator, std::uint32_t second_denominator) {
+  return static_cast<std::uint64_t>(first_numerator) * second_denominator ==
+         static_cast<std::uint64_t>(second_numerator) * first_denominator;
 }
 
 struct UntimedPresentationPrefix {
@@ -904,7 +992,8 @@ bool frame_rates_are_close(std::uint32_t first_numerator, std::uint32_t first_de
 }
 
 std::optional<std::uint64_t> observed_eos_duration(const TimingScan& scan,
-                                                   std::uint64_t nominal_frame_duration) {
+                                                   std::uint64_t nominal_frame_duration,
+                                                   bool clamp_final_period_to_nominal) {
   if (scan.timed_sample_count != scan.sample_count || !scan.first_stream_time.has_value() ||
       !scan.last_stream_time.has_value() || scan.stored_timing_count == 0) {
     return std::nullopt;
@@ -917,6 +1006,9 @@ std::optional<std::uint64_t> observed_eos_duration(const TimingScan& scan,
   auto final_duration = nominal_frame_duration;
   if (unique_count >= 2) {
     final_duration = times[unique_count - 1] - times[unique_count - 2];
+    if (clamp_final_period_to_nominal) {
+      final_duration = std::max(final_duration, nominal_frame_duration);
+    }
   }
   const auto span = *scan.last_stream_time - *scan.first_stream_time;
   return final_duration > std::numeric_limits<std::uint64_t>::max() - span
@@ -1246,7 +1338,21 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
                                                       static_cast<std::uint32_t>(fps_numerator),
                                                       static_cast<std::uint32_t>(fps_denominator)),
                      kTimingReorderLookahead) < timing_scan.sample_count;
-  if (!timing_scan.reached_eos && caps_rate_cannot_cover_observed_samples) {
+  const auto preliminary_frame_rate =
+      infer_constant_frame_rate(timing_scan, timing_scan.reached_eos);
+  const bool preliminary_rate_is_conclusive =
+      preliminary_frame_rate.has_value() &&
+      inferred_frame_rate_is_eligible(*preliminary_frame_rate, timing_scan.reached_eos) &&
+      inferred_frame_rate_improves_on_caps(*preliminary_frame_rate, caps_frame_rate_is_plausible,
+                                           fps_numerator, fps_denominator);
+  const bool caps_rate_conflict_needs_more_evidence =
+      preliminary_frame_rate.has_value() && caps_frame_rate_is_plausible &&
+      !preliminary_rate_is_conclusive &&
+      !frame_rates_are_identical(
+          preliminary_frame_rate->numerator, preliminary_frame_rate->denominator,
+          static_cast<std::uint32_t>(fps_numerator), static_cast<std::uint32_t>(fps_denominator));
+  if (!timing_scan.reached_eos &&
+      (caps_rate_cannot_cover_observed_samples || caps_rate_conflict_needs_more_evidence)) {
     while (timing_scan.sample_count <= kMaximumConflictingMetadataCountSamples) {
       void* sample = pull_compressed_sample(
           api, probe_sink, bus, deadline,
@@ -1260,23 +1366,23 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
     }
   }
   const auto inferred_frame_rate = infer_constant_frame_rate(timing_scan, timing_scan.reached_eos);
+  if (inferred_frame_rate.has_value() &&
+      static_cast<long double>(inferred_frame_rate->numerator) / inferred_frame_rate->denominator >
+          kMaximumSaneFps) {
+    throw GpuVideoProbeError("video parser returned an implausible frame rate");
+  }
   const bool inferred_frame_rate_is_no_worse_than_caps =
       inferred_frame_rate.has_value() &&
+      inferred_frame_rate_is_eligible(*inferred_frame_rate, timing_scan.reached_eos) &&
+      inferred_frame_rate_improves_on_caps(*inferred_frame_rate, caps_frame_rate_is_plausible,
+                                           fps_numerator, fps_denominator);
+  const bool prefer_inferred_frame_rate = inferred_frame_rate_is_no_worse_than_caps;
+  const bool inferred_frame_rate_replaces_caps =
+      prefer_inferred_frame_rate &&
       (!caps_frame_rate_is_plausible ||
-       std::abs(static_cast<long double>(inferred_frame_rate->numerator) /
-                    inferred_frame_rate->denominator -
-                inferred_frame_rate->observed_fps) +
-               inferred_frame_rate->finite_span_fps_uncertainty <
-           std::abs(static_cast<long double>(fps_numerator) / fps_denominator -
-                    inferred_frame_rate->observed_fps));
-  const bool prefer_inferred_frame_rate =
-      inferred_frame_rate_is_no_worse_than_caps &&
-      (timing_scan.reached_eos || inferred_frame_rate->timestamp_multiplicity > 1 ||
-       !caps_frame_rate_is_plausible || caps_rate_cannot_cover_observed_samples ||
-       frame_rates_are_close(inferred_frame_rate->numerator, inferred_frame_rate->denominator,
-                             static_cast<std::uint32_t>(fps_numerator),
-                             static_cast<std::uint32_t>(fps_denominator),
-                             kFrameRatePreferenceTolerance));
+       !frame_rates_are_identical(inferred_frame_rate->numerator, inferred_frame_rate->denominator,
+                                  static_cast<std::uint32_t>(fps_numerator),
+                                  static_cast<std::uint32_t>(fps_denominator)));
   if (prefer_inferred_frame_rate) {
     fps_numerator = static_cast<int>(inferred_frame_rate->numerator);
     fps_denominator = static_cast<int>(inferred_frame_rate->denominator);
@@ -1311,8 +1417,10 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
                                      timing_scan.last_stream_time.has_value();
     const auto nominal_frame_duration =
         std::max<std::uint64_t>(kNanosecondsPerSecond * fps_den / fps_num, 1);
-    if (complete_timestamps && timing_scan.all_durations_known &&
-        timing_scan.final_frame_end.has_value() &&
+    const auto inferred_final_frame_duration =
+        minimum_duration_for_frame_count(1, fps_num, fps_den);
+    if (complete_timestamps && !inferred_frame_rate_replaces_caps &&
+        timing_scan.all_durations_known && timing_scan.final_frame_end.has_value() &&
         *timing_scan.final_frame_end >= *timing_scan.first_stream_time) {
       duration_ns = *timing_scan.final_frame_end - *timing_scan.first_stream_time;
       const auto minimum_boundary_duration =
@@ -1324,7 +1432,8 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
         duration_ns = minimum_boundary_duration;
       }
     } else if (complete_timestamps) {
-      duration_ns = observed_eos_duration(timing_scan, nominal_frame_duration)
+      duration_ns = observed_eos_duration(timing_scan, inferred_final_frame_duration,
+                                          inferred_frame_rate_replaces_caps)
                         .value_or(minimum_duration_for_frame_count(total_frames, fps_num, fps_den));
       duration_is_estimated = true;
     } else {

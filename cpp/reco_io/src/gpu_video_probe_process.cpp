@@ -20,6 +20,9 @@
 #include <vector>
 
 #if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #else
 #include <cerrno>
@@ -670,6 +673,7 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
       break;
     }
     if (wait_result < 0 && errno == ECHILD) {
+      (void)::kill(-child.get(), SIGKILL);
       child.release();
       break;
     }

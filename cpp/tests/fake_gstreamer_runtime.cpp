@@ -211,6 +211,16 @@ FakeCaps parser_sample_caps() {
   } else if (scenario() == "probe-container-rate-over-vui") {
     caps.fps_numerator = 15'000;
     caps.fps_denominator = 1'001;
+  } else if (scenario() == "probe-bounded-stale-caps") {
+    caps.fps_numerator = 30;
+    caps.fps_denominator = 1;
+  } else if (scenario() == "probe-eos-vui-duration-mismatch" ||
+             scenario() == "probe-sparse-exact-30-gaps") {
+    caps.fps_numerator = 15;
+    caps.fps_denominator = 1;
+  } else if (scenario() == "probe-container-exact-5997-parser-ntsc") {
+    caps.fps_numerator = 60'000;
+    caps.fps_denominator = 1'001;
   } else if (scenario() == "probe-reordered-periodic-missing-pts" ||
              scenario() == "probe-bounded-caps-underestimate" ||
              scenario() == "probe-long-reordered-periodic-missing-pts") {
@@ -297,6 +307,15 @@ std::uint64_t parser_frame_offset(std::uint64_t frame_index, const FakeCaps& cap
 }
 
 std::uint64_t parser_timing_offset(std::uint64_t frame_index, const FakeCaps& caps) {
+  if (scenario() == "probe-sparse-exact-30-gaps") {
+    const auto gap_count = static_cast<std::uint64_t>(frame_index >= 150U) +
+                           static_cast<std::uint64_t>(frame_index >= 300U) +
+                           static_cast<std::uint64_t>(frame_index >= 450U);
+    return (frame_index + gap_count) * 1'000'000'000ULL / 30U;
+  }
+  if (scenario() == "probe-container-exact-5997-parser-ntsc") {
+    return frame_index * 100'000'000'000ULL / 5'997U;
+  }
   if (scenario() == "probe-reordered-periodic-missing-pts" ||
       scenario() == "probe-bounded-caps-underestimate" ||
       scenario() == "probe-long-reordered-periodic-missing-pts") {
@@ -956,6 +975,16 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     } else if (current_scenario == "probe-container-rate-over-vui") {
       timing_caps.fps_numerator = 15;
       timing_caps.fps_denominator = 1;
+    } else if (current_scenario == "probe-bounded-stale-caps") {
+      timing_caps.fps_numerator = 15;
+      timing_caps.fps_denominator = 1;
+    } else if (current_scenario == "probe-eos-vui-duration-mismatch" ||
+               current_scenario == "probe-sparse-exact-30-gaps") {
+      timing_caps.fps_numerator = 30;
+      timing_caps.fps_denominator = 1;
+    } else if (current_scenario == "probe-container-exact-5997-parser-ntsc") {
+      timing_caps.fps_numerator = 5'997;
+      timing_caps.fps_denominator = 100;
     } else if (current_scenario == "probe-bad-fps" ||
                current_scenario == "probe-unset-fps-inferred" ||
                current_scenario == "probe-vfr-unset-fps" ||
@@ -996,6 +1025,10 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
         : current_scenario == "probe-one-frame-rounding"                    ? 33'333'333ULL
         : current_scenario == "probe-inexact-caps-fps"                      ? 2'000'000'000ULL
         : current_scenario == "probe-container-rate-over-vui"               ? 40'000'000'000ULL
+        : current_scenario == "probe-bounded-stale-caps"                    ? 40'000'000'000ULL
+        : current_scenario == "probe-eos-vui-duration-mismatch"             ? 5'100'000'000ULL
+        : current_scenario == "probe-sparse-exact-30-gaps"                  ? 20'100'000'000ULL
+        : current_scenario == "probe-container-exact-5997-parser-ntsc"      ? 10'005'002'501ULL
         : current_scenario == "probe-short-quantized-exact-30"              ? 100'000'000ULL
         : current_scenario == "probe-short-quantized-exact-5997"            ? 50'000'000ULL
         : current_scenario == "probe-unset-fps-inferred"                    ? 4'000'000'000ULL
@@ -1050,6 +1083,11 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
                   ? std::numeric_limits<std::uint64_t>::max()
                   : snapped_seek_target + seek_advance
             : selected_stream_start_ns + parser_timing_offset(sequential_index, timing_caps);
+    if (current_scenario == "probe-eos-vui-duration-mismatch" && !sink->pipeline->has_seek &&
+        sequential_index >= 150U) {
+      sink->probe_eos = true;
+      return nullptr;
+    }
     if (target_ns >= selected_duration_ns) {
       sink->probe_eos = true;
       return nullptr;
@@ -1133,10 +1171,11 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     } else {
       sample->buffer.pts = target_ns;
     }
-    const auto frame_duration_ns = sink->pipeline->has_seek
-                                       ? parser_frame_offset(1, timing_caps)
-                                       : parser_timing_offset(sequential_index + 1, timing_caps) -
-                                             parser_timing_offset(sequential_index, timing_caps);
+    const auto frame_duration_ns =
+        current_scenario == "probe-eos-vui-duration-mismatch" ? parser_frame_offset(1, sample_caps)
+        : sink->pipeline->has_seek                            ? parser_frame_offset(1, timing_caps)
+                                   : parser_timing_offset(sequential_index + 1, timing_caps) -
+                                         parser_timing_offset(sequential_index, timing_caps);
     const auto remaining_ns = selected_duration_ns - target_ns;
     sample->buffer.duration =
         remaining_ns > frame_duration_ns && remaining_ns - frame_duration_ns > 1 ? frame_duration_ns

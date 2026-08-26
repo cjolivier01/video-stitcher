@@ -397,6 +397,17 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_eq(retimed_constant.total_frames, 150ULL,
             "retimed constant stream retains its EOS-proven AU count");
 
+  set_scenario("probe-eos-vui-duration-mismatch");
+  const auto corrected_duration = probe_video(container_config(video_path), timeout_ns);
+  expect_eq(corrected_duration.fps_numerator, 30U,
+            "EOS timestamp cadence replaces contradictory VUI caps");
+  expect_eq(corrected_duration.duration_ns, 5'000'000'000ULL,
+            "corrected cadence does not trust contradictory parser buffer durations");
+  expect_eq(corrected_duration.total_frames, 150ULL,
+            "corrected EOS duration retains the exact AU count");
+  expect_true(corrected_duration.duration_is_estimated,
+              "timestamp-derived corrected duration is explicitly estimated");
+
   set_scenario("probe-duplicate-pts-pairs");
   const auto duplicate_pts = probe_video(container_config(video_path), timeout_ns);
   expect_eq(duplicate_pts.fps_numerator, 50U,
@@ -512,6 +523,25 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_eq(container_rate.total_frames, 600ULL,
             "container frame rate preserves the 600-frame duration count");
 
+  set_scenario("probe-bounded-stale-caps");
+  const auto stale_caps = probe_video(container_config(video_path), timeout_ns);
+  expect_eq(stale_caps.fps_numerator, 15U,
+            "bounded constant timing overrides substantially stale caps");
+  expect_eq(stale_caps.fps_denominator, 1U, "substantial stale-caps correction remains exact");
+  expect_eq(stale_caps.total_frames, 600ULL,
+            "stale high-rate caps cannot double the calibration frame count");
+
+  set_scenario("probe-sparse-exact-30-gaps");
+  const auto sparse_exact = probe_video(container_config(video_path), timeout_ns);
+  expect_eq(sparse_exact.fps_numerator, 30U,
+            "sparse exact timestamp grid wins over a gap-biased span average");
+  expect_eq(sparse_exact.fps_denominator, 1U,
+            "sparse timestamp gaps preserve the exact cadence denominator");
+  expect_eq(sparse_exact.duration_ns, 20'100'000'000ULL,
+            "sparse timestamp gaps preserve the presentation duration");
+  expect_eq(sparse_exact.total_frames, 600ULL,
+            "sparse timestamp gaps retain the EOS-proven AU count");
+
   set_scenario("probe-clustered-missing-pts");
   const auto clustered_missing_pts = probe_video(container_config(video_path), timeout_ns);
   expect_eq(clustered_missing_pts.fps_numerator, 30U,
@@ -529,6 +559,15 @@ void probe_contracts(const std::filesystem::path& video_path,
             "exact near-canonical caps are not snapped to an NTSC numerator");
   expect_eq(exact_5997_fps.fps_denominator, 100U,
             "exact near-canonical caps preserve their denominator");
+
+  set_scenario("probe-container-exact-5997-parser-ntsc");
+  const auto container_exact_5997 = probe_video(container_config(video_path), timeout_ns);
+  expect_eq(container_exact_5997.fps_numerator, 5'997U,
+            "exact container cadence overrides normalized parser caps");
+  expect_eq(container_exact_5997.fps_denominator, 100U,
+            "exact container cadence preserves its noncanonical denominator");
+  expect_eq(container_exact_5997.total_frames, 600ULL,
+            "near-NTSC conflict extension retains the exact AU count");
 
   set_scenario("probe-quantized-no-vui-5994");
   const auto quantized_no_vui = probe_video(container_config(video_path), timeout_ns);
@@ -853,6 +892,12 @@ void auto_reaped_workers_are_supported(const std::filesystem::path& video_path) 
   }
 
   bool probe_succeeded = false;
+#if defined(__linux__)
+  const auto descendant_path =
+      video_path.parent_path() / (video_path.filename().string() + ".probe-descendant");
+  std::filesystem::remove(descendant_path);
+  bool descendant_probe_succeeded = false;
+#endif
   try {
     set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
     probe_succeeded = reco::io::probe_gpu_video(container_config(video_path),
@@ -862,10 +907,44 @@ void auto_reaped_workers_are_supported(const std::filesystem::path& video_path) 
     std::cerr << "FAIL: auto-reaped worker probe threw: " << error.what() << '\n';
     ++failures;
   }
+#if defined(__linux__)
+  try {
+    set_environment("RECO_FAKE_PROBE_DESCENDANT_PATH", descendant_path.string());
+    set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata-with-descendant");
+    descendant_probe_succeeded = reco::io::probe_gpu_video(container_config(video_path),
+                                                           fake_probe_worker_path, 5'000'000'000ULL)
+                                     .width == 854U;
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: auto-reaped descendant probe threw: " << error.what() << '\n';
+    ++failures;
+  }
+#endif
   if (sigaction(SIGCHLD, &previous_action, nullptr) != 0) {
     expect_true(false, "SIGCHLD policy restores");
   }
   expect_true(probe_succeeded, "auto-reaped worker returns its framed response");
+#if defined(__linux__)
+  expect_true(descendant_probe_succeeded,
+              "auto-reaped worker with a descendant returns its framed response");
+  pid_t descendant = -1;
+  {
+    std::ifstream input(descendant_path);
+    input >> descendant;
+  }
+  expect_true(descendant > 0, "auto-reaped worker records its descendant");
+  bool descendant_exited = false;
+  const auto exit_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (descendant > 0 && std::chrono::steady_clock::now() < exit_deadline) {
+    errno = 0;
+    if (kill(descendant, 0) != 0 && errno == ESRCH) {
+      descendant_exited = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  expect_true(descendant_exited, "ECHILD supervision kills the worker process group");
+  std::filesystem::remove(descendant_path);
+#endif
 #else
   (void)video_path;
 #endif
