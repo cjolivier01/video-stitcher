@@ -25,6 +25,10 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+
+// Older Windows SDK headers omit the JobList convenience macro even though
+// UpdateProcThreadAttribute accepts the documented attribute on supported OSes.
+constexpr DWORD_PTR kProcThreadAttributeJobList = ProcThreadAttributeValue(13, FALSE, TRUE, FALSE);
 #else
 #include <cerrno>
 #include <csignal>
@@ -310,7 +314,7 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
     throw GpuVideoProbeError("failed to restrict video probe worker inherited handles");
   }
   std::array<HANDLE, 1> assigned_jobs{job.get()};
-  if (UpdateProcThreadAttribute(attributes.get(), 0, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+  if (UpdateProcThreadAttribute(attributes.get(), 0, kProcThreadAttributeJobList,
                                 assigned_jobs.data(), sizeof(assigned_jobs), nullptr,
                                 nullptr) == 0) {
     throw GpuVideoProbeError("failed to assign the video probe worker Job at launch");
