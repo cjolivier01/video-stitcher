@@ -71,6 +71,7 @@ enum class ObjectKind {
   DisplayInfo,
   OutputInfo,
   ProbeInfo,
+  InputBudget,
   Pad,
 };
 
@@ -83,6 +84,7 @@ struct FakePipeline;
 
 using FakePadProbeCallback = int (*)(void*, void*, void*);
 using FakeDestroyNotify = void (*)(void*);
+using FakeSignalCallback = void (*)(void*, void*, void*);
 
 struct FakeSink : FakeObject {
   explicit FakeSink(FakePipeline* owner) : FakeObject(ObjectKind::Sink), pipeline(owner) {}
@@ -119,6 +121,16 @@ struct FakeProbeInfo : FakeObject {
   bool container = false;
 };
 
+struct FakeInputBudget : FakeObject {
+  explicit FakeInputBudget(FakePipeline* owner)
+      : FakeObject(ObjectKind::InputBudget), pipeline(owner) {}
+  FakePipeline* pipeline = nullptr;
+  FakeSignalCallback callback = nullptr;
+  void* callback_data = nullptr;
+  FakeDestroyNotify destroy_notify = nullptr;
+  unsigned long signal_id = 0;
+};
+
 struct FakePad : FakeObject {
   FakePad() : FakeObject(ObjectKind::Pad) {}
   FakePadProbeCallback callback = nullptr;
@@ -141,6 +153,7 @@ struct FakePipeline : FakeObject {
   std::int64_t seek_target_ns = 0;
   bool has_seek = false;
   std::uint64_t seek_generation = 0;
+  FakeInputBudget* input_budget = nullptr;
 };
 
 constexpr std::uint64_t kFakeCapsMagic = 0x5245434f43415053ULL;
@@ -708,6 +721,12 @@ RECO_FAKE_EXPORT void* gst_bin_get_by_name(void* pipeline_pointer, const char* n
     record("get-container-info");
     return new FakeProbeInfo(pipeline, true);
   }
+  if (name != nullptr && std::strcmp(name, "input_budget") == 0) {
+    record("get-input-budget");
+    auto* budget = new FakeInputBudget(pipeline);
+    pipeline->input_budget = budget;
+    return budget;
+  }
   return nullptr;
 }
 
@@ -1039,6 +1058,18 @@ RECO_FAKE_EXPORT void gst_object_unref(void* object) {
     record("unref-probe-info");
     delete static_cast<FakeProbeInfo*>(object);
     break;
+  case ObjectKind::InputBudget: {
+    record("unref-input-budget");
+    auto* budget = static_cast<FakeInputBudget*>(object);
+    if (budget->destroy_notify != nullptr && budget->callback_data != nullptr) {
+      budget->destroy_notify(budget->callback_data);
+    }
+    if (budget->pipeline != nullptr && budget->pipeline->input_budget == budget) {
+      budget->pipeline->input_budget = nullptr;
+    }
+    delete budget;
+    break;
+  }
   case ObjectKind::Pad:
     record("unref-display-pad");
     if (static_cast<FakePad*>(object)->probe_id != 0) {
@@ -1112,6 +1143,37 @@ RECO_FAKE_EXPORT void* gst_mini_object_get_qdata(void* object, std::uint32_t) {
 
 RECO_FAKE_EXPORT std::uint32_t g_quark_from_static_string(const char*) { return 1; }
 
+RECO_FAKE_EXPORT unsigned long g_signal_connect_data(void* instance, const char*,
+                                                     void (*callback)(), void* data,
+                                                     FakeDestroyNotify destroy_notify, int) {
+  auto* budget = static_cast<FakeInputBudget*>(instance);
+  if (budget == nullptr || budget->kind != ObjectKind::InputBudget || callback == nullptr) {
+    return 0;
+  }
+  budget->callback = reinterpret_cast<FakeSignalCallback>(callback);
+  budget->callback_data = data;
+  budget->destroy_notify = destroy_notify;
+  budget->signal_id = 1;
+  record("connect-input-budget");
+  return budget->signal_id;
+}
+
+RECO_FAKE_EXPORT void g_signal_handler_disconnect(void* instance, unsigned long signal_id) {
+  auto* budget = static_cast<FakeInputBudget*>(instance);
+  if (budget == nullptr || budget->kind != ObjectKind::InputBudget ||
+      signal_id != budget->signal_id) {
+    return;
+  }
+  if (budget->destroy_notify != nullptr && budget->callback_data != nullptr) {
+    budget->destroy_notify(budget->callback_data);
+  }
+  budget->callback = nullptr;
+  budget->callback_data = nullptr;
+  budget->destroy_notify = nullptr;
+  budget->signal_id = 0;
+  record("disconnect-input-budget");
+}
+
 RECO_FAKE_EXPORT void gst_caps_unref(void* caps) {
   record("caps-unref");
   delete static_cast<FakeCaps*>(caps);
@@ -1120,6 +1182,11 @@ RECO_FAKE_EXPORT void gst_caps_unref(void* caps) {
 RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uint64_t timeout_ns) {
   auto* sink = static_cast<FakeSink*>(sink_pointer);
   if (sink->pipeline->parser_probe) {
+    if (auto* budget = sink->pipeline->input_budget;
+        budget != nullptr && budget->callback != nullptr) {
+      GstBufferAbi input_buffer;
+      budget->callback(budget, &input_buffer, budget->callback_data);
+    }
     record("pull-probe");
     sink->probe_eos = false;
     if (sink->observed_seek_generation != sink->pipeline->seek_generation) {
@@ -1747,6 +1814,10 @@ RECO_FAKE_EXPORT void gst_sample_unref(void* sample) {
   auto* fake_sample = static_cast<FakeSample*>(sample);
   release_buffer_qdata(fake_sample->buffer);
   delete fake_sample;
+}
+
+RECO_FAKE_EXPORT std::size_t gst_buffer_get_size(const void*) {
+  return scenario() == "probe-input-byte-budget" ? 65ULL * 1024ULL * 1024ULL : 4'096ULL;
 }
 
 RECO_FAKE_EXPORT void gst_mini_object_unref(void* object) {

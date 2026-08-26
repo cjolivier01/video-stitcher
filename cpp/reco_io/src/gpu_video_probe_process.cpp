@@ -34,6 +34,7 @@ constexpr DWORD_PTR kProcThreadAttributeJobList = ProcThreadAttributeValue(13, F
 #include <cstring>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -46,6 +47,16 @@ constexpr DWORD_PTR kProcThreadAttributeJobList = ProcThreadAttributeValue(13, F
 extern char** environ;
 #endif
 
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) ||                         \
+    __has_feature(memory_sanitizer)
+#define RECO_PROBE_WIDE_ADDRESS_SANITIZER 1
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define RECO_PROBE_WIDE_ADDRESS_SANITIZER 1
+#endif
+
 namespace reco::io {
 namespace {
 
@@ -56,6 +67,7 @@ constexpr auto kProcessPollInterval = std::chrono::milliseconds(2);
 constexpr auto kMinimumTerminationReserve = std::chrono::milliseconds(50);
 constexpr auto kMaximumTerminationReserve = std::chrono::milliseconds(250);
 constexpr std::size_t kMaximumConcurrentProbeWorkers = 32;
+constexpr std::uint64_t kMaximumWorkerAddressSpaceBytes = 512ULL * 1024ULL * 1024ULL;
 
 struct SupervisorSlots {
   std::mutex mutex;
@@ -303,7 +315,11 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
 
   UniqueHandle job(CreateJobObjectW(nullptr, nullptr));
   JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-  limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+  limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
+                                            JOB_OBJECT_LIMIT_PROCESS_MEMORY |
+                                            JOB_OBJECT_LIMIT_JOB_MEMORY;
+  limits.ProcessMemoryLimit = static_cast<SIZE_T>(kMaximumWorkerAddressSpaceBytes);
+  limits.JobMemoryLimit = static_cast<SIZE_T>(kMaximumWorkerAddressSpaceBytes);
   if (!job || SetInformationJobObject(job.get(), JobObjectExtendedLimitInformation, &limits,
                                       sizeof(limits)) == 0) {
     throw GpuVideoProbeError("failed to configure video probe worker Job");
@@ -764,15 +780,44 @@ bool guardian_sleep(std::chrono::nanoseconds delay) {
 }
 
 void guardian_close_from(int descriptor, long maximum_descriptor) {
+#if defined(__APPLE__)
+  (void)::closefrom(descriptor);
+  return;
+#endif
 #if defined(__linux__) && defined(SYS_close_range)
   if (::syscall(SYS_close_range, static_cast<unsigned int>(descriptor),
                 std::numeric_limits<unsigned int>::max(), 0U) == 0) {
     return;
   }
 #endif
+#if defined(F_CLOSEM)
+  if (::fcntl(descriptor, F_CLOSEM, 0) == 0) {
+    return;
+  }
+#endif
   for (long value = descriptor; value < maximum_descriptor; ++value) {
     (void)::close(static_cast<int>(value));
   }
+}
+
+bool guardian_limit_worker_address_space() {
+#if defined(RECO_PROBE_WIDE_ADDRESS_SANITIZER)
+  // Wide-address sanitizers reserve terabytes of shadow virtual memory before main.
+  return true;
+#else
+  struct rlimit current{};
+  if (::getrlimit(RLIMIT_AS, &current) != 0) {
+    return false;
+  }
+  const auto requested = static_cast<rlim_t>(kMaximumWorkerAddressSpaceBytes);
+  const auto existing = current.rlim_cur == RLIM_INFINITY ? requested : current.rlim_cur;
+  const auto limit = std::min(existing, requested);
+  if (limit == 0) {
+    return false;
+  }
+  const struct rlimit bounded{.rlim_cur = limit, .rlim_max = current.rlim_max};
+  return ::setrlimit(RLIMIT_AS, &bounded) == 0;
+#endif
 }
 
 void guardian_terminate_worker(pid_t worker_pid) {
@@ -856,7 +901,8 @@ std::size_t format_guardian_parent_argument(char* destination, std::size_t capac
       guardian_exit(127);
     }
 #endif
-    if (::setpgid(0, 0) != 0 || ::dup2(kGuardianWorkerInput, STDIN_FILENO) < 0 ||
+    if (!guardian_limit_worker_address_space() || ::setpgid(0, 0) != 0 ||
+        ::dup2(kGuardianWorkerInput, STDIN_FILENO) < 0 ||
         ::dup2(kGuardianWorkerOutput, STDOUT_FILENO) < 0) {
       guardian_exit(127);
     }

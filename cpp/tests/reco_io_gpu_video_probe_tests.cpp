@@ -26,14 +26,13 @@
 
 #if !defined(_WIN32)
 #include <csignal>
+#include <fcntl.h>
 #include <poll.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #else
 #include <windows.h>
-#endif
-#if defined(__linux__)
-#include <fcntl.h>
 #endif
 
 using namespace reco::io;
@@ -158,6 +157,16 @@ std::optional<pid_t> wait_for_direct_child(pid_t parent,
   }
   return std::nullopt;
 }
+#endif
+
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) ||                         \
+    __has_feature(memory_sanitizer)
+#define RECO_PROBE_WIDE_ADDRESS_SANITIZER 1
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define RECO_PROBE_WIDE_ADDRESS_SANITIZER 1
 #endif
 
 #if defined(_WIN32)
@@ -1028,7 +1037,7 @@ void invalid_inputs_fail(const std::filesystem::path& video_path,
       "not a readable regular file", "missing input rejected before probing");
 
   for (const auto& [scenario_name, fragment] :
-       std::array<std::pair<std::string_view, std::string_view>, 19>{
+       std::array<std::pair<std::string_view, std::string_view>, 20>{
            {{"old-version", "1.10 or newer"},
             {"init-error", "fake initialization failure"},
             {"probe-parse-error", "fake parse failure"},
@@ -1047,6 +1056,7 @@ void invalid_inputs_fail(const std::filesystem::path& video_path,
             {"probe-unparsed-caps", "decoder-compatible"},
             {"probe-avc-caps", "decoder-compatible"},
             {"probe-nal-caps", "decoder-compatible"},
+            {"probe-input-byte-budget", "bytes-per-access-unit"},
             {"probe-bad-dimensions", "invalid visible"}}}) {
     set_scenario(scenario_name);
     expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
@@ -1695,6 +1705,70 @@ void unrelated_descriptors_are_not_inherited(const std::filesystem::path& video_
 #endif
 }
 
+void lowered_file_limit_does_not_leak_high_descriptors(const std::filesystem::path& video_path) {
+#if defined(__APPLE__)
+  const auto marker_path =
+      video_path.parent_path() / (video_path.filename().string() + ".high-descriptor");
+  const auto marker = ::open(marker_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  expect_true(marker >= 0, "high-descriptor marker opens");
+  if (marker < 0) {
+    return;
+  }
+  const auto high_descriptor = ::fcntl(marker, F_DUPFD, 512);
+  expect_true(high_descriptor >= 512, "high descriptor opens before lowering RLIMIT_NOFILE");
+  struct rlimit original{};
+  const bool have_limit = ::getrlimit(RLIMIT_NOFILE, &original) == 0;
+  expect_true(have_limit, "RLIMIT_NOFILE is readable");
+  if (high_descriptor >= 512 && have_limit) {
+    const struct rlimit lowered{.rlim_cur = std::min<rlim_t>(64, original.rlim_max),
+                                .rlim_max = original.rlim_max};
+    const bool lowered_ok = ::setrlimit(RLIMIT_NOFILE, &lowered) == 0;
+    expect_true(lowered_ok, "RLIMIT_NOFILE soft limit is lowered");
+    if (lowered_ok) {
+      set_environment("RECO_FAKE_PROBE_FORBIDDEN_FD", std::to_string(high_descriptor));
+      set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "descriptor-isolation");
+      try {
+        expect_eq(reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
+                                            5'000'000'000ULL)
+                      .width,
+                  854U, "macOS worker closes descriptors above the lowered file limit");
+      } catch (const std::exception& error) {
+        std::cerr << "FAIL: lowered-limit descriptor isolation threw: " << error.what() << '\n';
+        ++failures;
+      }
+      (void)::setrlimit(RLIMIT_NOFILE, &original);
+    }
+  }
+  set_environment("RECO_FAKE_PROBE_FORBIDDEN_FD", "");
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+  if (high_descriptor >= 0) {
+    (void)::close(high_descriptor);
+  }
+  (void)::close(marker);
+  std::filesystem::remove(marker_path);
+#else
+  (void)video_path;
+#endif
+}
+
+void worker_address_space_is_limited(const std::filesystem::path& video_path) {
+#if !defined(_WIN32) && !defined(RECO_PROBE_WIDE_ADDRESS_SANITIZER)
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "memory-limit");
+  try {
+    expect_eq(reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
+                                        5'000'000'000ULL)
+                  .width,
+              854U, "POSIX worker inherits the bounded address-space limit");
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: address-space limit probe threw: " << error.what() << '\n';
+    ++failures;
+  }
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+#else
+  (void)video_path;
+#endif
+}
+
 void non_utf8_path_round_trips() {
 #if defined(__linux__)
   auto filename = std::string("reco_gpu_probe_non_utf8_");
@@ -1734,7 +1808,8 @@ void windows_path_runtime_discovery(const std::filesystem::path& video_path,
                          ("reco_gstreamer_path_" + std::to_string(GetCurrentProcessId()));
   std::filesystem::remove_all(directory);
   std::filesystem::create_directories(directory);
-  for (const auto* name : {"gstreamer-1.0-0.dll", "gstapp-1.0-0.dll", "libglib-2.0-0.dll"}) {
+  for (const auto* name :
+       {"gstreamer-1.0-0.dll", "gstapp-1.0-0.dll", "libglib-2.0-0.dll", "libgobject-2.0-0.dll"}) {
     std::filesystem::copy_file(runtime, directory / name,
                                std::filesystem::copy_options::overwrite_existing);
   }
@@ -1744,6 +1819,7 @@ void windows_path_runtime_discovery(const std::filesystem::path& video_path,
   set_environment("RECO_GSTREAMER_DYLIB_PATH", "");
   set_environment("RECO_GSTAPP_DYLIB_PATH", "");
   set_environment("RECO_GLIB_DYLIB_PATH", "");
+  set_environment("RECO_GOBJECT_DYLIB_PATH", "");
   try {
     set_scenario("probe-ok");
     expect_eq(probe_video(container_config(video_path), 5'000'000'000ULL).width, 3840U,
@@ -1756,6 +1832,7 @@ void windows_path_runtime_discovery(const std::filesystem::path& video_path,
   set_environment("RECO_GSTREAMER_DYLIB_PATH", runtime.string());
   set_environment("RECO_GSTAPP_DYLIB_PATH", runtime.string());
   set_environment("RECO_GLIB_DYLIB_PATH", runtime.string());
+  set_environment("RECO_GOBJECT_DYLIB_PATH", runtime.string());
   std::filesystem::remove_all(directory);
 #else
   (void)video_path;
@@ -1842,6 +1919,7 @@ int main(int argc, char** argv) {
   set_environment("RECO_GSTREAMER_DYLIB_PATH", runtime.string());
   set_environment("RECO_GSTAPP_DYLIB_PATH", runtime.string());
   set_environment("RECO_GLIB_DYLIB_PATH", runtime.string());
+  set_environment("RECO_GOBJECT_DYLIB_PATH", runtime.string());
 
   const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
   const auto video_path = std::filesystem::temp_directory_path() /
@@ -1866,6 +1944,8 @@ int main(int argc, char** argv) {
   auto_reaped_workers_are_supported(video_path);
   windows_job_reclaims_worker_descendants(video_path);
   unrelated_descriptors_are_not_inherited(video_path);
+  lowered_file_limit_does_not_leak_high_descriptors(video_path);
+  worker_address_space_is_limited(video_path);
   unrelated_descriptor_writer_does_not_delay_pipe_eof(video_path);
   parent_death_reclaims_worker(video_path);
   caller_death_reclaims_worker_and_descendant(video_path);

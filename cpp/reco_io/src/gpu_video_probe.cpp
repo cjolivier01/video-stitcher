@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -69,6 +70,7 @@ constexpr std::uint64_t kTimingWindowSeekPrerollNs = kNanosecondsPerSecond;
 // reorder suffix. This also remains larger than the bounded prefix scan.
 constexpr std::size_t kMaximumTimingWindowSamples = 5'000 + kTimingReorderLookahead + 1;
 constexpr std::uint64_t kMaximumCompressedSamplePulls = 50'000;
+constexpr std::uint64_t kMaximumBytesBeforeCompressedAccessUnit = 64ULL * 1024ULL * 1024ULL;
 constexpr std::size_t kStoredTimingSamples = kMaximumTimingWindowSamples;
 static_assert(kStoredTimingSamples >= kTimingAnalysisSamples + kTimingReorderLookahead);
 static_assert(kStoredTimingSamples > kMaximumConflictingMetadataCountSamples);
@@ -300,6 +302,7 @@ public:
   using AppSinkTryPullSample = void* (*)(void*, std::uint64_t);
   using AppSinkIsEos = int (*)(void*);
   using SampleGetBuffer = void* (*)(void*);
+  using BufferGetSize = std::size_t (*)(const void*);
   using SampleGetCaps = void* (*)(void*);
   using SampleGetSegment = const void* (*)(void*);
   using SampleUnref = void (*)(void*);
@@ -311,12 +314,18 @@ public:
   using CapsUnref = void (*)(void*);
   using ErrorFree = void (*)(GErrorAbi*);
   using Free = void (*)(void*);
+  using GenericCallback = void (*)();
+  using DestroyNotify = void (*)(void*);
+  using SignalConnectData = unsigned long (*)(void*, const char*, GenericCallback, void*,
+                                              DestroyNotify, int);
+  using SignalHandlerDisconnect = void (*)(void*, unsigned long);
 
   ProbeApi() {
 #if defined(_WIN32)
     core = load_library("RECO_GSTREAMER_DYLIB_PATH", {"gstreamer-1.0-0.dll"}, "GStreamer");
     app = load_library("RECO_GSTAPP_DYLIB_PATH", {"gstapp-1.0-0.dll"}, "GstApp");
     glib = load_library("RECO_GLIB_DYLIB_PATH", {"libglib-2.0-0.dll", "glib-2.0-0.dll"}, "GLib");
+    gobject = load_library("RECO_GOBJECT_DYLIB_PATH", {"libgobject-2.0-0.dll"}, "GObject");
 #elif defined(__APPLE__)
     core = load_library("RECO_GSTREAMER_DYLIB_PATH",
                         {"libgstreamer-1.0.0.dylib", "libgstreamer-1.0.dylib",
@@ -339,12 +348,20 @@ public:
                       "/Library/Frameworks/GStreamer.framework/Versions/1.0/lib/"
                       "libglib-2.0.0.dylib"},
                      "GLib");
+    gobject = load_library(
+        "RECO_GOBJECT_DYLIB_PATH",
+        {"libgobject-2.0.0.dylib", "libgobject-2.0.dylib",
+         "/opt/homebrew/lib/libgobject-2.0.0.dylib", "/usr/local/lib/libgobject-2.0.0.dylib",
+         "/Library/Frameworks/GStreamer.framework/Versions/1.0/lib/libgobject-2.0.0.dylib"},
+        "GObject");
 #else
     core = load_library("RECO_GSTREAMER_DYLIB_PATH",
                         {"libgstreamer-1.0.so.0", "libgstreamer-1.0.so"}, "GStreamer");
     app = load_library("RECO_GSTAPP_DYLIB_PATH", {"libgstapp-1.0.so.0", "libgstapp-1.0.so"},
                        "GstApp");
     glib = load_library("RECO_GLIB_DYLIB_PATH", {"libglib-2.0.so.0", "libglib-2.0.so"}, "GLib");
+    gobject = load_library("RECO_GOBJECT_DYLIB_PATH", {"libgobject-2.0.so.0", "libgobject-2.0.so"},
+                           "GObject");
 #endif
 
     init_check = core->symbol<InitCheck>("gst_init_check");
@@ -366,6 +383,7 @@ public:
     app_sink_try_pull_sample = app->symbol<AppSinkTryPullSample>("gst_app_sink_try_pull_sample");
     app_sink_is_eos = app->symbol<AppSinkIsEos>("gst_app_sink_is_eos");
     sample_get_buffer = core->symbol<SampleGetBuffer>("gst_sample_get_buffer");
+    buffer_get_size = core->symbol<BufferGetSize>("gst_buffer_get_size");
     sample_get_caps = core->symbol<SampleGetCaps>("gst_sample_get_caps");
     sample_get_segment = core->symbol<SampleGetSegment>("gst_sample_get_segment");
     sample_unref = core->symbol<SampleUnref>("gst_mini_object_unref");
@@ -377,11 +395,15 @@ public:
     caps_unref = core->symbol<CapsUnref>("gst_caps_unref");
     error_free = glib->symbol<ErrorFree>("g_error_free");
     free = glib->symbol<Free>("g_free");
+    signal_connect_data = gobject->symbol<SignalConnectData>("g_signal_connect_data");
+    signal_handler_disconnect =
+        gobject->symbol<SignalHandlerDisconnect>("g_signal_handler_disconnect");
   }
 
   std::shared_ptr<DynamicLibrary> core;
   std::shared_ptr<DynamicLibrary> app;
   std::shared_ptr<DynamicLibrary> glib;
+  std::shared_ptr<DynamicLibrary> gobject;
   InitCheck init_check = nullptr;
   Version version = nullptr;
   ParseLaunch parse_launch = nullptr;
@@ -401,6 +423,7 @@ public:
   AppSinkTryPullSample app_sink_try_pull_sample = nullptr;
   AppSinkIsEos app_sink_is_eos = nullptr;
   SampleGetBuffer sample_get_buffer = nullptr;
+  BufferGetSize buffer_get_size = nullptr;
   SampleGetCaps sample_get_caps = nullptr;
   SampleGetSegment sample_get_segment = nullptr;
   SampleUnref sample_unref = nullptr;
@@ -412,6 +435,8 @@ public:
   CapsUnref caps_unref = nullptr;
   ErrorFree error_free = nullptr;
   Free free = nullptr;
+  SignalConnectData signal_connect_data = nullptr;
+  SignalHandlerDisconnect signal_handler_disconnect = nullptr;
 };
 
 std::string take_error(const ProbeApi& api, GErrorAbi*& error, std::string_view fallback) {
@@ -474,11 +499,13 @@ std::string build_probe_pipeline(const GpuFileDecodeConfig& config,
   pipeline << "filesrc location=" << quote_gstreamer_property(path_for_gstreamer(absolute_path))
            << " ! ";
   if (config.elementary_stream) {
-    pipeline << parser_for_codec(config.codec);
+    pipeline << "identity name=input_budget signal-handoffs=true silent=true ! "
+             << parser_for_codec(config.codec);
   } else {
     pipeline << gpu_decode_container_demuxer(*config.container)
              << " ! capsfilter caps=\"video/x-h264;video/x-h265\""
-             << " ! identity name=container_info silent=true ! parsebin";
+             << " ! identity name=container_info silent=true"
+             << " ! identity name=input_budget signal-handoffs=true silent=true ! parsebin";
   }
   pipeline << " ! capsfilter caps=\"video/x-h264,stream-format=byte-stream,alignment=au;"
               "video/x-h265,stream-format=byte-stream,alignment=au\""
@@ -596,7 +623,30 @@ std::string pop_pipeline_error(const std::shared_ptr<ProbeApi>& api, void* bus) 
 
 class CompressedSampleBudget {
 public:
+  void observe_input_bytes(std::size_t bytes) noexcept {
+    auto current = input_bytes_.load(std::memory_order_relaxed);
+    while (true) {
+      const auto increment = static_cast<std::uint64_t>(bytes);
+      const auto next = increment > std::numeric_limits<std::uint64_t>::max() - current
+                            ? std::numeric_limits<std::uint64_t>::max()
+                            : current + increment;
+      if (input_bytes_.compare_exchange_weak(current, next, std::memory_order_relaxed)) {
+        return;
+      }
+    }
+  }
+
+  void require_input_within_limit() const {
+    const auto observed = input_bytes_.load(std::memory_order_relaxed);
+    if (observed < completed_input_bytes_ ||
+        observed - completed_input_bytes_ > kMaximumBytesBeforeCompressedAccessUnit) {
+      throw GpuVideoProbeError("video parser exceeded the compressed bytes-per-access-unit limit");
+    }
+  }
+
   void consume() {
+    require_input_within_limit();
+    completed_input_bytes_ = input_bytes_.load(std::memory_order_relaxed);
     if (consumed_ == kMaximumCompressedSamplePulls) {
       throw GpuVideoProbeError(
           "video parser exceeded the compressed access-unit metadata work limit");
@@ -605,8 +655,24 @@ public:
   }
 
 private:
+  std::atomic<std::uint64_t> input_bytes_{0};
+  std::uint64_t completed_input_bytes_ = 0;
   std::uint64_t consumed_ = 0;
 };
+
+struct InputBudgetCallbackData {
+  const ProbeApi* api = nullptr;
+  CompressedSampleBudget* budget = nullptr;
+};
+
+void input_budget_handoff(void*, void* buffer, void* user_data) noexcept {
+  const auto* callback = static_cast<const InputBudgetCallbackData*>(user_data);
+  if (callback == nullptr || callback->api == nullptr || callback->budget == nullptr ||
+      buffer == nullptr) {
+    return;
+  }
+  callback->budget->observe_input_bytes(callback->api->buffer_get_size(buffer));
+}
 
 std::optional<std::pair<std::uint32_t, std::uint32_t>>
 reduce_matroska_buffer_duration(std::uint64_t duration_ns) {
@@ -678,6 +744,7 @@ void* pull_compressed_sample(const std::shared_ptr<ProbeApi>& api, void* probe_s
                              std::chrono::steady_clock::time_point deadline,
                              std::string_view timeout_message) {
   while (true) {
+    sample_budget.require_input_within_limit();
     const auto poll_timeout =
         std::min(remaining_timeout_ns(deadline, timeout_message), kSamplePollTimeoutNs);
     if (void* sample = api->app_sink_try_pull_sample(probe_sink, poll_timeout); sample != nullptr) {
@@ -688,6 +755,7 @@ void* pull_compressed_sample(const std::shared_ptr<ProbeApi>& api, void* probe_s
       sample_budget.consume();
       return sample_owner.release();
     }
+    sample_budget.require_input_within_limit();
     if (const auto error = pop_pipeline_error(api, bus); !error.empty()) {
       throw GpuVideoProbeError(error);
     }
@@ -1739,6 +1807,26 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
   if (probe_sink == nullptr) {
     throw GpuVideoProbeError("GStreamer parser-only probe has no compressed-stream sink");
   }
+  void* input_budget_element = api->bin_get_by_name(pipeline, "input_budget");
+  std::unique_ptr<void, ProbeApi::ObjectUnref> input_budget_owner(input_budget_element,
+                                                                  api->object_unref);
+  if (input_budget_element == nullptr) {
+    throw GpuVideoProbeError("GStreamer parser-only probe has no compressed-input budget");
+  }
+  InputBudgetCallbackData input_budget_callback{.api = api.get(), .budget = &sample_budget};
+  const auto input_budget_signal =
+      api->signal_connect_data(input_budget_element, "handoff",
+                               reinterpret_cast<ProbeApi::GenericCallback>(&input_budget_handoff),
+                               &input_budget_callback, nullptr, 0);
+  if (input_budget_signal == 0) {
+    throw GpuVideoProbeError("failed to attach the compressed-input byte budget");
+  }
+  struct DisconnectInputBudget {
+    std::shared_ptr<ProbeApi> api;
+    void* element = nullptr;
+    unsigned long signal = 0;
+    ~DisconnectInputBudget() { api->signal_handler_disconnect(element, signal); }
+  } disconnect_input_budget{api, input_budget_element, input_budget_signal};
   void* bus = api->element_get_bus(pipeline);
   std::unique_ptr<void, ProbeApi::ObjectUnref> bus_owner(bus, api->object_unref);
   if (bus == nullptr) {

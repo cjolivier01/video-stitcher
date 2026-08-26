@@ -13,6 +13,7 @@
 #include <io.h>
 #else
 #include <dirent.h>
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 
@@ -21,15 +22,16 @@ int run_gpu_video_probe_worker();
 #if defined(_WIN32)
 int run_gpu_video_probe_guardian();
 #endif
-#if !defined(_WIN32)
-int run_gpu_video_probe_guard();
-#endif
 } // namespace reco::io::detail
 
 #if !defined(_WIN32)
 namespace {
 
 bool close_unrelated_descriptors() {
+#if defined(__APPLE__)
+  (void)::closefrom(3);
+  return true;
+#endif
 #if defined(__linux__)
   if (auto* directory = ::opendir("/proc/self/fd"); directory != nullptr) {
     const auto directory_descriptor = ::dirfd(directory);
@@ -52,6 +54,11 @@ bool close_unrelated_descriptors() {
     return true;
   }
 #endif
+#if defined(F_CLOSEM)
+  if (::fcntl(3, F_CLOSEM, 0) == 0) {
+    return true;
+  }
+#endif
   const auto maximum_descriptor = ::sysconf(_SC_OPEN_MAX);
   if (maximum_descriptor < 0) {
     return false;
@@ -71,11 +78,6 @@ int main(int argc, char** argv) {
 #if defined(_WIN32)
   if (argc == 2 && std::strcmp(argv[1], "--reco-video-probe-guardian") == 0) {
     return reco::io::detail::run_gpu_video_probe_guardian();
-  }
-#endif
-#if !defined(_WIN32)
-  if (argc == 2 && std::strcmp(argv[1], "--reco-video-probe-guard") == 0) {
-    return reco::io::detail::run_gpu_video_probe_guard();
   }
 #endif
   if (argc < 2 || std::strcmp(argv[1], "--reco-video-probe-worker") != 0) {

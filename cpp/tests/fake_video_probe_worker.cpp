@@ -24,6 +24,7 @@
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -326,6 +327,32 @@ int main(int argc, char** argv) {
   }
 #endif
   const char* scenario = std::getenv("RECO_FAKE_PROBE_WORKER_SCENARIO");
+#if !defined(_WIN32)
+  if (scenario != nullptr && std::strcmp(scenario, "memory-limit") == 0) {
+    struct rlimit address_space{};
+    constexpr rlim_t kExpectedMaximum = 512ULL * 1024ULL * 1024ULL;
+    if (::getrlimit(RLIMIT_AS, &address_space) != 0 || address_space.rlim_cur == RLIM_INFINITY ||
+        address_space.rlim_cur > kExpectedMaximum) {
+      return 5;
+    }
+  }
+  if (scenario != nullptr && std::strcmp(scenario, "descriptor-isolation") == 0) {
+    const char* forbidden_descriptor = std::getenv("RECO_FAKE_PROBE_FORBIDDEN_FD");
+    if (forbidden_descriptor != nullptr && forbidden_descriptor[0] != '\0') {
+      char* end = nullptr;
+      errno = 0;
+      const auto descriptor = std::strtol(forbidden_descriptor, &end, 10);
+      if (errno != 0 || end == forbidden_descriptor || end == nullptr || *end != '\0' ||
+          descriptor < 0 || descriptor > std::numeric_limits<int>::max()) {
+        return 5;
+      }
+      errno = 0;
+      if (::fcntl(static_cast<int>(descriptor), F_GETFD) >= 0 || errno != EBADF) {
+        return 4;
+      }
+    }
+  }
+#endif
   if (!write_lifecycle_event("worker")) {
     return EXIT_FAILURE;
   }
@@ -427,8 +454,9 @@ int main(int argc, char** argv) {
       response = {{"protocol_version", std::numeric_limits<std::uint64_t>::max()}, {"ok", false}};
     } else if (std::strcmp(scenario, "valid-metadata") == 0 ||
                std::strcmp(scenario, "valid-metadata-with-descendant") == 0 ||
-#if defined(__linux__)
+#if !defined(_WIN32)
                std::strcmp(scenario, "descriptor-isolation") == 0 ||
+               std::strcmp(scenario, "memory-limit") == 0 ||
 #endif
                std::strcmp(scenario, "invalid-metadata") == 0 ||
                std::strcmp(scenario, "negative-metadata") == 0 ||
@@ -444,10 +472,10 @@ int main(int argc, char** argv) {
                        : nlohmann::json(
                              std::strcmp(scenario, "valid-metadata") == 0 ||
                                      std::strcmp(scenario, "valid-metadata-with-descendant") == 0 ||
-#if defined(__linux__)
+#if !defined(_WIN32)
                                      std::strcmp(scenario, "descriptor-isolation") == 0 ||
 #endif
-                                     false
+                                     std::strcmp(scenario, "memory-limit") == 0 || false
                                  ? 854
                                  : 853)},
                   {"height", 480},
