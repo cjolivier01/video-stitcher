@@ -53,6 +53,27 @@ constexpr std::size_t kStoredTimingSamples = kMaximumExactCountSamples + 1;
 static_assert(kStoredTimingSamples >= kTimingAnalysisSamples + kTimingReorderLookahead);
 constexpr std::uint32_t kMaximumFrameRateDenominator = 1001;
 constexpr long double kFrameRatePreferenceTolerance = 0.05L;
+constexpr long double kMaximumTimingDeltaVariation = 0.10L;
+constexpr long double kCanonicalFrameRateTolerance = 0.0005L;
+constexpr std::array<std::pair<std::uint32_t, std::uint32_t>, 17> kCanonicalFrameRates{{
+    {24'000, 1'001},
+    {24, 1},
+    {25, 1},
+    {30'000, 1'001},
+    {30, 1},
+    {48, 1},
+    {50, 1},
+    {60'000, 1'001},
+    {60, 1},
+    {100, 1},
+    {120'000, 1'001},
+    {120, 1},
+    {200, 1},
+    {240'000, 1'001},
+    {240, 1},
+    {480, 1},
+    {960, 1},
+}};
 
 struct GErrorAbi {
   std::uint32_t domain = 0;
@@ -518,8 +539,14 @@ void observe_timing_sample(const std::shared_ptr<ProbeApi>& api, void* sample, T
   }
 }
 
-std::optional<std::pair<std::uint32_t, std::uint32_t>>
-infer_constant_frame_rate(const TimingScan& scan, bool complete_stream) {
+struct InferredFrameRate {
+  std::uint32_t numerator = 0;
+  std::uint32_t denominator = 0;
+  std::size_t timestamp_multiplicity = 1;
+};
+
+std::optional<InferredFrameRate> infer_constant_frame_rate(const TimingScan& scan,
+                                                           bool complete_stream) {
   if (scan.stored_timing_count < 3) {
     return std::nullopt;
   }
@@ -530,10 +557,28 @@ infer_constant_frame_rate(const TimingScan& scan, bool complete_stream) {
                                   ? scan.stored_timing_count
                                   : std::min(scan.stored_timing_count, kTimingAnalysisSamples);
   const auto timing_end = times.begin() + static_cast<std::ptrdiff_t>(analysis_count);
+  std::size_t timestamp_multiplicity = 0;
+  for (auto group_begin = times.begin(); group_begin != timing_end;) {
+    const auto group_end = std::find_if(
+        group_begin, timing_end, [value = *group_begin](auto item) { return item != value; });
+    const auto group_size = static_cast<std::size_t>(group_end - group_begin);
+    if (timestamp_multiplicity == 0) {
+      timestamp_multiplicity = group_size;
+    } else if (group_size != timestamp_multiplicity) {
+      return std::nullopt;
+    }
+    group_begin = group_end;
+  }
   const auto unique_end = std::unique(times.begin(), timing_end);
   const auto unique_count = static_cast<std::size_t>(unique_end - times.begin());
-  if (unique_count < 3) {
+  if (unique_count < 3 || timestamp_multiplicity == 0) {
     return std::nullopt;
+  }
+  if (complete_stream) {
+    if (scan.sample_count % unique_count != 0) {
+      return std::nullopt;
+    }
+    timestamp_multiplicity = static_cast<std::size_t>(scan.sample_count / unique_count);
   }
 
   auto minimum_delta = std::numeric_limits<std::uint64_t>::max();
@@ -543,7 +588,9 @@ infer_constant_frame_rate(const TimingScan& scan, bool complete_stream) {
     minimum_delta = std::min(minimum_delta, delta);
     maximum_delta = std::max(maximum_delta, delta);
   }
-  if (minimum_delta == 0 || maximum_delta - minimum_delta > 2) {
+  if (minimum_delta == 0 || (maximum_delta - minimum_delta > 2 &&
+                             static_cast<long double>(maximum_delta - minimum_delta) >
+                                 minimum_delta * kMaximumTimingDeltaVariation)) {
     return std::nullopt;
   }
 
@@ -552,7 +599,16 @@ infer_constant_frame_rate(const TimingScan& scan, bool complete_stream) {
     return std::nullopt;
   }
   const long double observed_fps =
-      static_cast<long double>(unique_count - 1) * kNanosecondsPerSecond / span_ns;
+      static_cast<long double>((unique_count - 1) * timestamp_multiplicity) *
+      kNanosecondsPerSecond / span_ns;
+  for (const auto& [numerator, denominator] : kCanonicalFrameRates) {
+    const auto canonical_fps = static_cast<long double>(numerator) / denominator;
+    if (std::abs(canonical_fps - observed_fps) <= canonical_fps * kCanonicalFrameRateTolerance) {
+      return InferredFrameRate{.numerator = numerator,
+                               .denominator = denominator,
+                               .timestamp_multiplicity = timestamp_multiplicity};
+    }
+  }
   long double best_error = std::numeric_limits<long double>::infinity();
   std::uint32_t best_numerator = 0;
   std::uint32_t best_denominator = 0;
@@ -575,7 +631,9 @@ infer_constant_frame_rate(const TimingScan& scan, bool complete_stream) {
     return std::nullopt;
   }
   const auto divisor = std::gcd(best_numerator, best_denominator);
-  return std::pair(best_numerator / divisor, best_denominator / divisor);
+  return InferredFrameRate{.numerator = best_numerator / divisor,
+                           .denominator = best_denominator / divisor,
+                           .timestamp_multiplicity = timestamp_multiplicity};
 }
 
 bool frame_rates_are_close(std::uint32_t first_numerator, std::uint32_t first_denominator,
@@ -895,14 +953,15 @@ GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config, std::uint64_t t
   const auto inferred_frame_rate = infer_constant_frame_rate(timing_scan, timing_scan.reached_eos);
   const bool prefer_inferred_frame_rate =
       inferred_frame_rate.has_value() &&
-      (timing_scan.reached_eos || !caps_frame_rate_is_plausible ||
-       frame_rates_are_close(inferred_frame_rate->first, inferred_frame_rate->second,
+      (timing_scan.reached_eos || inferred_frame_rate->timestamp_multiplicity > 1 ||
+       !caps_frame_rate_is_plausible ||
+       frame_rates_are_close(inferred_frame_rate->numerator, inferred_frame_rate->denominator,
                              static_cast<std::uint32_t>(fps_numerator),
                              static_cast<std::uint32_t>(fps_denominator),
                              kFrameRatePreferenceTolerance));
   if (prefer_inferred_frame_rate) {
-    fps_numerator = static_cast<int>(inferred_frame_rate->first);
-    fps_denominator = static_cast<int>(inferred_frame_rate->second);
+    fps_numerator = static_cast<int>(inferred_frame_rate->numerator);
+    fps_denominator = static_cast<int>(inferred_frame_rate->denominator);
   } else if (!caps_frame_rate_is_plausible) {
     fps_numerator = static_cast<int>(kFallbackFpsNumerator);
     fps_denominator = static_cast<int>(kFallbackFpsDenominator);
@@ -970,8 +1029,7 @@ GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config, std::uint64_t t
       }
     } else if (!config.elementary_stream && !timing_scan.first_stream_time.has_value()) {
       duration_is_estimated = true;
-    } else if (config.elementary_stream &&
-               timing_scan.timed_sample_count != timing_scan.sample_count) {
+    } else if (config.elementary_stream) {
       duration_is_estimated = true;
     }
     total_frames =

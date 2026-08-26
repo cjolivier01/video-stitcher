@@ -325,6 +325,31 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_eq(retimed_constant.total_frames, 150ULL,
             "retimed constant stream retains its EOS-proven AU count");
 
+  set_scenario("probe-duplicate-pts-pairs");
+  const auto duplicate_pts = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(duplicate_pts.fps_numerator, 50U,
+            "duplicate PTS pairs cannot halve a plausible caps frame rate");
+  expect_eq(duplicate_pts.total_frames, 200ULL,
+            "duplicate PTS pairs retain their EOS-proven AU count");
+  expect_eq(duplicate_pts.duration_ns, 4'000'000'000ULL,
+            "duplicate PTS pairs retain their observed terminal span");
+
+  set_scenario("probe-paired-au-missing-pts");
+  const auto paired_missing_pts = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(paired_missing_pts.fps_numerator, 50U,
+            "uniformly missing paired-AU PTS values preserve the AU rate");
+  expect_eq(paired_missing_pts.total_frames, 200ULL,
+            "uniformly missing paired-AU PTS values retain the exact AU count");
+
+  set_scenario("probe-quantized-no-vui-5994");
+  const auto quantized_no_vui = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(quantized_no_vui.fps_numerator, 60'000U,
+            "90 kHz quantized timing snaps to the standard NTSC numerator");
+  expect_eq(quantized_no_vui.fps_denominator, 1'001U,
+            "90 kHz quantized timing snaps to the standard NTSC denominator");
+  expect_eq(quantized_no_vui.total_frames, 240ULL,
+            "quantized no-VUI stream retains its EOS-proven AU count");
+
   set_scenario("probe-vfr-missing-durations");
   const auto missing_durations = probe_gpu_video(container_config(video_path), timeout_ns);
   expect_eq(missing_durations.duration_ns, 6'000'000'000ULL,

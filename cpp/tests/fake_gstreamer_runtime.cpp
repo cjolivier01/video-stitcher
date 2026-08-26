@@ -230,6 +230,15 @@ FakeCaps parser_sample_caps() {
   } else if (scenario() == "probe-vfr-missing-durations") {
     caps.fps_numerator = 45;
     caps.fps_denominator = 1;
+  } else if (scenario() == "probe-duplicate-pts-pairs") {
+    caps.fps_numerator = 50;
+    caps.fps_denominator = 1;
+  } else if (scenario() == "probe-paired-au-missing-pts") {
+    caps.fps_numerator = 25;
+    caps.fps_denominator = 1;
+  } else if (scenario() == "probe-quantized-no-vui-5994") {
+    caps.fps_numerator = 0;
+    caps.fps_denominator = 1;
   } else if (scenario() == "probe-caps-runahead") {
     caps.width = 854;
     caps.height = 480;
@@ -262,6 +271,14 @@ std::uint64_t parser_timing_offset(std::uint64_t frame_index, const FakeCaps& ca
   if (scenario() == "probe-reduced-cadence-after-prefix") {
     return frame_index <= 90U ? frame_index * 1'000'000'000ULL / 30U
                               : 3'000'000'000ULL + (frame_index - 90U) * 1'000'000'000ULL / 15U;
+  }
+  if (scenario() == "probe-duplicate-pts-pairs" || scenario() == "probe-paired-au-missing-pts") {
+    return (frame_index / 2U) * 40'000'000ULL;
+  }
+  if (scenario() == "probe-quantized-no-vui-5994") {
+    const auto ticks = static_cast<std::uint64_t>(
+        std::llround(static_cast<long double>(frame_index) * 90'000.0L * 1'001.0L / 60'000.0L));
+    return ticks * 1'000'000'000ULL / 90'000ULL;
   }
   return parser_frame_offset(frame_index, caps);
 }
@@ -628,6 +645,14 @@ RECO_FAKE_EXPORT int gst_element_query_duration(void*, int format, std::int64_t*
     *duration = 575'935'624'115;
     return 1;
   }
+  if (scenario() == "probe-duplicate-pts-pairs" || scenario() == "probe-paired-au-missing-pts") {
+    *duration = 4'000'000'000;
+    return 1;
+  }
+  if (scenario() == "probe-quantized-no-vui-5994") {
+    *duration = 4'004'000'000;
+    return 1;
+  }
   *duration = 10'000'000'000LL;
   return 1;
 }
@@ -796,6 +821,9 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     } else if (current_scenario == "probe-retimed-constant-pts") {
       timing_caps.fps_numerator = 30;
       timing_caps.fps_denominator = 1;
+    } else if (current_scenario == "probe-quantized-no-vui-5994") {
+      timing_caps.fps_numerator = 60'000;
+      timing_caps.fps_denominator = 1'001;
     }
     const std::uint64_t selected_stream_start_ns =
         current_scenario == "probe-delayed-stream"   ? 4'000'000'000ULL
@@ -824,6 +852,9 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
         : current_scenario == "probe-estimated-count-lower-bound"  ? 10'000'000'000ULL
         : current_scenario == "probe-retimed-constant-pts"         ? 5'000'000'000ULL
         : current_scenario == "probe-long-untimed-elementary"      ? 600'000'000'000ULL
+        : current_scenario == "probe-duplicate-pts-pairs"          ? 4'000'000'000ULL
+        : current_scenario == "probe-paired-au-missing-pts"        ? 4'000'000'000ULL
+        : current_scenario == "probe-quantized-no-vui-5994"        ? 4'004'000'000ULL
         : current_scenario == "probe-bframe-cutoff"                ? 4'000'000'000ULL
         : current_scenario == "probe-quantized-timestamps"         ? 4'170'833'333ULL
         : current_scenario == "probe-exact-frame-count"            ? 100'100'000ULL
@@ -862,7 +893,11 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     sample->segment_stream_origin_ns = selected_stream_start_ns;
     sample->segment_outside = current_scenario == "probe-seek-preroll" &&
                               sink->pipeline->has_seek && seek_pull_index == 0;
-    if (current_scenario == "probe-unknown-pts" || current_scenario == "probe-long-unknown-pts") {
+    if (current_scenario == "probe-paired-au-missing-pts" && !sink->pipeline->has_seek &&
+        (sequential_index % 2U) != 0) {
+      sample->buffer.pts = std::numeric_limits<std::uint64_t>::max();
+    } else if (current_scenario == "probe-unknown-pts" ||
+               current_scenario == "probe-long-unknown-pts") {
       sample->buffer.pts = std::numeric_limits<std::uint64_t>::max();
     } else if (current_scenario == "probe-mixed-prefix-pts" && !sink->pipeline->has_seek &&
                sequential_index == 0) {
