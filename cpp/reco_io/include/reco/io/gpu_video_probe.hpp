@@ -15,15 +15,17 @@ struct GpuVideoProbe {
   std::uint32_t width = 0;
   /// Parser-visible video height in pixels.
   std::uint32_t height = 0;
-  /// Exact frame-rate numerator from constant parser timing or parser caps.
+  /// Frame-rate numerator from constant parser timing, parser caps, or the
+  /// explicit 30 fps fallback used when both are unavailable.
   std::uint32_t fps_numerator = 0;
-  /// Exact frame-rate denominator from constant parser timing or parser caps.
+  /// Frame-rate denominator matching `fps_numerator`.
   std::uint32_t fps_denominator = 0;
   /// Frame rate as a floating-point value for Rust-compatible selection math.
   double fps = 0.0;
   /// Parsed or explicitly estimated duration in nanoseconds.
   std::uint64_t duration_ns = 0;
-  /// Truncated `duration * fps` frame-count estimate.
+  /// Exact compressed access-unit count when EOS or bounded seeks establish
+  /// it, otherwise the truncated `duration * fps` estimate.
   std::uint64_t total_frames = 0;
   /// Whether `duration_ns` is a fallback or an uncorrelated container estimate.
   bool duration_is_estimated = false;
@@ -38,9 +40,10 @@ public:
 /// Uses the production GStreamer demux/parser topology to probe a local input.
 ///
 /// The pipeline stops before NVDEC and never produces a decoded frame. The
-/// selected stream's duration is correlated with bounded seeks over compressed
-/// access-unit timestamps. The timeout must be between one second and one hour,
-/// inclusive.
+/// The selected stream's duration is correlated with bounded seeks over
+/// compressed access-unit timestamps. Streams without usable timing are
+/// scanned to EOS so their access units remain countable. The timeout must be
+/// between one second and one hour, inclusive.
 [[nodiscard]] GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config,
                                             std::uint64_t timeout_ns);
 

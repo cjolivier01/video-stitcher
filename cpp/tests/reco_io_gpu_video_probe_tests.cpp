@@ -145,7 +145,7 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_eq(result.fps_denominator, 1'001U, "parser FPS denominator");
   expect_true(std::abs(result.fps - 30'000.0 / 1'001.0) < 1e-12, "rational FPS");
   expect_eq(result.duration_ns, 10'000'000'000ULL, "queried duration");
-  expect_eq(result.total_frames, 299ULL, "exact rational frame count truncates");
+  expect_eq(result.total_frames, 300ULL, "bounded seeks preserve the exact access-unit count");
   expect_true(!result.duration_is_estimated, "known duration is not estimated");
 
   const auto events = read_events(event_path);
@@ -253,6 +253,71 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_eq(inferred_fps.fps_denominator, 1U, "inferred constant frame rate is reduced exactly");
   expect_eq(inferred_fps.total_frames, 60ULL, "inexact container caps do not lose a proven frame");
 
+  set_scenario("probe-long-unknown-pts");
+  const auto long_unknown_pts = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(long_unknown_pts.duration_ns, 3'000'000'000ULL,
+            "long unknown-PTS stream uses its exact access-unit count");
+  expect_eq(long_unknown_pts.total_frames, 90ULL,
+            "unknown-PTS stream scanning continues beyond the timing window");
+  expect_true(long_unknown_pts.duration_is_estimated,
+              "long unknown-PTS duration remains explicitly estimated");
+
+  set_scenario("probe-mixed-prefix-pts");
+  const auto mixed_prefix = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(mixed_prefix.duration_ns, 4'000'000'000ULL,
+            "untimed prefix retains its nominal frame interval");
+  expect_eq(mixed_prefix.total_frames, 120ULL, "untimed prefix does not shift the stream origin");
+  expect_true(mixed_prefix.duration_is_estimated,
+              "duration with an untimed prefix is explicitly estimated");
+
+  set_scenario("probe-unset-fps-inferred");
+  const auto unset_fps = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(unset_fps.fps_numerator, 30U, "unset caps frame rate is inferred from timestamps");
+  expect_eq(unset_fps.fps_denominator, 1U, "inferred unset-caps frame rate is exact");
+  expect_eq(unset_fps.total_frames, 120ULL, "unset caps frame rate remains seek-countable");
+
+  const auto untimed_elementary =
+      probe_gpu_video(elementary_config(video_path, GpuDecodeCodec::H264), timeout_ns);
+  expect_eq(untimed_elementary.fps_numerator, 30U,
+            "timing-less elementary stream uses the explicit frame-rate fallback");
+  expect_eq(untimed_elementary.total_frames, 120ULL,
+            "timing-less elementary stream is counted through EOS");
+  expect_true(untimed_elementary.duration_is_estimated,
+              "timing-less elementary duration remains explicitly estimated");
+
+  set_scenario("probe-vfr-unset-fps");
+  const auto vfr_fallback = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(vfr_fallback.fps_numerator, 30U, "VFR stream uses explicit fallback frame rate");
+  expect_eq(vfr_fallback.total_frames, 135ULL,
+            "VFR stream preserves its exact compressed access-unit count");
+  expect_eq(vfr_fallback.duration_ns, 4'720'000'000ULL,
+            "VFR EOS scan preserves observed presentation duration");
+
+  set_scenario("probe-bframe-cutoff");
+  const auto reordered_cutoff = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(reordered_cutoff.fps_numerator, 30U,
+            "timing lookahead closes a B-frame group at the analysis boundary");
+  expect_eq(reordered_cutoff.fps_denominator, 1U,
+            "B-frame timing inference keeps the reduced rational rate");
+  expect_eq(reordered_cutoff.total_frames, 120ULL,
+            "B-frame cutoff does not lose the delayed presentation frame");
+
+  set_scenario("probe-quantized-timestamps");
+  const auto quantized = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(quantized.total_frames, 100ULL,
+            "seek-proven count survives coarse timestamp quantization");
+  expect_eq(quantized.duration_ns, 4'170'833'334ULL,
+            "quantized duration is clamped to the proven frame-count boundary");
+  expect_true(!quantized.duration_is_estimated,
+              "seek-correlated quantized duration remains authoritative");
+
+  set_scenario("probe-bad-fps");
+  const auto invalid_caps_fps = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(invalid_caps_fps.fps_numerator, 30U,
+            "invalid caps rate is replaced by constant parser timing");
+  expect_eq(invalid_caps_fps.fps_denominator, 1U,
+            "invalid caps timing inference is reduced exactly");
+
   set_scenario("probe-seek-unsupported");
   const auto unseekable = probe_gpu_video(container_config(video_path), timeout_ns);
   expect_eq(unseekable.duration_ns, 10'000'000'000ULL,
@@ -261,7 +326,7 @@ void probe_contracts(const std::filesystem::path& video_path,
               "uncorrelated container duration is explicitly marked estimated");
 
   set_scenario("probe-seek-preroll");
-  expect_eq(probe_gpu_video(container_config(video_path), timeout_ns).total_frames, 299ULL,
+  expect_eq(probe_gpu_video(container_config(video_path), timeout_ns).total_frames, 300ULL,
             "seek preroll outside the active segment is ignored");
 
   set_scenario("probe-ok");
@@ -334,9 +399,6 @@ void invalid_inputs_fail(const std::filesystem::path& video_path,
   set_scenario("probe-odd-dimensions");
   expect_probe_error([&] { (void)probe_gpu_video(container_config(video_path), timeout_ns); },
                      "incompatible with NV12", "odd parser-visible dimensions rejected");
-  set_scenario("probe-bad-fps");
-  expect_probe_error([&] { (void)probe_gpu_video(container_config(video_path), timeout_ns); },
-                     "invalid frame rate", "zero-denominator FPS rejected");
   set_scenario("probe-high-fps");
   expect_probe_error([&] { (void)probe_gpu_video(container_config(video_path), timeout_ns); },
                      "implausible frame rate", "time-base artifact FPS rejected");
