@@ -196,12 +196,23 @@ FakeCaps parser_sample_caps() {
   } else if (scenario() == "probe-duration-mismatch" || scenario() == "probe-delayed-stream" ||
              scenario() == "probe-nonzero-origin" || scenario() == "probe-decode-order-origin" ||
              scenario() == "probe-unknown-pts" || scenario() == "probe-long-unknown-pts" ||
-             scenario() == "probe-mixed-prefix-pts" || scenario() == "probe-one-frame-rounding") {
+             scenario() == "probe-mixed-prefix-pts" ||
+             scenario() == "probe-long-mixed-prefix-pts" ||
+             scenario() == "probe-one-frame-rounding") {
     caps.fps_numerator = 30;
     caps.fps_denominator = 1;
   } else if (scenario() == "probe-inexact-caps-fps") {
     caps.fps_numerator = 59;
     caps.fps_denominator = 2;
+  } else if (scenario() == "probe-duplicate-pts-transition") {
+    caps.fps_numerator = 25;
+    caps.fps_denominator = 1;
+  } else if (scenario() == "probe-short-quantized-exact-30") {
+    caps.fps_numerator = 30;
+    caps.fps_denominator = 1;
+  } else if (scenario() == "probe-short-quantized-exact-5997") {
+    caps.fps_numerator = 5'997;
+    caps.fps_denominator = 100;
   } else if (scenario() == "probe-bframe-cutoff") {
     caps.fps_numerator = 119;
     caps.fps_denominator = 4;
@@ -263,6 +274,23 @@ std::uint64_t parser_frame_offset(std::uint64_t frame_index, const FakeCaps& cap
 }
 
 std::uint64_t parser_timing_offset(std::uint64_t frame_index, const FakeCaps& caps) {
+  if (scenario() == "probe-duplicate-pts-transition") {
+    return frame_index < 64U ? (frame_index / 2U) * 40'000'000ULL
+                             : (frame_index - 32U) * 40'000'000ULL;
+  }
+  if (scenario() == "probe-short-quantized-exact-30") {
+    constexpr std::array<std::uint64_t, 4> kOffsets{0, 33'000'000ULL, 67'000'000ULL,
+                                                    100'000'000ULL};
+    return frame_index < kOffsets.size()
+               ? kOffsets[frame_index]
+               : kOffsets.back() + (frame_index - kOffsets.size() + 1U) * 33'000'000ULL;
+  }
+  if (scenario() == "probe-short-quantized-exact-5997") {
+    constexpr std::array<std::uint64_t, 4> kOffsets{0, 17'000'000ULL, 33'000'000ULL, 50'000'000ULL};
+    return frame_index < kOffsets.size()
+               ? kOffsets[frame_index]
+               : kOffsets.back() + (frame_index - kOffsets.size() + 1U) * 17'000'000ULL;
+  }
   if (scenario() == "probe-vfr-unset-fps") {
     return (frame_index / 2U) * 70'000'000ULL + (frame_index % 2U) * 30'000'000ULL;
   }
@@ -628,6 +656,11 @@ RECO_FAKE_EXPORT int gst_element_query_duration(void*, int format, std::int64_t*
     *duration = 4'000'000'000;
     return 1;
   }
+  if (scenario() == "probe-long-mixed-prefix-pts" ||
+      scenario() == "probe-duplicate-pts-transition") {
+    *duration = 20'000'000'000;
+    return 1;
+  }
   if (scenario() == "probe-quantized-timestamps") {
     *duration = 4'170'833'333;
     return 1;
@@ -836,7 +869,9 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
         : current_scenario == "probe-nonzero-origin" ? 766'666'666ULL
                                                      : 0;
     const std::uint64_t selected_duration_ns =
-        current_scenario == "probe-duration-unknown" || current_scenario == "probe-duration-zero" ||
+        current_scenario == "probe-buffered-async-error" ||
+                current_scenario == "probe-duration-unknown" ||
+                current_scenario == "probe-duration-zero" ||
                 current_scenario == "probe-seek-unsupported" ||
                 current_scenario == "probe-pull-timeout" || current_scenario == "probe-seek-preroll"
             ? 200'000'000'000ULL
@@ -847,8 +882,11 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
         : current_scenario == "probe-unknown-pts"                  ? 1'000'000'000ULL
         : current_scenario == "probe-long-unknown-pts"             ? 3'000'000'000ULL
         : current_scenario == "probe-mixed-prefix-pts"             ? 4'000'000'000ULL
+        : current_scenario == "probe-long-mixed-prefix-pts"        ? 20'000'000'000ULL
         : current_scenario == "probe-one-frame-rounding"           ? 33'333'333ULL
         : current_scenario == "probe-inexact-caps-fps"             ? 2'000'000'000ULL
+        : current_scenario == "probe-short-quantized-exact-30"     ? 100'000'000ULL
+        : current_scenario == "probe-short-quantized-exact-5997"   ? 50'000'000ULL
         : current_scenario == "probe-unset-fps-inferred"           ? 4'000'000'000ULL
         : current_scenario == "probe-vfr-unset-fps"                ? 4'720'000'000ULL
         : current_scenario == "probe-vfr-late-transition"          ? 6'000'000'000ULL
@@ -859,6 +897,7 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
         : current_scenario == "probe-retimed-constant-pts"         ? 5'000'000'000ULL
         : current_scenario == "probe-long-untimed-elementary"      ? 600'000'000'000ULL
         : current_scenario == "probe-duplicate-pts-pairs"          ? 4'000'000'000ULL
+        : current_scenario == "probe-duplicate-pts-transition"     ? 20'000'000'000ULL
         : current_scenario == "probe-paired-au-missing-pts"        ? 4'000'000'000ULL
         : current_scenario == "probe-clustered-missing-pts"        ? 4'000'000'000ULL
         : current_scenario == "probe-exact-5997-fps"               ? 4'000'000'000ULL
@@ -912,6 +951,9 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
       sample->buffer.pts = std::numeric_limits<std::uint64_t>::max();
     } else if (current_scenario == "probe-mixed-prefix-pts" && !sink->pipeline->has_seek &&
                sequential_index == 0) {
+      sample->buffer.pts = std::numeric_limits<std::uint64_t>::max();
+    } else if (current_scenario == "probe-long-mixed-prefix-pts" && !sink->pipeline->has_seek &&
+               sequential_index < 30U) {
       sample->buffer.pts = std::numeric_limits<std::uint64_t>::max();
     } else if (current_scenario == "probe-decode-order-origin" && !sink->pipeline->has_seek) {
       const auto presentation_index = sequential_index == 0   ? 2ULL
@@ -1251,6 +1293,7 @@ RECO_FAKE_EXPORT void* gst_bus_timed_pop_filtered(void* bus_pointer, std::uint64
   auto* bus = static_cast<FakeBus*>(bus_pointer);
   ++bus->poll_count;
   const bool ready = scenario() == "stream-error" || scenario() == "probe-async-error" ||
+                     (scenario() == "probe-buffered-async-error" && bus->poll_count >= 513) ||
                      (scenario() == "delayed-stream-error" && bus->poll_count >= 2);
   if (!ready || bus->emitted_error || (types & (1U << 1U)) == 0) {
     return nullptr;
@@ -1260,8 +1303,10 @@ RECO_FAKE_EXPORT void* gst_bus_timed_pop_filtered(void* bus_pointer, std::uint64
 }
 
 RECO_FAKE_EXPORT void gst_message_parse_error(void*, GErrorAbi** error, char** debug) {
-  *error = make_error(scenario() == "probe-async-error" ? "fake parser failure"
-                                                        : "fake decoder failure");
+  *error =
+      make_error(scenario() == "probe-async-error" || scenario() == "probe-buffered-async-error"
+                     ? "fake parser failure"
+                     : "fake decoder failure");
   *debug = duplicate("fake debug detail");
 }
 

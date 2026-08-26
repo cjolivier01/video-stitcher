@@ -391,6 +391,12 @@ std::uint64_t multiply_divide_floor_saturating(std::uint64_t a, std::uint32_t b,
   return quotient;
 }
 
+std::uint64_t add_saturating(std::uint64_t first, std::uint64_t second) {
+  return second > std::numeric_limits<std::uint64_t>::max() - first
+             ? std::numeric_limits<std::uint64_t>::max()
+             : first + second;
+}
+
 std::uint64_t frame_count_for_duration(std::uint64_t duration_ns, std::uint32_t fps_numerator,
                                        std::uint32_t fps_denominator) {
   const auto divisor = kNanosecondsPerSecond * fps_denominator;
@@ -471,6 +477,10 @@ void* pull_compressed_sample(const std::shared_ptr<ProbeApi>& api, void* probe_s
     const auto poll_timeout =
         std::min(remaining_timeout_ns(deadline, timeout_message), kSamplePollTimeoutNs);
     if (void* sample = api->app_sink_try_pull_sample(probe_sink, poll_timeout); sample != nullptr) {
+      if (const auto error = pop_pipeline_error(api, bus); !error.empty()) {
+        api->sample_unref(sample);
+        throw GpuVideoProbeError(error);
+      }
       return sample;
     }
     if (const auto error = pop_pipeline_error(api, bus); !error.empty()) {
@@ -547,6 +557,7 @@ struct InferredFrameRate {
   std::uint32_t denominator = 0;
   std::size_t timestamp_multiplicity = 1;
   long double observed_fps = 0.0L;
+  long double finite_span_fps_uncertainty = 0.0L;
 };
 
 std::size_t timed_sample_stride(const TimingScan& scan) {
@@ -579,24 +590,24 @@ std::optional<InferredFrameRate> infer_constant_frame_rate(const TimingScan& sca
   auto times = scan.stream_times;
   const auto stored_end = times.begin() + static_cast<std::ptrdiff_t>(scan.stored_timing_count);
   std::sort(times.begin(), stored_end);
-  const auto analysis_count = complete_stream
-                                  ? scan.stored_timing_count
-                                  : std::min(scan.stored_timing_count, kTimingAnalysisSamples);
-  const auto timing_end = times.begin() + static_cast<std::ptrdiff_t>(analysis_count);
   std::size_t duplicate_timestamp_multiplicity = 0;
-  for (auto group_begin = times.begin(); group_begin != timing_end;) {
+  for (auto group_begin = times.begin(); group_begin != stored_end;) {
     const auto group_end = std::find_if(
-        group_begin, timing_end, [value = *group_begin](auto item) { return item != value; });
+        group_begin, stored_end, [value = *group_begin](auto item) { return item != value; });
     const auto group_size = static_cast<std::size_t>(group_end - group_begin);
     if (duplicate_timestamp_multiplicity == 0) {
       duplicate_timestamp_multiplicity = group_size;
-    } else if (group_size != duplicate_timestamp_multiplicity) {
+    } else if (group_size != duplicate_timestamp_multiplicity &&
+               (complete_stream || group_end != stored_end ||
+                group_size > duplicate_timestamp_multiplicity)) {
       return std::nullopt;
     }
     group_begin = group_end;
   }
-  const auto unique_end = std::unique(times.begin(), timing_end);
-  const auto unique_count = static_cast<std::size_t>(unique_end - times.begin());
+  const auto unique_end = std::unique(times.begin(), stored_end);
+  const auto stored_unique_count = static_cast<std::size_t>(unique_end - times.begin());
+  const auto unique_count =
+      complete_stream ? stored_unique_count : std::min(stored_unique_count, kTimingAnalysisSamples);
   if (unique_count < 3 || duplicate_timestamp_multiplicity == 0) {
     return std::nullopt;
   }
@@ -623,13 +634,18 @@ std::optional<InferredFrameRate> infer_constant_frame_rate(const TimingScan& sca
   const long double observed_fps =
       static_cast<long double>((unique_count - 1) * timestamp_multiplicity) *
       kNanosecondsPerSecond / span_ns;
+  // Require a rate correction to improve on caps by more than half a frame
+  // over the finite observation span.
+  const auto finite_span_fps_uncertainty =
+      observed_fps / (2.0L * static_cast<long double>((unique_count - 1) * timestamp_multiplicity));
   for (const auto& [numerator, denominator] : kCanonicalFrameRates) {
     const auto canonical_fps = static_cast<long double>(numerator) / denominator;
     if (std::abs(canonical_fps - observed_fps) <= canonical_fps * kCanonicalFrameRateTolerance) {
       return InferredFrameRate{.numerator = numerator,
                                .denominator = denominator,
                                .timestamp_multiplicity = timestamp_multiplicity,
-                               .observed_fps = observed_fps};
+                               .observed_fps = observed_fps,
+                               .finite_span_fps_uncertainty = finite_span_fps_uncertainty};
     }
   }
   long double best_error = std::numeric_limits<long double>::infinity();
@@ -657,7 +673,8 @@ std::optional<InferredFrameRate> infer_constant_frame_rate(const TimingScan& sca
   return InferredFrameRate{.numerator = best_numerator / divisor,
                            .denominator = best_denominator / divisor,
                            .timestamp_multiplicity = timestamp_multiplicity,
-                           .observed_fps = observed_fps};
+                           .observed_fps = observed_fps,
+                           .finite_span_fps_uncertainty = finite_span_fps_uncertainty};
 }
 
 bool frame_rates_are_close(std::uint32_t first_numerator, std::uint32_t first_denominator,
@@ -980,7 +997,8 @@ GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config, std::uint64_t t
       (!caps_frame_rate_is_plausible ||
        std::abs(static_cast<long double>(inferred_frame_rate->numerator) /
                     inferred_frame_rate->denominator -
-                inferred_frame_rate->observed_fps) <=
+                inferred_frame_rate->observed_fps) +
+               inferred_frame_rate->finite_span_fps_uncertainty <
            std::abs(static_cast<long double>(fps_numerator) / fps_denominator -
                     inferred_frame_rate->observed_fps));
   const bool prefer_inferred_frame_rate =
@@ -1053,8 +1071,12 @@ GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config, std::uint64_t t
           selected_stream_duration(api, pipeline, probe_sink, bus, duration_ns,
                                    *timing_scan.first_stream_time, fps_num, fps_den, deadline);
       if (selected_duration.has_value()) {
-        duration_ns = selected_duration->duration_ns;
-        correlated_frame_count = selected_duration->frame_count;
+        const auto untimed_prefix_frames = timing_scan.timed_sample_indices[0];
+        const auto untimed_prefix_duration =
+            minimum_duration_for_frame_count(untimed_prefix_frames, fps_num, fps_den);
+        duration_ns = add_saturating(selected_duration->duration_ns, untimed_prefix_duration);
+        correlated_frame_count =
+            add_saturating(selected_duration->frame_count, untimed_prefix_frames);
         duration_is_estimated = true;
       } else {
         duration_is_estimated = true;

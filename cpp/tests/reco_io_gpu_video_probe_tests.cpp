@@ -256,6 +256,23 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_eq(inferred_fps.fps_denominator, 1U, "inferred constant frame rate is reduced exactly");
   expect_eq(inferred_fps.total_frames, 60ULL, "inexact container caps do not lose a proven frame");
 
+  set_scenario("probe-short-quantized-exact-30");
+  const auto short_exact_30 = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(short_exact_30.fps_numerator, 30U,
+            "short quantized timing preserves an exact caps numerator");
+  expect_eq(short_exact_30.fps_denominator, 1U,
+            "short quantized timing preserves an exact caps denominator");
+  expect_eq(short_exact_30.total_frames, 3ULL, "short quantized timing retains the exact AU count");
+
+  set_scenario("probe-short-quantized-exact-5997");
+  const auto short_exact_5997 = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(short_exact_5997.fps_numerator, 5'997U,
+            "short quantized near-canonical timing preserves the exact caps numerator");
+  expect_eq(short_exact_5997.fps_denominator, 100U,
+            "short quantized near-canonical timing preserves the exact caps denominator");
+  expect_eq(short_exact_5997.total_frames, 3ULL,
+            "short near-canonical timing retains the exact AU count");
+
   set_scenario("probe-long-unknown-pts");
   const auto long_unknown_pts = probe_gpu_video(container_config(video_path), timeout_ns);
   expect_eq(long_unknown_pts.duration_ns, 3'000'000'000ULL,
@@ -274,6 +291,17 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_eq(mixed_prefix.total_frames, 120ULL, "untimed prefix does not shift the stream origin");
   expect_true(mixed_prefix.duration_is_estimated,
               "duration with an untimed prefix is explicitly estimated");
+
+  set_scenario("probe-long-mixed-prefix-pts");
+  const auto long_mixed_prefix = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(long_mixed_prefix.duration_ns, 20'000'000'000ULL,
+            "long untimed prefix is included in correlated duration");
+  expect_eq(long_mixed_prefix.total_frames, 600ULL,
+            "long untimed prefix is included in correlated frame count");
+  expect_true(long_mixed_prefix.duration_is_estimated,
+              "long untimed-prefix duration remains explicitly estimated");
+  expect_true(long_mixed_prefix.total_frames_is_estimated,
+              "bounded long untimed-prefix count remains explicitly estimated");
 
   set_scenario("probe-unset-fps-inferred");
   const auto unset_fps = probe_gpu_video(container_config(video_path), timeout_ns);
@@ -333,6 +361,17 @@ void probe_contracts(const std::filesystem::path& video_path,
             "duplicate PTS pairs retain their EOS-proven AU count");
   expect_eq(duplicate_pts.duration_ns, 4'000'000'000ULL,
             "duplicate PTS pairs retain their observed terminal span");
+
+  set_scenario("probe-duplicate-pts-transition");
+  const auto duplicate_transition = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(duplicate_transition.fps_numerator, 25U,
+            "duplicate PTS multiplicity must remain uniform across the bounded scan");
+  expect_eq(duplicate_transition.fps_denominator, 1U,
+            "duplicate PTS transition preserves the caps denominator");
+  expect_eq(duplicate_transition.total_frames, 513ULL,
+            "duplicate PTS transition preserves the observed AU lower bound");
+  expect_true(duplicate_transition.total_frames_is_estimated,
+              "bounded duplicate PTS transition count remains explicitly estimated");
 
   set_scenario("probe-paired-au-missing-pts");
   const auto paired_missing_pts = probe_gpu_video(container_config(video_path), timeout_ns);
@@ -483,7 +522,7 @@ void invalid_inputs_fail(const std::filesystem::path& video_path,
       "not a readable regular file", "missing input rejected before probing");
 
   for (const auto& [scenario_name, fragment] :
-       std::array<std::pair<std::string_view, std::string_view>, 18>{
+       std::array<std::pair<std::string_view, std::string_view>, 19>{
            {{"old-version", "1.10 or newer"},
             {"init-error", "fake initialization failure"},
             {"probe-parse-error", "fake parse failure"},
@@ -494,6 +533,7 @@ void invalid_inputs_fail(const std::filesystem::path& video_path,
             {"probe-state-error", "playing state"},
             {"probe-stream-error", "playing state"},
             {"probe-async-error", "fake parser failure"},
+            {"probe-buffered-async-error", "fake parser failure"},
             {"probe-no-supported-video", "H.264 or HEVC"},
             {"probe-missing-sample-caps", "H.264 or HEVC"},
             {"probe-missing-caps-structure", "no structure"},
