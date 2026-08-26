@@ -484,6 +484,7 @@ void* pull_compressed_sample(const std::shared_ptr<ProbeApi>& api, void* probe_s
 
 struct TimingScan {
   std::array<std::uint64_t, kStoredTimingSamples> stream_times{};
+  std::array<std::uint64_t, kStoredTimingSamples> timed_sample_indices{};
   std::uint64_t sample_count = 0;
   std::uint64_t timed_sample_count = 0;
   std::size_t stored_timing_count = 0;
@@ -518,7 +519,9 @@ void observe_timing_sample(const std::shared_ptr<ProbeApi>& api, void* sample, T
 
   ++scan.timed_sample_count;
   if (scan.stored_timing_count < scan.stream_times.size()) {
-    scan.stream_times[scan.stored_timing_count++] = stream_time;
+    scan.stream_times[scan.stored_timing_count] = stream_time;
+    scan.timed_sample_indices[scan.stored_timing_count] = scan.sample_count - 1;
+    ++scan.stored_timing_count;
   }
   scan.first_stream_time = scan.first_stream_time.has_value()
                                ? std::min(*scan.first_stream_time, stream_time)
@@ -543,7 +546,30 @@ struct InferredFrameRate {
   std::uint32_t numerator = 0;
   std::uint32_t denominator = 0;
   std::size_t timestamp_multiplicity = 1;
+  long double observed_fps = 0.0L;
 };
+
+std::size_t timed_sample_stride(const TimingScan& scan) {
+  if (scan.stored_timing_count < 2) {
+    return 1;
+  }
+  const auto stride = scan.timed_sample_indices[1] - scan.timed_sample_indices[0];
+  if (stride <= 1) {
+    return 1;
+  }
+  for (std::size_t index = 2; index < scan.stored_timing_count; ++index) {
+    if (scan.timed_sample_indices[index] - scan.timed_sample_indices[index - 1] != stride) {
+      return 1;
+    }
+  }
+  const auto first_index = scan.timed_sample_indices[0];
+  const auto last_index = scan.timed_sample_indices[scan.stored_timing_count - 1];
+  if (first_index >= stride || last_index >= scan.sample_count ||
+      scan.sample_count - 1 - last_index >= stride) {
+    return 1;
+  }
+  return static_cast<std::size_t>(stride);
+}
 
 std::optional<InferredFrameRate> infer_constant_frame_rate(const TimingScan& scan,
                                                            bool complete_stream) {
@@ -557,29 +583,25 @@ std::optional<InferredFrameRate> infer_constant_frame_rate(const TimingScan& sca
                                   ? scan.stored_timing_count
                                   : std::min(scan.stored_timing_count, kTimingAnalysisSamples);
   const auto timing_end = times.begin() + static_cast<std::ptrdiff_t>(analysis_count);
-  std::size_t timestamp_multiplicity = 0;
+  std::size_t duplicate_timestamp_multiplicity = 0;
   for (auto group_begin = times.begin(); group_begin != timing_end;) {
     const auto group_end = std::find_if(
         group_begin, timing_end, [value = *group_begin](auto item) { return item != value; });
     const auto group_size = static_cast<std::size_t>(group_end - group_begin);
-    if (timestamp_multiplicity == 0) {
-      timestamp_multiplicity = group_size;
-    } else if (group_size != timestamp_multiplicity) {
+    if (duplicate_timestamp_multiplicity == 0) {
+      duplicate_timestamp_multiplicity = group_size;
+    } else if (group_size != duplicate_timestamp_multiplicity) {
       return std::nullopt;
     }
     group_begin = group_end;
   }
   const auto unique_end = std::unique(times.begin(), timing_end);
   const auto unique_count = static_cast<std::size_t>(unique_end - times.begin());
-  if (unique_count < 3 || timestamp_multiplicity == 0) {
+  if (unique_count < 3 || duplicate_timestamp_multiplicity == 0) {
     return std::nullopt;
   }
-  if (complete_stream) {
-    if (scan.sample_count % unique_count != 0) {
-      return std::nullopt;
-    }
-    timestamp_multiplicity = static_cast<std::size_t>(scan.sample_count / unique_count);
-  }
+  const auto positional_multiplicity = timed_sample_stride(scan);
+  const auto timestamp_multiplicity = duplicate_timestamp_multiplicity * positional_multiplicity;
 
   auto minimum_delta = std::numeric_limits<std::uint64_t>::max();
   std::uint64_t maximum_delta = 0;
@@ -606,7 +628,8 @@ std::optional<InferredFrameRate> infer_constant_frame_rate(const TimingScan& sca
     if (std::abs(canonical_fps - observed_fps) <= canonical_fps * kCanonicalFrameRateTolerance) {
       return InferredFrameRate{.numerator = numerator,
                                .denominator = denominator,
-                               .timestamp_multiplicity = timestamp_multiplicity};
+                               .timestamp_multiplicity = timestamp_multiplicity,
+                               .observed_fps = observed_fps};
     }
   }
   long double best_error = std::numeric_limits<long double>::infinity();
@@ -633,7 +656,8 @@ std::optional<InferredFrameRate> infer_constant_frame_rate(const TimingScan& sca
   const auto divisor = std::gcd(best_numerator, best_denominator);
   return InferredFrameRate{.numerator = best_numerator / divisor,
                            .denominator = best_denominator / divisor,
-                           .timestamp_multiplicity = timestamp_multiplicity};
+                           .timestamp_multiplicity = timestamp_multiplicity,
+                           .observed_fps = observed_fps};
 }
 
 bool frame_rates_are_close(std::uint32_t first_numerator, std::uint32_t first_denominator,
@@ -951,8 +975,16 @@ GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config, std::uint64_t t
     observe_timing_sample(api, sample, timing_scan);
   }
   const auto inferred_frame_rate = infer_constant_frame_rate(timing_scan, timing_scan.reached_eos);
-  const bool prefer_inferred_frame_rate =
+  const bool inferred_frame_rate_is_no_worse_than_caps =
       inferred_frame_rate.has_value() &&
+      (!caps_frame_rate_is_plausible ||
+       std::abs(static_cast<long double>(inferred_frame_rate->numerator) /
+                    inferred_frame_rate->denominator -
+                inferred_frame_rate->observed_fps) <=
+           std::abs(static_cast<long double>(fps_numerator) / fps_denominator -
+                    inferred_frame_rate->observed_fps));
+  const bool prefer_inferred_frame_rate =
+      inferred_frame_rate_is_no_worse_than_caps &&
       (timing_scan.reached_eos || inferred_frame_rate->timestamp_multiplicity > 1 ||
        !caps_frame_rate_is_plausible ||
        frame_rates_are_close(inferred_frame_rate->numerator, inferred_frame_rate->denominator,

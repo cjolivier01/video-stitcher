@@ -341,6 +341,24 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_eq(paired_missing_pts.total_frames, 200ULL,
             "uniformly missing paired-AU PTS values retain the exact AU count");
 
+  set_scenario("probe-clustered-missing-pts");
+  const auto clustered_missing_pts = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(clustered_missing_pts.fps_numerator, 30U,
+            "clustered missing PTS values do not imply uniform AU multiplicity");
+  expect_eq(clustered_missing_pts.fps_denominator, 1U,
+            "clustered missing PTS values preserve the caps frame-rate denominator");
+  expect_eq(clustered_missing_pts.total_frames, 120ULL,
+            "clustered missing PTS values retain the exact AU count");
+  expect_eq(clustered_missing_pts.duration_ns, 4'000'000'000ULL,
+            "clustered missing PTS values retain the caps-rate duration");
+
+  set_scenario("probe-exact-5997-fps");
+  const auto exact_5997_fps = probe_gpu_video(container_config(video_path), timeout_ns);
+  expect_eq(exact_5997_fps.fps_numerator, 5'997U,
+            "exact near-canonical caps are not snapped to an NTSC numerator");
+  expect_eq(exact_5997_fps.fps_denominator, 100U,
+            "exact near-canonical caps preserve their denominator");
+
   set_scenario("probe-quantized-no-vui-5994");
   const auto quantized_no_vui = probe_gpu_video(container_config(video_path), timeout_ns);
   expect_eq(quantized_no_vui.fps_numerator, 60'000U,

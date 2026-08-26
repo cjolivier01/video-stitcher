@@ -236,6 +236,12 @@ FakeCaps parser_sample_caps() {
   } else if (scenario() == "probe-paired-au-missing-pts") {
     caps.fps_numerator = 25;
     caps.fps_denominator = 1;
+  } else if (scenario() == "probe-clustered-missing-pts") {
+    caps.fps_numerator = 30;
+    caps.fps_denominator = 1;
+  } else if (scenario() == "probe-exact-5997-fps") {
+    caps.fps_numerator = 5'997;
+    caps.fps_denominator = 100;
   } else if (scenario() == "probe-quantized-no-vui-5994") {
     caps.fps_numerator = 0;
     caps.fps_denominator = 1;
@@ -854,6 +860,8 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
         : current_scenario == "probe-long-untimed-elementary"      ? 600'000'000'000ULL
         : current_scenario == "probe-duplicate-pts-pairs"          ? 4'000'000'000ULL
         : current_scenario == "probe-paired-au-missing-pts"        ? 4'000'000'000ULL
+        : current_scenario == "probe-clustered-missing-pts"        ? 4'000'000'000ULL
+        : current_scenario == "probe-exact-5997-fps"               ? 4'000'000'000ULL
         : current_scenario == "probe-quantized-no-vui-5994"        ? 4'004'000'000ULL
         : current_scenario == "probe-bframe-cutoff"                ? 4'000'000'000ULL
         : current_scenario == "probe-quantized-timestamps"         ? 4'170'833'333ULL
@@ -895,6 +903,9 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
                               sink->pipeline->has_seek && seek_pull_index == 0;
     if (current_scenario == "probe-paired-au-missing-pts" && !sink->pipeline->has_seek &&
         (sequential_index % 2U) != 0) {
+      sample->buffer.pts = std::numeric_limits<std::uint64_t>::max();
+    } else if (current_scenario == "probe-clustered-missing-pts" && !sink->pipeline->has_seek &&
+               sequential_index >= 60U) {
       sample->buffer.pts = std::numeric_limits<std::uint64_t>::max();
     } else if (current_scenario == "probe-unknown-pts" ||
                current_scenario == "probe-long-unknown-pts") {
