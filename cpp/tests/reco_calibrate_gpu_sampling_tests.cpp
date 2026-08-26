@@ -70,6 +70,8 @@ GpuDecodedFrame metadata_frame(std::uint64_t frame_index) {
                    .surface_ptr = reinterpret_cast<void*>(0x1000),
                    .abi = NvbufSurfaceAbi::DeepStream9_1,
                    .memory_type = NvmmMemoryType::SurfaceArray},
+          .visible_width = 64,
+          .visible_height = 32,
           .owner = std::make_shared<int>(1),
           .frame_index = frame_index};
 }
@@ -241,9 +243,9 @@ struct CudaNvmmOwner {
 
 std::pair<GpuDecodedFrame, std::weak_ptr<CudaNvmmOwner>>
 make_cuda_frame(CudaBackend& backend, std::uint64_t frame_index, std::uint8_t y_value,
-                std::uint32_t width = 66, std::uint32_t height = 32,
-                std::shared_ptr<CopyOrderTrace> trace = {}) {
-  auto source_allocation = backend.allocate_pitched(width, height + height / 2U, 16);
+                std::uint32_t width = 854, std::uint32_t height = 32,
+                std::uint32_t allocation_width = 864, std::shared_ptr<CopyOrderTrace> trace = {}) {
+  auto source_allocation = backend.allocate_pitched(allocation_width, height + height / 2U, 16);
   const std::size_t pitch = source_allocation.pitch;
   const std::size_t total_size = pitch * (height + height / 2U);
   auto owner =
@@ -258,7 +260,7 @@ make_cuda_frame(CudaBackend& backend, std::uint64_t frame_index, std::uint8_t y_
                                   .height = height + height / 2U});
 
   auto& params = owner->params;
-  params.width = width;
+  params.width = allocation_width;
   params.height = height;
   params.pitch = pitch;
   params.color_format = abi::kColorNv12_709;
@@ -266,12 +268,12 @@ make_cuda_frame(CudaBackend& backend, std::uint64_t frame_index, std::uint8_t y_
   params.data_size = total_size;
   params.data_ptr = reinterpret_cast<void*>(static_cast<std::uintptr_t>(owner->allocation.ptr()));
   params.plane_params.num_planes = 2;
-  params.plane_params.width[0] = width;
+  params.plane_params.width[0] = allocation_width;
   params.plane_params.height[0] = height;
   params.plane_params.pitch[0] = pitch;
   params.plane_params.psize[0] = pitch * height;
   params.plane_params.bytes_per_pix[0] = 1;
-  params.plane_params.width[1] = width / 2U;
+  params.plane_params.width[1] = allocation_width / 2U;
   params.plane_params.height[1] = height / 2U;
   params.plane_params.pitch[1] = pitch;
   params.plane_params.offset[1] = pitch * height;
@@ -286,6 +288,8 @@ make_cuda_frame(CudaBackend& backend, std::uint64_t frame_index, std::uint8_t y_
   auto info = extract_nvmm_frame_info(&owner->surface, NvbufSurfaceAbi::DeepStream9_1);
   std::weak_ptr<CudaNvmmOwner> lifetime = owner;
   return {GpuDecodedFrame{.nvmm = info,
+                          .visible_width = width,
+                          .visible_height = height,
                           .owner = std::move(owner),
                           .frame_index = frame_index,
                           .pts_ns = frame_index * 33'333'333U,
@@ -300,7 +304,7 @@ void selected_y_planes_are_copied_device_to_device(CudaBackend& backend) {
   std::vector<std::weak_ptr<CudaNvmmOwner>> lifetimes;
   for (std::uint64_t index = 0; index < 5; ++index) {
     auto [frame, lifetime] =
-        make_cuda_frame(backend, index, static_cast<std::uint8_t>(20 + index), 66, 32, trace);
+        make_cuda_frame(backend, index, static_cast<std::uint8_t>(20 + index), 854, 32, 864, trace);
     frames.push_back(std::move(frame));
     lifetimes.push_back(std::move(lifetime));
   }
@@ -327,7 +331,7 @@ void selected_y_planes_are_copied_device_to_device(CudaBackend& backend) {
   expect_eq(selected[1].frame_index, 3U, "second selected index preserved");
   expect_true(selected[0].pts_ns == 33'333'333U, "selected PTS preserved");
   expect_true(selected[1].duration_ns == 33'333'333U, "selected duration preserved");
-  expect_eq(selected[0].width, 66U, "non-aligned calibration frame width preserved");
+  expect_eq(selected[0].width, 854U, "visible calibration frame width preserved");
   expect_true(selected[0].pitch >= selected[0].width,
               "calibration copy uses a pitch covering the frame width");
   expect_eq(selected[0].y_plane.size(), selected[0].pitch * selected[0].height,
@@ -355,8 +359,8 @@ void selected_y_planes_are_copied_device_to_device(CudaBackend& backend) {
   expect_true(!lifetimes[4].expired(), "unread decoder frame remains owned by source");
 
   std::vector<GpuDecodedFrame> changing_frames;
-  changing_frames.push_back(make_cuda_frame(backend, 0, 1, 64, 32).first);
-  changing_frames.push_back(make_cuda_frame(backend, 1, 2, 32, 16).first);
+  changing_frames.push_back(make_cuda_frame(backend, 0, 1, 64, 32, 64).first);
+  changing_frames.push_back(make_cuda_frame(backend, 1, 2, 32, 16, 32).first);
   VectorSource changing_source(std::move(changing_frames));
   expect_error<GpuFrameExtractionError>(
       [&] {

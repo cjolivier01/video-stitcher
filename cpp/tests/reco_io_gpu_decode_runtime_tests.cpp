@@ -136,6 +136,8 @@ void production_source_retains_mapped_sample() {
               "selected DeepStream ABI preserved");
   expect_true(first.frame->nvmm.memory_type == NvmmMemoryType::CudaDevice,
               "dGPU CUDA-device memory preserved");
+  expect_eq(first.frame->visible_width, 1280U, "sample caps visible width preserved");
+  expect_eq(first.frame->visible_height, 720U, "sample caps visible height preserved");
   expect_true(first.frame->nvmm.color_matrix == Nv12ColorMatrix::Bt709,
               "NV12 matrix metadata preserved");
 
@@ -169,6 +171,21 @@ void production_source_retains_mapped_sample() {
   events = read_events(event_path);
   expect_eq(count_event(events, "pull"), 3U,
             "idempotent EOS does not perform a third pull on either source");
+}
+
+void aligned_nvmm_allocation_preserves_visible_caps() {
+  set_scenario("visible-crop");
+  auto source =
+      open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+  const auto result = source->read();
+  expect_true(result.frame.has_value(), "visible-crop scenario returns a frame");
+  if (!result.frame.has_value()) {
+    return;
+  }
+  expect_eq(result.frame->nvmm.width, 864U, "aligned NVMM allocation width preserved");
+  expect_eq(result.frame->nvmm.y_pitch, 1024U, "aligned NVMM allocation pitch preserved");
+  expect_eq(result.frame->visible_width, 854U, "caps visible width preserved separately");
+  expect_eq(result.frame->visible_height, 720U, "caps visible height preserved separately");
 }
 
 void unknown_timestamps_are_not_fabricated() {
@@ -276,12 +293,16 @@ void runtime_failures_are_reported() {
   }
 
   for (const auto& [scenario_name, fragment] :
-       std::array<std::pair<std::string_view, std::string_view>, 5>{
+       std::array<std::pair<std::string_view, std::string_view>, 9>{
            {{"stream-error", "fake decoder failure"},
             {"delayed-stream-error", "fake decoder failure"},
             {"missing-buffer", "does not contain a buffer"},
             {"map-error", "failed to map"},
-            {"invalid-surface", "filled-buffer count"}}}) {
+            {"invalid-surface", "filled-buffer count"},
+            {"missing-caps", "does not contain negotiated caps"},
+            {"missing-caps-structure", "do not contain a structure"},
+            {"invalid-caps", "valid visible dimensions"},
+            {"oversized-caps", "exceed the NVMM allocation"}}}) {
     set_scenario(scenario_name);
     auto source =
         open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
@@ -303,6 +324,7 @@ int main() {
   set_environment("RECO_FAKE_GST_EVENT_PATH", event_path.string());
 
   production_source_retains_mapped_sample();
+  aligned_nvmm_allocation_preserves_visible_caps();
   unknown_timestamps_are_not_fabricated();
   concurrent_reads_serialize_appsink_access();
   fatal_pipeline_errors_are_latched();

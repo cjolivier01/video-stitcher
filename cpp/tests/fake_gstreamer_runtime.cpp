@@ -134,24 +134,24 @@ FakeSample* make_sample() {
     sample->buffer.duration = std::numeric_limits<std::uint64_t>::max();
   }
 
-  sample->params.width = 1280;
+  sample->params.width = scenario() == "visible-crop" ? 864 : 1280;
   sample->params.height = 720;
-  sample->params.pitch = 1280;
+  sample->params.pitch = scenario() == "visible-crop" ? 1024 : 1280;
   sample->params.color_format = abi::kColorNv12_709;
   sample->params.layout = abi::kLayoutPitch;
-  sample->params.data_size = 1280 * 1080;
+  sample->params.data_size = sample->params.pitch * 1080;
   sample->params.data_ptr = reinterpret_cast<void*>(0x10000000);
   sample->params.plane_params.num_planes = 2;
-  sample->params.plane_params.width[0] = 1280;
+  sample->params.plane_params.width[0] = sample->params.width;
   sample->params.plane_params.height[0] = 720;
-  sample->params.plane_params.pitch[0] = 1280;
-  sample->params.plane_params.psize[0] = 1280 * 720;
+  sample->params.plane_params.pitch[0] = sample->params.pitch;
+  sample->params.plane_params.psize[0] = sample->params.pitch * 720;
   sample->params.plane_params.bytes_per_pix[0] = 1;
-  sample->params.plane_params.width[1] = 640;
+  sample->params.plane_params.width[1] = sample->params.width / 2U;
   sample->params.plane_params.height[1] = 360;
-  sample->params.plane_params.pitch[1] = 1280;
-  sample->params.plane_params.offset[1] = 1280 * 720;
-  sample->params.plane_params.psize[1] = 1280 * 360;
+  sample->params.plane_params.pitch[1] = sample->params.pitch;
+  sample->params.plane_params.offset[1] = sample->params.pitch * 720;
+  sample->params.plane_params.psize[1] = sample->params.pitch * 360;
   sample->params.plane_params.bytes_per_pix[1] = 2;
   sample->surface.gpu_id = 0;
   sample->surface.batch_size = 1;
@@ -241,7 +241,9 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
   const auto current_scenario = scenario();
   if ((current_scenario == "frame-eos" || current_scenario == "unknown-time" ||
        current_scenario == "missing-buffer" || current_scenario == "map-error" ||
-       current_scenario == "invalid-surface") &&
+       current_scenario == "invalid-surface" || current_scenario == "visible-crop" ||
+       current_scenario == "missing-caps" || current_scenario == "missing-caps-structure" ||
+       current_scenario == "invalid-caps" || current_scenario == "oversized-caps") &&
       current == 0) {
     return make_sample();
   }
@@ -251,7 +253,8 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
 RECO_FAKE_EXPORT int gst_app_sink_is_eos(void* sink_pointer) {
   const auto current_scenario = scenario();
   const auto* sink = static_cast<FakeSink*>(sink_pointer);
-  return (current_scenario == "frame-eos" || current_scenario == "unknown-time") &&
+  return (current_scenario == "frame-eos" || current_scenario == "unknown-time" ||
+          current_scenario == "visible-crop") &&
          sink->pull_count >= 2;
 }
 
@@ -260,6 +263,29 @@ RECO_FAKE_EXPORT void* gst_sample_get_buffer(void* sample) {
     return nullptr;
   }
   return &static_cast<FakeSample*>(sample)->buffer;
+}
+
+RECO_FAKE_EXPORT void* gst_sample_get_caps(void* sample) {
+  return scenario() == "missing-caps" ? nullptr : sample;
+}
+
+RECO_FAKE_EXPORT void* gst_caps_get_structure(const void* caps, std::uint32_t index) {
+  return index == 0 && scenario() != "missing-caps-structure" ? const_cast<void*>(caps) : nullptr;
+}
+
+RECO_FAKE_EXPORT int gst_structure_get_int(const void*, const char* field, int* value) {
+  if (value == nullptr || field == nullptr || scenario() == "invalid-caps") {
+    return 0;
+  }
+  if (std::strcmp(field, "width") == 0) {
+    *value = scenario() == "visible-crop" ? 854 : (scenario() == "oversized-caps" ? 1290 : 1280);
+    return 1;
+  }
+  if (std::strcmp(field, "height") == 0) {
+    *value = 720;
+    return 1;
+  }
+  return 0;
 }
 
 RECO_FAKE_EXPORT void gst_sample_unref(void* sample) {

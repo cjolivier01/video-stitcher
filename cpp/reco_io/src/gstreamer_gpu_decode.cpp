@@ -166,7 +166,10 @@ public:
   using AppSinkTryPullSample = void* (*)(void*, std::uint64_t);
   using AppSinkIsEos = int (*)(void*);
   using SampleGetBuffer = void* (*)(void*);
+  using SampleGetCaps = void* (*)(void*);
   using SampleUnref = void (*)(void*);
+  using CapsGetStructure = void* (*)(const void*, std::uint32_t);
+  using StructureGetInt = int (*)(const void*, const char*, int*);
   using BufferMap = int (*)(void*, GstMapInfoAbi*, std::uint32_t);
   using BufferUnmap = void (*)(void*, GstMapInfoAbi*);
   using BusTimedPopFiltered = void* (*)(void*, std::uint64_t, std::uint32_t);
@@ -207,7 +210,10 @@ public:
     element_get_bus = core_library->symbol<ElementGetBus>("gst_element_get_bus");
     object_unref = core_library->symbol<ObjectUnref>("gst_object_unref");
     sample_get_buffer = core_library->symbol<SampleGetBuffer>("gst_sample_get_buffer");
+    sample_get_caps = core_library->symbol<SampleGetCaps>("gst_sample_get_caps");
     sample_unref = core_library->symbol<SampleUnref>("gst_sample_unref");
+    caps_get_structure = core_library->symbol<CapsGetStructure>("gst_caps_get_structure");
+    structure_get_int = core_library->symbol<StructureGetInt>("gst_structure_get_int");
     buffer_map = core_library->symbol<BufferMap>("gst_buffer_map");
     buffer_unmap = core_library->symbol<BufferUnmap>("gst_buffer_unmap");
     bus_timed_pop_filtered =
@@ -234,7 +240,10 @@ public:
   AppSinkTryPullSample app_sink_try_pull_sample = nullptr;
   AppSinkIsEos app_sink_is_eos = nullptr;
   SampleGetBuffer sample_get_buffer = nullptr;
+  SampleGetCaps sample_get_caps = nullptr;
   SampleUnref sample_unref = nullptr;
+  CapsGetStructure caps_get_structure = nullptr;
+  StructureGetInt structure_get_int = nullptr;
   BufferMap buffer_map = nullptr;
   BufferUnmap buffer_unmap = nullptr;
   BusTimedPopFiltered bus_timed_pop_filtered = nullptr;
@@ -255,6 +264,25 @@ std::string take_error(const std::shared_ptr<GstreamerApi>& api, GErrorAbi*& err
     error = nullptr;
   }
   return message;
+}
+
+std::pair<std::uint32_t, std::uint32_t> visible_dimensions(const std::shared_ptr<GstreamerApi>& api,
+                                                           void* sample) {
+  void* caps = api->sample_get_caps(sample);
+  if (caps == nullptr) {
+    throw GpuDecodeError("GStreamer sample does not contain negotiated caps");
+  }
+  void* structure = api->caps_get_structure(caps, 0);
+  if (structure == nullptr) {
+    throw GpuDecodeError("GStreamer sample caps do not contain a structure");
+  }
+  int width = 0;
+  int height = 0;
+  if (api->structure_get_int(structure, "width", &width) == 0 ||
+      api->structure_get_int(structure, "height", &height) == 0 || width <= 0 || height <= 0) {
+    throw GpuDecodeError("GStreamer sample caps do not contain valid visible dimensions");
+  }
+  return {static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height)};
 }
 
 class GstSampleOwner {
@@ -383,6 +411,7 @@ public:
       throw GpuDecodeError("GStreamer sample does not contain a buffer");
     }
     owner->map_buffer(buffer);
+    const auto [visible_width, visible_height] = visible_dimensions(api_, sample);
 
     NvmmFrameInfo nvmm;
     try {
@@ -394,6 +423,8 @@ public:
     const auto& gst_buffer = *static_cast<const GstBufferAbi*>(buffer);
     GpuDecodedFrame frame{
         .nvmm = nvmm,
+        .visible_width = visible_width,
+        .visible_height = visible_height,
         .owner = owner,
         .frame_index = next_frame_index_,
         .pts_ns = gst_buffer.pts == kGstClockTimeNone
@@ -403,6 +434,10 @@ public:
                            ? std::nullopt
                            : std::optional<std::uint64_t>(gst_buffer.duration),
     };
+    if (const auto validation_error = validate_gpu_decoded_frame(frame);
+        validation_error.has_value()) {
+      throw GpuDecodeError("invalid GStreamer GPU frame: " + *validation_error);
+    }
     ++next_frame_index_;
     return make_gpu_decode_frame(std::move(frame));
   }

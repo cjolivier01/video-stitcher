@@ -134,6 +134,8 @@ void surface_array_mapping_retains_and_unmaps_owner() {
   std::weak_ptr<int> decoder_lifetime = decoder_owner;
 
   GpuDecodedFrame decoded{.nvmm = info,
+                          .visible_width = info.width - 2,
+                          .visible_height = info.height,
                           .owner = decoder_owner,
                           .frame_index = 3,
                           .pts_ns = 1'000'000,
@@ -144,6 +146,7 @@ void surface_array_mapping_retains_and_unmaps_owner() {
   expect_eq(mapped.uv_ptr, 0x40000000U + 1280U * 720U, "mapped UV pointer");
   expect_eq(mapped.y_pitch, 1280U, "mapped Y pitch");
   expect_eq(mapped.uv_pitch, 1280U, "mapped UV pitch");
+  expect_eq(mapped.width, 1278U, "mapped CUDA view uses visible width");
   expect_eq(mapped.gpu_id, 0U, "mapped GPU id");
   expect_eq(mapped_again.y_ptr, mapped.y_ptr, "duplicate map shares CUDA mapping");
   expect_true(mapped.color_matrix == Nv12ColorMatrix::Bt709, "BT.709 metadata preserved");

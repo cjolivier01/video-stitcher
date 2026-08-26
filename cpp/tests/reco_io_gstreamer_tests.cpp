@@ -254,6 +254,8 @@ GpuDecodedFrame valid_gpu_frame() {
                    .surface_ptr = reinterpret_cast<void*>(0x1234),
                    .memory_type = NvmmMemoryType::SurfaceArray,
                    .gpu_id = 0},
+          .visible_width = 1920,
+          .visible_height = 1080,
           .owner = std::make_shared<int>(1),
           .frame_index = 7,
           .pts_ns = 33'333'333,
@@ -307,6 +309,15 @@ void gpu_decode_frame_source_preserves_gpu_residency() {
   frame = valid_gpu_frame();
   frame.owner.reset();
   expect_true(validate_gpu_decoded_frame(frame).has_value(), "missing buffer owner rejected");
+
+  frame = valid_gpu_frame();
+  frame.visible_width = 0;
+  expect_true(validate_gpu_decoded_frame(frame).has_value(), "zero visible width rejected");
+
+  frame = valid_gpu_frame();
+  frame.visible_width = frame.nvmm.width + 2;
+  expect_true(validate_gpu_decoded_frame(frame).has_value(),
+              "visible width beyond NVMM allocation rejected");
 
   frame = valid_gpu_frame();
   frame.nvmm.uv_pitch += 128;
