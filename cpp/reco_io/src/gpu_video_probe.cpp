@@ -58,10 +58,14 @@ constexpr std::uint64_t kMaximumDecodeReorderFrames = 32;
 // prefix are explicitly marked estimated after duration correlation.
 constexpr std::uint64_t kMaximumExactCountSamples = 512;
 constexpr std::uint64_t kMaximumConflictingMetadataCountSamples = 4096;
-constexpr std::size_t kTailTimingSamples = 256;
 constexpr std::uint64_t kTailTimingWindowNs = 5ULL * kNanosecondsPerSecond;
-constexpr std::size_t kStoredTimingSamples = kMaximumConflictingMetadataCountSamples + 1;
+constexpr std::uint64_t kTimingWindowSeekPrerollNs = kNanosecondsPerSecond;
+// Five seconds at the highest accepted frame rate plus a complete decoder
+// reorder suffix. This also remains larger than the bounded prefix scan.
+constexpr std::size_t kMaximumTimingWindowSamples = 5'000 + kTimingReorderLookahead + 1;
+constexpr std::size_t kStoredTimingSamples = kMaximumTimingWindowSamples;
 static_assert(kStoredTimingSamples >= kTimingAnalysisSamples + kTimingReorderLookahead);
+static_assert(kStoredTimingSamples > kMaximumConflictingMetadataCountSamples);
 constexpr std::size_t kMinimumExactNoncanonicalRateSamples = 128;
 constexpr std::uint32_t kMaximumFrameRateDenominator = 1001;
 constexpr long double kFrameRatePreferenceTolerance = 0.05L;
@@ -657,7 +661,8 @@ std::optional<InferredFrameRate> infer_sparse_reordered_frame_rate(
     const std::array<std::uint64_t, kStoredTimingSamples>& sorted_unique_times,
     const std::array<std::pair<std::uint64_t, std::uint64_t>, kStoredTimingSamples>& timing_points,
     std::size_t unique_count) {
-  if (scan.stored_timing_count != scan.timed_sample_count || unique_count < 3 ||
+  if (scan.stored_timing_count != scan.timed_sample_count ||
+      scan.timed_sample_count == scan.sample_count || unique_count < 3 ||
       scan.sample_count <= 2 * kTimingReorderLookahead + 1) {
     return std::nullopt;
   }
@@ -710,7 +715,6 @@ std::optional<InferredFrameRate> infer_sparse_reordered_frame_rate(
       continue;
     }
     bool fits_timestamp_grid = true;
-    std::size_t unit_interval_count = 0;
     long double grid_error = 0.0L;
     for (std::size_t index = 1; index < unique_count; ++index) {
       const auto delta_ns = sorted_unique_times[index] - sorted_unique_times[index - 1];
@@ -723,13 +727,6 @@ std::optional<InferredFrameRate> infer_sparse_reordered_frame_rate(
         break;
       }
       grid_error += std::abs(frame_steps - rounded_steps);
-      if (rounded_steps == 1.0L) {
-        ++unit_interval_count;
-      }
-    }
-    if (scan.timed_sample_count == scan.sample_count &&
-        unit_interval_count * 10 < (unique_count - 1) * 9) {
-      fits_timestamp_grid = false;
     }
     const auto error = std::abs(candidate_fps - observed_fps);
     constexpr long double kGridErrorTieTolerance = 1e-12L;
@@ -760,7 +757,9 @@ std::optional<InferredFrameRate> infer_sparse_reordered_frame_rate(
 }
 
 std::optional<InferredFrameRate> infer_constant_frame_rate(const TimingScan& scan,
-                                                           bool complete_stream) {
+                                                           bool complete_stream,
+                                                           bool complete_timing_span,
+                                                           bool trim_reorder_suffix) {
   if (scan.stored_timing_count < 3) {
     return std::nullopt;
   }
@@ -807,7 +806,14 @@ std::optional<InferredFrameRate> infer_constant_frame_rate(const TimingScan& sca
   }
   const auto unique_end = std::unique(times.begin(), stored_end);
   const auto stored_unique_count = static_cast<std::size_t>(unique_end - times.begin());
-  const auto unique_count = stored_unique_count;
+  // An incomplete decode-order prefix can end with future B-frame PTS values
+  // whose intervening presentation timestamps arrive just after the pull
+  // boundary. Analyze the presentation-contiguous core; doubled intervals in
+  // that core, and every interval in an EOS-complete scan, still reject.
+  const auto unique_count = trim_reorder_suffix && scan.timed_sample_count == scan.sample_count &&
+                                    stored_unique_count > kTimingReorderLookahead + 2
+                                ? stored_unique_count - kTimingReorderLookahead
+                                : stored_unique_count;
   if (unique_count < 3 || duplicate_timestamp_multiplicity == 0) {
     return std::nullopt;
   }
@@ -839,7 +845,7 @@ std::optional<InferredFrameRate> infer_constant_frame_rate(const TimingScan& sca
   // Require a rate correction to improve on caps by more than half a frame
   // over the finite observation span.
   const auto finite_span_fps_uncertainty =
-      complete_stream && unique_count >= kTimingAnalysisSamples
+      complete_timing_span && unique_count >= kTimingAnalysisSamples
           ? 0.0L
           : observed_fps /
                 (2.0L * static_cast<long double>((unique_count - 1) * timestamp_multiplicity));
@@ -888,7 +894,7 @@ std::optional<InferredFrameRate> infer_constant_frame_rate(const TimingScan& sca
                   });
   bool noncanonical_rate_has_materially_better_grid_fit = false;
   if (best_denominator != 0 && best_error <= tolerance && !best_rate_is_canonical &&
-      unique_count >= kMinimumExactNoncanonicalRateSamples) {
+      (complete_timing_span || unique_count >= kMinimumExactNoncanonicalRateSamples)) {
     if (!canonical_rate_is_close) {
       noncanonical_rate_has_materially_better_grid_fit = true;
     } else {
@@ -1037,56 +1043,72 @@ std::optional<std::uint64_t> sample_presentation_stream_time(const std::shared_p
                                           : std::optional<std::uint64_t>(stream_time);
 }
 
-enum class TailTimingStatus { Unavailable, Constant, Nonconstant };
+enum class TimingWindowStatus { Unavailable, Constant, Nonconstant };
 
-struct TailTimingEvidence {
-  TailTimingStatus status = TailTimingStatus::Unavailable;
+struct TimingWindowEvidence {
+  TimingWindowStatus status = TimingWindowStatus::Unavailable;
   std::optional<InferredFrameRate> frame_rate;
 };
 
-TailTimingEvidence infer_tail_frame_rate(const std::shared_ptr<ProbeApi>& api, void* pipeline,
-                                         void* probe_sink, void* bus,
-                                         std::uint64_t container_duration_ns,
+TimingWindowEvidence infer_timing_window(const std::shared_ptr<ProbeApi>& api, void* pipeline,
+                                         void* probe_sink, void* bus, std::uint64_t start_ns,
+                                         std::optional<std::uint64_t> end_ns, bool require_eos,
                                          std::chrono::steady_clock::time_point deadline) {
-  if (container_duration_ns <= kTailTimingWindowNs) {
-    return {};
-  }
-  const auto target_ns = container_duration_ns - kTailTimingWindowNs;
-  if (target_ns > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ||
+  const auto seek_ns =
+      start_ns > kTimingWindowSeekPrerollNs ? start_ns - kTimingWindowSeekPrerollNs : 0;
+  if (seek_ns > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ||
       api->element_seek_simple(pipeline, kGstFormatTime, kGstSeekFlagFlushAccurate,
-                               static_cast<std::int64_t>(target_ns)) == 0) {
+                               static_cast<std::int64_t>(seek_ns)) == 0) {
     return {};
   }
 
-  TimingScan tail_scan;
-  constexpr std::size_t kMaximumTailPrerollSamples =
-      kTailTimingSamples + kMaximumDecodeReorderFrames;
-  for (std::size_t pulls = 0;
-       pulls < kMaximumTailPrerollSamples && tail_scan.sample_count < kTailTimingSamples; ++pulls) {
+  TimingScan window_scan;
+  bool window_started = false;
+  bool covered_end = !end_ns.has_value();
+  std::size_t samples_after_end = 0;
+  while (true) {
     void* sample = pull_compressed_sample(
         api, probe_sink, bus, deadline,
-        "GStreamer parser-only probe timed out while sampling terminal stream timing");
+        require_eos
+            ? "GStreamer parser-only probe timed out while sampling terminal stream timing"
+            : "GStreamer parser-only probe timed out while sampling interior stream timing");
     std::unique_ptr<void, ProbeApi::SampleUnref> sample_owner(sample, api->sample_unref);
     if (sample == nullptr) {
-      tail_scan.reached_eos = true;
+      window_scan.reached_eos = true;
       break;
     }
     const auto stream_time = sample_presentation_stream_time(api, sample);
-    if (!stream_time.has_value()) {
-      return {};
+    if (!window_started) {
+      if (!stream_time.has_value() || *stream_time < start_ns) {
+        continue;
+      }
+      window_started = true;
     }
-    if (*stream_time < target_ns) {
+    observe_timing_sample(api, sample, window_scan);
+    if (!end_ns.has_value()) {
       continue;
     }
-    observe_timing_sample(api, sample, tail_scan);
+    if (!covered_end && stream_time.has_value() && *stream_time >= *end_ns) {
+      covered_end = true;
+      continue;
+    }
+    if (covered_end && ++samples_after_end >= kMaximumDecodeReorderFrames) {
+      break;
+    }
   }
-  auto frame_rate = infer_constant_frame_rate(tail_scan, false);
+  if (!window_started || (require_eos && !window_scan.reached_eos) ||
+      (end_ns.has_value() && !covered_end)) {
+    return {};
+  }
+  auto frame_rate = infer_constant_frame_rate(window_scan, false, true, !require_eos);
   if (frame_rate.has_value()) {
-    return {.status = TailTimingStatus::Constant, .frame_rate = std::move(frame_rate)};
+    return {.status = TimingWindowStatus::Constant, .frame_rate = std::move(frame_rate)};
   }
   return {
-      .status = tail_scan.sample_count >= kTimingAnalysisSamples ? TailTimingStatus::Nonconstant
-                                                                 : TailTimingStatus::Unavailable,
+      .status = window_scan.sample_count >= kTimingAnalysisSamples &&
+                        window_scan.timed_sample_count == window_scan.sample_count
+                    ? TimingWindowStatus::Nonconstant
+                    : TimingWindowStatus::Unavailable,
       .frame_rate = std::nullopt,
   };
 }
@@ -1413,8 +1435,8 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
                                                       static_cast<std::uint32_t>(fps_numerator),
                                                       static_cast<std::uint32_t>(fps_denominator)),
                      kTimingReorderLookahead) < timing_scan.sample_count;
-  const auto preliminary_frame_rate =
-      infer_constant_frame_rate(timing_scan, timing_scan.reached_eos);
+  const auto preliminary_frame_rate = infer_constant_frame_rate(
+      timing_scan, timing_scan.reached_eos, timing_scan.reached_eos, !timing_scan.reached_eos);
   const bool caps_rate_conflict_needs_more_evidence =
       preliminary_frame_rate.has_value() && caps_frame_rate_is_plausible &&
       !frame_rates_are_identical(
@@ -1437,14 +1459,79 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
       observe_timing_sample(api, sample, timing_scan);
     }
   }
-  const auto inferred_frame_rate = infer_constant_frame_rate(timing_scan, timing_scan.reached_eos);
-  const auto tail_timing = !timing_scan.reached_eos && queried_container_duration.has_value()
-                               ? infer_tail_frame_rate(api, pipeline, probe_sink, bus,
-                                                       *queried_container_duration, deadline)
-                               : TailTimingEvidence{};
-  if (tail_timing.status == TailTimingStatus::Nonconstant) {
+  const auto inferred_frame_rate = infer_constant_frame_rate(
+      timing_scan, timing_scan.reached_eos, timing_scan.reached_eos, !timing_scan.reached_eos);
+  if (inferred_frame_rate.has_value() &&
+      static_cast<long double>(inferred_frame_rate->numerator) / inferred_frame_rate->denominator >
+          kMaximumSaneFps) {
+    throw GpuVideoProbeError("video parser returned an implausible frame rate");
+  }
+  const bool prefix_has_dense_nonconstant_timing =
+      !inferred_frame_rate.has_value() &&
+      timing_scan.timed_sample_count == timing_scan.sample_count &&
+      timing_scan.sample_count >= kTimingAnalysisSamples;
+  if (prefix_has_dense_nonconstant_timing) {
     throw GpuVideoProbeError(
-        "variable frame-rate video is unsupported for indexed GPU calibration sampling");
+        "variable frame-rate video is unsupported for indexed GPU calibration sampling "
+        "(dense prefix timing is nonconstant)");
+  }
+
+  TimingWindowEvidence tail_timing;
+  if (!config.elementary_stream && !timing_scan.reached_eos &&
+      queried_container_duration.has_value()) {
+    std::optional<std::pair<std::uint32_t, std::uint32_t>> representative_rate;
+    if (inferred_frame_rate.has_value()) {
+      representative_rate =
+          std::pair(inferred_frame_rate->numerator, inferred_frame_rate->denominator);
+    } else if (caps_frame_rate_is_plausible) {
+      representative_rate = std::pair(static_cast<std::uint32_t>(fps_numerator),
+                                      static_cast<std::uint32_t>(fps_denominator));
+    }
+    const auto validate_window = [&](const TimingWindowEvidence& evidence,
+                                     std::uint64_t window_start_ns) {
+      if (evidence.status != TimingWindowStatus::Constant || !evidence.frame_rate.has_value()) {
+        throw GpuVideoProbeError(
+            evidence.status == TimingWindowStatus::Nonconstant
+                ? "variable frame-rate video is unsupported for indexed GPU calibration sampling "
+                  "(timing window starting at " +
+                      std::to_string(window_start_ns) + " ns is nonconstant)"
+                : "video parser could not verify constant frame timing across the selected stream");
+      }
+      if (representative_rate.has_value() &&
+          !frame_rates_are_close(representative_rate->first, representative_rate->second,
+                                 evidence.frame_rate->numerator, evidence.frame_rate->denominator,
+                                 kCanonicalFrameRateTolerance)) {
+        throw GpuVideoProbeError(
+            "variable frame-rate video is unsupported for indexed GPU calibration sampling "
+            "(representative rates " +
+            std::to_string(representative_rate->first) + "/" +
+            std::to_string(representative_rate->second) + " and " +
+            std::to_string(evidence.frame_rate->numerator) + "/" +
+            std::to_string(evidence.frame_rate->denominator) + " disagree)");
+      }
+      representative_rate =
+          std::pair(evidence.frame_rate->numerator, evidence.frame_rate->denominator);
+    };
+
+    constexpr std::array<std::uint64_t, 3> kInteriorWindowQuarterPositions{1, 2, 3};
+    constexpr auto kHalfTimingWindowNs = kTailTimingWindowNs / 2U;
+    for (const auto quarter : kInteriorWindowQuarterPositions) {
+      const auto center_ns = multiply_divide_floor_saturating(
+          *queried_container_duration, quarter, kInteriorWindowQuarterPositions.size() + 1U);
+      const auto start_ns = center_ns > kHalfTimingWindowNs ? center_ns - kHalfTimingWindowNs : 0;
+      const auto end_ns =
+          std::min(add_saturating(start_ns, kTailTimingWindowNs), *queried_container_duration);
+      validate_window(
+          infer_timing_window(api, pipeline, probe_sink, bus, start_ns, end_ns, false, deadline),
+          start_ns);
+    }
+
+    const auto tail_start_ns = *queried_container_duration > kTailTimingWindowNs
+                                   ? *queried_container_duration - kTailTimingWindowNs
+                                   : 0;
+    tail_timing = infer_timing_window(api, pipeline, probe_sink, bus, tail_start_ns, std::nullopt,
+                                      true, deadline);
+    validate_window(tail_timing, tail_start_ns);
   }
   const bool representative_tail_matches =
       inferred_frame_rate.has_value() && tail_timing.frame_rate.has_value() &&
@@ -1455,25 +1542,6 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
       !representative_tail_matches) {
     throw GpuVideoProbeError(
         "variable frame-rate video is unsupported for indexed GPU calibration sampling");
-  }
-  const bool tail_matches_caps =
-      tail_timing.frame_rate.has_value() && caps_frame_rate_is_plausible &&
-      frame_rates_are_close(tail_timing.frame_rate->numerator, tail_timing.frame_rate->denominator,
-                            static_cast<std::uint32_t>(fps_numerator),
-                            static_cast<std::uint32_t>(fps_denominator),
-                            kCanonicalFrameRateTolerance);
-  const bool prefix_has_dense_nonconstant_timing =
-      !inferred_frame_rate.has_value() &&
-      timing_scan.timed_sample_count == timing_scan.sample_count &&
-      timing_scan.sample_count >= kTimingAnalysisSamples;
-  if (prefix_has_dense_nonconstant_timing && !tail_matches_caps) {
-    throw GpuVideoProbeError(
-        "variable frame-rate video is unsupported for indexed GPU calibration sampling");
-  }
-  if (inferred_frame_rate.has_value() &&
-      static_cast<long double>(inferred_frame_rate->numerator) / inferred_frame_rate->denominator >
-          kMaximumSaneFps) {
-    throw GpuVideoProbeError("video parser returned an implausible frame rate");
   }
   const bool bounded_noncanonical_rate_is_conclusive =
       inferred_frame_rate.has_value() && inferred_frame_rate->requires_complete_stream &&
@@ -1586,6 +1654,8 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
     }
     total_frames = correlated_frame_count.value_or(total_frames);
     total_frames = std::max(total_frames, timing_scan.sample_count);
+    duration_ns =
+        std::max(duration_ns, minimum_duration_for_frame_count(total_frames, fps_num, fps_den));
   }
   return {.width = static_cast<std::uint32_t>(width),
           .height = static_cast<std::uint32_t>(height),

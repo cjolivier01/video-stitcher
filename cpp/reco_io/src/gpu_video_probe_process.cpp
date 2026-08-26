@@ -140,15 +140,15 @@ private:
 
 class StartupAttributeList {
 public:
-  StartupAttributeList() {
+  explicit StartupAttributeList(DWORD attribute_count) {
     SIZE_T size = 0;
-    (void)InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
+    (void)InitializeProcThreadAttributeList(nullptr, attribute_count, 0, &size);
     if (size == 0) {
       throw GpuVideoProbeError("failed to size video probe worker launch attributes");
     }
     storage_.resize(size);
     value_ = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(storage_.data());
-    if (InitializeProcThreadAttributeList(value_, 1, 0, &size) == 0) {
+    if (InitializeProcThreadAttributeList(value_, attribute_count, 0, &size) == 0) {
       throw GpuVideoProbeError("failed to initialize video probe worker launch attributes");
     }
   }
@@ -293,13 +293,27 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   }
   UniqueHandle child_stderr(child_stderr_raw);
 
-  StartupAttributeList attributes;
+  UniqueHandle job(CreateJobObjectW(nullptr, nullptr));
+  JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+  limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+  if (!job || SetInformationJobObject(job.get(), JobObjectExtendedLimitInformation, &limits,
+                                      sizeof(limits)) == 0) {
+    throw GpuVideoProbeError("failed to configure video probe worker Job");
+  }
+
+  StartupAttributeList attributes(2);
   std::array<HANDLE, 3> inherited_handles{child_stdin.get(), child_stdout.get(),
                                           child_stderr.get()};
   if (UpdateProcThreadAttribute(attributes.get(), 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
                                 inherited_handles.data(), sizeof(inherited_handles), nullptr,
                                 nullptr) == 0) {
     throw GpuVideoProbeError("failed to restrict video probe worker inherited handles");
+  }
+  std::array<HANDLE, 1> assigned_jobs{job.get()};
+  if (UpdateProcThreadAttribute(attributes.get(), 0, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+                                assigned_jobs.data(), sizeof(assigned_jobs), nullptr,
+                                nullptr) == 0) {
+    throw GpuVideoProbeError("failed to assign the video probe worker Job at launch");
   }
 
   const auto encoded_path = worker_path.u8string();
@@ -328,16 +342,6 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   }
   UniqueHandle process(process_info.hProcess);
   UniqueHandle thread(process_info.hThread);
-  UniqueHandle job(CreateJobObjectW(nullptr, nullptr));
-  JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
-  limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-  if (!job ||
-      SetInformationJobObject(job.get(), JobObjectExtendedLimitInformation, &limits,
-                              sizeof(limits)) == 0 ||
-      AssignProcessToJobObject(job.get(), process.get()) == 0) {
-    TerminateProcess(process.get(), 1);
-    throw GpuVideoProbeError("failed to isolate video probe worker process");
-  }
   if (std::chrono::steady_clock::now() >= deadline) {
     (void)TerminateJobObject(job.get(), 1);
     (void)WaitForSingleObject(process.get(), INFINITE);
@@ -651,11 +655,14 @@ std::string read_response(int input, std::chrono::steady_clock::time_point deadl
   read_exact(input, response.data(), response.size(), deadline);
 
   char trailing = '\0';
-  const auto trailing_size = ::recv(input, &trailing, 1, MSG_PEEK);
+  ssize_t trailing_size = 0;
+  do {
+    trailing_size = ::recv(input, &trailing, 1, MSG_PEEK);
+  } while (trailing_size < 0 && errno == EINTR);
   if (trailing_size > 0) {
     throw GpuVideoProbeError("video probe worker response has trailing IPC bytes");
   }
-  if (trailing_size < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+  if (trailing_size < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
     throw GpuVideoProbeError("failed to inspect video probe worker response: " +
                              std::string(std::strerror(errno)));
   }

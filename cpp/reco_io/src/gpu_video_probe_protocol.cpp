@@ -19,6 +19,91 @@ constexpr std::size_t kMaximumCborNestingDepth = 32;
 constexpr std::uint32_t kProbeProtocolVersion = 1;
 constexpr double kMaximumSaneFps = 1000.0;
 constexpr std::uint32_t kMaximumGpuVideoDimension = 65'536;
+constexpr std::uint64_t kNanosecondsPerSecond = 1'000'000'000ULL;
+constexpr std::uint64_t kExactFrameCountTolerance = 32;
+
+struct DivisionResult {
+  std::uint64_t quotient;
+  std::uint64_t remainder;
+};
+
+bool add_modulo(std::uint64_t left, std::uint64_t right, std::uint64_t divisor,
+                std::uint64_t& result) {
+  if (left >= divisor - right) {
+    result = left - (divisor - right);
+    return true;
+  }
+  result = left + right;
+  return false;
+}
+
+std::optional<DivisionResult> multiply_divide(std::uint64_t multiplicand, std::uint32_t multiplier,
+                                              std::uint64_t divisor) {
+  const auto whole = multiplicand / divisor;
+  if (whole != 0 && multiplier > std::numeric_limits<std::uint64_t>::max() / whole) {
+    return std::nullopt;
+  }
+
+  std::uint64_t quotient = whole * multiplier;
+  std::uint64_t partial_quotient = 0;
+  std::uint64_t partial_remainder = 0;
+  const auto remainder = multiplicand % divisor;
+  for (std::uint32_t bit = 32; bit-- > 0;) {
+    if (partial_quotient > std::numeric_limits<std::uint64_t>::max() / 2U) {
+      return std::nullopt;
+    }
+    partial_quotient *= 2U;
+    std::uint64_t next_remainder = 0;
+    const bool doubled_remainder_wrapped =
+        add_modulo(partial_remainder, partial_remainder, divisor, next_remainder);
+    if (doubled_remainder_wrapped &&
+        partial_quotient == std::numeric_limits<std::uint64_t>::max()) {
+      return std::nullopt;
+    }
+    partial_quotient += doubled_remainder_wrapped ? 1U : 0U;
+    partial_remainder = next_remainder;
+    if (((multiplier >> bit) & 1U) != 0U) {
+      const bool added_remainder_wrapped =
+          add_modulo(partial_remainder, remainder, divisor, next_remainder);
+      if (added_remainder_wrapped &&
+          partial_quotient == std::numeric_limits<std::uint64_t>::max()) {
+        return std::nullopt;
+      }
+      partial_quotient += added_remainder_wrapped ? 1U : 0U;
+      partial_remainder = next_remainder;
+    }
+  }
+  if (partial_quotient > std::numeric_limits<std::uint64_t>::max() - quotient) {
+    return std::nullopt;
+  }
+  return DivisionResult{quotient + partial_quotient, partial_remainder};
+}
+
+std::optional<std::uint64_t> rounded_frame_count(std::uint64_t duration_ns,
+                                                 std::uint32_t fps_numerator,
+                                                 std::uint32_t fps_denominator) {
+  const auto divisor = kNanosecondsPerSecond * static_cast<std::uint64_t>(fps_denominator);
+  const auto division = multiply_divide(duration_ns, fps_numerator, divisor);
+  if (!division.has_value()) {
+    return std::nullopt;
+  }
+  const bool round_up = division->remainder >= divisor - division->remainder;
+  if (round_up && division->quotient == std::numeric_limits<std::uint64_t>::max()) {
+    return std::nullopt;
+  }
+  return division->quotient + (round_up ? 1U : 0U);
+}
+
+bool exact_frame_count_is_consistent(const GpuVideoProbe& probe) {
+  const auto expected =
+      rounded_frame_count(probe.duration_ns, probe.fps_numerator, probe.fps_denominator);
+  if (!expected.has_value()) {
+    return false;
+  }
+  const auto difference = probe.total_frames > *expected ? probe.total_frames - *expected
+                                                         : *expected - probe.total_frames;
+  return difference <= kExactFrameCountTolerance;
+}
 
 int encode_container(const std::optional<GpuDecodeContainer>& container) {
   return container.has_value() ? static_cast<int>(*container) : -1;
@@ -349,6 +434,10 @@ GpuVideoProbe decode_probe_response(std::string_view payload) {
                            static_cast<long double>(probe.duration_ns);
   if (!std::isfinite(average_fps) || average_fps > kMaximumSaneFps * 1.01L) {
     throw GpuVideoProbeError("video probe worker returned invalid metadata");
+  }
+  if (!probe.duration_is_estimated && !probe.total_frames_is_estimated &&
+      !exact_frame_count_is_consistent(probe)) {
+    throw GpuVideoProbeError("video probe worker returned inconsistent exact metadata");
   }
   return probe;
 }

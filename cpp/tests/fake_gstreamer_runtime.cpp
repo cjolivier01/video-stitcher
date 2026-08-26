@@ -208,7 +208,7 @@ FakeCaps parser_sample_caps() {
   } else if (scenario() == "probe-inexact-caps-fps") {
     caps.fps_numerator = 59;
     caps.fps_denominator = 2;
-  } else if (scenario() == "probe-long-unset-fps-15" ||
+  } else if (scenario() == "probe-long-unset-fps-15" || scenario() == "probe-short-unset-fps-15" ||
              scenario() == "probe-durationless-unseekable-15") {
     caps.fps_numerator = 0;
     caps.fps_denominator = 1;
@@ -273,6 +273,13 @@ FakeCaps parser_sample_caps() {
   } else if (scenario() == "probe-retimed-constant-pts") {
     caps.fps_numerator = 15;
     caps.fps_denominator = 1;
+  } else if (scenario() == "probe-terminal-60-eos" ||
+             scenario() == "probe-terminal-transition-after-256") {
+    caps.fps_numerator = 60;
+    caps.fps_denominator = 1;
+  } else if (scenario() == "probe-gap-before-reorder-suffix") {
+    caps.fps_numerator = 30;
+    caps.fps_denominator = 1;
   } else if (scenario() == "probe-vfr-missing-durations") {
     caps.fps_numerator = 45;
     caps.fps_denominator = 1;
@@ -311,6 +318,17 @@ std::uint64_t parser_frame_offset(std::uint64_t frame_index, const FakeCaps& cap
 }
 
 std::uint64_t parser_timing_offset(std::uint64_t frame_index, const FakeCaps& caps) {
+  if (scenario() == "probe-prefix-vfr-tail-cfr") {
+    constexpr std::uint64_t kFirstTransitionFrame = 120;
+    constexpr std::uint64_t kSecondTransitionFrame = 180;
+    if (frame_index <= kFirstTransitionFrame) {
+      return frame_index * 1'000'000'000ULL / 30U;
+    }
+    if (frame_index <= kSecondTransitionFrame) {
+      return 4'000'000'000ULL + (frame_index - kFirstTransitionFrame) * 1'000'000'000ULL / 15U;
+    }
+    return 8'000'000'000ULL + (frame_index - kSecondTransitionFrame) * 1'000'000'000ULL / 30U;
+  }
   if (scenario() == "probe-late-vfr-after-bounded-prefix") {
     constexpr std::uint64_t kTransitionFrame = 5'000;
     constexpr std::uint64_t kTransitionNs = kTransitionFrame * 1'000'000'000ULL / 30U;
@@ -379,6 +397,10 @@ std::uint64_t parser_timing_offset(std::uint64_t frame_index, const FakeCaps& ca
   }
   if (scenario() == "probe-dropped-frame-after-prefix") {
     const auto presentation_index = frame_index < 100U ? frame_index : frame_index + 1U;
+    return presentation_index * 1'000'000'000ULL / 30U;
+  }
+  if (scenario() == "probe-gap-before-reorder-suffix") {
+    const auto presentation_index = frame_index < 480U ? frame_index : frame_index + 1U;
     return presentation_index * 1'000'000'000ULL / 30U;
   }
   if (scenario() == "probe-reduced-cadence-after-prefix") {
@@ -735,6 +757,16 @@ RECO_FAKE_EXPORT int gst_element_query_duration(void*, int format, std::int64_t*
     *duration = 200'000'000'000;
     return 1;
   }
+  if (scenario() == "probe-interior-vfr-recovery" || scenario() == "probe-prefix-vfr-tail-cfr") {
+    *duration = 200'000'000'000;
+    return 1;
+  }
+  if (scenario() == "probe-terminal-60-eos" ||
+      scenario() == "probe-terminal-transition-after-256" ||
+      scenario() == "probe-gap-before-reorder-suffix") {
+    *duration = 20'000'000'000;
+    return 1;
+  }
   if (scenario() == "probe-exact-frame-count") {
     *duration = 100'100'000;
     return 1;
@@ -844,10 +876,7 @@ RECO_FAKE_EXPORT int gst_element_seek_simple(void* pipeline_pointer, int format,
     return 1;
   }
   if (format != 3 || target < 0 || scenario() == "probe-seek-unsupported" ||
-      scenario() == "probe-durationless-unseekable-15" ||
-      scenario() == "probe-long-duplicate-pts-pairs" ||
-      scenario() == "probe-bounded-caps-underestimate" ||
-      scenario() == "probe-long-reordered-periodic-missing-pts") {
+      scenario() == "probe-durationless-unseekable-15") {
     return 0;
   }
   static_cast<FakePipeline*>(pipeline_pointer)->seek_target_ns = target;
@@ -1013,6 +1042,7 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
       timing_caps.fps_numerator = 5'997;
       timing_caps.fps_denominator = 100;
     } else if (current_scenario == "probe-long-unset-fps-15" ||
+               current_scenario == "probe-short-unset-fps-15" ||
                current_scenario == "probe-durationless-unseekable-15") {
       timing_caps.fps_numerator = 15;
       timing_caps.fps_denominator = 1;
@@ -1061,9 +1091,15 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
         : current_scenario == "probe-sparse-exact-30-gaps"                  ? 20'100'000'000ULL
         : current_scenario == "probe-container-exact-5997-parser-ntsc"      ? 10'005'002'501ULL
         : current_scenario == "probe-long-unset-fps-15"                     ? 40'000'000'000ULL
+        : current_scenario == "probe-short-unset-fps-15"                    ? 1'000'000'000ULL
         : current_scenario == "probe-durationless-unseekable-15"            ? 600'000'000'000ULL
         : current_scenario == "probe-late-vfr-after-bounded-prefix"         ? 200'000'000'000ULL
         : current_scenario == "probe-vfr-in-final-window"                   ? 200'000'000'000ULL
+        : current_scenario == "probe-interior-vfr-recovery"                 ? 200'000'000'000ULL
+        : current_scenario == "probe-prefix-vfr-tail-cfr"                   ? 200'000'000'000ULL
+        : current_scenario == "probe-terminal-60-eos"                       ? 20'000'000'000ULL
+        : current_scenario == "probe-terminal-transition-after-256"         ? 20'000'000'000ULL
+        : current_scenario == "probe-gap-before-reorder-suffix"             ? 20'000'000'000ULL
         : current_scenario == "probe-short-quantized-exact-30"              ? 100'000'000ULL
         : current_scenario == "probe-short-quantized-exact-5997"            ? 50'000'000ULL
         : current_scenario == "probe-unset-fps-inferred"                    ? 4'000'000'000ULL
@@ -1109,7 +1145,8 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     const auto snapped_seek_target =
         sink->pipeline->has_seek
             ? current_scenario == "probe-late-vfr-after-bounded-prefix" ||
-                      current_scenario == "probe-vfr-in-final-window"
+                      current_scenario == "probe-vfr-in-final-window" ||
+                      current_scenario == "probe-interior-vfr-recovery"
                   ? static_cast<std::uint64_t>(sink->pipeline->seek_target_ns)
                   : snapped_parser_seek_target(
                         static_cast<std::uint64_t>(sink->pipeline->seek_target_ns),
@@ -1117,8 +1154,15 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
             : 0;
     constexpr std::uint64_t kLateVfrTransitionNs = 5'000ULL * 1'000'000'000ULL / 30U;
     constexpr std::uint64_t kFinalWindowSlowSamples = 80;
+    constexpr std::uint64_t kLateTerminalTransitionSamples = 330;
     const bool samples_mixed_final_window =
         current_scenario == "probe-vfr-in-final-window" && sink->pipeline->has_seek;
+    const bool samples_slow_interior =
+        current_scenario == "probe-interior-vfr-recovery" && sink->pipeline->has_seek &&
+        snapped_seek_target >= 80'000'000'000ULL && snapped_seek_target < 120'000'000'000ULL;
+    const bool samples_late_terminal_transition =
+        current_scenario == "probe-terminal-transition-after-256" && sink->pipeline->has_seek &&
+        sink->pipeline->seek_target_ns == 14'000'000'000LL;
     const bool uses_fast_terminal_cadence =
         (current_scenario == "probe-late-vfr-after-bounded-prefix" &&
          snapped_seek_target >= kLateVfrTransitionNs) ||
@@ -1128,7 +1172,14 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
             ? seek_advance_index * 1'000'000'000ULL / 30U
             : kFinalWindowSlowSamples * 1'000'000'000ULL / 30U +
                   (seek_advance_index - kFinalWindowSlowSamples) * 1'000'000'000ULL / 60U;
-    const auto seek_advance = samples_mixed_final_window ? mixed_final_window_advance
+    const auto late_terminal_advance =
+        seek_advance_index <= kLateTerminalTransitionSamples
+            ? seek_advance_index * 1'000'000'000ULL / 60U
+            : kLateTerminalTransitionSamples * 1'000'000'000ULL / 60U +
+                  (seek_advance_index - kLateTerminalTransitionSamples) * 1'000'000'000ULL / 30U;
+    const auto seek_advance = samples_late_terminal_transition ? late_terminal_advance
+                              : samples_mixed_final_window     ? mixed_final_window_advance
+                              : samples_slow_interior ? seek_advance_index * 1'000'000'000ULL / 15U
                               : sink->pipeline->has_seek && uses_fast_terminal_cadence
                                   ? seek_advance_index * 1'000'000'000ULL / 60U
                                   : parser_timing_offset(seek_advance_index, timing_caps);
@@ -1144,6 +1195,10 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
       return nullptr;
     }
     if (target_ns >= selected_duration_ns) {
+      if (current_scenario == "probe-terminal-60-eos" && sink->pipeline->has_seek &&
+          sink->pipeline->seek_target_ns == 14'000'000'000LL) {
+        record("terminal-window-eos");
+      }
       sink->probe_eos = true;
       return nullptr;
     }
@@ -1227,7 +1282,10 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
       sample->buffer.pts = target_ns;
     }
     const auto frame_duration_ns =
-        sink->pipeline->has_seek && uses_fast_terminal_cadence ? 1'000'000'000ULL / 60U
+        samples_late_terminal_transition && seek_advance_index >= kLateTerminalTransitionSamples
+            ? 1'000'000'000ULL / 30U
+        : samples_slow_interior                                  ? 1'000'000'000ULL / 15U
+        : sink->pipeline->has_seek && uses_fast_terminal_cadence ? 1'000'000'000ULL / 60U
         : current_scenario == "probe-eos-vui-duration-mismatch"
             ? parser_frame_offset(1, sample_caps)
         : sink->pipeline->has_seek ? parser_frame_offset(1, timing_caps)

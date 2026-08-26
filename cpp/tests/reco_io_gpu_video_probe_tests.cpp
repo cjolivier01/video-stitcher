@@ -504,15 +504,9 @@ void probe_contracts(const std::filesystem::path& video_path,
             "periodically untimed duplicate groups retain caps-rate duration");
 
   set_scenario("probe-duplicate-pts-transition");
-  const auto duplicate_transition = probe_video(container_config(video_path), timeout_ns);
-  expect_eq(duplicate_transition.fps_numerator, 25U,
-            "duplicate PTS multiplicity must remain uniform across the bounded scan");
-  expect_eq(duplicate_transition.fps_denominator, 1U,
-            "duplicate PTS transition preserves the caps denominator");
-  expect_eq(duplicate_transition.total_frames, 513ULL,
-            "duplicate PTS transition preserves the observed AU lower bound");
-  expect_true(duplicate_transition.total_frames_is_estimated,
-              "bounded duplicate PTS transition count remains explicitly estimated");
+  expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
+                     "variable frame-rate",
+                     "dense duplicate PTS multiplicity transitions are rejected unconditionally");
 
   set_scenario("probe-duplicate-pts-reorder-cutoff");
   const auto duplicate_reorder_cutoff = probe_video(container_config(video_path), timeout_ns);
@@ -526,14 +520,9 @@ void probe_contracts(const std::filesystem::path& video_path,
               "reordered duplicate PTS count is exact after reaching EOS");
 
   set_scenario("probe-duplicate-pts-transition-untimed-tail");
-  const auto duplicate_transition_untimed_tail =
-      probe_video(container_config(video_path), timeout_ns);
-  expect_eq(duplicate_transition_untimed_tail.fps_numerator, 25U,
-            "untimed tail does not hide an earlier duplicate PTS cadence transition");
-  expect_eq(duplicate_transition_untimed_tail.fps_denominator, 1U,
-            "duplicate transition before an untimed tail preserves the caps denominator");
-  expect_eq(duplicate_transition_untimed_tail.total_frames, 513ULL,
-            "duplicate transition before an untimed tail preserves the AU lower bound");
+  expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
+                     "variable frame-rate",
+                     "an untimed tail cannot excuse a dense duplicate PTS cadence transition");
 
   set_scenario("probe-duplicate-pts-larger-reorder-suffix");
   expect_probe_error(
@@ -594,15 +583,9 @@ void probe_contracts(const std::filesystem::path& video_path,
             "stale high-rate caps cannot double the calibration frame count");
 
   set_scenario("probe-sparse-exact-30-gaps");
-  const auto sparse_exact = probe_video(container_config(video_path), timeout_ns);
-  expect_eq(sparse_exact.fps_numerator, 30U,
-            "sparse exact timestamp grid wins over a gap-biased span average");
-  expect_eq(sparse_exact.fps_denominator, 1U,
-            "sparse timestamp gaps preserve the exact cadence denominator");
-  expect_eq(sparse_exact.duration_ns, 20'100'000'000ULL,
-            "sparse timestamp gaps preserve the presentation duration");
-  expect_eq(sparse_exact.total_frames, 600ULL,
-            "sparse timestamp gaps retain the EOS-proven AU count");
+  expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
+                     "variable frame-rate",
+                     "fully timestamped doubled intervals are not reinterpreted as sparse timing");
 
   set_scenario("probe-clustered-missing-pts");
   const auto clustered_missing_pts = probe_video(container_config(video_path), timeout_ns);
@@ -640,6 +623,15 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_eq(quantized_no_vui.total_frames, 240ULL,
             "quantized no-VUI stream retains its EOS-proven AU count");
 
+  set_scenario("probe-short-unset-fps-15");
+  const auto short_unset_15 = probe_video(container_config(video_path), timeout_ns);
+  expect_eq(short_unset_15.fps_numerator, 15U,
+            "short EOS-proven timing infers an exact noncanonical frame rate");
+  expect_eq(short_unset_15.fps_denominator, 1U,
+            "short EOS-proven noncanonical timing retains its denominator");
+  expect_eq(short_unset_15.total_frames, 15ULL,
+            "short noncanonical inference retains its EOS-proven AU count");
+
   set_scenario("probe-long-unset-fps-15");
   const auto long_unset_15 = probe_video(container_config(video_path), timeout_ns);
   expect_eq(long_unset_15.fps_numerator, 15U,
@@ -657,6 +649,8 @@ void probe_contracts(const std::filesystem::path& video_path,
             "bounded durationless inference preserves its exact denominator");
   expect_eq(bounded_unset_15.total_frames, 4'097ULL,
             "durationless inference preserves the observed compressed-AU lower bound");
+  expect_eq(bounded_unset_15.duration_ns, 273'133'333'334ULL,
+            "durationless inference covers its observed compressed-AU lower bound");
   expect_true(bounded_unset_15.total_frames_is_estimated,
               "durationless bounded frame count remains explicitly estimated");
 
@@ -670,17 +664,45 @@ void probe_contracts(const std::filesystem::path& video_path,
                      "variable frame-rate",
                      "mixed cadence inside the terminal timing window is rejected");
 
+  set_scenario("probe-interior-vfr-recovery");
+  expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
+                     "variable frame-rate",
+                     "a middle 30-to-15-to-30 cadence change is rejected by interior sampling");
+
+  set_scenario("probe-prefix-vfr-tail-cfr");
+  expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
+                     "variable frame-rate",
+                     "a constant terminal cadence cannot excuse a dense nonconstant prefix");
+
+  set_scenario("probe-gap-before-reorder-suffix");
+  expect_probe_error(
+      [&] { (void)probe_video(container_config(video_path), timeout_ns); }, "variable frame-rate",
+      "a dense gap immediately before the reorder suffix remains part of prefix analysis");
+
+  std::filesystem::remove(event_path);
+  set_scenario("probe-terminal-60-eos");
+  const auto terminal_60 = probe_video(container_config(video_path), timeout_ns);
+  expect_eq(terminal_60.fps_numerator, 60U,
+            "60 fps terminal timing retains the exact caps numerator");
+  expect_eq(terminal_60.total_frames, 1'200ULL,
+            "60 fps terminal timing retains the correlated frame count");
+  expect_true(has_event(read_events(event_path), "terminal-window-eos"),
+              "the five-second 60 fps terminal window drains through EOS");
+
+  set_scenario("probe-terminal-transition-after-256");
+  expect_probe_error(
+      [&] { (void)probe_video(container_config(video_path), timeout_ns); }, "variable frame-rate",
+      "a terminal cadence transition after 256 analyzed samples is detected before EOS");
+
   set_scenario("probe-vfr-missing-durations");
   expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
                      "variable frame-rate",
                      "missing buffer durations do not hide dense nonconstant PTS timing");
 
   set_scenario("probe-dropped-frame-after-prefix");
-  const auto dropped_frame = probe_video(container_config(video_path), timeout_ns);
-  expect_eq(dropped_frame.total_frames, 179ULL,
-            "dropped AU after the timing prefix is not reconstructed as a timestamp slot");
-  expect_true(!dropped_frame.total_frames_is_estimated,
-              "dropped-frame EOS scan reports an exact count");
+  expect_probe_error(
+      [&] { (void)probe_video(container_config(video_path), timeout_ns); }, "variable frame-rate",
+      "a fully timestamped missing access-unit interval is rejected as nonconstant cadence");
 
   set_scenario("probe-reduced-cadence-after-prefix");
   expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
@@ -722,13 +744,10 @@ void probe_contracts(const std::filesystem::path& video_path,
               "bounded lower-bound count remains explicitly estimated");
 
   set_scenario("probe-seek-unsupported");
-  const auto unseekable = probe_video(container_config(video_path), timeout_ns);
-  expect_eq(unseekable.duration_ns, 10'000'000'000ULL,
-            "unseekable parser retains bounded container-duration fallback");
-  expect_true(unseekable.duration_is_estimated,
-              "uncorrelated container duration is explicitly marked estimated");
-  expect_true(unseekable.total_frames_is_estimated,
-              "unseekable long-stream frame count is explicitly estimated");
+  expect_probe_error(
+      [&] { (void)probe_video(container_config(video_path), timeout_ns); },
+      "could not verify constant frame timing",
+      "an unseekable long container fails closed when terminal timing cannot be verified");
 
   set_scenario("probe-seek-preroll");
   const auto seek_preroll = probe_video(container_config(video_path), timeout_ns);
@@ -748,32 +767,16 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_true(unknown_pts_preroll.duration_is_estimated,
               "PTS-less seek-preroll duration remains explicitly estimated");
 
-  std::filesystem::remove(event_path);
   set_scenario("probe-seek-untimestamped-tail");
-  const auto untimestamped_tail = probe_video(container_config(video_path), timeout_ns);
-  expect_eq(untimestamped_tail.duration_ns, 20'000'000'000ULL,
-            "untimestamped seek tail falls back to the selected-stream duration");
-  expect_eq(untimestamped_tail.total_frames, 600ULL,
-            "untimestamped seek tail estimates frame count from validated caps");
-  expect_true(untimestamped_tail.total_frames_is_estimated,
-              "untimestamped seek-tail count remains explicitly estimated");
-  expect_true(untimestamped_tail.duration_is_estimated,
-              "untimestamped seek-tail duration remains explicitly estimated");
-  const auto untimestamped_tail_events = read_events(event_path);
-  expect_true(std::count(untimestamped_tail_events.begin(), untimestamped_tail_events.end(),
-                         "pull-probe") <= 515,
-              "untimestamped seek tail abandons correlation without a linear parser drain");
+  expect_probe_error(
+      [&] { (void)probe_video(container_config(video_path), timeout_ns); },
+      "could not verify constant frame timing",
+      "an untimestamped terminal window cannot establish constant presentation timing");
 
   set_scenario("probe-seek-dts-reorder-tail");
-  const auto dts_reorder_tail = probe_video(container_config(video_path), timeout_ns);
-  expect_eq(dts_reorder_tail.duration_ns, 20'000'000'000ULL,
-            "DTS-only reordered seek tail retains the final presentation span");
-  expect_eq(dts_reorder_tail.total_frames, 600ULL,
-            "DTS-only reordered seek tail retains the final presentation frame");
-  expect_true(dts_reorder_tail.total_frames_is_estimated,
-              "DTS-correlated bounded count remains explicitly estimated");
-  expect_true(dts_reorder_tail.duration_is_estimated,
-              "DTS-correlated bounded duration remains explicitly estimated");
+  expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
+                     "could not verify constant frame timing",
+                     "DTS-only terminal evidence cannot prove constant presentation timing");
 
   set_scenario("probe-blocking-seek");
   const auto blocking_seek_started = std::chrono::steady_clock::now();
