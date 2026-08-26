@@ -95,6 +95,13 @@ cc_binary(
     deps = ["//cpp/reco_io"],
 )
 
+cc_binary(
+    name = "fake_video_probe_worker",
+    testonly = True,
+    srcs = ["fake_video_probe_worker.cpp"],
+    deps = ["@nlohmann_json//:json"],
+)
+
 cc_test(
     name = "reco_io_gpu_decode_runtime_tests",
     size = "small",
@@ -105,10 +112,17 @@ cc_test(
 
 cc_test(
     name = "reco_io_gpu_video_probe_tests",
-    size = "small",
+    size = "medium",
     srcs = ["reco_io_gpu_video_probe_tests.cpp"],
-    data = [":libfake_gstreamer_runtime.so"],
-    deps = ["//cpp/reco_io"],
+    data = [
+        ":fake_video_probe_worker",
+        ":libfake_gstreamer_runtime.so",
+        "//cpp/reco_io:reco_video_probe_worker",
+    ],
+    deps = [
+        "//cpp/reco_io",
+        "@rules_cc//cc/runfiles",
+    ],
 )
 
 cc_test(

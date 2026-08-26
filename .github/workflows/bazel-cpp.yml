@@ -7,7 +7,26 @@ on:
 
 jobs:
   test:
-    name: Bazel C++ tests
+    name: Bazel C++ tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: bazel-contrib/setup-bazel@4fd964a13a440a8aeb0be47350db2fc640f19ca8 # v0.15.0
+        with:
+          bazelisk-cache: true
+          disk-cache: true
+          repository-cache: true
+      - name: Test C++ port
+        run: bazel test //cpp/...
+      - name: Build C++ fuzz harnesses
+        run: bazel build //cpp/reco_core:input_path_fuzz //cpp/reco_core:calibration_json_fuzz
+
+  sanitizers:
+    name: Bazel C++ sanitizers
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -16,11 +35,9 @@ jobs:
           bazelisk-cache: true
           disk-cache: true
           repository-cache: true
-      - name: Test C++ port scaffold
-        run: bazel test //cpp/tests:reco_control_tests //cpp/tests:reco_core_data_tests //cpp/tests:reco_core_math_events_tests //cpp/tests:reco_io_config_tests //cpp/tests:reco_autocam_policy_tests
-      - name: Test C++ port scaffold with ASan
-        run: bazel test --config=asan //cpp/tests:reco_control_tests //cpp/tests:reco_core_data_tests //cpp/tests:reco_core_math_events_tests //cpp/tests:reco_io_config_tests //cpp/tests:reco_autocam_policy_tests
-      - name: Test C++ port scaffold with UBSan
-        run: bazel test --config=ubsan //cpp/tests:reco_control_tests //cpp/tests:reco_core_data_tests //cpp/tests:reco_core_math_events_tests //cpp/tests:reco_io_config_tests //cpp/tests:reco_autocam_policy_tests
-      - name: Build C++ fuzz harnesses
-        run: bazel build //cpp/reco_core:input_path_fuzz //cpp/reco_core:calibration_json_fuzz
+      - name: Test probe and decode runtimes with ASan
+        run: bazel test --config=asan //cpp/tests:reco_io_gpu_video_probe_tests //cpp/tests:reco_io_gpu_decode_runtime_tests
+      - name: Test probe and decode runtimes with UBSan
+        run: bazel test --config=ubsan //cpp/tests:reco_io_gpu_video_probe_tests //cpp/tests:reco_io_gpu_decode_runtime_tests
+      - name: Test probe runtime with TSan
+        run: bazel test --config=tsan //cpp/tests:reco_io_gpu_video_probe_tests

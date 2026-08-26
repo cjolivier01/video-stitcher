@@ -3,6 +3,7 @@
 #include "reco/io/gpu_decode.hpp"
 
 #include <cstdint>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -47,8 +48,15 @@ public:
 /// selected stream's duration is correlated with bounded seeks over
 /// compressed access-unit timestamps. The parser scans a bounded AU prefix to
 /// EOS when practical; longer streams expose an explicitly estimated count.
-/// The timeout must be between one second and one hour, inclusive.
+/// `worker_path` must be the absolute path of the deployed
+/// `reco_video_probe_worker` executable.
+/// The worker is isolated so a blocked native multimedia call can be killed
+/// with its process-owned resources. The timeout covers worker launch, IPC,
+/// probing, and teardown; a bounded part of it is reserved for process
+/// termination and reaping, subject to operating-system progress. It must be
+/// between one second and one hour, inclusive.
 [[nodiscard]] GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config,
+                                            const std::filesystem::path& worker_path,
                                             std::uint64_t timeout_ns);
 
 } // namespace reco::io

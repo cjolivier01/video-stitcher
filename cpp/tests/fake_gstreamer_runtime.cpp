@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -78,7 +77,6 @@ enum class ObjectKind {
 struct FakeObject {
   explicit FakeObject(ObjectKind object_kind) : kind(object_kind) {}
   ObjectKind kind;
-  std::atomic<std::uint32_t> reference_count{1};
 };
 
 struct FakePipeline;
@@ -257,6 +255,7 @@ FakeCaps parser_sample_caps() {
     caps.fps_numerator = 45;
     caps.fps_denominator = 1;
   } else if (scenario() == "probe-duplicate-pts-pairs" ||
+             scenario() == "probe-long-duplicate-pts-pairs" ||
              scenario() == "probe-duplicate-clustered-missing-groups") {
     caps.fps_numerator = 50;
     caps.fps_denominator = 1;
@@ -336,7 +335,8 @@ std::uint64_t parser_timing_offset(std::uint64_t frame_index, const FakeCaps& ca
     return frame_index <= 90U ? frame_index * 1'000'000'000ULL / 30U
                               : 3'000'000'000ULL + (frame_index - 90U) * 1'000'000'000ULL / 15U;
   }
-  if (scenario() == "probe-duplicate-pts-pairs" || scenario() == "probe-paired-au-missing-pts" ||
+  if (scenario() == "probe-duplicate-pts-pairs" || scenario() == "probe-long-duplicate-pts-pairs" ||
+      scenario() == "probe-paired-au-missing-pts" ||
       scenario() == "probe-duplicate-clustered-missing-groups") {
     return (frame_index / 2U) * 40'000'000ULL;
   }
@@ -615,6 +615,11 @@ RECO_FAKE_EXPORT void* gst_element_get_static_pad(void* element_pointer, const c
 
 RECO_FAKE_EXPORT int gst_element_set_state(void* pipeline_pointer, int state) {
   record(state == 4 ? "state-playing" : state == 3 ? "state-paused" : "state-null");
+  if (state == 1 && scenario() == "probe-blocking-null-state") {
+    std::this_thread::sleep_for(std::chrono::seconds(30));
+  } else if (state == 4 && scenario() == "probe-blocking-playing") {
+    std::this_thread::sleep_for(std::chrono::seconds(30));
+  }
   const auto* pipeline = static_cast<FakePipeline*>(pipeline_pointer);
   if (state == 4 && ((!pipeline->parser_probe && scenario() == "state-error") ||
                      (pipeline->parser_probe &&
@@ -648,7 +653,7 @@ RECO_FAKE_EXPORT int gst_element_query_duration(void*, int format, std::int64_t*
   record("query-duration");
   const auto current_scenario = scenario();
   if (current_scenario == "probe-blocking-duration-query") {
-    std::this_thread::sleep_for(std::chrono::seconds(2));
+    std::this_thread::sleep_for(std::chrono::seconds(30));
     if (format != 3 || duration == nullptr) {
       return 0;
     }
@@ -740,6 +745,10 @@ RECO_FAKE_EXPORT int gst_element_query_duration(void*, int format, std::int64_t*
     *duration = 575'935'624'115;
     return 1;
   }
+  if (scenario() == "probe-long-duplicate-pts-pairs") {
+    *duration = 11'980'000'000;
+    return 1;
+  }
   if (scenario() == "probe-duplicate-pts-pairs" || scenario() == "probe-paired-au-missing-pts" ||
       scenario() == "probe-duplicate-clustered-missing-groups") {
     *duration = 4'000'000'000;
@@ -758,7 +767,7 @@ RECO_FAKE_EXPORT int gst_element_seek_simple(void* pipeline_pointer, int format,
   record("seek-compressed");
   const auto current_scenario = scenario();
   if (current_scenario == "probe-blocking-seek") {
-    std::this_thread::sleep_for(std::chrono::seconds(2));
+    std::this_thread::sleep_for(std::chrono::seconds(30));
     if (format != 3 || target < 0) {
       return 0;
     }
@@ -767,7 +776,8 @@ RECO_FAKE_EXPORT int gst_element_seek_simple(void* pipeline_pointer, int format,
     ++static_cast<FakePipeline*>(pipeline_pointer)->seek_generation;
     return 1;
   }
-  if (format != 3 || target < 0 || scenario() == "probe-seek-unsupported") {
+  if (format != 3 || target < 0 || scenario() == "probe-seek-unsupported" ||
+      scenario() == "probe-long-duplicate-pts-pairs") {
     return 0;
   }
   static_cast<FakePipeline*>(pipeline_pointer)->seek_target_ns = target;
@@ -784,21 +794,11 @@ RECO_FAKE_EXPORT void* gst_element_get_bus(void*) {
   return new FakeBus;
 }
 
-RECO_FAKE_EXPORT void* gst_object_ref(void* object) {
-  if (object != nullptr) {
-    static_cast<FakeObject*>(object)->reference_count.fetch_add(1, std::memory_order_relaxed);
-  }
-  return object;
-}
-
 RECO_FAKE_EXPORT void gst_object_unref(void* object) {
   if (object == nullptr) {
     return;
   }
   auto* base = static_cast<FakeObject*>(object);
-  if (base->reference_count.fetch_sub(1, std::memory_order_acq_rel) != 1) {
-    return;
-  }
   switch (base->kind) {
   case ObjectKind::Pipeline:
     record("unref-pipeline");
@@ -915,6 +915,9 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     if (scenario() == "probe-async-error") {
       return nullptr;
     }
+    if (scenario() == "probe-blocking-pull") {
+      std::this_thread::sleep_for(std::chrono::seconds(30));
+    }
     if (scenario() == "probe-timeout" ||
         (scenario() == "probe-pull-timeout" && sink->pipeline->has_seek)) {
       std::this_thread::sleep_for(std::chrono::nanoseconds(timeout_ns));
@@ -980,6 +983,7 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
         : current_scenario == "probe-retimed-constant-pts"                  ? 5'000'000'000ULL
         : current_scenario == "probe-long-untimed-elementary"               ? 600'000'000'000ULL
         : current_scenario == "probe-duplicate-pts-pairs"                   ? 4'000'000'000ULL
+        : current_scenario == "probe-long-duplicate-pts-pairs"              ? 12'000'000'000ULL
         : current_scenario == "probe-duplicate-clustered-missing-groups"    ? 4'000'000'000ULL
         : current_scenario == "probe-duplicate-pts-transition"              ? 20'000'000'000ULL
         : current_scenario == "probe-duplicate-pts-reorder-cutoff"          ? 20'000'000'000ULL

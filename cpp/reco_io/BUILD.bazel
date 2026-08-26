@@ -1,4 +1,4 @@
-load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 
 cc_library(
     name = "reco_io",
@@ -7,6 +7,10 @@ cc_library(
         "src/gstreamer_gpu_decode.cpp",
         "src/gpu_decode.cpp",
         "src/gpu_video_probe.cpp",
+        "src/gpu_video_probe_internal.hpp",
+        "src/gpu_video_probe_process.cpp",
+        "src/gpu_video_probe_protocol.cpp",
+        "src/gpu_video_probe_protocol.hpp",
         "src/jsonl_sink.cpp",
         "src/nvmm.cpp",
         "src/output.cpp",
@@ -31,4 +35,22 @@ cc_library(
         "//cpp/reco_core",
         "@nlohmann_json//:json",
     ],
+)
+
+cc_binary(
+    name = "reco_video_probe_worker",
+    srcs = [
+        "src/gpu_video_probe_internal.hpp",
+        "src/gpu_video_probe_protocol.hpp",
+        "src/gpu_video_probe_worker.cpp",
+        "src/gpu_video_probe_worker_main.cpp",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [":reco_io"],
+)
+
+filegroup(
+    name = "reco_video_probe_runtime",
+    srcs = [":reco_video_probe_worker"],
+    visibility = ["//visibility:public"],
 )

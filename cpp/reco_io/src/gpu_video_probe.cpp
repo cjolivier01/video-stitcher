@@ -1,27 +1,24 @@
 #include "reco/io/gpu_video_probe.hpp"
 
+#include "gpu_video_probe_internal.hpp"
+
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdlib>
-#include <exception>
 #include <filesystem>
 #include <initializer_list>
 #include <iterator>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <numeric>
 #include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
-#include <thread>
-#include <type_traits>
 #include <utility>
 
 #if defined(_WIN32)
@@ -116,11 +113,35 @@ struct GstBufferAbi {
 static_assert(offsetof(GstBufferAbi, pts) == (sizeof(void*) == 8 ? 72 : 40));
 static_assert(sizeof(GstBufferAbi) == (sizeof(void*) == 8 ? 112 : 80));
 
+#if defined(_WIN32)
+std::wstring utf8_to_wide(std::string_view value) {
+  if (value.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    throw GpuVideoProbeError("video-probe runtime path is too long");
+  }
+  const auto size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+                                        static_cast<int>(value.size()), nullptr, 0);
+  if (size <= 0) {
+    throw GpuVideoProbeError("video-probe runtime path is not valid UTF-8");
+  }
+  std::wstring result(static_cast<std::size_t>(size), L'\0');
+  if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+                          static_cast<int>(value.size()), result.data(), size) != size) {
+    throw GpuVideoProbeError("failed to convert video-probe runtime path");
+  }
+  return result;
+}
+#endif
+
 class DynamicLibrary {
 public:
   explicit DynamicLibrary(std::string path) : path_(std::move(path)) {
 #if defined(_WIN32)
-    handle_ = LoadLibraryA(path_.c_str());
+    const auto wide_path = utf8_to_wide(path_);
+    auto flags = LOAD_LIBRARY_SEARCH_DEFAULT_DIRS;
+    if (std::filesystem::path(wide_path).is_absolute()) {
+      flags |= LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR;
+    }
+    handle_ = LoadLibraryExW(wide_path.c_str(), nullptr, flags);
     if (handle_ == nullptr) {
       throw GpuVideoProbeError("failed to load " + path_ + " (Windows error " +
                                std::to_string(GetLastError()) + ")");
@@ -221,7 +242,6 @@ public:
   using BusTimedPopFiltered = void* (*)(void*, std::uint64_t, std::uint32_t);
   using MessageParseError = void (*)(void*, GErrorAbi**, char**);
   using MessageUnref = void (*)(void*);
-  using ObjectRef = void* (*)(void*);
   using ObjectUnref = void (*)(void*);
   using ErrorFree = void (*)(GErrorAbi*);
   using Free = void (*)(void*);
@@ -271,7 +291,6 @@ public:
     bus_timed_pop_filtered = core->symbol<BusTimedPopFiltered>("gst_bus_timed_pop_filtered");
     message_parse_error = core->symbol<MessageParseError>("gst_message_parse_error");
     message_unref = core->symbol<MessageUnref>("gst_mini_object_unref");
-    object_ref = core->symbol<ObjectRef>("gst_object_ref");
     object_unref = core->symbol<ObjectUnref>("gst_object_unref");
     error_free = glib->symbol<ErrorFree>("g_error_free");
     free = glib->symbol<Free>("g_free");
@@ -305,86 +324,10 @@ public:
   BusTimedPopFiltered bus_timed_pop_filtered = nullptr;
   MessageParseError message_parse_error = nullptr;
   MessageUnref message_unref = nullptr;
-  ObjectRef object_ref = nullptr;
   ObjectUnref object_unref = nullptr;
   ErrorFree error_free = nullptr;
   Free free = nullptr;
 };
-
-template <typename Result> struct DeadlineCallState {
-  std::mutex mutex;
-  std::condition_variable condition;
-  std::optional<Result> result;
-  std::exception_ptr error;
-  bool completed = false;
-  bool abandoned = false;
-};
-
-template <typename Operation>
-auto invoke_gstreamer_before_deadline(const std::shared_ptr<ProbeApi>& api, void* pipeline,
-                                      std::chrono::steady_clock::time_point deadline,
-                                      std::string_view timeout_message, bool& cleanup_deferred,
-                                      Operation operation)
-    -> std::invoke_result_t<Operation, void*> {
-  using Result = std::invoke_result_t<Operation, void*>;
-  static_assert(!std::is_void_v<Result>);
-  if (std::chrono::steady_clock::now() >= deadline) {
-    throw GpuVideoProbeError(std::string(timeout_message));
-  }
-
-  void* retained_pipeline = api->object_ref(pipeline);
-  if (retained_pipeline == nullptr) {
-    throw GpuVideoProbeError("failed to retain GStreamer probe pipeline");
-  }
-  auto state = std::make_shared<DeadlineCallState<Result>>();
-  std::thread worker;
-  try {
-    worker =
-        std::thread([api, retained_pipeline, state, operation = std::move(operation)]() mutable {
-          std::optional<Result> result;
-          std::exception_ptr error;
-          try {
-            result.emplace(operation(retained_pipeline));
-          } catch (...) {
-            error = std::current_exception();
-          }
-
-          bool abandoned = false;
-          {
-            std::lock_guard lock(state->mutex);
-            state->result = std::move(result);
-            state->error = error;
-            state->completed = true;
-            abandoned = state->abandoned;
-          }
-          state->condition.notify_one();
-          if (abandoned) {
-            (void)api->element_set_state(retained_pipeline, kGstStateNull);
-          }
-          api->object_unref(retained_pipeline);
-        });
-  } catch (...) {
-    api->object_unref(retained_pipeline);
-    throw;
-  }
-
-  std::unique_lock lock(state->mutex);
-  if (!state->condition.wait_until(lock, deadline, [&state] { return state->completed; })) {
-    state->abandoned = true;
-    cleanup_deferred = true;
-    lock.unlock();
-    worker.detach();
-    throw GpuVideoProbeError(std::string(timeout_message));
-  }
-  auto result = std::move(state->result);
-  const auto error = state->error;
-  lock.unlock();
-  worker.join();
-  if (error != nullptr) {
-    std::rethrow_exception(error);
-  }
-  return std::move(*result);
-}
 
 std::string take_error(const ProbeApi& api, GErrorAbi*& error, std::string_view fallback) {
   std::unique_ptr<GErrorAbi, ProbeApi::ErrorFree> error_owner(std::exchange(error, nullptr),
@@ -887,7 +830,8 @@ struct SelectedStreamProbe {
 FrameSeekResult seek_compressed_frame(const std::shared_ptr<ProbeApi>& api, void* pipeline,
                                       void* probe_sink, void* bus, std::uint64_t stream_origin_ns,
                                       std::uint64_t frame_index, std::uint32_t fps_numerator,
-                                      std::uint32_t fps_denominator, bool& cleanup_deferred,
+                                      std::uint32_t fps_denominator,
+                                      std::size_t timestamp_multiplicity,
                                       std::chrono::steady_clock::time_point deadline) {
   const auto relative_target_ns = frame_timestamp_ns(frame_index, fps_numerator, fps_denominator);
   if (relative_target_ns > std::numeric_limits<std::uint64_t>::max() - stream_origin_ns) {
@@ -896,19 +840,18 @@ FrameSeekResult seek_compressed_frame(const std::shared_ptr<ProbeApi>& api, void
   const auto target_ns = stream_origin_ns + relative_target_ns;
   const auto period_numerator = kNanosecondsPerSecond * fps_denominator;
   const auto half_frame_ns = period_numerator / (2ULL * fps_numerator);
-  const auto earliest_matching_pts = target_ns > half_frame_ns ? target_ns - half_frame_ns : 0;
+  const auto nominal_frame_ns = period_numerator / fps_numerator;
+  const auto duplicate_span_ns =
+      timestamp_multiplicity - 1 > std::numeric_limits<std::uint64_t>::max() / nominal_frame_ns
+          ? std::numeric_limits<std::uint64_t>::max()
+          : nominal_frame_ns * (timestamp_multiplicity - 1);
+  const auto matching_tolerance_ns = add_saturating(duplicate_span_ns, half_frame_ns);
+  const auto earliest_matching_pts =
+      target_ns > matching_tolerance_ns ? target_ns - matching_tolerance_ns : 0;
   if (earliest_matching_pts >
-      static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
-    return {.usable = false};
-  }
-  const auto seek_succeeded = invoke_gstreamer_before_deadline(
-      api, pipeline, deadline, "GStreamer parser-only probe timed out while seeking stream end",
-      cleanup_deferred, [api, earliest_matching_pts](void* retained_pipeline) {
-        return api->element_seek_simple(retained_pipeline, kGstFormatTime,
-                                        kGstSeekFlagFlushAccurate,
-                                        static_cast<std::int64_t>(earliest_matching_pts));
-      });
-  if (seek_succeeded == 0) {
+          static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ||
+      api->element_seek_simple(pipeline, kGstFormatTime, kGstSeekFlagFlushAccurate,
+                               static_cast<std::int64_t>(earliest_matching_pts)) == 0) {
     return {.usable = false};
   }
 
@@ -963,14 +906,17 @@ std::optional<SelectedStreamProbe>
 selected_stream_duration(const std::shared_ptr<ProbeApi>& api, void* pipeline, void* probe_sink,
                          void* bus, std::uint64_t container_duration_ns,
                          std::uint64_t stream_origin_ns, std::uint32_t fps_numerator,
-                         std::uint32_t fps_denominator, bool& cleanup_deferred,
+                         std::uint32_t fps_denominator, std::size_t timestamp_multiplicity,
                          std::chrono::steady_clock::time_point deadline) {
   const auto duration_frame_ceiling =
       frame_count_ceiling_for_duration(container_duration_ns, fps_numerator, fps_denominator);
   if (duration_frame_ceiling == std::numeric_limits<std::uint64_t>::max()) {
     return std::nullopt;
   }
-  const auto search_frame_limit = duration_frame_ceiling + 1;
+  if (timestamp_multiplicity > std::numeric_limits<std::uint64_t>::max() - duration_frame_ceiling) {
+    return std::nullopt;
+  }
+  const auto search_frame_limit = duration_frame_ceiling + timestamp_multiplicity;
   const auto maximum_stream_span_ns =
       minimum_duration_for_frame_count(search_frame_limit, fps_numerator, fps_denominator);
   if (maximum_stream_span_ns == std::numeric_limits<std::uint64_t>::max()) {
@@ -984,7 +930,7 @@ selected_stream_duration(const std::shared_ptr<ProbeApi>& api, void* pipeline, v
     const auto candidate = first + (last - first) / 2;
     const auto result =
         seek_compressed_frame(api, pipeline, probe_sink, bus, stream_origin_ns, candidate,
-                              fps_numerator, fps_denominator, cleanup_deferred, deadline);
+                              fps_numerator, fps_denominator, timestamp_multiplicity, deadline);
     if (!result.usable) {
       return std::nullopt;
     }
@@ -1028,7 +974,8 @@ selected_stream_duration(const std::shared_ptr<ProbeApi>& api, void* pipeline, v
 
 } // namespace
 
-GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config, std::uint64_t timeout_ns) {
+GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& config,
+                                                 std::uint64_t timeout_ns) {
   if (const auto error = validate_gpu_file_decode_config(config); error.has_value()) {
     throw std::invalid_argument(*error);
   }
@@ -1097,23 +1044,12 @@ GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config, std::uint64_t t
     throw GpuVideoProbeError("GStreamer parser-only probe has no message bus");
   }
 
-  bool cleanup_deferred = false;
   struct ResetPipeline {
     std::shared_ptr<ProbeApi> api;
     void* pipeline = nullptr;
-    bool& cleanup_deferred;
-    ~ResetPipeline() {
-      if (!cleanup_deferred) {
-        (void)api->element_set_state(pipeline, kGstStateNull);
-      }
-    }
-  } reset{api, pipeline, cleanup_deferred};
-  const auto playing_result = invoke_gstreamer_before_deadline(
-      api, pipeline, deadline, "GStreamer parser-only probe timed out while entering playing state",
-      cleanup_deferred, [api](void* retained_pipeline) {
-        return api->element_set_state(retained_pipeline, kGstStatePlaying);
-      });
-  if (playing_result == kGstStateChangeFailure) {
+    ~ResetPipeline() { (void)api->element_set_state(pipeline, kGstStateNull); }
+  } reset{api, pipeline};
+  if (api->element_set_state(pipeline, kGstStatePlaying) == kGstStateChangeFailure) {
     throw GpuVideoProbeError("GStreamer parser-only probe failed to enter playing state");
   }
   void* initial_sample = nullptr;
@@ -1221,6 +1157,12 @@ GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config, std::uint64_t t
 
   const auto fps_num = static_cast<std::uint32_t>(fps_numerator);
   const auto fps_den = static_cast<std::uint32_t>(fps_denominator);
+  const auto timestamp_multiplicity =
+      inferred_frame_rate.has_value() &&
+              frame_rates_are_close(fps_num, fps_den, inferred_frame_rate->numerator,
+                                    inferred_frame_rate->denominator, kFrameRatePreferenceTolerance)
+          ? inferred_frame_rate->timestamp_multiplicity
+          : 1U;
   std::uint64_t duration_ns = 0;
   std::uint64_t total_frames = 0;
   std::optional<std::uint64_t> correlated_frame_count;
@@ -1255,27 +1197,17 @@ GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config, std::uint64_t t
     }
   } else {
     total_frames_is_estimated = true;
-    struct DurationQueryResult {
-      int succeeded = 0;
-      std::int64_t duration_ns = 0;
-    };
-    const auto duration_query = invoke_gstreamer_before_deadline(
-        api, pipeline, deadline,
-        "GStreamer parser-only probe timed out while querying stream duration", cleanup_deferred,
-        [api](void* retained_pipeline) {
-          DurationQueryResult result;
-          result.succeeded =
-              api->element_query_duration(retained_pipeline, kGstFormatTime, &result.duration_ns);
-          return result;
-        });
-    duration_is_estimated = duration_query.succeeded == 0 || duration_query.duration_ns <= 0;
+    std::int64_t queried_duration = 0;
+    duration_is_estimated =
+        api->element_query_duration(pipeline, kGstFormatTime, &queried_duration) == 0 ||
+        queried_duration <= 0;
     duration_ns = duration_is_estimated ? kFallbackDurationSeconds * kNanosecondsPerSecond
-                                        : static_cast<std::uint64_t>(duration_query.duration_ns);
+                                        : static_cast<std::uint64_t>(queried_duration);
     if (!config.elementary_stream && !duration_is_estimated &&
         timing_scan.first_stream_time.has_value()) {
       const auto selected_duration = selected_stream_duration(
           api, pipeline, probe_sink, bus, duration_ns, *timing_scan.first_stream_time, fps_num,
-          fps_den, cleanup_deferred, deadline);
+          fps_den, timestamp_multiplicity, deadline);
       if (selected_duration.has_value()) {
         const auto untimed_prefix =
             infer_untimed_presentation_prefix(timing_scan, fps_num, fps_den);
@@ -1291,8 +1223,15 @@ GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config, std::uint64_t t
     } else if (config.elementary_stream) {
       duration_is_estimated = true;
     }
-    total_frames =
-        correlated_frame_count.value_or(frame_count_for_duration(duration_ns, fps_num, fps_den));
+    total_frames = frame_count_for_duration(duration_ns, fps_num, fps_den);
+    if (!correlated_frame_count.has_value() && timestamp_multiplicity > 1) {
+      const auto remainder = total_frames % timestamp_multiplicity;
+      const auto missing_group_frames = remainder == 0 ? 0 : timestamp_multiplicity - remainder;
+      total_frames = add_saturating(total_frames, missing_group_frames);
+      duration_ns =
+          std::max(duration_ns, minimum_duration_for_frame_count(total_frames, fps_num, fps_den));
+    }
+    total_frames = correlated_frame_count.value_or(total_frames);
     total_frames = std::max(total_frames, timing_scan.sample_count);
   }
   return {.width = static_cast<std::uint32_t>(width),
