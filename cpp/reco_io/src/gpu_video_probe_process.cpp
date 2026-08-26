@@ -317,10 +317,15 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
     throw GpuVideoProbeError("failed to duplicate the video probe worker Job handle");
   }
   UniqueHandle child_job(child_job_raw);
+  UniqueHandle start_gate(CreateEventW(&security, TRUE, FALSE, nullptr));
+  if (!start_gate) {
+    throw GpuVideoProbeError("failed to create the video probe worker start gate");
+  }
 
   StartupAttributeList attributes(2);
-  std::array<HANDLE, 5> inherited_handles{child_stdin.get(), child_stdout.get(), child_stderr.get(),
-                                          parent_liveness.get(), child_job.get()};
+  std::array<HANDLE, 6> inherited_handles{child_stdin.get(),  child_stdout.get(),
+                                          child_stderr.get(), parent_liveness.get(),
+                                          child_job.get(),    start_gate.get()};
   if (UpdateProcThreadAttribute(attributes.get(), 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
                                 inherited_handles.data(), sizeof(inherited_handles), nullptr,
                                 nullptr) == 0) {
@@ -339,7 +344,8 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   const auto application = utf8_to_wide(utf8_path);
   auto command_line = L"\"" + application + L"\" --reco-video-probe-worker " +
                       std::to_wstring(reinterpret_cast<std::uintptr_t>(parent_liveness.get())) +
-                      L" " + std::to_wstring(reinterpret_cast<std::uintptr_t>(child_job.get()));
+                      L" " + std::to_wstring(reinterpret_cast<std::uintptr_t>(child_job.get())) +
+                      L" " + std::to_wstring(reinterpret_cast<std::uintptr_t>(start_gate.get()));
   STARTUPINFOEXW startup{};
   startup.StartupInfo.cb = sizeof(startup);
   startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
@@ -357,15 +363,25 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   UniqueHandle process(process_info.hProcess);
   UniqueHandle thread(process_info.hThread);
   thread.reset();
-  parent_liveness.reset();
-  child_job.reset();
   const auto terminate_worker = [&] {
-    if (TerminateJobObject(job.get(), 1) == 0) {
-      (void)TerminateProcess(process.get(), 1);
-    }
+    (void)TerminateJobObject(job.get(), 1);
+    (void)TerminateProcess(process.get(), 1);
     (void)WaitForSingleObject(process.get(), INFINITE);
     job.reset();
   };
+  BOOL worker_in_job = FALSE;
+  if (IsProcessInJob(process.get(), job.get(), &worker_in_job) == 0 ||
+      (worker_in_job == FALSE && AssignProcessToJobObject(job.get(), process.get()) == 0)) {
+    terminate_worker();
+    throw GpuVideoProbeError("failed to verify video probe worker Job containment");
+  }
+  if (SetEvent(start_gate.get()) == 0) {
+    terminate_worker();
+    throw GpuVideoProbeError("failed to release the video probe worker start gate");
+  }
+  start_gate.reset();
+  parent_liveness.reset();
+  child_job.reset();
   if (std::chrono::steady_clock::now() >= deadline) {
     terminate_worker();
     throw_worker_timeout();

@@ -230,16 +230,23 @@ bool start_parent_liveness_watch(const char* parent_argument, const char* job_ar
   }
   try {
     std::thread([parent, job] {
-      if (WaitForSingleObject(parent, INFINITE) != WAIT_OBJECT_0 ||
-          TerminateJobObject(job, 3) == 0) {
-        (void)TerminateProcess(GetCurrentProcess(), 3);
-        std::_Exit(EXIT_FAILURE);
-      }
+      (void)WaitForSingleObject(parent, INFINITE);
+      (void)TerminateJobObject(job, 3);
+      (void)TerminateProcess(GetCurrentProcess(), 3);
+      std::_Exit(EXIT_FAILURE);
     }).detach();
   } catch (...) {
     return false;
   }
   return true;
+}
+
+bool wait_for_start_gate(const char* gate_argument) {
+  HANDLE gate = nullptr;
+  if (!parse_handle(gate_argument, gate) || WaitForSingleObject(gate, INFINITE) != WAIT_OBJECT_0) {
+    return false;
+  }
+  return CloseHandle(gate) != 0;
 }
 #endif
 
@@ -256,7 +263,7 @@ int main(int argc, char** argv) {
   }
 #endif
 #if defined(_WIN32)
-  constexpr int kExpectedArguments = 4;
+  constexpr int kExpectedArguments = 5;
 #else
   constexpr int kExpectedArguments = 3;
 #endif
@@ -274,7 +281,7 @@ int main(int argc, char** argv) {
   if (_setmode(_fileno(stdin), _O_BINARY) == -1 || _setmode(_fileno(stdout), _O_BINARY) == -1) {
     return EXIT_FAILURE;
   }
-  if (!start_parent_liveness_watch(argv[2], argv[3])) {
+  if (!start_parent_liveness_watch(argv[2], argv[3]) || !wait_for_start_gate(argv[4])) {
     return EXIT_FAILURE;
   }
 #endif

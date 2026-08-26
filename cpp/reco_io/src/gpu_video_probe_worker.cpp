@@ -144,10 +144,10 @@ void start_parent_liveness_watch(std::uint64_t expected_parent_pid,
     throw GpuVideoProbeError("video probe worker received invalid lifecycle handles");
   }
   std::thread([parent, job] {
-    if (WaitForSingleObject(parent, INFINITE) != WAIT_OBJECT_0 || TerminateJobObject(job, 3) == 0) {
-      (void)TerminateProcess(GetCurrentProcess(), 3);
-      std::_Exit(3);
-    }
+    (void)WaitForSingleObject(parent, INFINITE);
+    (void)TerminateJobObject(job, 3);
+    (void)TerminateProcess(GetCurrentProcess(), 3);
+    std::_Exit(3);
   }).detach();
 #else
   (void)parent_liveness_handle;
@@ -164,6 +164,20 @@ void start_parent_liveness_watch(std::uint64_t expected_parent_pid,
 #endif
 }
 
+void wait_for_start_gate(std::uintptr_t start_gate_handle) {
+#if defined(_WIN32)
+  const auto start_gate = reinterpret_cast<HANDLE>(start_gate_handle);
+  DWORD flags = 0;
+  if (GetHandleInformation(start_gate, &flags) == 0 ||
+      WaitForSingleObject(start_gate, INFINITE) != WAIT_OBJECT_0) {
+    throw GpuVideoProbeError("video probe worker received an invalid start gate");
+  }
+  (void)CloseHandle(start_gate);
+#else
+  (void)start_gate_handle;
+#endif
+}
+
 } // namespace
 
 #if !defined(_WIN32)
@@ -171,10 +185,12 @@ int run_gpu_video_probe_guard() { return run_process_group_guard(); }
 #endif
 
 int run_gpu_video_probe_worker(std::uint64_t expected_parent_pid,
-                               std::uintptr_t parent_liveness_handle, std::uintptr_t job_handle) {
+                               std::uintptr_t parent_liveness_handle, std::uintptr_t job_handle,
+                               std::uintptr_t start_gate_handle) {
   std::string response;
   try {
     start_parent_liveness_watch(expected_parent_pid, parent_liveness_handle, job_handle);
+    wait_for_start_gate(start_gate_handle);
     const auto payload = read_request();
     const auto request = decode_probe_request(payload);
     response = encode_probe_success(probe_gpu_video_in_process(request.config, request.timeout_ns));

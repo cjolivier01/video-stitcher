@@ -17,7 +17,8 @@
 
 namespace reco::io::detail {
 int run_gpu_video_probe_worker(std::uint64_t expected_parent_pid,
-                               std::uintptr_t parent_liveness_handle, std::uintptr_t job_handle);
+                               std::uintptr_t parent_liveness_handle, std::uintptr_t job_handle,
+                               std::uintptr_t start_gate_handle);
 #if !defined(_WIN32)
 int run_gpu_video_probe_guard();
 #endif
@@ -74,7 +75,7 @@ int main(int argc, char** argv) {
     return 2;
   }
 #if defined(_WIN32)
-  if (argc != 4) {
+  if (argc != 5) {
     return 2;
   }
   const auto parse_handle = [](const char* value, std::uintptr_t& handle) {
@@ -90,13 +91,16 @@ int main(int argc, char** argv) {
   };
   std::uintptr_t parent_liveness_handle = 0;
   std::uintptr_t job_handle = 0;
-  if (!parse_handle(argv[2], parent_liveness_handle) || !parse_handle(argv[3], job_handle)) {
+  std::uintptr_t start_gate_handle = 0;
+  if (!parse_handle(argv[2], parent_liveness_handle) || !parse_handle(argv[3], job_handle) ||
+      !parse_handle(argv[4], start_gate_handle)) {
     return 2;
   }
   if (_setmode(_fileno(stdin), _O_BINARY) == -1 || _setmode(_fileno(stdout), _O_BINARY) == -1) {
     return 2;
   }
-  return reco::io::detail::run_gpu_video_probe_worker(0, parent_liveness_handle, job_handle);
+  return reco::io::detail::run_gpu_video_probe_worker(0, parent_liveness_handle, job_handle,
+                                                      start_gate_handle);
 #else
   if (argc != 3) {
     return 2;
@@ -115,6 +119,6 @@ int main(int argc, char** argv) {
       expected_parent_pid == 0 || (value[separator + 1] == '0' && !close_unrelated_descriptors())) {
     return 2;
   }
-  return reco::io::detail::run_gpu_video_probe_worker(expected_parent_pid, 0, 0);
+  return reco::io::detail::run_gpu_video_probe_worker(expected_parent_pid, 0, 0, 0);
 #endif
 }
