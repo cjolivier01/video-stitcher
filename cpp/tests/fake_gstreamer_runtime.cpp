@@ -81,6 +81,7 @@ struct FakeSink : FakeObject {
 struct FakeBus : FakeObject {
   FakeBus() : FakeObject(ObjectKind::Bus) {}
   bool emitted_error = false;
+  std::uint32_t poll_count = 0;
 };
 
 struct FakeMessage {};
@@ -165,7 +166,7 @@ FakeSample* make_sample() {
 RECO_FAKE_EXPORT void gst_version(std::uint32_t* major, std::uint32_t* minor, std::uint32_t* micro,
                                   std::uint32_t* nano) {
   *major = 1;
-  *minor = 28;
+  *minor = scenario() == "old-version" ? 8 : 28;
   *micro = 2;
   *nano = 0;
 }
@@ -233,7 +234,7 @@ RECO_FAKE_EXPORT void gst_object_unref(void* object) {
   }
 }
 
-RECO_FAKE_EXPORT void* gst_app_sink_pull_sample(void* sink_pointer) {
+RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uint64_t) {
   record("pull");
   auto* sink = static_cast<FakeSink*>(sink_pointer);
   const auto current = sink->pull_count++;
@@ -283,7 +284,10 @@ RECO_FAKE_EXPORT void gst_buffer_unmap(void*, GstMapInfoAbi*) { record("unmap");
 RECO_FAKE_EXPORT void* gst_bus_timed_pop_filtered(void* bus_pointer, std::uint64_t,
                                                   std::uint32_t types) {
   auto* bus = static_cast<FakeBus*>(bus_pointer);
-  if (scenario() != "stream-error" || bus->emitted_error || (types & (1U << 1U)) == 0) {
+  ++bus->poll_count;
+  const bool ready = scenario() == "stream-error" ||
+                     (scenario() == "delayed-stream-error" && bus->poll_count >= 2);
+  if (!ready || bus->emitted_error || (types & (1U << 1U)) == 0) {
     return nullptr;
   }
   bus->emitted_error = true;

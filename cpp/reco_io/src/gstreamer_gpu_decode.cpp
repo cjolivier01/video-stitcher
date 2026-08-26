@@ -27,7 +27,7 @@ constexpr int kGstStatePlaying = 4;
 constexpr int kGstStateChangeFailure = 0;
 constexpr std::uint32_t kGstMessageError = 1U << 1U;
 constexpr std::uint64_t kGstClockTimeNone = std::numeric_limits<std::uint64_t>::max();
-constexpr std::uint64_t kPipelineErrorWaitNs = 100'000'000;
+constexpr std::uint64_t kSamplePollTimeoutNs = 100'000'000;
 
 struct GErrorAbi {
   std::uint32_t domain = 0;
@@ -163,7 +163,7 @@ public:
   using ElementSetState = int (*)(void*, int);
   using ElementGetBus = void* (*)(void*);
   using ObjectUnref = void (*)(void*);
-  using AppSinkPullSample = void* (*)(void*);
+  using AppSinkTryPullSample = void* (*)(void*, std::uint64_t);
   using AppSinkIsEos = int (*)(void*);
   using SampleGetBuffer = void* (*)(void*);
   using SampleUnref = void (*)(void*);
@@ -214,7 +214,8 @@ public:
         core_library->symbol<BusTimedPopFiltered>("gst_bus_timed_pop_filtered");
     message_parse_error = core_library->symbol<MessageParseError>("gst_message_parse_error");
     message_unref = core_library->symbol<MessageUnref>("gst_message_unref");
-    app_sink_pull_sample = app_library->symbol<AppSinkPullSample>("gst_app_sink_pull_sample");
+    app_sink_try_pull_sample =
+        app_library->symbol<AppSinkTryPullSample>("gst_app_sink_try_pull_sample");
     app_sink_is_eos = app_library->symbol<AppSinkIsEos>("gst_app_sink_is_eos");
     error_free = glib_library->symbol<ErrorFree>("g_error_free");
     free = glib_library->symbol<Free>("g_free");
@@ -230,7 +231,7 @@ public:
   ElementSetState element_set_state = nullptr;
   ElementGetBus element_get_bus = nullptr;
   ObjectUnref object_unref = nullptr;
-  AppSinkPullSample app_sink_pull_sample = nullptr;
+  AppSinkTryPullSample app_sink_try_pull_sample = nullptr;
   AppSinkIsEos app_sink_is_eos = nullptr;
   SampleGetBuffer sample_get_buffer = nullptr;
   SampleUnref sample_unref = nullptr;
@@ -314,8 +315,9 @@ public:
     std::uint32_t micro = 0;
     std::uint32_t nano = 0;
     api_->version(&major, &minor, &micro, &nano);
-    if (major != 1) {
-      throw GpuDecodeError("unsupported GStreamer runtime major version " + std::to_string(major));
+    if (major != 1 || minor < 10) {
+      throw GpuDecodeError("GStreamer 1.10 or newer is required, found " + std::to_string(major) +
+                           "." + std::to_string(minor));
     }
 
     GErrorAbi* error = nullptr;
@@ -356,19 +358,19 @@ public:
       return make_gpu_decode_eos();
     }
 
-    void* sample = api_->app_sink_pull_sample(sink_);
-    if (sample == nullptr) {
-      if (const auto error = pop_pipeline_error(0); !error.empty()) {
+    void* sample = nullptr;
+    while (sample == nullptr) {
+      sample = api_->app_sink_try_pull_sample(sink_, kSamplePollTimeoutNs);
+      if (sample != nullptr) {
+        break;
+      }
+      if (const auto error = pop_pipeline_error(); !error.empty()) {
         throw GpuDecodeError(error);
       }
       if (api_->app_sink_is_eos(sink_) != 0) {
         ended_ = true;
         return make_gpu_decode_eos();
       }
-      if (const auto error = pop_pipeline_error(kPipelineErrorWaitNs); !error.empty()) {
-        throw GpuDecodeError(error);
-      }
-      throw GpuDecodeError("GStreamer appsink stopped without EOS or an error message");
     }
 
     auto owner = std::make_shared<GstSampleOwner>(api_, sample);
@@ -402,8 +404,8 @@ public:
   }
 
 private:
-  [[nodiscard]] std::string pop_pipeline_error(std::uint64_t timeout_ns) {
-    void* message = api_->bus_timed_pop_filtered(bus_, timeout_ns, kGstMessageError);
+  [[nodiscard]] std::string pop_pipeline_error() {
+    void* message = api_->bus_timed_pop_filtered(bus_, 0, kGstMessageError);
     if (message == nullptr) {
       return {};
     }

@@ -222,8 +222,9 @@ void concurrent_reads_serialize_appsink_access() {
 
 void runtime_failures_are_reported() {
   for (const auto& [scenario_name, fragment] :
-       std::array<std::pair<std::string_view, std::string_view>, 5>{
-           {{"init-error", "fake initialization failure"},
+       std::array<std::pair<std::string_view, std::string_view>, 6>{
+           {{"old-version", "1.10 or newer"},
+            {"init-error", "fake initialization failure"},
             {"parse-error", "fake parse failure"},
             {"missing-sink", "does not contain appsink"},
             {"missing-bus", "does not provide a message bus"},
@@ -240,10 +241,10 @@ void runtime_failures_are_reported() {
   for (const auto& [scenario_name, fragment] :
        std::array<std::pair<std::string_view, std::string_view>, 5>{
            {{"stream-error", "fake decoder failure"},
+            {"delayed-stream-error", "fake decoder failure"},
             {"missing-buffer", "does not contain a buffer"},
             {"map-error", "failed to map"},
-            {"invalid-surface", "filled-buffer count"},
-            {"no-eos", "without EOS"}}}) {
+            {"invalid-surface", "filled-buffer count"}}}) {
     set_scenario(scenario_name);
     auto source =
         open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
