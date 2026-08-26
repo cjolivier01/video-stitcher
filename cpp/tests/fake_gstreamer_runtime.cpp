@@ -74,6 +74,7 @@ struct FakeObject {
 struct FakePipeline;
 
 using FakePadProbeCallback = int (*)(void*, void*, void*);
+using FakeDestroyNotify = void (*)(void*);
 
 struct FakeSink : FakeObject {
   explicit FakeSink(FakePipeline* owner) : FakeObject(ObjectKind::Sink), pipeline(owner) {}
@@ -97,6 +98,7 @@ struct FakePad : FakeObject {
   FakePad() : FakeObject(ObjectKind::Pad) {}
   FakePadProbeCallback callback = nullptr;
   void* callback_data = nullptr;
+  FakeDestroyNotify destroy_notify = nullptr;
   unsigned long probe_id = 0;
   std::uint32_t current_width = 1280;
   std::uint32_t current_height = 720;
@@ -168,8 +170,10 @@ FakeSample* make_sample(std::uint32_t sample_index = 0) {
     sample->buffer.pts = std::numeric_limits<std::uint64_t>::max();
     sample->buffer.duration = std::numeric_limits<std::uint64_t>::max();
   } else if (scenario() == "caps-runahead" || scenario() == "caps-runahead-stale-caps" ||
-             scenario() == "duplicate-transition-pts") {
+             scenario() == "duplicate-transition-pts" || scenario() == "same-allocation-runahead") {
     sample->buffer.pts = (static_cast<std::uint64_t>(sample_index) + 1U) * 1'000'000'000ULL;
+  } else if (scenario() == "drop-transition-first") {
+    sample->buffer.pts = 2'000'000'000ULL;
   }
 
   sample->params.width =
@@ -216,6 +220,9 @@ std::uint32_t predecoder_width(std::uint32_t sample_index) {
   if ((scenario() == "caps-runahead" || scenario() == "caps-runahead-unknown-time") &&
       sample_index == 0) {
     return 854;
+  }
+  if (scenario() == "same-allocation-runahead" || scenario() == "drop-transition-first") {
+    return sample_index == 0 ? 1100 : 1200;
   }
   return 1280;
 }
@@ -349,7 +356,7 @@ RECO_FAKE_EXPORT void* gst_pad_get_current_caps(void* pad_pointer) {
 
 RECO_FAKE_EXPORT unsigned long gst_pad_add_probe(void* pad_pointer, int,
                                                  FakePadProbeCallback callback, void* user_data,
-                                                 void (*)(void*)) {
+                                                 FakeDestroyNotify destroy_notify) {
   record("add-display-probe");
   if (scenario() == "probe-install-error") {
     return 0;
@@ -357,6 +364,7 @@ RECO_FAKE_EXPORT unsigned long gst_pad_add_probe(void* pad_pointer, int,
   auto* pad = static_cast<FakePad*>(pad_pointer);
   pad->callback = callback;
   pad->callback_data = user_data;
+  pad->destroy_notify = destroy_notify;
   pad->probe_id = 1;
   return pad->probe_id;
 }
@@ -365,9 +373,16 @@ RECO_FAKE_EXPORT void gst_pad_remove_probe(void* pad_pointer, unsigned long prob
   record("remove-display-probe");
   auto* pad = static_cast<FakePad*>(pad_pointer);
   if (pad->probe_id == probe_id) {
+    auto* callback_data = pad->callback_data;
+    const auto destroy_notify = pad->destroy_notify;
     pad->callback = nullptr;
     pad->callback_data = nullptr;
+    pad->destroy_notify = nullptr;
     pad->probe_id = 0;
+    if (destroy_notify != nullptr) {
+      record("destroy-display-probe-data");
+      destroy_notify(callback_data);
+    }
   }
 }
 
@@ -404,9 +419,20 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     }
     return sample;
   }
+  if (current_scenario == "drop-transition-first" && current == 0) {
+    auto* sample = make_sample(current);
+    GstBufferAbi old_buffer;
+    old_buffer.pts = 1'000'000'000ULL;
+    push_predecoder_buffer(sink->pipeline->display_pad, old_buffer, predecoder_width(0),
+                           predecoder_height());
+    push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, predecoder_width(1),
+                           predecoder_height());
+    return sample;
+  }
   const bool caps_runahead = current_scenario == "caps-runahead" ||
                              current_scenario == "caps-runahead-unknown-time" ||
-                             current_scenario == "caps-runahead-stale-caps";
+                             current_scenario == "caps-runahead-stale-caps" ||
+                             current_scenario == "same-allocation-runahead";
   if (caps_runahead && current < 2) {
     auto* sample = make_sample(current);
     if (current == 0) {
@@ -442,10 +468,13 @@ RECO_FAKE_EXPORT int gst_app_sink_is_eos(void* sink_pointer) {
   return (current_scenario == "frame-eos" || current_scenario == "unknown-time" ||
           current_scenario == "visible-crop" || current_scenario == "caps-runahead" ||
           current_scenario == "caps-runahead-unknown-time" ||
-          current_scenario == "caps-runahead-stale-caps") &&
+          current_scenario == "caps-runahead-stale-caps" ||
+          current_scenario == "same-allocation-runahead" ||
+          current_scenario == "drop-transition-first") &&
          sink->pull_count >= (current_scenario == "caps-runahead" ||
                                       current_scenario == "caps-runahead-unknown-time" ||
-                                      current_scenario == "caps-runahead-stale-caps"
+                                      current_scenario == "caps-runahead-stale-caps" ||
+                                      current_scenario == "same-allocation-runahead"
                                   ? 3U
                                   : 2U);
 }

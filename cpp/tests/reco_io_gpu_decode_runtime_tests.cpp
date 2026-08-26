@@ -151,6 +151,8 @@ void production_source_retains_mapped_sample() {
   expect_eq(count_event(events, "state-null"), 1U, "source shutdown stops pipeline");
   expect_eq(count_event(events, "remove-display-probe"), 1U,
             "source shutdown removes the geometry callback");
+  expect_eq(count_event(events, "destroy-display-probe-data"), 1U,
+            "GStreamer owns and destroys the geometry callback state");
   expect_eq(count_event(events, "probe-leaked"), 0U,
             "geometry callback does not outlive its source");
   expect_eq(count_event(events, "unmap"), 0U,
@@ -237,6 +239,43 @@ void duplicate_pts_at_geometry_transition_is_ambiguous() {
   expect_gpu_decode_error([&] { (void)source->read(); },
                           "timestamp is ambiguous at a geometry transition",
                           "duplicate PTS cannot relabel an old allocation with new geometry");
+}
+
+void valid_transition_with_unchanged_allocation_is_correlated() {
+  set_scenario("same-allocation-runahead");
+  auto source =
+      open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+
+  const auto first = source->read();
+  expect_true(first.frame.has_value(), "same-allocation first frame returned");
+  if (first.frame.has_value()) {
+    expect_eq(first.frame->nvmm.width, 1280U, "same-allocation first padded width");
+    expect_eq(first.frame->visible_width, 1100U, "same-allocation first visible width");
+  }
+
+  const auto second = source->read();
+  expect_true(second.frame.has_value(), "same-allocation transition frame returned");
+  if (second.frame.has_value()) {
+    expect_eq(second.frame->nvmm.width, 1280U, "same-allocation second padded width");
+    expect_eq(second.frame->visible_width, 1200U, "same-allocation second visible width");
+  }
+}
+
+void dropped_first_frame_can_land_on_exact_transition() {
+  set_scenario("drop-transition-first");
+  auto config = valid_config();
+  config.drop = true;
+  auto source =
+      open_gstreamer_gpu_file_decode_source(std::move(config), NvbufSurfaceAbi::DeepStream9_1);
+
+  const auto result = source->read();
+  expect_true(result.frame.has_value(), "dropped exact-transition frame returned");
+  if (result.frame.has_value()) {
+    expect_eq(result.frame->pts_ns.value_or(0), 2'000'000'000ULL,
+              "dropped exact-transition PTS preserved");
+    expect_eq(result.frame->visible_width, 1200U,
+              "dropped exact-transition frame uses current geometry");
+  }
 }
 
 void stale_parser_caps_reject_allocation_changes() {
@@ -427,6 +466,8 @@ int main() {
   padded_sink_caps_preserve_predecoder_dimensions();
   runahead_caps_are_correlated_by_timestamp();
   duplicate_pts_at_geometry_transition_is_ambiguous();
+  valid_transition_with_unchanged_allocation_is_correlated();
+  dropped_first_frame_can_land_on_exact_transition();
   stale_parser_caps_reject_allocation_changes();
   dropped_samples_do_not_accumulate_geometry_records();
   first_frame_rejects_grossly_stale_geometry();
