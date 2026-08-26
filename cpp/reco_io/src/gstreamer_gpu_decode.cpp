@@ -450,8 +450,9 @@ public:
       }
       if (selected != transitions_.begin() && selected->pts_ns == pts_ns) {
         const auto previous = std::prev(selected);
-        if (previous->last_pts_ns == pts_ns && previous_allocation_dimensions.has_value() &&
-            *previous_allocation_dimensions == allocation_dimensions) {
+        if (previous->last_pts_ns == pts_ns &&
+            (!previous_allocation_dimensions.has_value() ||
+             *previous_allocation_dimensions == allocation_dimensions)) {
           throw GpuDecodeError(
               "GStreamer decoded frame timestamp is ambiguous at a geometry transition");
         }

@@ -278,6 +278,18 @@ void dropped_first_frame_can_land_on_exact_transition() {
   }
 }
 
+void dropped_first_duplicate_pts_at_transition_is_ambiguous() {
+  set_scenario("drop-duplicate-transition-first");
+  auto config = valid_config();
+  config.drop = true;
+  auto source =
+      open_gstreamer_gpu_file_decode_source(std::move(config), NvbufSurfaceAbi::DeepStream9_1);
+
+  expect_gpu_decode_error([&] { (void)source->read(); },
+                          "timestamp is ambiguous at a geometry transition",
+                          "first retained duplicate-PTS boundary frame remains ambiguous");
+}
+
 void stale_parser_caps_reject_allocation_changes() {
   set_scenario("caps-runahead-stale-caps");
   auto source =
@@ -468,6 +480,7 @@ int main() {
   duplicate_pts_at_geometry_transition_is_ambiguous();
   valid_transition_with_unchanged_allocation_is_correlated();
   dropped_first_frame_can_land_on_exact_transition();
+  dropped_first_duplicate_pts_at_transition_is_ambiguous();
   stale_parser_caps_reject_allocation_changes();
   dropped_samples_do_not_accumulate_geometry_records();
   first_frame_rejects_grossly_stale_geometry();

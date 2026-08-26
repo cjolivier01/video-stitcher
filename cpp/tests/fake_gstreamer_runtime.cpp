@@ -172,7 +172,8 @@ FakeSample* make_sample(std::uint32_t sample_index = 0) {
   } else if (scenario() == "caps-runahead" || scenario() == "caps-runahead-stale-caps" ||
              scenario() == "duplicate-transition-pts" || scenario() == "same-allocation-runahead") {
     sample->buffer.pts = (static_cast<std::uint64_t>(sample_index) + 1U) * 1'000'000'000ULL;
-  } else if (scenario() == "drop-transition-first") {
+  } else if (scenario() == "drop-transition-first" ||
+             scenario() == "drop-duplicate-transition-first") {
     sample->buffer.pts = 2'000'000'000ULL;
   }
 
@@ -427,6 +428,17 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
                            predecoder_height());
     push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, predecoder_width(1),
                            predecoder_height());
+    return sample;
+  }
+  if (current_scenario == "drop-duplicate-transition-first" && current == 0) {
+    auto* sample = make_sample(current);
+    GstBufferAbi earlier_old_buffer;
+    earlier_old_buffer.pts = 1'000'000'000ULL;
+    push_predecoder_buffer(sink->pipeline->display_pad, earlier_old_buffer, 1280, 720);
+    push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, 1280, 720);
+    GstBufferAbi next_buffer;
+    next_buffer.pts = sample->buffer.pts;
+    push_predecoder_buffer(sink->pipeline->display_pad, next_buffer, 1100, 720);
     return sample;
   }
   const bool caps_runahead = current_scenario == "caps-runahead" ||
