@@ -284,3 +284,78 @@ impl Akaze {
         (keypoints, descriptors)
     }
 }
+
+#[cfg(test)]
+mod cpp_parity_tests {
+    use super::*;
+    use ::image::{DynamicImage, GrayImage};
+
+    #[test]
+    fn single_sublevel_multi_octave_golden() {
+        let size = 192u32;
+        let mut gray = vec![0u8; (size * size) as usize];
+        for y in 0..size {
+            for x in 0..size {
+                let mut hash = x
+                    .wrapping_mul(0x9e37_79b9)
+                    .wrapping_add(y.wrapping_mul(0x85eb_ca6b));
+                hash ^= hash >> 16;
+                hash = hash.wrapping_mul(0x7feb_352d);
+                hash ^= hash >> 15;
+                gray[(y * size + x) as usize] = (hash >> 24) as u8;
+            }
+        }
+        let image = DynamicImage::ImageLuma8(GrayImage::from_raw(size, size, gray).unwrap());
+        let detector = Akaze::builder()
+            .threshold(0.0001)
+            .num_sublevels(1)
+            .max_octave_evolution(2)
+            .build();
+        let (points, descriptors) = detector.extract(&image);
+        let mut pairs: Vec<_> = points.into_iter().zip(descriptors).collect();
+        pairs.sort_by(|lhs, rhs| rhs.0.response.total_cmp(&lhs.0.response));
+        pairs.truncate(8);
+        let expected: [(f32, f32, f32, u64); 8] = [
+            (145.971_4, 91.091_18, 0.007_582_044, 0xaad2_7300_bf98_bf85),
+            (139.686_94, 70.186_005, 0.006_565_546, 0x5543_f2d2_04f5_066a),
+            (
+                112.508_705,
+                114.866_55,
+                0.006_493_865_5,
+                0x5ef3_c7c5_3a73_2e1a,
+            ),
+            (
+                109.104_33,
+                50.350_243,
+                0.006_122_364_7,
+                0x6391_2f75_a777_a366,
+            ),
+            (
+                31.625_605,
+                117.065_25,
+                0.005_789_659_5,
+                0x1fac_9f6c_2818_eca1,
+            ),
+            (139.708_63, 99.887_5, 0.005_627_152_5, 0x9d13_b095_7795_803d),
+            (96.377_85, 29.344_637, 0.005_588_544, 0x00a4_e28f_dc35_3062),
+            (
+                113.278_81,
+                77.035_09,
+                0.005_495_154_8,
+                0x5edb_53ab_09ce_ee26,
+            ),
+        ];
+        assert_eq!(pairs.len(), expected.len());
+        for ((point, descriptor), golden) in pairs.into_iter().zip(expected) {
+            let hash = descriptor
+                .iter()
+                .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+                    (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+                });
+            assert!((point.point.0 - golden.0).abs() <= 2.0e-4);
+            assert!((point.point.1 - golden.1).abs() <= 2.0e-4);
+            assert!((point.response - golden.2).abs() <= 1.0e-7);
+            assert_eq!(hash, golden.3);
+        }
+    }
+}

@@ -820,6 +820,8 @@ __device__ unsigned int akaze_first_cached_overlap(
 extern "C" __global__ void akaze_select_scale_extrema(
     unsigned long long candidates,
     unsigned int candidate_count,
+    unsigned int candidate_begin,
+    unsigned int batch_count,
     unsigned long long levels,
     unsigned int level_count,
     unsigned long long cache_indices,
@@ -837,7 +839,12 @@ extern "C" __global__ void akaze_select_scale_extrema(
   unsigned int* count = akaze_pointer<unsigned int>(cache_count);
   unsigned int* selected = akaze_pointer<unsigned int>(selected_flags);
 
-  for (unsigned int index = 0U; index < candidate_count; ++index) {
+  const unsigned int available = candidate_begin < candidate_count
+      ? candidate_count - candidate_begin
+      : 0U;
+  const unsigned int candidate_end = candidate_begin +
+      (batch_count < available ? batch_count : available);
+  for (unsigned int index = candidate_begin; index < candidate_end; ++index) {
     const AkazeCandidate current = values[index];
     if (current.level >= level_count) {
       continue;
@@ -888,20 +895,22 @@ extern "C" __global__ void akaze_select_scale_extrema(
     selected[index] = 1U;
   }
 
-  // Rust performs a second pass over the completed cache. A lower-scale
-  // entry is discarded when a later cache slot from the next scale overlaps
-  // it, including entries that replaced an earlier cache value in place.
-  for (unsigned int slot = 0U; slot < *count; ++slot) {
-    const unsigned int index = indices[slot];
-    const AkazeCandidate current = values[index];
-    if (current.level + 1U >= level_count) {
-      continue;
-    }
-    const unsigned int upper_slot = akaze_first_cached_overlap(
-        current, current.level + 1U, selection_levels, values, indices, cells, *count, slot,
-        true);
-    if (upper_slot != 0xffffffffU) {
-      selected[index] = 0U;
+  if (candidate_end == candidate_count) {
+    // Rust performs a second pass over the completed cache. A lower-scale
+    // entry is discarded when a later cache slot from the next scale overlaps
+    // it, including entries that replaced an earlier cache value in place.
+    for (unsigned int slot = 0U; slot < *count; ++slot) {
+      const unsigned int index = indices[slot];
+      const AkazeCandidate current = values[index];
+      if (current.level + 1U >= level_count) {
+        continue;
+      }
+      const unsigned int upper_slot = akaze_first_cached_overlap(
+          current, current.level + 1U, selection_levels, values, indices, cells, *count, slot,
+          true);
+      if (upper_slot != 0xffffffffU) {
+        selected[index] = 0U;
+      }
     }
   }
 }
@@ -955,11 +964,13 @@ __device__ bool akaze_make_feature(
   return true;
 }
 
-// Creates descending-response radix keys. Candidate order is already
-// level-major/row-major; stable radix passes therefore preserve response ties.
+// Creates descending-response radix keys in Rust accepted-cache slot order.
+// Stable radix passes therefore preserve response ties after cache replacement.
 extern "C" __global__ void akaze_prepare_feature_keys(
     unsigned long long candidates,
     unsigned int candidate_count,
+    unsigned long long cache_indices,
+    unsigned long long cache_count,
     unsigned long long selected_flags,
     unsigned long long keys,
     unsigned long long indices,
@@ -982,10 +993,16 @@ extern "C" __global__ void akaze_prepare_feature_keys(
   if (index >= candidate_count) {
     return;
   }
-  akaze_pointer<unsigned int>(indices)[index] = index;
+  const unsigned int accepted_count = *akaze_const_pointer<unsigned int>(cache_count);
+  const unsigned int candidate_index = index < accepted_count
+      ? akaze_const_pointer<unsigned int>(cache_indices)[index]
+      : 0U;
+  akaze_pointer<unsigned int>(indices)[index] = candidate_index;
   unsigned int key = 0xffffffffU;
-  if (akaze_const_pointer<unsigned int>(selected_flags)[index] != 0U) {
-    const AkazeCandidate candidate = akaze_const_pointer<AkazeCandidate>(candidates)[index];
+  if (index < accepted_count && candidate_index < candidate_count &&
+      akaze_const_pointer<unsigned int>(selected_flags)[candidate_index] != 0U) {
+    const AkazeCandidate candidate =
+        akaze_const_pointer<AkazeCandidate>(candidates)[candidate_index];
     AkazeFeaturePoint point;
     float detector_x;
     float detector_y;

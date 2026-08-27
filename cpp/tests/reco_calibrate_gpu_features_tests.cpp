@@ -382,6 +382,10 @@ void api_validation(CudaBackend& backend, const GpuAkazePipeline& pipeline,
   expect_invalid_argument([&] { (void)pipeline.detect(valid_frame.view(), invalid_config); },
                           "detector zero octaves");
   invalid_config = config;
+  invalid_config.border_margin = kMaxCalibrationDimension + 1U;
+  expect_invalid_argument([&] { (void)pipeline.detect(valid_frame.view(), invalid_config); },
+                          "detector oversized border margin");
+  invalid_config = config;
   invalid_config.use_region = true;
   invalid_config.region = {.x_min = 0.75F, .x_max = 0.25F, .y_min = 0.0F, .y_max = 1.0F};
   expect_invalid_argument([&] { (void)pipeline.detect(valid_frame.view(), invalid_config); },
@@ -625,6 +629,59 @@ void crop_and_non_power_resize_matches_rust_golden(CudaBackend& backend,
     if (index < descriptors.size()) {
       expect_eq(descriptor_hash(descriptors[index]), rust_golden[index].descriptor_hash,
                 "crop-resize Rust-golden descriptor");
+    }
+  }
+}
+
+void single_sublevel_multi_octave_matches_rust_golden(CudaBackend& backend,
+                                                      const GpuAkazePipeline& pipeline) {
+  constexpr std::uint32_t size = 192;
+  std::vector<std::uint8_t> pixels(static_cast<std::size_t>(size) * size);
+  for (std::uint32_t y = 0; y < size; ++y) {
+    for (std::uint32_t x = 0; x < size; ++x) {
+      std::uint32_t hash = x * 0x9e3779b9U + y * 0x85ebca6bU;
+      hash ^= hash >> 16U;
+      hash *= 0x7feb352dU;
+      hash ^= hash >> 15U;
+      pixels[static_cast<std::size_t>(y) * size + x] = static_cast<std::uint8_t>(hash >> 24U);
+    }
+  }
+  const auto frame = make_frame_from_pixels(backend, std::move(pixels), size, size);
+  auto config = detector_config(8);
+  config.num_sublevels = 1;
+  config.max_octaves = 2;
+  const auto features = pipeline.detect(frame.view(), config);
+  const auto points = download_points(backend, features);
+  const auto descriptors = feature_descriptors(backend, features);
+
+  struct GoldenFeature {
+    float x;
+    float y;
+    float response;
+    std::uint64_t descriptor_hash;
+  };
+  constexpr std::array<GoldenFeature, 8> rust_golden{{
+      {145.971405029297F, 91.091178894043F, 0.007582044229F, 0xaad27300bf98bf85ULL},
+      {139.686935424805F, 70.186004638672F, 0.006565546151F, 0x5543f2d204f5066aULL},
+      {112.508705139160F, 114.866546630859F, 0.006493865512F, 0x5ef3c7c53a732e1aULL},
+      {109.104331970215F, 50.350242614746F, 0.006122364663F, 0x63912f75a777a366ULL},
+      {31.625604629517F, 117.065246582031F, 0.005789659452F, 0x1fac9f6c2818eca1ULL},
+      {139.708633422852F, 99.887496948242F, 0.005627152510F, 0x9d13b0957795803dULL},
+      {96.377853393555F, 29.344636917114F, 0.005588544067F, 0x00a4e28fdc353062ULL},
+      {113.278808593750F, 77.035087585449F, 0.005495154765F, 0x5edb53ab09ceee26ULL},
+  }};
+  expect_eq(points.size(), rust_golden.size(), "single-sublevel Rust-golden feature count");
+  expect_eq(descriptors.size(), rust_golden.size(), "single-sublevel Rust-golden descriptor count");
+  for (std::size_t index = 0; index < std::min(points.size(), rust_golden.size()); ++index) {
+    expect_near(points[index].x, rust_golden[index].x, 2.0e-4F,
+                "single-sublevel Rust-golden feature x");
+    expect_near(points[index].y, rust_golden[index].y, 2.0e-4F,
+                "single-sublevel Rust-golden feature y");
+    expect_near(points[index].response, rust_golden[index].response, 1.0e-7F,
+                "single-sublevel Rust-golden feature response");
+    if (index < descriptors.size()) {
+      expect_eq(descriptor_hash(descriptors[index]), rust_golden[index].descriptor_hash,
+                "single-sublevel Rust-golden descriptor");
     }
   }
 }
@@ -885,8 +942,9 @@ int main() {
 
   const auto shard = test_shard();
   if (shard != "all" && shard != "contracts" && shard != "detection" && shard != "golden" &&
-      shard != "triangle" && shard != "crop" && shard != "selection" && shard != "selection-race" &&
-      shard != "selection-full" && shard != "rotation" && shard != "matching") {
+      shard != "triangle" && shard != "crop" && shard != "contrast" && shard != "selection" &&
+      shard != "selection-race" && shard != "selection-full" && shard != "rotation" &&
+      shard != "matching") {
     std::cerr << "FAIL: unknown CUDA feature test shard: " << shard << '\n';
     return EXIT_FAILURE;
   }
@@ -911,6 +969,9 @@ int main() {
     }
     if (shard_enabled(shard, "golden") || shard == "crop") {
       crop_and_non_power_resize_matches_rust_golden(backend, pipeline);
+    }
+    if (shard_enabled(shard, "golden") || shard == "contrast") {
+      single_sublevel_multi_octave_matches_rust_golden(backend, pipeline);
     }
     if (shard == "selection-full") {
       full_resolution_adversarial_selection_is_bounded(backend, pipeline);

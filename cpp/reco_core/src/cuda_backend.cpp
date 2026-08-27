@@ -1,7 +1,7 @@
 #include "reco/core/cuda_backend.hpp"
 
-#include <array>
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -153,7 +153,8 @@ void validate_2d_shape(std::size_t src_pitch, std::size_t dst_pitch, std::size_t
 
 void validate_dim3(CudaDim3 dim, const char* name) {
   if (dim.x == 0 || dim.y == 0 || dim.z == 0) {
-    throw std::invalid_argument(std::string("CUDA kernel ") + name + " dimensions must be non-zero");
+    throw std::invalid_argument(std::string("CUDA kernel ") + name +
+                                " dimensions must be non-zero");
   }
 }
 
@@ -246,13 +247,11 @@ struct CudaBackend::Impl {
     cu_memcpy_dtoh = driver.symbol<decltype(cu_memcpy_dtoh)>("cuMemcpyDtoH_v2");
     cu_mem_get_info = driver.symbol<decltype(cu_mem_get_info)>("cuMemGetInfo_v2");
     cu_mem_get_allocation_granularity =
-        driver.symbol<decltype(cu_mem_get_allocation_granularity)>(
-            "cuMemGetAllocationGranularity");
+        driver.symbol<decltype(cu_mem_get_allocation_granularity)>("cuMemGetAllocationGranularity");
     cu_mem_address_reserve = driver.symbol<decltype(cu_mem_address_reserve)>("cuMemAddressReserve");
     cu_mem_create = driver.symbol<decltype(cu_mem_create)>("cuMemCreate");
     cu_mem_export_to_shareable_handle =
-        driver.symbol<decltype(cu_mem_export_to_shareable_handle)>(
-            "cuMemExportToShareableHandle");
+        driver.symbol<decltype(cu_mem_export_to_shareable_handle)>("cuMemExportToShareableHandle");
     cu_mem_map = driver.symbol<decltype(cu_mem_map)>("cuMemMap");
     cu_mem_set_access = driver.symbol<decltype(cu_mem_set_access)>("cuMemSetAccess");
     cu_mem_release = driver.symbol<decltype(cu_mem_release)>("cuMemRelease");
@@ -357,8 +356,41 @@ struct CudaBackend::Impl {
   CUresult (*cu_module_unload)(CUmodule) = nullptr;
   CUresult (*cu_module_get_function)(CUfunction*, CUmodule, const char*) = nullptr;
   CUresult (*cu_launch_kernel)(CUfunction, unsigned int, unsigned int, unsigned int, unsigned int,
-                               unsigned int, unsigned int, unsigned int, CUstream, void**, void**) =
-      nullptr;
+                               unsigned int, unsigned int, unsigned int, CUstream, void**,
+                               void**) = nullptr;
+};
+
+struct CudaModule::State {
+  State(std::shared_ptr<CudaBackend::Impl> backend_in, CUcontext context_in, CUmodule module_in)
+      : backend(std::move(backend_in)), context(context_in), module(module_in) {}
+
+  State(const State&) = delete;
+  State& operator=(const State&) = delete;
+
+  ~State() { unload(backend, context, module); }
+
+  static void unload(const std::shared_ptr<CudaBackend::Impl>& backend, CUcontext context,
+                     CUmodule module) noexcept {
+    if (backend == nullptr || context == nullptr || module == nullptr) {
+      return;
+    }
+    try {
+      const CUcontext previous_context = backend->current_context();
+      backend->set_current_context(context);
+      try {
+        check_cuda("cuModuleUnload", backend->cu_module_unload(module));
+      } catch (...) {
+        backend->set_current_context(previous_context);
+        throw;
+      }
+      backend->set_current_context(previous_context);
+    } catch (...) {
+    }
+  }
+
+  std::shared_ptr<CudaBackend::Impl> backend;
+  CUcontext context = nullptr;
+  CUmodule module = nullptr;
 };
 
 CudaDeviceBuffer::CudaDeviceBuffer(CudaDevicePtr ptr, std::size_t size,
@@ -366,8 +398,7 @@ CudaDeviceBuffer::CudaDeviceBuffer(CudaDevicePtr ptr, std::size_t size,
     : ptr_(ptr), size_(size), free_(std::move(free)) {}
 
 CudaDeviceBuffer::CudaDeviceBuffer(CudaDeviceBuffer&& other) noexcept
-    : ptr_(std::exchange(other.ptr_, 0)),
-      size_(std::exchange(other.size_, 0)),
+    : ptr_(std::exchange(other.ptr_, 0)), size_(std::exchange(other.size_, 0)),
       free_(std::move(other.free_)) {}
 
 CudaDeviceBuffer& CudaDeviceBuffer::operator=(CudaDeviceBuffer&& other) noexcept {
@@ -400,18 +431,13 @@ void CudaDeviceBuffer::reset() {
 CudaSharedMemory::CudaSharedMemory(std::shared_ptr<CudaBackend::Impl> backend, void* context,
                                    CudaDevicePtr ptr, std::size_t size,
                                    CudaShareableHandle shareable_handle)
-    : backend_(std::move(backend)),
-      context_(context),
-      ptr_(ptr),
-      size_(size),
+    : backend_(std::move(backend)), context_(context), ptr_(ptr), size_(size),
       shareable_handle_(shareable_handle),
       owns_shareable_handle_(valid_shareable_handle(shareable_handle)) {}
 
 CudaSharedMemory::CudaSharedMemory(CudaSharedMemory&& other) noexcept
-    : backend_(std::move(other.backend_)),
-      context_(std::exchange(other.context_, nullptr)),
-      ptr_(std::exchange(other.ptr_, 0)),
-      size_(std::exchange(other.size_, 0)),
+    : backend_(std::move(other.backend_)), context_(std::exchange(other.context_, nullptr)),
+      ptr_(std::exchange(other.ptr_, 0)), size_(std::exchange(other.size_, 0)),
       shareable_handle_(std::exchange(other.shareable_handle_, invalid_shareable_handle())),
       owns_shareable_handle_(std::exchange(other.owns_shareable_handle_, false)) {}
 
@@ -464,22 +490,55 @@ void CudaSharedMemory::reset() {
   backend_.reset();
 }
 
-CudaKernel::CudaKernel(std::shared_ptr<CudaBackend::Impl> backend, void* context, void* module,
-                       void* function)
-    : backend_(std::move(backend)), context_(context), module_(module), function_(function) {}
+CudaModule::CudaModule(std::shared_ptr<State> state) : state_(std::move(state)) {}
+
+CudaModule::CudaModule(CudaModule&& other) noexcept : state_(std::move(other.state_)) {}
+
+CudaModule& CudaModule::operator=(CudaModule&& other) noexcept {
+  if (this != &other) {
+    state_ = std::move(other.state_);
+  }
+  return *this;
+}
+
+CudaModule::~CudaModule() = default;
+
+CudaKernel CudaModule::load_kernel(std::string_view function_name) const {
+  validate_no_nul(function_name, "kernel function name");
+  const auto state = state_;
+  if (state == nullptr) {
+    throw std::invalid_argument("CUDA kernel load requires a live module");
+  }
+
+  std::string terminated_name(function_name);
+  terminated_name.push_back('\0');
+  const CUcontext previous_context = state->backend->current_context();
+  state->backend->set_current_context(state->context);
+  CUfunction function = nullptr;
+  try {
+    check_cuda("cuModuleGetFunction", state->backend->cu_module_get_function(
+                                          &function, state->module, terminated_name.data()));
+  } catch (...) {
+    state->backend->set_current_context(previous_context);
+    throw;
+  }
+  state->backend->set_current_context(previous_context);
+  return CudaKernel(state, function);
+}
+
+void CudaModule::reset() { state_.reset(); }
+
+CudaKernel::CudaKernel(std::shared_ptr<CudaModule::State> module, void* function)
+    : module_state_(std::move(module)), function_(function) {}
 
 CudaKernel::CudaKernel(CudaKernel&& other) noexcept
-    : backend_(std::move(other.backend_)),
-      context_(std::exchange(other.context_, nullptr)),
-      module_(std::exchange(other.module_, nullptr)),
+    : module_state_(std::move(other.module_state_)),
       function_(std::exchange(other.function_, nullptr)) {}
 
 CudaKernel& CudaKernel::operator=(CudaKernel&& other) noexcept {
   if (this != &other) {
     reset();
-    backend_ = std::move(other.backend_);
-    context_ = std::exchange(other.context_, nullptr);
-    module_ = std::exchange(other.module_, nullptr);
+    module_state_ = std::move(other.module_state_);
     function_ = std::exchange(other.function_, nullptr);
   }
   return *this;
@@ -493,57 +552,42 @@ void CudaKernel::launch(const CudaLaunchConfig& config, std::span<void*> args) c
   }
   validate_dim3(config.grid, "grid");
   validate_dim3(config.block, "block");
-  const CUcontext previous_context = backend_->current_context();
-  backend_->set_current_context(static_cast<CUcontext>(context_));
+  const auto& backend = module_state_->backend;
+  const CUcontext previous_context = backend->current_context();
+  backend->set_current_context(module_state_->context);
   void** kernel_args = args.empty() ? nullptr : args.data();
   try {
     check_cuda("cuLaunchKernel",
-               backend_->cu_launch_kernel(static_cast<CUfunction>(function_), config.grid.x,
-                                          config.grid.y, config.grid.z, config.block.x,
-                                          config.block.y, config.block.z, config.shared_memory_bytes,
-                                          nullptr, kernel_args, nullptr));
+               backend->cu_launch_kernel(static_cast<CUfunction>(function_), config.grid.x,
+                                         config.grid.y, config.grid.z, config.block.x,
+                                         config.block.y, config.block.z, config.shared_memory_bytes,
+                                         nullptr, kernel_args, nullptr));
   } catch (...) {
-    backend_->set_current_context(previous_context);
+    backend->set_current_context(previous_context);
     throw;
   }
-  backend_->set_current_context(previous_context);
+  backend->set_current_context(previous_context);
 }
 
 void CudaKernel::synchronize() const {
   if (!*this) {
     throw std::invalid_argument("CUDA kernel synchronize requires a live kernel");
   }
-  const CUcontext previous_context = backend_->current_context();
-  backend_->set_current_context(static_cast<CUcontext>(context_));
+  const auto& backend = module_state_->backend;
+  const CUcontext previous_context = backend->current_context();
+  backend->set_current_context(module_state_->context);
   try {
-    check_cuda("cuCtxSynchronize", backend_->cu_ctx_synchronize());
+    check_cuda("cuCtxSynchronize", backend->cu_ctx_synchronize());
   } catch (...) {
-    backend_->set_current_context(previous_context);
+    backend->set_current_context(previous_context);
     throw;
   }
-  backend_->set_current_context(previous_context);
+  backend->set_current_context(previous_context);
 }
 
 void CudaKernel::reset() {
-  if (module_ == nullptr) {
-    return;
-  }
-  try {
-    const CUcontext previous_context = backend_->current_context();
-    backend_->set_current_context(static_cast<CUcontext>(context_));
-    try {
-      check_cuda("cuModuleUnload", backend_->cu_module_unload(static_cast<CUmodule>(module_)));
-    } catch (...) {
-      backend_->set_current_context(previous_context);
-      throw;
-    }
-    backend_->set_current_context(previous_context);
-  } catch (...) {
-  }
-  context_ = nullptr;
-  module_ = nullptr;
   function_ = nullptr;
-  backend_.reset();
+  module_state_.reset();
 }
 
 bool CudaBackend::is_available() {
@@ -593,8 +637,8 @@ CudaDeviceInfo CudaBackend::device_info(int ordinal) const {
   const CUdevice device = impl_->device(ordinal);
 
   std::array<char, 256> name{};
-  check_cuda("cuDeviceGetName", impl_->cu_device_get_name(name.data(), static_cast<int>(name.size()),
-                                                          device));
+  check_cuda("cuDeviceGetName",
+             impl_->cu_device_get_name(name.data(), static_cast<int>(name.size()), device));
   CUuuid uuid{};
   check_cuda("cuDeviceGetUuid", impl_->cu_device_get_uuid(&uuid, device));
 
@@ -681,9 +725,9 @@ CudaSharedMemory CudaBackend::allocate_shared_memory(std::size_t bytes) const {
       .location = {.type = kMemLocationTypeDevice, .id = current_device},
   };
   std::size_t granularity = 0;
-  check_cuda("cuMemGetAllocationGranularity",
-             impl_->cu_mem_get_allocation_granularity(&granularity, &prop,
-                                                      kMemAllocGranularityMinimum));
+  check_cuda(
+      "cuMemGetAllocationGranularity",
+      impl_->cu_mem_get_allocation_granularity(&granularity, &prop, kMemAllocGranularityMinimum));
   const std::size_t alloc_size = round_up_to_granularity(bytes, granularity);
 
   CUdeviceptr ptr = 0;
@@ -807,10 +851,8 @@ void CudaBackend::copy_device_to_host_2d(const CudaDeviceToHost2DCopy& copy) con
   check_cuda("cuMemcpy2D_v2 (DtoH)", impl_->cu_memcpy_2d(&desc));
 }
 
-CudaKernel CudaBackend::load_kernel_from_ptx(std::string_view ptx,
-                                             std::string_view function_name) const {
+CudaModule CudaBackend::load_module_from_ptx(std::string_view ptx) const {
   validate_ptx(ptx);
-  validate_no_nul(function_name, "kernel function name");
   impl_->ensure_current_context_for_copy();
   const CUcontext context = impl_->current_context();
   if (context == nullptr) {
@@ -820,21 +862,21 @@ CudaKernel CudaBackend::load_kernel_from_ptx(std::string_view ptx,
   if (terminated_ptx.back() != '\0') {
     terminated_ptx.push_back('\0');
   }
-  std::string terminated_name(function_name);
-  terminated_name.push_back('\0');
-
   CUmodule module = nullptr;
   check_cuda("cuModuleLoadData", impl_->cu_module_load_data(&module, terminated_ptx.data()));
-  CUfunction function = nullptr;
   try {
-    check_cuda("cuModuleGetFunction",
-               impl_->cu_module_get_function(&function, module, terminated_name.data()));
+    return CudaModule(std::make_shared<CudaModule::State>(impl_, context, module));
   } catch (...) {
-    const auto unload_result = impl_->cu_module_unload(module);
-    (void)unload_result;
+    CudaModule::State::unload(impl_, context, module);
     throw;
   }
-  return CudaKernel(impl_, context, module, function);
+}
+
+CudaKernel CudaBackend::load_kernel_from_ptx(std::string_view ptx,
+                                             std::string_view function_name) const {
+  validate_ptx(ptx);
+  validate_no_nul(function_name, "kernel function name");
+  return load_module_from_ptx(ptx).load_kernel(function_name);
 }
 
 void CudaBackend::synchronize() const {

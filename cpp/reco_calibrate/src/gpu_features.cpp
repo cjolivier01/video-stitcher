@@ -31,6 +31,7 @@ constexpr double kContrastPercentile = 0.7;
 constexpr float kMinimumContrast = 1.0e-6F;
 constexpr double kFedMaximumStep = 0.25;
 constexpr std::size_t kCandidateBytes = 76;
+constexpr std::uint32_t kSelectionBatchCandidates = 256;
 
 static_assert(sizeof(GpuFeaturePoint) == 24);
 
@@ -255,6 +256,9 @@ void validate_config(const GpuAkazeConfig& config) {
   if (config.max_octaves == 0 || config.max_octaves > 8) {
     throw std::invalid_argument("GPU AKAZE octave count must be in [1, 8]");
   }
+  if (config.border_margin > reco::core::kMaxCalibrationDimension) {
+    throw std::invalid_argument("GPU AKAZE border margin exceeds the supported image dimension");
+  }
   if (config.use_region) {
     validate_region(config.region);
   }
@@ -434,37 +438,39 @@ struct GpuAkazePipeline::Impl {
     detail::NvrtcCompiler compiler;
     const auto akaze_ptx = compiler.compile(kGpuAkazeKernelSource, "reco_calibrate_gpu_akaze.cu",
                                             {.disable_fmad = true});
-    y_to_float = backend.load_kernel_from_ptx(akaze_ptx, "akaze_y_to_float");
-    triangle_vertical_y = backend.load_kernel_from_ptx(akaze_ptx, "akaze_triangle_vertical_y");
-    triangle_horizontal = backend.load_kernel_from_ptx(akaze_ptx, "akaze_triangle_horizontal");
-    gaussian_x = backend.load_kernel_from_ptx(akaze_ptx, "akaze_gaussian_x");
-    gaussian_y = backend.load_kernel_from_ptx(akaze_ptx, "akaze_gaussian_y");
-    half_size = backend.load_kernel_from_ptx(akaze_ptx, "akaze_half_size");
-    scharr = backend.load_kernel_from_ptx(akaze_ptx, "akaze_scharr");
-    clear_histogram = backend.load_kernel_from_ptx(akaze_ptx, "akaze_clear_histogram");
-    gradient_histogram = backend.load_kernel_from_ptx(akaze_ptx, "akaze_gradient_histogram");
-    histogram_percentile = backend.load_kernel_from_ptx(akaze_ptx, "akaze_histogram_percentile");
-    conductivity = backend.load_kernel_from_ptx(akaze_ptx, "akaze_conductivity");
-    diffusion_step = backend.load_kernel_from_ptx(akaze_ptx, "akaze_diffusion_step");
-    hessian_response = backend.load_kernel_from_ptx(akaze_ptx, "akaze_hessian_response");
-    nms_flags = backend.load_kernel_from_ptx(akaze_ptx, "akaze_nms_flags");
-    akaze_scan_block = backend.load_kernel_from_ptx(akaze_ptx, "akaze_scan_block");
-    akaze_scan_add = backend.load_kernel_from_ptx(akaze_ptx, "akaze_scan_add");
-    scatter_candidates = backend.load_kernel_from_ptx(akaze_ptx, "akaze_scatter_candidates");
-    select_scale_extrema = backend.load_kernel_from_ptx(akaze_ptx, "akaze_select_scale_extrema");
-    prepare_feature_keys = backend.load_kernel_from_ptx(akaze_ptx, "akaze_prepare_feature_keys");
-    radix_zero_flags = backend.load_kernel_from_ptx(akaze_ptx, "akaze_radix_zero_flags");
-    radix_scatter = backend.load_kernel_from_ptx(akaze_ptx, "akaze_radix_scatter");
-    emit_features = backend.load_kernel_from_ptx(akaze_ptx, "akaze_emit_features");
-    describe_features = backend.load_kernel_from_ptx(akaze_ptx, "akaze_describe_features");
+    akaze_module = backend.load_module_from_ptx(akaze_ptx);
+    y_to_float = akaze_module.load_kernel("akaze_y_to_float");
+    triangle_vertical_y = akaze_module.load_kernel("akaze_triangle_vertical_y");
+    triangle_horizontal = akaze_module.load_kernel("akaze_triangle_horizontal");
+    gaussian_x = akaze_module.load_kernel("akaze_gaussian_x");
+    gaussian_y = akaze_module.load_kernel("akaze_gaussian_y");
+    half_size = akaze_module.load_kernel("akaze_half_size");
+    scharr = akaze_module.load_kernel("akaze_scharr");
+    clear_histogram = akaze_module.load_kernel("akaze_clear_histogram");
+    gradient_histogram = akaze_module.load_kernel("akaze_gradient_histogram");
+    histogram_percentile = akaze_module.load_kernel("akaze_histogram_percentile");
+    conductivity = akaze_module.load_kernel("akaze_conductivity");
+    diffusion_step = akaze_module.load_kernel("akaze_diffusion_step");
+    hessian_response = akaze_module.load_kernel("akaze_hessian_response");
+    nms_flags = akaze_module.load_kernel("akaze_nms_flags");
+    akaze_scan_block = akaze_module.load_kernel("akaze_scan_block");
+    akaze_scan_add = akaze_module.load_kernel("akaze_scan_add");
+    scatter_candidates = akaze_module.load_kernel("akaze_scatter_candidates");
+    select_scale_extrema = akaze_module.load_kernel("akaze_select_scale_extrema");
+    prepare_feature_keys = akaze_module.load_kernel("akaze_prepare_feature_keys");
+    radix_zero_flags = akaze_module.load_kernel("akaze_radix_zero_flags");
+    radix_scatter = akaze_module.load_kernel("akaze_radix_scatter");
+    emit_features = akaze_module.load_kernel("akaze_emit_features");
+    describe_features = akaze_module.load_kernel("akaze_describe_features");
 
     const auto match_ptx = compiler.compile(kGpuMatchKernelSource, "reco_calibrate_gpu_match.cu");
-    match_one_way = backend.load_kernel_from_ptx(match_ptx, "match_one_way");
-    match_crosscheck = backend.load_kernel_from_ptx(match_ptx, "match_crosscheck_flags");
-    match_scan_block = backend.load_kernel_from_ptx(match_ptx, "match_scan_block");
-    match_scan_add = backend.load_kernel_from_ptx(match_ptx, "match_scan_add");
-    match_scatter = backend.load_kernel_from_ptx(match_ptx, "match_scatter");
-    match_sort = backend.load_kernel_from_ptx(match_ptx, "match_stable_sort");
+    match_module = backend.load_module_from_ptx(match_ptx);
+    match_one_way = match_module.load_kernel("match_one_way");
+    match_crosscheck = match_module.load_kernel("match_crosscheck_flags");
+    match_scan_block = match_module.load_kernel("match_scan_block");
+    match_scan_add = match_module.load_kernel("match_scan_add");
+    match_scatter = match_module.load_kernel("match_scatter");
+    match_sort = match_module.load_kernel("match_stable_sort");
   }
 
   [[nodiscard]] DeviceImage gaussian(const DeviceImage& source, float sigma) const {
@@ -593,6 +599,8 @@ struct GpuAkazePipeline::Impl {
   }
 
   reco::core::CudaBackend backend;
+  reco::core::CudaModule akaze_module;
+  reco::core::CudaModule match_module;
   reco::core::CudaKernel y_to_float;
   reco::core::CudaKernel triangle_vertical_y;
   reco::core::CudaKernel triangle_horizontal;
@@ -734,6 +742,17 @@ GpuFeatureSet GpuAkazePipeline::detect(const GpuGrayFrame& frame,
       smooth = impl_->gaussian(lt, 1.0F);
     }
 
+    const bool contrast_requires_base_gradients =
+        level_index == 0 && (specs.size() == 1U || specs[1].octave != specs[0].octave);
+    if (contrast_requires_base_gradients) {
+      auto contrast_smooth = impl_->gaussian(smooth, 1.0F);
+      auto contrast_lx = allocate_float_image(backend, spec.width, spec.height);
+      auto contrast_ly = allocate_float_image(backend, spec.width, spec.height);
+      impl_->derivatives(contrast_smooth, 1U, contrast_lx, contrast_ly);
+      impl_->compute_contrast(contrast_lx, contrast_ly, histogram, maximum, nonzero, contrast);
+      contrast_ready = true;
+    }
+
     DeviceImage flow_lx;
     DeviceImage flow_ly;
     if (level_index > 0) {
@@ -770,15 +789,6 @@ GpuFeatureSet GpuAkazePipeline::detect(const GpuGrayFrame& frame,
                diffusion_output_pitch, width, height, step_size);
         std::swap(lt, diffusion_target);
       }
-    }
-
-    if (!contrast_ready && level_index + 1U == specs.size()) {
-      auto contrast_smooth = impl_->gaussian(smooth, 1.0F);
-      auto contrast_lx = allocate_float_image(backend, spec.width, spec.height);
-      auto contrast_ly = allocate_float_image(backend, spec.width, spec.height);
-      impl_->derivatives(contrast_smooth, 1U, contrast_lx, contrast_ly);
-      impl_->compute_contrast(contrast_lx, contrast_ly, histogram, maximum, nonzero, contrast);
-      contrast_ready = true;
     }
 
     auto detector_lx = allocate_float_image(backend, spec.width, spec.height);
@@ -917,10 +927,17 @@ GpuFeatureSet GpuAkazePipeline::detect(const GpuGrayFrame& frame,
     auto cache_indices_ptr = cache_indices.ptr();
     auto cache_cells_ptr = cache_cells.ptr();
     auto cache_count_ptr = cache_count.ptr();
-    launch(impl_->select_scale_extrema,
-           {.grid = {.x = 1, .y = 1, .z = 1}, .block = {.x = 1, .y = 1, .z = 1}}, candidates_ptr,
-           candidate_count_arg, selection_levels_ptr, level_count, cache_indices_ptr,
-           cache_cells_ptr, cache_count_ptr, selected_flags_ptr);
+    for (std::uint32_t candidate_begin = 0; candidate_begin < candidate_count;) {
+      const auto batch_count =
+          std::min(kSelectionBatchCandidates, candidate_count - candidate_begin);
+      auto candidate_begin_arg = candidate_begin;
+      auto batch_count_arg = batch_count;
+      launch(impl_->select_scale_extrema,
+             {.grid = {.x = 1, .y = 1, .z = 1}, .block = {.x = 1, .y = 1, .z = 1}}, candidates_ptr,
+             candidate_count_arg, candidate_begin_arg, batch_count_arg, selection_levels_ptr,
+             level_count, cache_indices_ptr, cache_cells_ptr, cache_count_ptr, selected_flags_ptr);
+      candidate_begin += batch_count;
+    }
 
     auto inverse_detection_scale = 1.0F / geometry.detector_scale;
     auto crop_x_float = static_cast<float>(geometry.crop_x);
@@ -943,10 +960,10 @@ GpuFeatureSet GpuAkazePipeline::detect(const GpuGrayFrame& frame,
     auto indices_output = indices_b.ptr();
     auto valid_count_ptr = valid_count.ptr();
     launch(impl_->prepare_feature_keys, linear_launch(candidate_count), candidates_ptr,
-           candidate_count_arg, selected_flags_ptr, keys_input, indices_input, valid_count_ptr,
-           inverse_detection_scale, crop_x_float, crop_y_float, use_roi, roi_x_min, roi_x_max,
-           roi_y_min, roi_y_max, border_y, border_pitch, border_width, border_height, border_margin,
-           black_threshold);
+           candidate_count_arg, cache_indices_ptr, cache_count_ptr, selected_flags_ptr, keys_input,
+           indices_input, valid_count_ptr, inverse_detection_scale, crop_x_float, crop_y_float,
+           use_roi, roi_x_min, roi_x_max, roi_y_min, roi_y_max, border_y, border_pitch,
+           border_width, border_height, border_margin, black_threshold);
 
     std::vector<reco::core::CudaDeviceBuffer> radix_scan_scratch;
     auto radix_flags_ptr = radix_flags.ptr();
