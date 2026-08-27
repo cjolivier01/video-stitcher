@@ -105,9 +105,19 @@ struct AkazeLevelView {
   unsigned int reserved;
 };
 
+// Spatial lookup metadata for deterministic scale-space suppression. pixel_base
+// addresses the level in the global NMS flag/offset arrays.
+struct AkazeSelectionLevel {
+  unsigned int pixel_base;
+  unsigned int width;
+  unsigned int height;
+  unsigned int octave;
+};
+
 static_assert(sizeof(AkazeFeaturePoint) == 24, "feature point ABI must be 24 bytes");
 static_assert(sizeof(AkazeCandidate) == 76, "candidate ABI must be 76 bytes");
 static_assert(sizeof(AkazeLevelView) == 64, "level view ABI must be 64 bytes");
+static_assert(sizeof(AkazeSelectionLevel) == 16, "selection level ABI must be 16 bytes");
 
 extern "C" __global__ void akaze_y_to_float(
     unsigned long long src,
@@ -155,6 +165,88 @@ extern "C" __global__ void akaze_y_to_float(
       (1.0f - tx) * akaze_normalize_y(row1[x0], limited_range) +
       tx * akaze_normalize_y(row1[x1], limited_range);
   akaze_row<float>(dst, dst_pitch, y)[x] = (1.0f - ty) * upper + ty * lower;
+}
+
+// First pass of image::imageops::FilterType::Triangle downscaling. The filter
+// support expands with the reduction ratio, providing the antialiasing that a
+// single bilinear sample lacks. Source values are normalized before filtering
+// so full- and limited-range luma retain identical endpoint behavior.
+extern "C" __global__ void akaze_triangle_vertical_y(
+    unsigned long long src,
+    unsigned long long src_pitch,
+    unsigned long long dst,
+    unsigned long long dst_pitch,
+    unsigned int crop_x,
+    unsigned int crop_y,
+    unsigned int crop_width,
+    unsigned int crop_height,
+    unsigned int dst_height,
+    unsigned int limited_range) {
+  const unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= crop_width || y >= dst_height) {
+    return;
+  }
+
+  const float ratio = (float)crop_height / (float)dst_height;
+  const float sample_ratio = ratio < 1.0f ? 1.0f : ratio;
+  const float input = ((float)y + 0.5f) * ratio;
+  int first = (int)floorf(input - sample_ratio);
+  int last = (int)ceilf(input + sample_ratio);
+  first = akaze_clamp_int(first, 0, (int)crop_height - 1);
+  last = akaze_clamp_int(last, first + 1, (int)crop_height);
+  const float center = input - 0.5f;
+  float weighted_sum = 0.0f;
+  float weight_sum = 0.0f;
+  for (int source_y = first; source_y < last; ++source_y) {
+    const float distance = fabsf(((float)source_y - center) / sample_ratio);
+    const float weight = distance < 1.0f ? 1.0f - distance : 0.0f;
+    const unsigned char value = akaze_const_row<unsigned char>(
+        src, src_pitch, crop_y + (unsigned int)source_y)[crop_x + x];
+    weighted_sum += weight * akaze_normalize_y(value, limited_range);
+    weight_sum += weight;
+  }
+  akaze_row<float>(dst, dst_pitch, y)[x] = weighted_sum / weight_sum;
+}
+
+// Horizontal Triangle pass. Quantizing the final normalized sample to an
+// 8-bit step matches DynamicImage::resize_exact before AKAZE converts the
+// resized grayscale image to unit floats.
+extern "C" __global__ void akaze_triangle_horizontal(
+    unsigned long long src,
+    unsigned long long src_pitch,
+    unsigned int src_width,
+    unsigned long long dst,
+    unsigned long long dst_pitch,
+    unsigned int dst_width,
+    unsigned int height) {
+  const unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= dst_width || y >= height) {
+    return;
+  }
+
+  const float ratio = (float)src_width / (float)dst_width;
+  const float sample_ratio = ratio < 1.0f ? 1.0f : ratio;
+  const float input = ((float)x + 0.5f) * ratio;
+  int first = (int)floorf(input - sample_ratio);
+  int last = (int)ceilf(input + sample_ratio);
+  first = akaze_clamp_int(first, 0, (int)src_width - 1);
+  last = akaze_clamp_int(last, first + 1, (int)src_width);
+  const float center = input - 0.5f;
+  float weighted_sum = 0.0f;
+  float weight_sum = 0.0f;
+  const float* row = akaze_const_row<float>(src, src_pitch, y);
+  for (int source_x = first; source_x < last; ++source_x) {
+    const float distance = fabsf(((float)source_x - center) / sample_ratio);
+    const float weight = distance < 1.0f ? 1.0f - distance : 0.0f;
+    weighted_sum += weight * row[source_x];
+    weight_sum += weight;
+  }
+  const float filtered = weighted_sum / weight_sum;
+  const float quantized = roundf(fminf(fmaxf(filtered, 0.0f), 1.0f) * 255.0f) *
+      (1.0f / 255.0f);
+  akaze_row<float>(dst, dst_pitch, y)[x] = quantized;
 }
 
 extern "C" __global__ void akaze_gaussian_x(
@@ -681,12 +773,312 @@ __device__ __forceinline__ bool akaze_border_ok(
   return true;
 }
 
-// This kernel is intentionally serial: it preserves level order, row-major
-// detection order, first-overlap replacement, upper-level suppression, and
-// stable response ties exactly. candidates is compacted in place.
-extern "C" __global__ void akaze_select_features(
+__device__ __forceinline__ bool akaze_response_precedes(
+    const AkazeCandidate& candidate, const AkazeCandidate& current) {
+  return candidate.response > current.response ||
+      (candidate.response == current.response && candidate.order < current.order);
+}
+
+// Searches only the geometrically possible overlap window in one scale-space
+// level. AKAZE feature radius divided by the target octave ratio is bounded by
+// the configured sublevel range, so work does not grow with candidate_count.
+__device__ bool akaze_has_scale_dominator(
+    const AkazeCandidate& current,
+    const AkazeSelectionLevel& level,
+    unsigned long long nms_flags,
+    unsigned long long nms_offsets,
+    unsigned long long candidates,
+    unsigned int candidate_count) {
+  const float current_ratio = akaze_octave_ratio(current.octave);
+  const float current_x = akaze_global_coordinate(current.x, current_ratio);
+  const float current_y = akaze_global_coordinate(current.y, current_ratio);
+  const float target_ratio = akaze_octave_ratio(level.octave);
+  const float target_offset = 0.5f * (target_ratio - 1.0f);
+  const float target_x = (current_x - target_offset) / target_ratio;
+  const float target_y = (current_y - target_offset) / target_ratio;
+  const float local_radius = current.size / target_ratio;
+  const int first_x = akaze_clamp_int(
+      (int)floorf(target_x - local_radius), 0, (int)level.width - 1);
+  const int last_x = akaze_clamp_int(
+      (int)ceilf(target_x + local_radius), 0, (int)level.width - 1);
+  const int first_y = akaze_clamp_int(
+      (int)floorf(target_y - local_radius), 0, (int)level.height - 1);
+  const int last_y = akaze_clamp_int(
+      (int)ceilf(target_y + local_radius), 0, (int)level.height - 1);
+  const unsigned int* flags = akaze_const_pointer<unsigned int>(nms_flags);
+  const unsigned int* offsets = akaze_const_pointer<unsigned int>(nms_offsets);
+  const AkazeCandidate* values = akaze_const_pointer<AkazeCandidate>(candidates);
+  for (int y = first_y; y <= last_y; ++y) {
+    for (int x = first_x; x <= last_x; ++x) {
+      const unsigned int pixel = level.pixel_base +
+          (unsigned int)y * level.width + (unsigned int)x;
+      if (flags[pixel] == 0U) {
+        continue;
+      }
+      const unsigned int candidate_index = offsets[pixel];
+      if (candidate_index >= candidate_count) {
+        continue;
+      }
+      const AkazeCandidate candidate = values[candidate_index];
+      if (candidate.order == current.order ||
+          !akaze_descriptor_bounds_ok(candidate) ||
+          !akaze_response_precedes(candidate, current)) {
+        continue;
+      }
+      const float ratio = akaze_octave_ratio(candidate.octave);
+      const float dx = current_x - akaze_global_coordinate(candidate.x, ratio);
+      const float dy = current_y - akaze_global_coordinate(candidate.y, ratio);
+      if (dx * dx + dy * dy <= current.size * current.size) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+extern "C" __global__ void akaze_mark_scale_extrema(
     unsigned long long candidates,
     unsigned int candidate_count,
+    unsigned long long levels,
+    unsigned int level_count,
+    unsigned long long nms_flags,
+    unsigned long long nms_offsets,
+    unsigned long long selected_flags) {
+  const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= candidate_count) {
+    return;
+  }
+  const AkazeCandidate current = akaze_const_pointer<AkazeCandidate>(candidates)[index];
+  unsigned int keep = akaze_descriptor_bounds_ok(current) ? 1U : 0U;
+  if (keep != 0U && current.level < level_count) {
+    const AkazeSelectionLevel* selection_levels =
+        akaze_const_pointer<AkazeSelectionLevel>(levels);
+    keep = akaze_has_scale_dominator(
+               current, selection_levels[current.level], nms_flags, nms_offsets,
+               candidates, candidate_count)
+        ? 0U
+        : 1U;
+    if (keep != 0U && current.level != 0U) {
+      keep = akaze_has_scale_dominator(
+                 current, selection_levels[current.level - 1U], nms_flags, nms_offsets,
+                 candidates, candidate_count)
+          ? 0U
+          : 1U;
+    }
+  }
+  akaze_pointer<unsigned int>(selected_flags)[index] = keep;
+}
+
+__device__ bool akaze_has_upper_level_overlap(
+    const AkazeCandidate& current,
+    const AkazeSelectionLevel& level,
+    unsigned long long nms_flags,
+    unsigned long long nms_offsets,
+    unsigned long long candidates,
+    unsigned int candidate_count,
+    unsigned long long scale_flags) {
+  const float current_ratio = akaze_octave_ratio(current.octave);
+  const float current_x = akaze_global_coordinate(current.x, current_ratio);
+  const float current_y = akaze_global_coordinate(current.y, current_ratio);
+  const float target_ratio = akaze_octave_ratio(level.octave);
+  const float target_offset = 0.5f * (target_ratio - 1.0f);
+  const float target_x = (current_x - target_offset) / target_ratio;
+  const float target_y = (current_y - target_offset) / target_ratio;
+  const float local_radius = current.size / target_ratio;
+  const int first_x = akaze_clamp_int(
+      (int)floorf(target_x - local_radius), 0, (int)level.width - 1);
+  const int last_x = akaze_clamp_int(
+      (int)ceilf(target_x + local_radius), 0, (int)level.width - 1);
+  const int first_y = akaze_clamp_int(
+      (int)floorf(target_y - local_radius), 0, (int)level.height - 1);
+  const int last_y = akaze_clamp_int(
+      (int)ceilf(target_y + local_radius), 0, (int)level.height - 1);
+  const unsigned int* flags = akaze_const_pointer<unsigned int>(nms_flags);
+  const unsigned int* offsets = akaze_const_pointer<unsigned int>(nms_offsets);
+  const unsigned int* extrema = akaze_const_pointer<unsigned int>(scale_flags);
+  const AkazeCandidate* values = akaze_const_pointer<AkazeCandidate>(candidates);
+  for (int y = first_y; y <= last_y; ++y) {
+    for (int x = first_x; x <= last_x; ++x) {
+      const unsigned int pixel = level.pixel_base +
+          (unsigned int)y * level.width + (unsigned int)x;
+      if (flags[pixel] == 0U) {
+        continue;
+      }
+      const unsigned int candidate_index = offsets[pixel];
+      if (candidate_index >= candidate_count || extrema[candidate_index] == 0U) {
+        continue;
+      }
+      const AkazeCandidate candidate = values[candidate_index];
+      const float ratio = akaze_octave_ratio(candidate.octave);
+      const float dx = current_x - akaze_global_coordinate(candidate.x, ratio);
+      const float dy = current_y - akaze_global_coordinate(candidate.y, ratio);
+      if (dx * dx + dy * dy <= current.size * current.size) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+extern "C" __global__ void akaze_mark_upper_level(
+    unsigned long long candidates,
+    unsigned int candidate_count,
+    unsigned long long levels,
+    unsigned int level_count,
+    unsigned long long nms_flags,
+    unsigned long long nms_offsets,
+    unsigned long long scale_flags,
+    unsigned long long selected_flags) {
+  const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= candidate_count) {
+    return;
+  }
+  const unsigned int keep = akaze_const_pointer<unsigned int>(scale_flags)[index];
+  if (keep == 0U) {
+    akaze_pointer<unsigned int>(selected_flags)[index] = 0U;
+    return;
+  }
+  const AkazeCandidate current = akaze_const_pointer<AkazeCandidate>(candidates)[index];
+  unsigned int output = keep;
+  if (current.level + 1U < level_count) {
+    const AkazeSelectionLevel upper =
+        akaze_const_pointer<AkazeSelectionLevel>(levels)[current.level + 1U];
+    output = akaze_has_upper_level_overlap(
+                 current, upper, nms_flags, nms_offsets, candidates, candidate_count, scale_flags)
+        ? 0U
+        : 1U;
+  }
+  akaze_pointer<unsigned int>(selected_flags)[index] = output;
+}
+
+__device__ bool akaze_make_feature(
+    const AkazeCandidate& candidate,
+    float inverse_detection_scale,
+    float crop_x,
+    float crop_y,
+    unsigned int use_roi,
+    float roi_x_min,
+    float roi_x_max,
+    float roi_y_min,
+    float roi_y_max,
+    unsigned long long border_y,
+    unsigned long long border_pitch,
+    unsigned int border_width,
+    unsigned int border_height,
+    unsigned int border_margin,
+    unsigned int black_threshold,
+    AkazeFeaturePoint* point) {
+  float refined_x;
+  float refined_y;
+  if (!akaze_refine(candidate, &refined_x, &refined_y)) {
+    return false;
+  }
+  const float ratio = akaze_octave_ratio(candidate.octave);
+  const float detector_x = akaze_global_coordinate(refined_x, ratio);
+  const float detector_y = akaze_global_coordinate(refined_y, ratio);
+  const float mapped_x = detector_x * inverse_detection_scale + crop_x;
+  const float mapped_y = detector_y * inverse_detection_scale + crop_y;
+  if (use_roi != 0U &&
+      (mapped_x < roi_x_min || mapped_x > roi_x_max ||
+       mapped_y < roi_y_min || mapped_y > roi_y_max)) {
+    return false;
+  }
+  if (!akaze_border_ok(border_y, border_pitch, border_width, border_height,
+                       border_margin, black_threshold, mapped_x, mapped_y)) {
+    return false;
+  }
+  point->x = mapped_x;
+  point->y = mapped_y;
+  point->response = candidate.response;
+  point->size = candidate.size;
+  point->octave = candidate.octave;
+  point->level = candidate.level;
+  return true;
+}
+
+// Creates descending-response radix keys. Candidate order is already
+// level-major/row-major; stable radix passes therefore preserve response ties.
+extern "C" __global__ void akaze_prepare_feature_keys(
+    unsigned long long candidates,
+    unsigned int candidate_count,
+    unsigned long long selected_flags,
+    unsigned long long keys,
+    unsigned long long indices,
+    unsigned long long valid_count,
+    float inverse_detection_scale,
+    float crop_x,
+    float crop_y,
+    unsigned int use_roi,
+    float roi_x_min,
+    float roi_x_max,
+    float roi_y_min,
+    float roi_y_max,
+    unsigned long long border_y,
+    unsigned long long border_pitch,
+    unsigned int border_width,
+    unsigned int border_height,
+    unsigned int border_margin,
+    unsigned int black_threshold) {
+  const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= candidate_count) {
+    return;
+  }
+  akaze_pointer<unsigned int>(indices)[index] = index;
+  unsigned int key = 0xffffffffU;
+  if (akaze_const_pointer<unsigned int>(selected_flags)[index] != 0U) {
+    const AkazeCandidate candidate = akaze_const_pointer<AkazeCandidate>(candidates)[index];
+    AkazeFeaturePoint point;
+    if (akaze_make_feature(candidate, inverse_detection_scale, crop_x, crop_y,
+                           use_roi, roi_x_min, roi_x_max, roi_y_min, roi_y_max,
+                           border_y, border_pitch, border_width, border_height,
+                           border_margin, black_threshold, &point)) {
+      key = ~__float_as_uint(candidate.response);
+      atomicAdd(akaze_pointer<unsigned int>(valid_count), 1U);
+    }
+  }
+  akaze_pointer<unsigned int>(keys)[index] = key;
+}
+
+extern "C" __global__ void akaze_radix_zero_flags(
+    unsigned long long keys,
+    unsigned int count,
+    unsigned int bit,
+    unsigned long long zero_flags) {
+  const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < count) {
+    const unsigned int key = akaze_const_pointer<unsigned int>(keys)[index];
+    akaze_pointer<unsigned int>(zero_flags)[index] = ((key >> bit) & 1U) == 0U ? 1U : 0U;
+  }
+}
+
+extern "C" __global__ void akaze_radix_scatter(
+    unsigned long long input_keys,
+    unsigned long long input_indices,
+    unsigned long long zero_flags,
+    unsigned long long zero_offsets,
+    unsigned int count,
+    unsigned long long output_keys,
+    unsigned long long output_indices) {
+  const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= count) {
+    return;
+  }
+  const unsigned int* flags = akaze_const_pointer<unsigned int>(zero_flags);
+  const unsigned int* offsets = akaze_const_pointer<unsigned int>(zero_offsets);
+  const unsigned int zero_count = offsets[count - 1U] + flags[count - 1U];
+  const unsigned int output_index = flags[index] != 0U
+      ? offsets[index]
+      : zero_count + index - offsets[index];
+  akaze_pointer<unsigned int>(output_keys)[output_index] =
+      akaze_const_pointer<unsigned int>(input_keys)[index];
+  akaze_pointer<unsigned int>(output_indices)[output_index] =
+      akaze_const_pointer<unsigned int>(input_indices)[index];
+}
+
+extern "C" __global__ void akaze_emit_features(
+    unsigned long long candidates,
+    unsigned long long sorted_indices,
+    unsigned long long valid_count,
     unsigned long long features,
     unsigned int max_features,
     unsigned long long feature_count,
@@ -704,109 +1096,26 @@ extern "C" __global__ void akaze_select_features(
     unsigned int border_height,
     unsigned int border_margin,
     unsigned int black_threshold) {
-  if (blockIdx.x != 0U || threadIdx.x != 0U) {
+  const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int available = *akaze_const_pointer<unsigned int>(valid_count);
+  const unsigned int output_count = available < max_features ? available : max_features;
+  if (index == 0U) {
+    *akaze_pointer<unsigned int>(feature_count) = output_count;
+  }
+  if (index >= output_count) {
     return;
   }
-  AkazeCandidate* values = akaze_pointer<AkazeCandidate>(candidates);
-  AkazeFeaturePoint* output = akaze_pointer<AkazeFeaturePoint>(features);
-  unsigned int selected_count = 0U;
-
-  for (unsigned int i = 0U; i < candidate_count; ++i) {
-    const AkazeCandidate current = values[i];
-    if (!akaze_descriptor_bounds_ok(current)) {
-      continue;
-    }
-    bool keep = true;
-    unsigned int replacement = selected_count;
-    for (unsigned int j = 0U; j < selected_count; ++j) {
-      if (akaze_overlaps(current, values[j])) {
-        if (current.response > values[j].response) {
-          replacement = j;
-        } else {
-          keep = false;
-        }
-        break;
-      }
-    }
-    if (keep) {
-      if (replacement < selected_count) {
-        values[replacement] = current;
-      } else {
-        values[selected_count++] = current;
-      }
-    }
+  const unsigned int candidate_index =
+      akaze_const_pointer<unsigned int>(sorted_indices)[index];
+  const AkazeCandidate candidate =
+      akaze_const_pointer<AkazeCandidate>(candidates)[candidate_index];
+  AkazeFeaturePoint point;
+  if (akaze_make_feature(candidate, inverse_detection_scale, crop_x, crop_y,
+                         use_roi, roi_x_min, roi_x_max, roi_y_min, roi_y_max,
+                         border_y, border_pitch, border_width, border_height,
+                         border_margin, black_threshold, &point)) {
+    akaze_pointer<AkazeFeaturePoint>(features)[index] = point;
   }
-
-  for (unsigned int i = 0U; i < selected_count; ++i) {
-    values[i].valid = 1U;
-    const float ratio_i = akaze_octave_ratio(values[i].octave);
-    const float x_i = akaze_global_coordinate(values[i].x, ratio_i);
-    const float y_i = akaze_global_coordinate(values[i].y, ratio_i);
-    for (unsigned int j = i; j < selected_count; ++j) {
-      if (values[i].level + 1U != values[j].level) {
-        continue;
-      }
-      const float ratio_j = akaze_octave_ratio(values[j].octave);
-      const float dx = x_i - akaze_global_coordinate(values[j].x, ratio_j);
-      const float dy = y_i - akaze_global_coordinate(values[j].y, ratio_j);
-      if (dx * dx + dy * dy <= values[i].size * values[i].size) {
-        values[i].valid = 0U;
-        break;
-      }
-    }
-  }
-
-  unsigned int output_count = 0U;
-  for (unsigned int i = 0U; i < selected_count; ++i) {
-    const AkazeCandidate candidate = values[i];
-    if (candidate.valid == 0U) {
-      continue;
-    }
-    float refined_x;
-    float refined_y;
-    if (!akaze_refine(candidate, &refined_x, &refined_y)) {
-      continue;
-    }
-    const float ratio = akaze_octave_ratio(candidate.octave);
-    const float detector_x = akaze_global_coordinate(refined_x, ratio);
-    const float detector_y = akaze_global_coordinate(refined_y, ratio);
-    const float mapped_x = detector_x * inverse_detection_scale + crop_x;
-    const float mapped_y = detector_y * inverse_detection_scale + crop_y;
-    if (use_roi != 0U &&
-        (mapped_x < roi_x_min || mapped_x > roi_x_max ||
-         mapped_y < roi_y_min || mapped_y > roi_y_max)) {
-      continue;
-    }
-    if (!akaze_border_ok(border_y, border_pitch, border_width, border_height,
-                         border_margin, black_threshold, mapped_x, mapped_y)) {
-      continue;
-    }
-
-    AkazeFeaturePoint point;
-    point.x = mapped_x;
-    point.y = mapped_y;
-    point.response = candidate.response;
-    point.size = candidate.size;
-    point.octave = candidate.octave;
-    point.level = candidate.level;
-
-    unsigned int insertion = output_count;
-    if (insertion < max_features) {
-      ++output_count;
-    } else if (max_features != 0U && point.response > output[max_features - 1U].response) {
-      insertion = max_features - 1U;
-    } else {
-      continue;
-    }
-    while (insertion > 0U && point.response > output[insertion - 1U].response) {
-      if (insertion < max_features) {
-        output[insertion] = output[insertion - 1U];
-      }
-      --insertion;
-    }
-    output[insertion] = point;
-  }
-  *akaze_pointer<unsigned int>(feature_count) = output_count;
 }
 
 __device__ __constant__ float kAkazeGauss25[49] = {

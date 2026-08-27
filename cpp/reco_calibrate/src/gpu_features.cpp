@@ -61,6 +61,15 @@ struct GpuLevelView {
 
 static_assert(sizeof(GpuLevelView) == 64);
 
+struct GpuSelectionLevel {
+  std::uint32_t pixel_base;
+  std::uint32_t width;
+  std::uint32_t height;
+  std::uint32_t octave;
+};
+
+static_assert(sizeof(GpuSelectionLevel) == 16);
+
 struct DeviceImage {
   reco::core::CudaDeviceBuffer buffer;
   std::size_t pitch = 0;
@@ -425,6 +434,8 @@ struct GpuAkazePipeline::Impl {
     detail::NvrtcCompiler compiler;
     const auto akaze_ptx = compiler.compile(kGpuAkazeKernelSource, "reco_calibrate_gpu_akaze.cu");
     y_to_float = backend.load_kernel_from_ptx(akaze_ptx, "akaze_y_to_float");
+    triangle_vertical_y = backend.load_kernel_from_ptx(akaze_ptx, "akaze_triangle_vertical_y");
+    triangle_horizontal = backend.load_kernel_from_ptx(akaze_ptx, "akaze_triangle_horizontal");
     gaussian_x = backend.load_kernel_from_ptx(akaze_ptx, "akaze_gaussian_x");
     gaussian_y = backend.load_kernel_from_ptx(akaze_ptx, "akaze_gaussian_y");
     half_size = backend.load_kernel_from_ptx(akaze_ptx, "akaze_half_size");
@@ -439,7 +450,12 @@ struct GpuAkazePipeline::Impl {
     akaze_scan_block = backend.load_kernel_from_ptx(akaze_ptx, "akaze_scan_block");
     akaze_scan_add = backend.load_kernel_from_ptx(akaze_ptx, "akaze_scan_add");
     scatter_candidates = backend.load_kernel_from_ptx(akaze_ptx, "akaze_scatter_candidates");
-    select_features = backend.load_kernel_from_ptx(akaze_ptx, "akaze_select_features");
+    mark_scale_extrema = backend.load_kernel_from_ptx(akaze_ptx, "akaze_mark_scale_extrema");
+    mark_upper_level = backend.load_kernel_from_ptx(akaze_ptx, "akaze_mark_upper_level");
+    prepare_feature_keys = backend.load_kernel_from_ptx(akaze_ptx, "akaze_prepare_feature_keys");
+    radix_zero_flags = backend.load_kernel_from_ptx(akaze_ptx, "akaze_radix_zero_flags");
+    radix_scatter = backend.load_kernel_from_ptx(akaze_ptx, "akaze_radix_scatter");
+    emit_features = backend.load_kernel_from_ptx(akaze_ptx, "akaze_emit_features");
     describe_features = backend.load_kernel_from_ptx(akaze_ptx, "akaze_describe_features");
 
     const auto match_ptx = compiler.compile(kGpuMatchKernelSource, "reco_calibrate_gpu_match.cu");
@@ -576,6 +592,8 @@ struct GpuAkazePipeline::Impl {
 
   reco::core::CudaBackend backend;
   reco::core::CudaKernel y_to_float;
+  reco::core::CudaKernel triangle_vertical_y;
+  reco::core::CudaKernel triangle_horizontal;
   reco::core::CudaKernel gaussian_x;
   reco::core::CudaKernel gaussian_y;
   reco::core::CudaKernel half_size;
@@ -590,7 +608,12 @@ struct GpuAkazePipeline::Impl {
   reco::core::CudaKernel akaze_scan_block;
   reco::core::CudaKernel akaze_scan_add;
   reco::core::CudaKernel scatter_candidates;
-  reco::core::CudaKernel select_features;
+  reco::core::CudaKernel mark_scale_extrema;
+  reco::core::CudaKernel mark_upper_level;
+  reco::core::CudaKernel prepare_feature_keys;
+  reco::core::CudaKernel radix_zero_flags;
+  reco::core::CudaKernel radix_scatter;
+  reco::core::CudaKernel emit_features;
   reco::core::CudaKernel describe_features;
   reco::core::CudaKernel match_one_way;
   reco::core::CudaKernel match_crosscheck;
@@ -656,9 +679,20 @@ GpuFeatureSet GpuAkazePipeline::detect(const GpuGrayFrame& frame,
   auto crop_width = geometry.crop_width;
   auto crop_height = geometry.crop_height;
   std::uint32_t limited_range = frame.color_range == reco::core::YuvColorRange::Limited ? 1U : 0U;
-  launch(impl_->y_to_float, image_launch(dst_width, dst_height), src, src_pitch, src_width,
-         src_height, dst, dst_pitch, dst_width, dst_height, crop_x, crop_y, crop_width, crop_height,
-         limited_range);
+  if (crop_width == dst_width && crop_height == dst_height) {
+    launch(impl_->y_to_float, image_launch(dst_width, dst_height), src, src_pitch, src_width,
+           src_height, dst, dst_pitch, dst_width, dst_height, crop_x, crop_y, crop_width,
+           crop_height, limited_range);
+  } else {
+    auto vertical = allocate_float_image(backend, crop_width, dst_height);
+    auto vertical_ptr = vertical.buffer.ptr();
+    auto vertical_pitch = static_cast<std::uint64_t>(vertical.pitch);
+    launch(impl_->triangle_vertical_y, image_launch(crop_width, dst_height), src, src_pitch,
+           vertical_ptr, vertical_pitch, crop_x, crop_y, crop_width, crop_height, dst_height,
+           limited_range);
+    launch(impl_->triangle_horizontal, image_launch(dst_width, dst_height), vertical_ptr,
+           vertical_pitch, crop_width, dst, dst_pitch, dst_width, dst_height);
+  }
 
   auto histogram = backend.allocate(300U * sizeof(std::uint32_t));
   auto maximum = backend.allocate(sizeof(std::uint32_t));
@@ -842,11 +876,47 @@ GpuFeatureSet GpuAkazePipeline::detect(const GpuGrayFrame& frame,
              candidates_ptr, capacity, overflow_ptr);
     }
 
+    std::vector<GpuSelectionLevel> host_selection_levels;
+    host_selection_levels.reserve(levels.size());
+    for (const auto& level : levels) {
+      host_selection_levels.push_back({.pixel_base = level.spec.pixel_base,
+                                       .width = level.spec.width,
+                                       .height = level.spec.height,
+                                       .octave = level.spec.octave});
+    }
+    auto selection_levels = backend.allocate(checked_multiply(
+        host_selection_levels.size(), sizeof(GpuSelectionLevel), "GPU AKAZE selection levels"));
+    upload_bytes(backend, host_selection_levels.data(),
+                 host_selection_levels.size() * sizeof(GpuSelectionLevel), selection_levels);
+
+    const auto candidate_bytes =
+        checked_multiply(candidate_count, sizeof(std::uint32_t), "GPU AKAZE candidate selection");
+    auto scale_flags = backend.allocate(candidate_bytes);
+    auto selected_flags = backend.allocate(candidate_bytes);
+    auto keys_a = backend.allocate(candidate_bytes);
+    auto keys_b = backend.allocate(candidate_bytes);
+    auto indices_a = backend.allocate(candidate_bytes);
+    auto indices_b = backend.allocate(candidate_bytes);
+    auto radix_flags = backend.allocate(candidate_bytes);
+    auto radix_offsets = backend.allocate(candidate_bytes);
+    auto valid_count = backend.allocate(sizeof(std::uint32_t));
+    backend.memset_d8(valid_count, 0);
+
     auto candidates_ptr = candidates.ptr();
     auto candidate_count_arg = candidate_count;
-    auto features_ptr = result->points.ptr();
-    auto max_features = config.max_keypoints;
-    auto feature_count = result->count.ptr();
+    auto selection_levels_ptr = selection_levels.ptr();
+    auto level_count = checked_u32(levels.size(), "GPU AKAZE selection level count");
+    auto nms_flags_ptr = flags.ptr();
+    auto nms_offsets_ptr = offsets.ptr();
+    auto scale_flags_ptr = scale_flags.ptr();
+    auto selected_flags_ptr = selected_flags.ptr();
+    launch(impl_->mark_scale_extrema, linear_launch(candidate_count), candidates_ptr,
+           candidate_count_arg, selection_levels_ptr, level_count, nms_flags_ptr, nms_offsets_ptr,
+           scale_flags_ptr);
+    launch(impl_->mark_upper_level, linear_launch(candidate_count), candidates_ptr,
+           candidate_count_arg, selection_levels_ptr, level_count, nms_flags_ptr, nms_offsets_ptr,
+           scale_flags_ptr, selected_flags_ptr);
+
     auto inverse_detection_scale = 1.0F / geometry.detector_scale;
     auto crop_x_float = static_cast<float>(geometry.crop_x);
     auto crop_y_float = static_cast<float>(geometry.crop_y);
@@ -862,9 +932,37 @@ GpuFeatureSet GpuAkazePipeline::detect(const GpuGrayFrame& frame,
     auto border_margin = config.border_margin;
     std::uint32_t black_threshold =
         frame.color_range == reco::core::YuvColorRange::Limited ? 25U : 10U;
-    launch(impl_->select_features,
-           {.grid = {.x = 1, .y = 1, .z = 1}, .block = {.x = 1, .y = 1, .z = 1}}, candidates_ptr,
-           candidate_count_arg, features_ptr, max_features, feature_count, inverse_detection_scale,
+    auto keys_input = keys_a.ptr();
+    auto keys_output = keys_b.ptr();
+    auto indices_input = indices_a.ptr();
+    auto indices_output = indices_b.ptr();
+    auto valid_count_ptr = valid_count.ptr();
+    launch(impl_->prepare_feature_keys, linear_launch(candidate_count), candidates_ptr,
+           candidate_count_arg, selected_flags_ptr, keys_input, indices_input, valid_count_ptr,
+           inverse_detection_scale, crop_x_float, crop_y_float, use_roi, roi_x_min, roi_x_max,
+           roi_y_min, roi_y_max, border_y, border_pitch, border_width, border_height, border_margin,
+           black_threshold);
+
+    std::vector<reco::core::CudaDeviceBuffer> radix_scan_scratch;
+    auto radix_flags_ptr = radix_flags.ptr();
+    auto radix_offsets_ptr = radix_offsets.ptr();
+    for (std::uint32_t bit = 0; bit < 32U; ++bit) {
+      auto bit_arg = bit;
+      launch(impl_->radix_zero_flags, linear_launch(candidate_count), keys_input,
+             candidate_count_arg, bit_arg, radix_flags_ptr);
+      impl_->exclusive_scan(impl_->akaze_scan_block, impl_->akaze_scan_add, radix_flags_ptr,
+                            radix_offsets_ptr, candidate_count, false, radix_scan_scratch);
+      launch(impl_->radix_scatter, linear_launch(candidate_count), keys_input, indices_input,
+             radix_flags_ptr, radix_offsets_ptr, candidate_count_arg, keys_output, indices_output);
+      std::swap(keys_input, keys_output);
+      std::swap(indices_input, indices_output);
+    }
+
+    auto features_ptr = result->points.ptr();
+    auto max_features = config.max_keypoints;
+    auto feature_count = result->count.ptr();
+    launch(impl_->emit_features, linear_launch(max_features), candidates_ptr, indices_input,
+           valid_count_ptr, features_ptr, max_features, feature_count, inverse_detection_scale,
            crop_x_float, crop_y_float, use_roi, roi_x_min, roi_x_max, roi_y_min, roi_y_max,
            border_y, border_pitch, border_width, border_height, border_margin, black_threshold);
 
@@ -897,7 +995,7 @@ GpuFeatureSet GpuAkazePipeline::detect(const GpuGrayFrame& frame,
              descriptors, descriptor_pitch);
       impl_->describe_features.synchronize();
     } else {
-      impl_->select_features.synchronize();
+      impl_->emit_features.synchronize();
     }
   }
   return GpuFeatureSet(std::move(result));

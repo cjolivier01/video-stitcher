@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -196,6 +197,20 @@ std::uint64_t descriptor_hash(const Descriptor& descriptor) {
     hash *= 1099511628211ULL;
   }
   return hash;
+}
+
+std::vector<GpuFeaturePoint> download_points(CudaBackend& backend, const GpuFeatureSet& features) {
+  const auto count = feature_count(backend, features);
+  std::vector<GpuFeaturePoint> points(count);
+  if (count != 0U) {
+    backend.copy_device_to_host_2d({.dst = points.data(),
+                                    .dst_pitch = points.size() * sizeof(GpuFeaturePoint),
+                                    .src = features.view().points,
+                                    .src_pitch = points.size() * sizeof(GpuFeaturePoint),
+                                    .width_bytes = points.size() * sizeof(GpuFeaturePoint),
+                                    .height = 1});
+  }
+  return points;
 }
 
 GpuAkazeConfig detector_config(std::uint32_t max_keypoints = 32) {
@@ -509,6 +524,88 @@ void resize_boundary_maps_to_source_coordinates(CudaBackend& backend,
   }
 }
 
+void triangle_downscale_matches_rust_golden(CudaBackend& backend,
+                                            const GpuAkazePipeline& pipeline) {
+  constexpr std::uint32_t width = 3840;
+  constexpr std::uint32_t height = 192;
+  const auto frame = make_frame(backend, width, height, width);
+  auto config = detector_config(16);
+  config.max_detection_width = 1920;
+  const auto features = pipeline.detect(frame.view(), config);
+  const auto points = download_points(backend, features);
+  expect_eq(points.size(), 16U, "Triangle golden feature count");
+
+  struct GoldenPoint {
+    float x;
+    float y;
+    float response;
+  };
+  constexpr std::array<GoldenPoint, 16> rust_golden{{
+      {3490.589111328F, 130.976364136F, 0.078354820609F},
+      {953.287475586F, 77.089065552F, 0.073465585709F},
+      {2177.023437500F, 106.958404541F, 0.072100788355F},
+      {1012.978332520F, 98.228263855F, 0.070630028844F},
+      {1355.276611328F, 131.111114502F, 0.068403765559F},
+      {2870.102294922F, 86.022186279F, 0.068134702742F},
+      {3158.328369141F, 91.927497864F, 0.066853381693F},
+      {3143.578857422F, 94.641464233F, 0.065145090222F},
+      {292.626037598F, 95.571952820F, 0.065043181181F},
+      {2452.126708984F, 85.024482727F, 0.064136497676F},
+      {828.253112793F, 96.716560364F, 0.063492082059F},
+      {2896.912353516F, 77.008834839F, 0.062778681517F},
+      {803.351623535F, 101.150360107F, 0.060621485114F},
+      {904.586303711F, 58.997024536F, 0.060412760824F},
+      {3274.332275391F, 95.149536133F, 0.060264542699F},
+      {1930.680053711F, 88.560333252F, 0.059688717127F},
+  }};
+  for (std::size_t index = 0; index < std::min(points.size(), rust_golden.size()); ++index) {
+    expect_near(points[index].x, rust_golden[index].x, 2.0e-4F, "Triangle Rust-golden feature x");
+    expect_near(points[index].y, rust_golden[index].y, 2.0e-4F, "Triangle Rust-golden feature y");
+    expect_near(points[index].response, rust_golden[index].response, 1.0e-7F,
+                "Triangle Rust-golden feature response");
+  }
+}
+
+void full_resolution_adversarial_selection_is_bounded(CudaBackend& backend,
+                                                      const GpuAkazePipeline& pipeline) {
+  constexpr std::uint32_t width = 1920;
+  constexpr std::uint32_t height = 1080;
+  constexpr std::size_t pitch = 1936;
+  std::vector<std::uint8_t> pixels(pitch * height, 0);
+  for (std::uint32_t y = 0; y < height; ++y) {
+    for (std::uint32_t x = 0; x < width; ++x) {
+      std::uint32_t hash = x * 0x9e3779b9U + y * 0x85ebca6bU;
+      hash ^= hash >> 16U;
+      hash *= 0x7feb352dU;
+      hash ^= hash >> 15U;
+      pixels[static_cast<std::size_t>(y) * pitch + x] = static_cast<std::uint8_t>(hash >> 24U);
+    }
+  }
+  auto device = backend.allocate(pitch * height);
+  backend.copy_host_to_device_2d({.src = pixels.data(),
+                                  .src_pitch = pitch,
+                                  .dst = device.ptr(),
+                                  .dst_pitch = pitch,
+                                  .width_bytes = width,
+                                  .height = height});
+  const DeviceFrame frame{
+      .pixels = std::move(device), .pitch = pitch, .width = width, .height = height};
+  auto config = detector_config(64);
+  config.threshold = 1.0e-8F;
+  config.max_detection_width = width;
+  config.num_sublevels = 1;
+  config.max_octaves = 1;
+
+  const auto started = std::chrono::steady_clock::now();
+  const auto features = pipeline.detect(frame.view(), config);
+  backend.synchronize();
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  expect_eq(feature_count(backend, features), config.max_keypoints,
+            "adversarial detector reaches its bounded output cap");
+  expect_true(elapsed < std::chrono::seconds(10),
+              "full-resolution adversarial selection completes without watchdog-scale latency");
+}
+
 void roi_boundaries_are_enforced(CudaBackend& backend, const GpuAkazePipeline& pipeline) {
   constexpr std::uint32_t width = 320;
   constexpr std::uint32_t height = 192;
@@ -721,6 +818,8 @@ int main() {
     detector_is_bounded_and_deterministic(backend, pipeline);
     luma_range_boundaries_are_equivalent(backend, pipeline);
     resize_boundary_maps_to_source_coordinates(backend, pipeline);
+    triangle_downscale_matches_rust_golden(backend, pipeline);
+    full_resolution_adversarial_selection_is_bounded(backend, pipeline);
     roi_boundaries_are_enforced(backend, pipeline);
     rotated_descriptors_match_known_vectors(backend, pipeline);
     matcher_ties_lowe_and_crosscheck(backend, pipeline);
