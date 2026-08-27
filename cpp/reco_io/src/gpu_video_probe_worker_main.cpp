@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <charconv>
 #include <cstdint>
@@ -27,6 +28,9 @@ int run_gpu_video_probe_worker();
 #if defined(_WIN32)
 int run_gpu_video_probe_guardian();
 #else
+int run_gpu_video_probe_supervisor(const char* executable, std::uint64_t pre_worker_report_delay_ns,
+                                   std::uint64_t pre_guardian_exec_delay_ns,
+                                   std::uint64_t caller_pid, bool has_marker);
 int run_gpu_video_probe_guardian(const char* executable, std::uint64_t pre_worker_report_delay_ns);
 #endif
 } // namespace reco::io::detail
@@ -106,6 +110,22 @@ int main(int argc, char** argv) {
     return reco::io::detail::run_gpu_video_probe_guardian();
   }
 #else
+  if (argc == 6 && std::strcmp(argv[1], "--reco-video-probe-supervisor") == 0) {
+    std::array<std::uint64_t, 3> values{};
+    for (std::size_t index = 0; index < values.size(); ++index) {
+      const std::string_view value(argv[index + 2U]);
+      const auto [end, error] =
+          std::from_chars(value.data(), value.data() + value.size(), values[index]);
+      if (error != std::errc{} || end != value.data() + value.size()) {
+        return 2;
+      }
+    }
+    if (argv[5][0] == '\0' || argv[5][1] != '\0' || (argv[5][0] != '0' && argv[5][0] != '1')) {
+      return 2;
+    }
+    return reco::io::detail::run_gpu_video_probe_supervisor(argv[0], values[0], values[1],
+                                                            values[2], argv[5][0] == '1');
+  }
   if (argc == 3 && std::strcmp(argv[1], "--reco-video-probe-guardian") == 0) {
     const std::string_view delay_value(argv[2]);
     std::uint64_t delay_ns = 0;

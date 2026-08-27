@@ -26,11 +26,15 @@
 #include <fcntl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
 namespace reco::io::detail {
 #if !defined(_WIN32)
+int run_gpu_video_probe_supervisor(const char* executable, std::uint64_t pre_worker_report_delay_ns,
+                                   std::uint64_t pre_guardian_exec_delay_ns,
+                                   std::uint64_t caller_pid, bool has_marker);
 int run_gpu_video_probe_guardian(const char* executable, std::uint64_t pre_worker_report_delay_ns);
 #endif
 } // namespace reco::io::detail
@@ -67,9 +71,18 @@ public:
 #if defined(_WIN32)
     const char* guardian_process = std::getenv("RECO_VIDEO_PROBE_GUARDIAN_PROCESS");
 #endif
-    if (scenario == nullptr || std::strcmp(scenario, "pre-main-block") != 0 ||
-        marker_path == nullptr || marker_path[0] == '\0' ||
-        (guardian_process != nullptr && std::strcmp(guardian_process, "1") == 0)) {
+    const bool worker_block =
+        scenario != nullptr && std::strcmp(scenario, "pre-main-block") == 0 &&
+        (guardian_process == nullptr || std::strcmp(guardian_process, "1") != 0);
+#if !defined(_WIN32)
+    const char* process_role = std::getenv("RECO_VIDEO_PROBE_PROCESS_ROLE");
+    const bool supervisor_block =
+        scenario != nullptr && std::strcmp(scenario, "supervisor-pre-main-block") == 0 &&
+        process_role != nullptr && std::strcmp(process_role, "supervisor") == 0;
+#else
+    constexpr bool supervisor_block = false;
+#endif
+    if ((!worker_block && !supervisor_block) || marker_path == nullptr || marker_path[0] == '\0') {
       return;
     }
 #if defined(_WIN32)
@@ -203,6 +216,106 @@ std::uint64_t spawn_sleeping_descendant() {
 }
 
 #if !defined(_WIN32)
+void terminate_and_reap(pid_t process_id) {
+  if (process_id <= 0) {
+    return;
+  }
+  (void)::kill(process_id, SIGKILL);
+  int status = 0;
+  while (::waitpid(process_id, &status, 0) < 0 && errno == EINTR) {
+  }
+}
+
+bool write_pipe_byte(int descriptor, char value) {
+  ssize_t written = -1;
+  do {
+    written = ::write(descriptor, &value, 1);
+  } while (written < 0 && errno == EINTR);
+  return written == 1;
+}
+
+bool read_pipe_byte(int descriptor, char* value) {
+  ssize_t received = -1;
+  do {
+    received = ::read(descriptor, value, 1);
+  } while (received < 0 && errno == EINTR);
+  return received == 1;
+}
+
+int run_aggregate_memory_with_descendant() {
+  constexpr std::size_t kAllocationBytes = 280ULL * 1024ULL * 1024ULL;
+  int readiness[2] = {-1, -1};
+  if (::pipe(readiness) != 0) {
+    return EXIT_FAILURE;
+  }
+
+  const auto descendant = ::fork();
+  if (descendant == 0) {
+    (void)::close(readiness[0]);
+    try {
+      std::vector<std::uint8_t> allocation(kAllocationBytes);
+      volatile auto* bytes = allocation.data();
+      for (std::size_t offset = 0; offset < allocation.size(); offset += 4'096U) {
+        bytes[offset] = static_cast<std::uint8_t>(offset);
+      }
+      if (!write_lifecycle_event("descendant-memory-ready") ||
+          !write_pipe_byte(readiness[1], 'R')) {
+        (void)::close(readiness[1]);
+        std::_Exit(EXIT_FAILURE);
+      }
+      (void)::close(readiness[1]);
+      std::this_thread::sleep_for(std::chrono::seconds(30));
+    } catch (...) {
+      (void)::close(readiness[1]);
+      std::_Exit(EXIT_FAILURE);
+    }
+    std::_Exit(EXIT_SUCCESS);
+  }
+
+  (void)::close(readiness[1]);
+  if (descendant < 0) {
+    (void)::close(readiness[0]);
+    return EXIT_FAILURE;
+  }
+  if (!write_process_marker("RECO_FAKE_PROBE_DESCENDANT_PATH",
+                            static_cast<std::uint64_t>(descendant))) {
+    (void)::close(readiness[0]);
+    terminate_and_reap(descendant);
+    return EXIT_FAILURE;
+  }
+
+  char ready = '\0';
+  if (!read_pipe_byte(readiness[0], &ready) || ready != 'R') {
+    (void)::close(readiness[0]);
+    terminate_and_reap(descendant);
+    return EXIT_FAILURE;
+  }
+  (void)::close(readiness[0]);
+  if (!write_lifecycle_event("worker-memory-allocation-started")) {
+    terminate_and_reap(descendant);
+    return EXIT_FAILURE;
+  }
+
+  try {
+    std::vector<std::uint8_t> allocation(kAllocationBytes);
+    volatile auto* bytes = allocation.data();
+    for (std::size_t offset = 0; offset < allocation.size(); offset += 4'096U) {
+      bytes[offset] = static_cast<std::uint8_t>(offset);
+    }
+    if (!write_lifecycle_event("worker-memory-ready")) {
+      terminate_and_reap(descendant);
+      return EXIT_FAILURE;
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(30));
+  } catch (...) {
+    (void)write_lifecycle_event("worker-memory-allocation-failed");
+    terminate_and_reap(descendant);
+    return EXIT_FAILURE;
+  }
+  terminate_and_reap(descendant);
+  return EXIT_FAILURE;
+}
+
 bool close_unrelated_descriptors() {
 #if defined(__linux__)
   std::error_code directory_error;
@@ -330,6 +443,22 @@ int main(int argc, char** argv) {
     return EXIT_SUCCESS;
   }
 #if !defined(_WIN32)
+  if (argc == 6 && std::strcmp(argv[1], "--reco-video-probe-supervisor") == 0) {
+    std::array<std::uint64_t, 3> values{};
+    for (std::size_t index = 0; index < values.size(); ++index) {
+      const std::string_view value(argv[index + 2U]);
+      const auto [end, error] =
+          std::from_chars(value.data(), value.data() + value.size(), values[index]);
+      if (error != std::errc{} || end != value.data() + value.size()) {
+        return 2;
+      }
+    }
+    if (argv[5][0] == '\0' || argv[5][1] != '\0' || (argv[5][0] != '0' && argv[5][0] != '1')) {
+      return 2;
+    }
+    return reco::io::detail::run_gpu_video_probe_supervisor(argv[0], values[0], values[1],
+                                                            values[2], argv[5][0] == '1');
+  }
   if (argc == 3 && std::strcmp(argv[1], "--reco-video-probe-guardian") == 0) {
     const std::string_view delay_value(argv[2]);
     std::uint64_t delay_ns = 0;
@@ -440,6 +569,30 @@ int main(int argc, char** argv) {
   if (!write_process_marker("RECO_FAKE_PROBE_WORKER_PID_PATH", current_process_id)) {
     return EXIT_FAILURE;
   }
+#if !defined(_WIN32)
+  if (scenario != nullptr && std::strcmp(scenario, "process-spawn-denied") == 0) {
+    const auto descendant = ::fork();
+    if (descendant == 0) {
+      std::_Exit(EXIT_SUCCESS);
+    }
+    if (descendant > 0) {
+      terminate_and_reap(descendant);
+      return 8;
+    }
+    if (errno != EPERM) {
+      return 9;
+    }
+    bool thread_ran = false;
+    std::thread thread([&thread_ran] { thread_ran = true; });
+    thread.join();
+    if (!thread_ran) {
+      return 10;
+    }
+  }
+  if (scenario != nullptr && std::strcmp(scenario, "aggregate-memory-with-descendant") == 0) {
+    return run_aggregate_memory_with_descendant();
+  }
+#endif
   if (scenario != nullptr && std::strcmp(scenario, "startup-marker") == 0) {
     const char* marker_path = std::getenv("RECO_FAKE_PROBE_STARTUP_MARKER_PATH");
     if (marker_path == nullptr || marker_path[0] == '\0') {
@@ -531,6 +684,7 @@ int main(int argc, char** argv) {
                std::strcmp(scenario, "valid-metadata-with-descendant") == 0 ||
 #if !defined(_WIN32)
                std::strcmp(scenario, "descriptor-isolation") == 0 ||
+               std::strcmp(scenario, "process-spawn-denied") == 0 ||
 #if !defined(__APPLE__)
                std::strcmp(scenario, "memory-limit") == 0 ||
 #endif
@@ -551,6 +705,7 @@ int main(int argc, char** argv) {
                                      std::strcmp(scenario, "valid-metadata-with-descendant") == 0 ||
 #if !defined(_WIN32)
                                      std::strcmp(scenario, "descriptor-isolation") == 0 ||
+                                     std::strcmp(scenario, "process-spawn-denied") == 0 ||
 #endif
 #if !defined(_WIN32) && !defined(__APPLE__)
                                      std::strcmp(scenario, "memory-limit") == 0 || false

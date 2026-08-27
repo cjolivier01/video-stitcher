@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -16,6 +17,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -46,6 +48,16 @@ namespace {
 int failures = 0;
 std::filesystem::path probe_worker_path;
 std::filesystem::path fake_probe_worker_path;
+#if !defined(_WIN32)
+std::filesystem::path test_executable_path;
+
+constexpr const char* kProbeCallerVideoPath = "RECO_FAKE_PROBE_CALLER_VIDEO_PATH";
+constexpr const char* kProbeCallerWorkerPath = "RECO_FAKE_PROBE_CALLER_WORKER_PATH";
+constexpr const char* kProbeCallerMode = "RECO_FAKE_PROBE_CALLER_MODE";
+constexpr const char* kProbeCallerTimeout = "RECO_FAKE_PROBE_CALLER_TIMEOUT_NS";
+constexpr const char* kProbeCallerDelay = "RECO_FAKE_PROBE_CALLER_DELAY_NS";
+constexpr const char* kProbeCallerMarkerPath = "RECO_FAKE_PROBE_CALLER_MARKER_PATH";
+#endif
 
 void expect_true(bool value, std::string_view message) {
   if (!value) {
@@ -145,15 +157,34 @@ wait_for_process_marker(const std::filesystem::path& path,
 }
 
 #if defined(__linux__)
-std::optional<pid_t> wait_for_direct_child(pid_t parent,
-                                           std::chrono::steady_clock::time_point deadline) {
+std::vector<pid_t> direct_children(pid_t parent) {
+  std::vector<pid_t> result;
   const auto task_path = std::filesystem::path("/proc") / std::to_string(parent) / "task";
+  std::error_code directory_error;
+  for (const auto& task : std::filesystem::directory_iterator(task_path, directory_error)) {
+    std::ifstream children(task.path() / "children");
+    for (pid_t child = -1; children >> child;) {
+      if (child > 0 && std::find(result.begin(), result.end(), child) == result.end()) {
+        result.push_back(child);
+      }
+    }
+  }
+  return result;
+}
+
+std::string process_command_line(pid_t process) {
+  std::ifstream input(std::filesystem::path("/proc") / std::to_string(process) / "cmdline",
+                      std::ios::binary);
+  return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+
+std::optional<pid_t> wait_for_direct_child(pid_t parent,
+                                           std::chrono::steady_clock::time_point deadline,
+                                           std::string_view command_fragment = {}) {
   while (std::chrono::steady_clock::now() < deadline) {
-    std::error_code directory_error;
-    for (const auto& task : std::filesystem::directory_iterator(task_path, directory_error)) {
-      std::ifstream children(task.path() / "children");
-      pid_t child = -1;
-      if (children >> child && child > 0) {
+    for (const auto child : direct_children(parent)) {
+      if (command_fragment.empty() ||
+          process_command_line(child).find(command_fragment) != std::string::npos) {
         return child;
       }
     }
@@ -250,6 +281,87 @@ GpuVideoProbe probe_video(const GpuFileDecodeConfig& config, std::uint64_t timeo
                              error.what());
   }
 }
+
+#if !defined(_WIN32)
+bool parse_probe_caller_duration(const char* value, std::uint64_t* duration_ns) {
+  if (value == nullptr || value[0] == '\0') {
+    return false;
+  }
+  const auto text = std::string_view(value);
+  const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), *duration_ns);
+  return error == std::errc{} && end == text.data() + text.size();
+}
+
+int run_posix_probe_caller() {
+  const char* video_path = std::getenv(kProbeCallerVideoPath);
+  const char* worker_path = std::getenv(kProbeCallerWorkerPath);
+  const char* mode_value = std::getenv(kProbeCallerMode);
+  const char* marker_path = std::getenv(kProbeCallerMarkerPath);
+  std::uint64_t timeout_ns = 0;
+  std::uint64_t delay_ns = 0;
+  if (video_path == nullptr || video_path[0] == '\0' || worker_path == nullptr ||
+      worker_path[0] == '\0' || mode_value == nullptr || mode_value[0] == '\0' ||
+      !parse_probe_caller_duration(std::getenv(kProbeCallerTimeout), &timeout_ns) ||
+      !parse_probe_caller_duration(std::getenv(kProbeCallerDelay), &delay_ns)) {
+    return EXIT_FAILURE;
+  }
+
+  const auto mode = std::string_view(mode_value);
+  if (mode != "probe" && mode != "pre-worker-report-delay" && mode != "pre-guardian-exec-delay") {
+    return EXIT_FAILURE;
+  }
+  if (mode == "pre-guardian-exec-delay" && (marker_path == nullptr || marker_path[0] == '\0')) {
+    return EXIT_FAILURE;
+  }
+
+  try {
+    const auto config = container_config(std::filesystem::path(video_path));
+    const auto worker = std::filesystem::path(worker_path);
+    if (mode == "probe") {
+      (void)reco::io::probe_gpu_video(config, worker, timeout_ns);
+    } else if (mode == "pre-worker-report-delay") {
+      (void)reco::io::detail::probe_gpu_video_with_pre_worker_report_delay_for_test(
+          config, worker, timeout_ns, delay_ns);
+      return 2;
+    } else {
+      (void)reco::io::detail::probe_gpu_video_with_pre_guardian_exec_delay_for_test(
+          config, worker, timeout_ns, delay_ns, std::filesystem::path(marker_path));
+    }
+  } catch (...) {
+    return EXIT_SUCCESS;
+  }
+  return EXIT_SUCCESS;
+}
+
+pid_t fork_exec_probe_caller(const std::filesystem::path& video_path,
+                             const std::filesystem::path& worker_path, std::string_view mode,
+                             std::uint64_t timeout_ns, std::uint64_t delay_ns = 0,
+                             const std::filesystem::path& marker_path = {}) {
+  set_environment(kProbeCallerVideoPath, video_path.string());
+  set_environment(kProbeCallerWorkerPath, worker_path.string());
+  set_environment(kProbeCallerMode, std::string(mode));
+  set_environment(kProbeCallerTimeout, std::to_string(timeout_ns));
+  set_environment(kProbeCallerDelay, std::to_string(delay_ns));
+  set_environment(kProbeCallerMarkerPath, marker_path.string());
+
+  auto executable = test_executable_path.string();
+  std::string helper_mode = "--reco-posix-probe-caller";
+  std::array<char*, 3> arguments{executable.data(), helper_mode.data(), nullptr};
+  const auto caller = ::fork();
+  if (caller == 0) {
+    ::execv(arguments[0], arguments.data());
+    ::_exit(127);
+  }
+
+  set_environment(kProbeCallerVideoPath, "");
+  set_environment(kProbeCallerWorkerPath, "");
+  set_environment(kProbeCallerMode, "");
+  set_environment(kProbeCallerTimeout, "");
+  set_environment(kProbeCallerDelay, "");
+  set_environment(kProbeCallerMarkerPath, "");
+  return caller;
+}
+#endif
 
 #if defined(_WIN32)
 int run_windows_parent_death_probe_caller() {
@@ -1215,19 +1327,30 @@ void aggregate_worker_memory_budget_is_enforced() {
   std::atomic<bool> start{false};
   std::atomic<bool> reservation_failed{false};
   std::vector<std::thread> reservations;
-  reservations.reserve(reservation_count);
-  for (std::size_t index = 0; index < reservation_count; ++index) {
-    reservations.emplace_back([&] {
-      ready.fetch_add(1, std::memory_order_release);
-      while (!start.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
+  try {
+    reservations.reserve(reservation_count);
+    for (std::size_t index = 0; index < reservation_count; ++index) {
+      reservations.emplace_back([&] {
+        ready.fetch_add(1, std::memory_order_release);
+        while (!start.load(std::memory_order_acquire)) {
+          std::this_thread::yield();
+        }
+        try {
+          reco::io::detail::hold_probe_worker_memory_reservation_for_test(2'000'000'000ULL);
+        } catch (...) {
+          reservation_failed.store(true, std::memory_order_release);
+        }
+      });
+    }
+  } catch (...) {
+    start.store(true, std::memory_order_release);
+    for (auto& reservation : reservations) {
+      if (reservation.joinable()) {
+        reservation.join();
       }
-      try {
-        reco::io::detail::hold_probe_worker_memory_reservation_for_test(2'000'000'000ULL);
-      } catch (...) {
-        reservation_failed.store(true, std::memory_order_release);
-      }
-    });
+    }
+    expect_true(false, "aggregate probe worker reservation threads are created");
+    return;
   }
   while (ready.load(std::memory_order_acquire) != reservation_count) {
     std::this_thread::yield();
@@ -1253,6 +1376,56 @@ void aggregate_worker_memory_budget_is_enforced() {
               "every reservation within the aggregate worker memory budget succeeds");
   expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
             "probe worker memory reservations are released after completion");
+}
+
+void deferred_cleanup_retains_worker_memory_reservation(const std::filesystem::path& video_path) {
+#if defined(__linux__)
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "block-input");
+  bool probe_failed = false;
+  std::thread probe([&] {
+    try {
+      (void)reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
+                                      1'000'000'000ULL);
+    } catch (...) {
+      probe_failed = true;
+    }
+  });
+
+  const auto supervisor =
+      wait_for_direct_child(::getpid(), std::chrono::steady_clock::now() + std::chrono::seconds(2),
+                            "--reco-video-probe-supervisor");
+  expect_true(supervisor.has_value(), "deferred-cleanup probe supervisor starts");
+  bool supervisor_stopped = false;
+  if (supervisor.has_value()) {
+    supervisor_stopped = ::kill(*supervisor, SIGSTOP) == 0;
+    expect_true(supervisor_stopped, "deferred-cleanup probe supervisor stops before timeout");
+  }
+
+  probe.join();
+  expect_true(probe_failed, "stopped supervisor causes a bounded probe failure");
+  if (supervisor_stopped) {
+    expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(),
+              reco::io::detail::maximum_probe_worker_address_space_bytes_for_test(),
+              "deferred supervisor cleanup retains its worker memory reservation");
+    (void)::kill(*supervisor, SIGCONT);
+  }
+
+  const auto release_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (reco::io::detail::reserved_probe_worker_address_space_bytes_for_test() != 0 &&
+         std::chrono::steady_clock::now() < release_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
+            "deferred supervisor cleanup releases its reservation after process-tree exit");
+  if (supervisor_stopped &&
+      reco::io::detail::reserved_probe_worker_address_space_bytes_for_test() != 0) {
+    (void)::kill(*supervisor, SIGKILL);
+    (void)::kill(*supervisor, SIGCONT);
+  }
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+#else
+  (void)video_path;
+#endif
 }
 
 void delayed_supervision_cannot_launch_worker(const std::filesystem::path& video_path) {
@@ -1301,24 +1474,17 @@ void launch_gate_prevents_post_timeout_process_start(const std::filesystem::path
 
 void guardian_death_before_pid_report_reclaims_worker(const std::filesystem::path& video_path) {
 #if defined(__linux__)
-  const auto caller = ::fork();
-  if (caller == 0) {
-    try {
-      (void)reco::io::detail::probe_gpu_video_with_pre_worker_report_delay_for_test(
-          container_config(video_path), fake_probe_worker_path, 30'000'000'000ULL,
-          5'000'000'000ULL);
-      std::_Exit(2);
-    } catch (...) {
-      std::_Exit(0);
-    }
-  }
+  const auto caller =
+      fork_exec_probe_caller(video_path, fake_probe_worker_path, "pre-worker-report-delay",
+                             30'000'000'000ULL, 5'000'000'000ULL);
   expect_true(caller > 0, "pre-report guardian-death caller starts");
   if (caller <= 0) {
     return;
   }
 
   const auto discovery_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-  const auto supervisor = wait_for_direct_child(caller, discovery_deadline);
+  const auto supervisor =
+      wait_for_direct_child(caller, discovery_deadline, "--reco-video-probe-supervisor");
   const auto guardian = supervisor.has_value()
                             ? wait_for_direct_child(*supervisor, discovery_deadline)
                             : std::nullopt;
@@ -1368,10 +1534,6 @@ void auto_reaped_workers_are_supported(const std::filesystem::path& video_path) 
   }
 
   bool probe_succeeded = false;
-  const auto descendant_path =
-      video_path.parent_path() / (video_path.filename().string() + ".probe-descendant");
-  std::filesystem::remove(descendant_path);
-  bool descendant_probe_succeeded = false;
   try {
     set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
     probe_succeeded = reco::io::probe_gpu_video(container_config(video_path),
@@ -1381,40 +1543,10 @@ void auto_reaped_workers_are_supported(const std::filesystem::path& video_path) 
     std::cerr << "FAIL: auto-reaped worker probe threw: " << error.what() << '\n';
     ++failures;
   }
-  try {
-    set_environment("RECO_FAKE_PROBE_DESCENDANT_PATH", descendant_path.string());
-    set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata-with-descendant");
-    descendant_probe_succeeded = reco::io::probe_gpu_video(container_config(video_path),
-                                                           fake_probe_worker_path, 5'000'000'000ULL)
-                                     .width == 854U;
-  } catch (const std::exception& error) {
-    std::cerr << "FAIL: auto-reaped descendant probe threw: " << error.what() << '\n';
-    ++failures;
-  }
   if (sigaction(SIGCHLD, &previous_action, nullptr) != 0) {
     expect_true(false, "SIGCHLD policy restores");
   }
   expect_true(probe_succeeded, "auto-reaped worker returns its framed response");
-  expect_true(descendant_probe_succeeded,
-              "auto-reaped worker with a descendant returns its framed response");
-  pid_t descendant = -1;
-  {
-    std::ifstream input(descendant_path);
-    input >> descendant;
-  }
-  expect_true(descendant > 0, "auto-reaped worker records its descendant");
-  bool descendant_exited = false;
-  const auto exit_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-  while (descendant > 0 && std::chrono::steady_clock::now() < exit_deadline) {
-    errno = 0;
-    if (kill(descendant, 0) != 0 && errno == ESRCH) {
-      descendant_exited = true;
-      break;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
-  expect_true(descendant_exited, "ECHILD supervision kills the worker process group");
-  std::filesystem::remove(descendant_path);
 #else
   (void)video_path;
 #endif
@@ -1465,29 +1597,16 @@ void caller_death_reclaims_worker_and_descendant(const std::filesystem::path& vi
 #if !defined(_WIN32)
   const auto worker_marker =
       video_path.parent_path() / (video_path.filename().string() + ".caller-worker");
-  const auto descendant_marker =
-      video_path.parent_path() / (video_path.filename().string() + ".caller-descendant");
   std::filesystem::remove(worker_marker);
-  std::filesystem::remove(descendant_marker);
   set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", worker_marker.string());
-  set_environment("RECO_FAKE_PROBE_DESCENDANT_PATH", descendant_marker.string());
-  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "block-input-with-descendant");
-  const auto caller = ::fork();
-  if (caller == 0) {
-    try {
-      (void)reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
-                                      30'000'000'000ULL);
-    } catch (...) {
-    }
-    std::_Exit(EXIT_SUCCESS);
-  }
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "block-input");
+  const auto caller =
+      fork_exec_probe_caller(video_path, fake_probe_worker_path, "probe", 30'000'000'000ULL);
   expect_true(caller > 0, "POSIX parent-death probe caller starts");
   if (caller > 0) {
     const auto marker_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     const auto worker = wait_for_process_marker(worker_marker, marker_deadline);
-    const auto descendant = wait_for_process_marker(descendant_marker, marker_deadline);
     expect_true(worker.has_value(), "POSIX isolated worker starts before caller death");
-    expect_true(descendant.has_value(), "POSIX worker descendant starts before caller death");
     (void)::kill(caller, SIGKILL);
     int caller_status = 0;
     while (::waitpid(caller, &caller_status, 0) < 0 && errno == EINTR) {
@@ -1515,12 +1634,9 @@ void caller_death_reclaims_worker_and_descendant(const std::filesystem::path& vi
       }
     };
     expect_process_exit(worker, "POSIX worker exits when its caller dies");
-    expect_process_exit(descendant, "POSIX worker descendant exits when its caller dies");
   }
   set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", "");
-  set_environment("RECO_FAKE_PROBE_DESCENDANT_PATH", "");
   std::filesystem::remove(worker_marker);
-  std::filesystem::remove(descendant_marker);
   set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
 #elif defined(_WIN32)
   const auto worker_marker =
@@ -1601,15 +1717,11 @@ void guardian_death_after_worker_release_reclaims_group(const std::filesystem::p
       video_path.parent_path() / (video_path.filename().string() + ".released-guardian");
   const auto worker_marker =
       video_path.parent_path() / (video_path.filename().string() + ".released-worker");
-  const auto descendant_marker =
-      video_path.parent_path() / (video_path.filename().string() + ".released-descendant");
   std::filesystem::remove(guardian_marker);
   std::filesystem::remove(worker_marker);
-  std::filesystem::remove(descendant_marker);
   set_environment("RECO_FAKE_PROBE_GUARDIAN_PID_PATH", guardian_marker.string());
   set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", worker_marker.string());
-  set_environment("RECO_FAKE_PROBE_DESCENDANT_PATH", descendant_marker.string());
-  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "block-input-with-descendant");
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "block-input");
 
   bool probe_failed = false;
   std::thread probe([&] {
@@ -1623,10 +1735,8 @@ void guardian_death_after_worker_release_reclaims_group(const std::filesystem::p
   const auto marker_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
   const auto guardian = wait_for_process_marker(guardian_marker, marker_deadline);
   const auto worker = wait_for_process_marker(worker_marker, marker_deadline);
-  const auto descendant = wait_for_process_marker(descendant_marker, marker_deadline);
   expect_true(guardian.has_value(), "released worker guardian records its process ID");
   expect_true(worker.has_value(), "released worker records its process ID");
-  expect_true(descendant.has_value(), "released worker descendant records its process ID");
 #if defined(__linux__) && defined(SYS_pidfd_open)
   const auto open_pidfd = [](const std::optional<std::uint64_t>& process_id) {
     if (!process_id.has_value() ||
@@ -1636,10 +1746,8 @@ void guardian_death_after_worker_release_reclaims_group(const std::filesystem::p
     return static_cast<int>(::syscall(SYS_pidfd_open, static_cast<pid_t>(*process_id), 0U));
   };
   const int worker_pidfd = open_pidfd(worker);
-  const int descendant_pidfd = open_pidfd(descendant);
 #else
   constexpr int worker_pidfd = -1;
-  constexpr int descendant_pidfd = -1;
 #endif
   if (guardian.has_value() &&
       *guardian <= static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max())) {
@@ -1692,16 +1800,53 @@ void guardian_death_after_worker_release_reclaims_group(const std::filesystem::p
     }
   };
   expect_exit(worker, worker_pidfd, "worker exits when its released guardian dies");
-  expect_exit(descendant, descendant_pidfd,
-              "worker descendant exits when its released guardian dies");
 
   set_environment("RECO_FAKE_PROBE_GUARDIAN_PID_PATH", "");
   set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", "");
-  set_environment("RECO_FAKE_PROBE_DESCENDANT_PATH", "");
   set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
   std::filesystem::remove(guardian_marker);
   std::filesystem::remove(worker_marker);
-  std::filesystem::remove(descendant_marker);
+#else
+  (void)video_path;
+#endif
+}
+
+void caller_death_before_supervisor_main(const std::filesystem::path& video_path) {
+#if !defined(_WIN32)
+  const auto marker_path =
+      video_path.parent_path() / (video_path.filename().string() + ".pre-main-supervisor");
+  std::filesystem::remove(marker_path);
+  set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", marker_path.string());
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "supervisor-pre-main-block");
+  const auto caller =
+      fork_exec_probe_caller(video_path, fake_probe_worker_path, "probe", 30'000'000'000ULL);
+  expect_true(caller > 0, "POSIX pre-main supervisor caller starts");
+  if (caller > 0) {
+    const auto supervisor = wait_for_process_marker(marker_path, std::chrono::steady_clock::now() +
+                                                                     std::chrono::seconds(2));
+    expect_true(supervisor.has_value(), "supervisor reaches its pre-main test block");
+    (void)::kill(caller, SIGKILL);
+    int caller_status = 0;
+    while (::waitpid(caller, &caller_status, 0) < 0 && errno == EINTR) {
+    }
+    bool exited = false;
+    const auto exit_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (supervisor.has_value() && std::chrono::steady_clock::now() < exit_deadline) {
+      errno = 0;
+      if (::kill(static_cast<pid_t>(*supervisor), 0) != 0 && errno == ESRCH) {
+        exited = true;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    expect_true(exited, "pre-main watchdog reclaims the supervisor when its caller dies");
+    if (supervisor.has_value() && !exited) {
+      (void)::kill(static_cast<pid_t>(*supervisor), SIGKILL);
+    }
+  }
+  set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", "");
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+  std::filesystem::remove(marker_path);
 #else
   (void)video_path;
 #endif
@@ -1713,16 +1858,9 @@ void caller_death_before_guardian_main(const std::filesystem::path& video_path) 
       video_path.parent_path() / (video_path.filename().string() + ".pre-main-guardian");
   std::filesystem::remove(marker_path);
   set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
-  const auto caller = ::fork();
-  if (caller == 0) {
-    try {
-      (void)reco::io::detail::probe_gpu_video_with_pre_guardian_exec_delay_for_test(
-          container_config(video_path), fake_probe_worker_path, 30'000'000'000ULL,
-          30'000'000'000ULL, marker_path);
-    } catch (...) {
-    }
-    std::_Exit(EXIT_SUCCESS);
-  }
+  const auto caller =
+      fork_exec_probe_caller(video_path, fake_probe_worker_path, "pre-guardian-exec-delay",
+                             30'000'000'000ULL, 30'000'000'000ULL, marker_path);
   expect_true(caller > 0, "POSIX pre-main guardian caller starts");
   if (caller <= 0) {
     return;
@@ -1833,15 +1971,8 @@ void caller_death_before_worker_main(const std::filesystem::path& video_path) {
   set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", worker_marker.string());
   set_environment("RECO_FAKE_PROBE_LIFECYCLE_PATH", lifecycle_path.string());
   set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "pre-main-block");
-  const auto caller = ::fork();
-  if (caller == 0) {
-    try {
-      (void)reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
-                                      30'000'000'000ULL);
-    } catch (...) {
-    }
-    std::_Exit(EXIT_SUCCESS);
-  }
+  const auto caller =
+      fork_exec_probe_caller(video_path, fake_probe_worker_path, "probe", 30'000'000'000ULL);
   expect_true(caller > 0, "POSIX pre-main parent-death probe caller starts");
   if (caller > 0) {
     const auto worker = wait_for_process_marker(worker_marker, std::chrono::steady_clock::now() +
@@ -2119,6 +2250,24 @@ void worker_address_space_is_limited(const std::filesystem::path& video_path) {
 #endif
 }
 
+void worker_process_creation_is_confined(const std::filesystem::path& video_path) {
+#if !defined(_WIN32)
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "process-spawn-denied");
+  try {
+    expect_eq(reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
+                                        5'000'000'000ULL)
+                  .width,
+              854U, "POSIX worker denies child processes while retaining thread support");
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: process-confinement probe threw: " << error.what() << '\n';
+    ++failures;
+  }
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+#else
+  (void)video_path;
+#endif
+}
+
 void watchdog_exit_after_memory_termination_is_expected() {
 #if !defined(_WIN32)
   constexpr std::int64_t watchdog_pid = 73;
@@ -2208,21 +2357,16 @@ void windows_path_runtime_discovery(const std::filesystem::path& video_path,
 void parent_death_reclaims_worker(const std::filesystem::path& video_path) {
 #if defined(__linux__)
   set_scenario("probe-blocking-playing");
-  const auto caller = fork();
-  if (caller == 0) {
-    try {
-      (void)probe_video(container_config(video_path), 5'000'000'000ULL);
-    } catch (...) {
-    }
-    std::_Exit(0);
-  }
+  const auto caller =
+      fork_exec_probe_caller(video_path, probe_worker_path, "probe", 5'000'000'000ULL);
   expect_true(caller > 0, "parent-death probe caller starts");
   if (caller <= 0) {
     return;
   }
 
   const auto discovery_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-  const auto supervisor = wait_for_direct_child(caller, discovery_deadline);
+  const auto supervisor =
+      wait_for_direct_child(caller, discovery_deadline, "--reco-video-probe-supervisor");
   const auto guardian = supervisor.has_value()
                             ? wait_for_direct_child(*supervisor, discovery_deadline)
                             : std::nullopt;
@@ -2268,8 +2412,14 @@ int main(int argc, char** argv) {
     return run_windows_parent_death_probe_caller();
   }
 #else
-  (void)argc;
-  (void)argv;
+  try {
+    test_executable_path = std::filesystem::absolute(argv[0]);
+  } catch (...) {
+    return EXIT_FAILURE;
+  }
+  if (argc == 2 && std::string_view(argv[1]) == "--reco-posix-probe-caller") {
+    return run_posix_probe_caller();
+  }
 #endif
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
   const auto runtime = resolve_runfile("cpp/tests/libfake_gstreamer_runtime.so");
@@ -2298,6 +2448,7 @@ int main(int argc, char** argv) {
   windows_path_runtime_discovery(video_path, runtime);
   worker_ipc_failures_are_bounded(video_path);
   aggregate_worker_memory_budget_is_enforced();
+  deferred_cleanup_retains_worker_memory_reservation(video_path);
   delayed_supervision_cannot_launch_worker(video_path);
   launch_gate_prevents_post_timeout_process_start(video_path);
   guardian_death_before_pid_report_reclaims_worker(video_path);
@@ -2308,10 +2459,12 @@ int main(int argc, char** argv) {
   guardian_initializers_cannot_observe_unrelated_descriptors(video_path);
   lowered_file_limit_does_not_leak_high_descriptors(video_path);
   worker_address_space_is_limited(video_path);
+  worker_process_creation_is_confined(video_path);
   watchdog_exit_after_memory_termination_is_expected();
   unrelated_descriptor_writer_does_not_delay_pipe_eof(video_path);
   parent_death_reclaims_worker(video_path);
   caller_death_reclaims_worker_and_descendant(video_path);
+  caller_death_before_supervisor_main(video_path);
   caller_death_before_guardian_main(video_path);
   caller_death_before_worker_main(video_path);
   pre_main_loader_stall_respects_timeout(video_path);
