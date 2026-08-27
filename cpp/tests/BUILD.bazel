@@ -274,6 +274,28 @@ cc_test(
 )
 
 cc_test(
+    name = "reco_calibrate_gpu_features_tests",
+    size = "medium",
+    srcs = ["reco_calibrate_gpu_features_tests.cpp"],
+    deps = [
+        "//cpp/reco_calibrate",
+        "//cpp/reco_core",
+    ],
+)
+
+cc_test(
+    name = "reco_calibrate_gpu_features_full_resolution_tests",
+    size = "large",
+    srcs = ["reco_calibrate_gpu_features_tests.cpp"],
+    env = {"RECO_GPU_FEATURE_TEST_SHARD": "selection-full"},
+    tags = ["manual"],
+    deps = [
+        "//cpp/reco_calibrate",
+        "//cpp/reco_core",
+    ],
+)
+
+cc_test(
     name = "reco_calibrate_gpu_sampling_tests",
     size = "small",
     srcs = ["reco_calibrate_gpu_sampling_tests.cpp"],

@@ -9,6 +9,8 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
@@ -20,6 +22,15 @@
 using namespace reco::core;
 
 namespace {
+
+static_assert(!std::is_copy_constructible_v<CudaModule>);
+static_assert(!std::is_copy_assignable_v<CudaModule>);
+static_assert(std::is_nothrow_move_constructible_v<CudaModule>);
+static_assert(std::is_nothrow_move_assignable_v<CudaModule>);
+static_assert(!std::is_copy_constructible_v<CudaKernel>);
+static_assert(!std::is_copy_assignable_v<CudaKernel>);
+static_assert(std::is_nothrow_move_constructible_v<CudaKernel>);
+static_assert(std::is_nothrow_move_assignable_v<CudaKernel>);
 
 int failures = 0;
 
@@ -55,6 +66,18 @@ template <typename Fn> void expect_overflow_error(Fn&& fn, std::string_view mess
     std::cerr << "FAIL: " << message << " did not throw\n";
     ++failures;
   } catch (const std::overflow_error&) {
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: " << message << " threw unexpected exception: " << error.what() << '\n';
+    ++failures;
+  }
+}
+
+template <typename Fn> void expect_runtime_error(Fn&& fn, std::string_view message) {
+  try {
+    fn();
+    std::cerr << "FAIL: " << message << " did not throw\n";
+    ++failures;
+  } catch (const std::runtime_error&) {
   } catch (const std::exception& error) {
     std::cerr << "FAIL: " << message << " threw unexpected exception: " << error.what() << '\n';
     ++failures;
@@ -125,6 +148,33 @@ constexpr char kFillBytesPtx[] = R"ptx(
     st.global.u8 [%rd3], %r1;
 
 DONE:
+    ret;
+}
+
+.visible .entry increment_bytes(
+    .param .u64 increment_bytes_param_0,
+    .param .u32 increment_bytes_param_1
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .b64 %rd<5>;
+
+    ld.param.u64 %rd1, [increment_bytes_param_0];
+    ld.param.u32 %r1, [increment_bytes_param_1];
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.u32 %r5, %r2, %r3, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra INCREMENT_DONE;
+    cvt.u64.u32 %rd2, %r5;
+    add.u64 %rd3, %rd1, %rd2;
+    ld.global.u8 %r6, [%rd3];
+    add.u32 %r7, %r6, 1;
+    st.global.u8 [%rd3], %r7;
+
+INCREMENT_DONE:
     ret;
 }
 )ptx";
@@ -239,11 +289,114 @@ int main() {
           (void)ignored;
         },
         "interior PTX NUL validation");
+    expect_invalid_argument(
+        [&] {
+          auto ignored = backend.load_module_from_ptx("");
+          (void)ignored;
+        },
+        "empty module PTX validation");
+    expect_invalid_argument(
+        [&] {
+          auto ignored = backend.load_module_from_ptx(ptx_with_interior_nul);
+          (void)ignored;
+        },
+        "interior module PTX NUL validation");
     std::string null_terminated_ptx(kFillBytesPtx);
     null_terminated_ptx.push_back('\0');
     auto null_terminated_kernel = backend.load_kernel_from_ptx(null_terminated_ptx, "fill_bytes");
     expect_true(static_cast<bool>(null_terminated_kernel), "loaded null-terminated CUDA kernel");
     null_terminated_kernel.reset();
+
+    CudaModule empty_module;
+    expect_true(!static_cast<bool>(empty_module), "default CUDA module is empty");
+    expect_invalid_argument(
+        [&] {
+          auto ignored = empty_module.load_kernel("fill_bytes");
+          (void)ignored;
+        },
+        "empty CUDA module kernel lookup validation");
+    auto shared_module = backend.load_module_from_ptx(null_terminated_ptx);
+    expect_true(static_cast<bool>(shared_module), "loaded shared CUDA module");
+    expect_invalid_argument(
+        [&] {
+          auto ignored = shared_module.load_kernel("");
+          (void)ignored;
+        },
+        "empty shared-module kernel name validation");
+    expect_runtime_error(
+        [&] {
+          auto ignored = shared_module.load_kernel("missing_function");
+          (void)ignored;
+        },
+        "missing shared-module kernel validation");
+    auto shared_fill = shared_module.load_kernel("fill_bytes");
+    auto shared_increment = shared_module.load_kernel("increment_bytes");
+    expect_true(static_cast<bool>(shared_fill), "resolved first shared-module kernel");
+    expect_true(static_cast<bool>(shared_increment), "resolved second shared-module kernel");
+
+    auto moved_module = std::move(shared_module);
+    expect_true(!static_cast<bool>(shared_module), "moved-from CUDA module is empty");
+    expect_true(static_cast<bool>(moved_module), "move-constructed CUDA module remains live");
+    expect_invalid_argument(
+        [&] {
+          auto ignored = shared_module.load_kernel("fill_bytes");
+          (void)ignored;
+        },
+        "moved-from CUDA module lookup validation");
+    CudaModule assigned_module;
+    assigned_module = std::move(moved_module);
+    expect_true(!static_cast<bool>(moved_module), "move-assigned source CUDA module is empty");
+    expect_true(static_cast<bool>(assigned_module), "move-assigned CUDA module remains live");
+    assigned_module.reset();
+    expect_true(!static_cast<bool>(assigned_module), "reset CUDA module is empty");
+    expect_true(static_cast<bool>(shared_fill), "first kernel retains reset shared module");
+    expect_true(static_cast<bool>(shared_increment), "second kernel retains reset shared module");
+
+    auto shared_buffer = backend.allocate(257);
+    backend.memset_d8(shared_buffer, 0);
+    CudaDevicePtr shared_ptr = shared_buffer.ptr();
+    std::uint32_t shared_fill_value = 0x3A;
+    std::uint32_t shared_count = static_cast<std::uint32_t>(shared_buffer.size());
+    void* shared_fill_args[] = {&shared_ptr, &shared_fill_value, &shared_count};
+    shared_fill.launch({.grid = {.x = 9}, .block = {.x = 32}}, shared_fill_args);
+    shared_fill.reset();
+    expect_true(!static_cast<bool>(shared_fill), "reset first shared-module kernel is empty");
+
+    auto moved_increment = std::move(shared_increment);
+    expect_true(!static_cast<bool>(shared_increment), "moved-from CUDA kernel is empty");
+    expect_true(static_cast<bool>(moved_increment), "move-constructed CUDA kernel remains live");
+    CudaKernel assigned_increment;
+    assigned_increment = std::move(moved_increment);
+    expect_true(!static_cast<bool>(moved_increment), "move-assigned source CUDA kernel is empty");
+    expect_true(static_cast<bool>(assigned_increment), "move-assigned CUDA kernel remains live");
+    void* increment_args[] = {&shared_ptr, &shared_count};
+    assigned_increment.launch({.grid = {.x = 9}, .block = {.x = 32}}, increment_args);
+    assigned_increment.synchronize();
+    const auto shared_result = backend.copy_to_host(shared_buffer);
+    for (const auto byte : shared_result) {
+      if (byte != static_cast<std::uint8_t>(shared_fill_value + 1U)) {
+        expect_true(false, "shared-module kernels execute after module handle reset");
+        break;
+      }
+    }
+
+    const auto load_module_without_backend_owner = [] {
+      const auto short_lived_backend = CudaBackend::create();
+      return short_lived_backend.load_module_from_ptx(kFillBytesPtx);
+    };
+    auto independently_owned_module = load_module_without_backend_owner();
+    auto independently_owned_kernel = independently_owned_module.load_kernel("increment_bytes");
+    independently_owned_module.reset();
+    independently_owned_kernel.launch({.grid = {.x = 9}, .block = {.x = 32}}, increment_args);
+    independently_owned_kernel.synchronize();
+    const auto independently_owned_result = backend.copy_to_host(shared_buffer);
+    for (const auto byte : independently_owned_result) {
+      if (byte != static_cast<std::uint8_t>(shared_fill_value + 2U)) {
+        expect_true(false, "shared module retains CUDA backend lifetime");
+        break;
+      }
+    }
+
     const auto kernel = backend.load_kernel_from_ptx(kFillBytesPtx, "fill_bytes");
     expect_true(static_cast<bool>(kernel), "loaded CUDA kernel");
     auto kernel_buffer = backend.allocate(257);
@@ -440,7 +593,8 @@ int main() {
     expect_true(static_cast<bool>(shared_memory), "shared memory allocation");
     expect_true(shared_memory.ptr() != 0, "shared memory device pointer");
     expect_true(shared_memory.size() >= 12345, "shared memory size rounded up");
-    expect_true(valid_shareable_handle(shared_memory.shareable_handle()), "shared memory OS handle");
+    expect_true(valid_shareable_handle(shared_memory.shareable_handle()),
+                "shared memory OS handle");
     auto released_memory = backend.allocate_shared_memory(4096);
     const CudaShareableHandle released_handle = released_memory.release_shareable_handle();
     expect_true(valid_shareable_handle(released_handle), "released shared memory OS handle");

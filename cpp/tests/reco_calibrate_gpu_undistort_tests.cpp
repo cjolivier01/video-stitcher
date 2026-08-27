@@ -247,6 +247,42 @@ int main() {
               {.ptr = src.ptr(), .pitch = src_pitch, .width = width, .height = height});
         },
         "in-place undistort");
+    expect_invalid_argument(
+        [&] {
+          undistorter.undistort_y({.ptr = src.ptr(),
+                                   .pitch = src_pitch,
+                                   .width = width,
+                                   .height = height,
+                                   .color_range = YuvColorRange::Limited},
+                                  {.ptr = dst.ptr(),
+                                   .pitch = dst_pitch,
+                                   .width = width,
+                                   .height = height,
+                                   .color_range = YuvColorRange::Full});
+        },
+        "mismatched source and destination color ranges");
+    expect_invalid_argument(
+        [&] {
+          undistorter.undistort_y(
+              {.ptr = src.ptr(),
+               .pitch = src_pitch,
+               .width = width,
+               .height = height,
+               .color_range = static_cast<YuvColorRange>(99)},
+              {.ptr = dst.ptr(), .pitch = dst_pitch, .width = width, .height = height});
+        },
+        "invalid source color range");
+    expect_invalid_argument(
+        [&] {
+          undistorter.undistort_y(
+              {.ptr = src.ptr(), .pitch = src_pitch, .width = width, .height = height},
+              {.ptr = dst.ptr(),
+               .pitch = dst_pitch,
+               .width = width,
+               .height = height,
+               .color_range = static_cast<YuvColorRange>(99)});
+        },
+        "invalid destination color range");
 
     undistorter.undistort_y(
         {.ptr = src.ptr(), .pitch = src_pitch, .width = width, .height = height},
@@ -261,6 +297,17 @@ int main() {
                        "zero-coefficient undistort pixel");
       }
     }
+
+    const auto make_owned_undistorter = [width, height] {
+      auto short_lived_backend = CudaBackend::create();
+      return GpuCalibrationUndistorter(
+          short_lived_backend,
+          {.camera = flat_camera(width, height), .output_width = width, .output_height = height});
+    };
+    auto owned_undistorter = make_owned_undistorter();
+    owned_undistorter.undistort_y(
+        {.ptr = src.ptr(), .pitch = src_pitch, .width = width, .height = height},
+        {.ptr = dst.ptr(), .pitch = dst_pitch, .width = width, .height = height});
 
     auto scaled_profile = flat_camera(width, height);
     scaled_profile.width = width * 2;

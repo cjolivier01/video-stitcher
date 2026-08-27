@@ -332,6 +332,10 @@ void selected_y_planes_are_copied_device_to_device(CudaBackend& backend) {
   expect_true(selected[0].pts_ns == 33'333'333U, "selected PTS preserved");
   expect_true(selected[1].duration_ns == 33'333'333U, "selected duration preserved");
   expect_eq(selected[0].width, 854U, "visible calibration frame width preserved");
+  expect_true(selected[0].color_range == YuvColorRange::Limited,
+              "calibration copy preserves the decoder luma range");
+  expect_true(selected[0].view().color_range == YuvColorRange::Limited,
+              "gray view preserves the calibration luma range");
   expect_true(selected[0].pitch >= selected[0].width,
               "calibration copy uses a pitch covering the frame width");
   expect_eq(selected[0].y_plane.size(), selected[0].pitch * selected[0].height,

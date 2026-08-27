@@ -2,6 +2,7 @@
 
 #include "reco/core/calibration.hpp"
 #include "reco/core/cuda_backend.hpp"
+#include "reco/core/video_format.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +15,7 @@ struct GpuGrayFrame {
   std::size_t pitch = 0;
   std::uint32_t width = 0;
   std::uint32_t height = 0;
+  reco::core::YuvColorRange color_range = reco::core::YuvColorRange::Full;
 };
 
 struct GpuUndistortConfig {
@@ -33,7 +35,7 @@ public:
   GpuCalibrationUndistorter& operator=(GpuCalibrationUndistorter&&) noexcept;
 
   [[nodiscard]] const GpuUndistortConfig& config() const;
-  // Source and destination device ranges must not overlap.
+  // Source and destination device ranges must not overlap and must carry the same color range.
   void undistort_y(const GpuGrayFrame& src, const GpuGrayFrame& dst) const;
 
 private:

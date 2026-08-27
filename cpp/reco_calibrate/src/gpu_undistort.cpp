@@ -1,5 +1,7 @@
 #include "reco/calibrate/gpu_undistort.hpp"
 
+#include "nvrtc_compiler.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -11,13 +13,6 @@
 #include <string>
 #include <string_view>
 #include <utility>
-#include <vector>
-
-#if defined(_WIN32)
-#include <windows.h>
-#else
-#include <dlfcn.h>
-#endif
 
 namespace reco::calibrate {
 namespace {
@@ -92,156 +87,6 @@ extern "C" __global__ void undistort_y_plane(
 }
 )cuda";
 
-enum class NvrtcResult : int {};
-using NvrtcProgram = void*;
-
-class DynamicLibrary {
-public:
-  explicit DynamicLibrary(const std::vector<const char*>& names) {
-    std::string attempted;
-    for (const char* name : names) {
-#if defined(_WIN32)
-      handle_ = LoadLibraryA(name);
-#else
-      handle_ = dlopen(name, RTLD_NOW | RTLD_LOCAL);
-#endif
-      if (handle_ != nullptr) {
-        return;
-      }
-      if (!attempted.empty()) {
-        attempted += ", ";
-      }
-      attempted += name;
-    }
-    throw std::runtime_error("failed to load NVRTC library; tried " + attempted);
-  }
-
-  DynamicLibrary(const DynamicLibrary&) = delete;
-  DynamicLibrary& operator=(const DynamicLibrary&) = delete;
-
-  DynamicLibrary(DynamicLibrary&& other) noexcept
-      : handle_(std::exchange(other.handle_, nullptr)) {}
-  DynamicLibrary& operator=(DynamicLibrary&& other) noexcept {
-    if (this != &other) {
-      reset();
-      handle_ = std::exchange(other.handle_, nullptr);
-    }
-    return *this;
-  }
-
-  ~DynamicLibrary() { reset(); }
-
-  template <typename Fn> Fn symbol(const char* name) const {
-#if defined(_WIN32)
-    auto* sym = reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(handle_), name));
-#else
-    auto* sym = dlsym(handle_, name);
-#endif
-    if (sym == nullptr) {
-      throw std::runtime_error(std::string("missing NVRTC symbol ") + name);
-    }
-    return reinterpret_cast<Fn>(sym);
-  }
-
-private:
-  void reset() {
-    if (handle_ == nullptr) {
-      return;
-    }
-#if defined(_WIN32)
-    FreeLibrary(static_cast<HMODULE>(handle_));
-#else
-    dlclose(handle_);
-#endif
-    handle_ = nullptr;
-  }
-
-  void* handle_ = nullptr;
-};
-
-class NvrtcCompiler {
-public:
-  NvrtcCompiler()
-#if defined(_WIN32)
-      : library_({"nvrtc64_130_0.dll", "nvrtc64_120_0.dll", "nvrtc64_112_0.dll"}) {
-#else
-      : library_({"libnvrtc.so", "libnvrtc.so.13", "libnvrtc.so.12", "libnvrtc.so.11.2"}) {
-#endif
-    create_program_ = library_.symbol<decltype(create_program_)>("nvrtcCreateProgram");
-    destroy_program_ = library_.symbol<decltype(destroy_program_)>("nvrtcDestroyProgram");
-    compile_program_ = library_.symbol<decltype(compile_program_)>("nvrtcCompileProgram");
-    get_ptx_size_ = library_.symbol<decltype(get_ptx_size_)>("nvrtcGetPTXSize");
-    get_ptx_ = library_.symbol<decltype(get_ptx_)>("nvrtcGetPTX");
-    get_program_log_size_ =
-        library_.symbol<decltype(get_program_log_size_)>("nvrtcGetProgramLogSize");
-    get_program_log_ = library_.symbol<decltype(get_program_log_)>("nvrtcGetProgramLog");
-    get_error_string_ = library_.symbol<decltype(get_error_string_)>("nvrtcGetErrorString");
-  }
-
-  [[nodiscard]] std::string compile(std::string_view source) const {
-    NvrtcProgram program = nullptr;
-    check("nvrtcCreateProgram",
-          create_program_(&program, source.data(), "reco_calibrate_gpu_undistort.cu", 0, nullptr,
-                          nullptr));
-    struct ProgramGuard {
-      NvrtcProgram program = nullptr;
-      NvrtcResult (*destroy)(NvrtcProgram*) = nullptr;
-
-      ~ProgramGuard() {
-        if (program != nullptr) {
-          (void)destroy(&program);
-        }
-      }
-    } guard{program, destroy_program_};
-
-    const char* options[] = {"--std=c++11"};
-    const NvrtcResult result = compile_program_(program, 1, options);
-    if (static_cast<int>(result) != 0) {
-      const std::string log = program_log(program);
-      throw std::runtime_error("nvrtcCompileProgram failed: " + log);
-    }
-
-    std::size_t ptx_size = 0;
-    check("nvrtcGetPTXSize", get_ptx_size_(program, &ptx_size));
-    std::string ptx(ptx_size, '\0');
-    check("nvrtcGetPTX", get_ptx_(program, ptx.data()));
-    return ptx;
-  }
-
-private:
-  void check(const char* function, NvrtcResult result) const {
-    if (static_cast<int>(result) != 0) {
-      const char* message = get_error_string_ != nullptr ? get_error_string_(result) : "unknown";
-      throw std::runtime_error(std::string(function) + " returned NVRTC error " + message);
-    }
-  }
-
-  [[nodiscard]] std::string program_log(NvrtcProgram program) const {
-    std::size_t size = 0;
-    const NvrtcResult size_result = get_program_log_size_(program, &size);
-    if (static_cast<int>(size_result) != 0 || size == 0) {
-      return "no compiler log";
-    }
-    std::string log(size, '\0');
-    const NvrtcResult log_result = get_program_log_(program, log.data());
-    if (static_cast<int>(log_result) != 0) {
-      return "failed to read compiler log";
-    }
-    return log;
-  }
-
-  DynamicLibrary library_;
-  NvrtcResult (*create_program_)(NvrtcProgram*, const char*, const char*, int, const char* const*,
-                                 const char* const*) = nullptr;
-  NvrtcResult (*destroy_program_)(NvrtcProgram*) = nullptr;
-  NvrtcResult (*compile_program_)(NvrtcProgram, int, const char* const*) = nullptr;
-  NvrtcResult (*get_ptx_size_)(NvrtcProgram, std::size_t*) = nullptr;
-  NvrtcResult (*get_ptx_)(NvrtcProgram, char*) = nullptr;
-  NvrtcResult (*get_program_log_size_)(NvrtcProgram, std::size_t*) = nullptr;
-  NvrtcResult (*get_program_log_)(NvrtcProgram, char*) = nullptr;
-  const char* (*get_error_string_)(NvrtcResult) = nullptr;
-};
-
 void validate_camera(const reco::core::CameraParams& camera) {
   if (camera.width == 0 || camera.height == 0) {
     throw std::invalid_argument("GPU undistort camera dimensions must be non-zero");
@@ -288,16 +133,26 @@ void validate_frame(const GpuGrayFrame& frame, std::string_view label) {
     throw std::invalid_argument(std::string("GPU undistort ") + std::string(label) +
                                 " pitch is smaller than width");
   }
+  switch (frame.color_range) {
+  case reco::core::YuvColorRange::Limited:
+  case reco::core::YuvColorRange::Full:
+    break;
+  default:
+    throw std::invalid_argument(std::string("GPU undistort ") + std::string(label) +
+                                " frame has an invalid color range");
+  }
 }
 
 std::uint64_t frame_span_bytes(const GpuGrayFrame& frame, std::string_view label) {
   const auto pitch = static_cast<std::uint64_t>(frame.pitch);
-  const auto height = static_cast<std::uint64_t>(frame.height);
-  if (pitch != 0 && height > std::numeric_limits<std::uint64_t>::max() / pitch) {
+  const auto rows_before_last = static_cast<std::uint64_t>(frame.height - 1U);
+  const auto width = static_cast<std::uint64_t>(frame.width);
+  const auto maximum = std::numeric_limits<std::uint64_t>::max();
+  if (rows_before_last != 0U && pitch > (maximum - width) / rows_before_last) {
     throw std::overflow_error(std::string("GPU undistort ") + std::string(label) +
                               " frame byte span overflow");
   }
-  return pitch * height;
+  return rows_before_last * pitch + width;
 }
 
 bool ranges_overlap(CudaDevicePtr lhs, std::uint64_t lhs_size, CudaDevicePtr rhs,
@@ -316,15 +171,16 @@ bool ranges_overlap(CudaDevicePtr lhs, std::uint64_t lhs_size, CudaDevicePtr rhs
 
 struct GpuCalibrationUndistorter::Impl {
   Impl(reco::core::CudaBackend& backend_in, GpuUndistortConfig config_in)
-      : backend(&backend_in), config(std::move(config_in)) {
+      : backend(backend_in), config(std::move(config_in)) {
     validate_config(config);
-    backend->ensure_primary_context();
-    NvrtcCompiler compiler;
-    const std::string ptx = compiler.compile(kUndistortKernelSource);
-    kernel = backend->load_kernel_from_ptx(ptx, "undistort_y_plane");
+    backend.ensure_primary_context();
+    detail::NvrtcCompiler compiler;
+    const std::string ptx =
+        compiler.compile(kUndistortKernelSource, "reco_calibrate_gpu_undistort.cu");
+    kernel = backend.load_kernel_from_ptx(ptx, "undistort_y_plane");
   }
 
-  reco::core::CudaBackend* backend = nullptr;
+  reco::core::CudaBackend backend;
   GpuUndistortConfig config;
   reco::core::CudaKernel kernel;
 };
@@ -347,6 +203,9 @@ void GpuCalibrationUndistorter::undistort_y(const GpuGrayFrame& src,
                                             const GpuGrayFrame& dst) const {
   validate_frame(src, "source");
   validate_frame(dst, "destination");
+  if (src.color_range != dst.color_range) {
+    throw std::invalid_argument("GPU undistort source and destination color ranges must match");
+  }
   const auto& config = impl_->config;
   if (dst.width != config.output_width || dst.height != config.output_height) {
     throw std::invalid_argument(

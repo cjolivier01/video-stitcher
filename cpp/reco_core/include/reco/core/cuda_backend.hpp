@@ -6,8 +6,8 @@
 #include <functional>
 #include <memory>
 #include <span>
-#include <string_view>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace reco::core {
@@ -103,6 +103,7 @@ struct CudaPitchedAllocation {
 };
 
 class CudaSharedMemory;
+class CudaModule;
 class CudaKernel;
 
 /// Optional non-throwing trace sink for explicit CUDA backend operations.
@@ -137,6 +138,9 @@ public:
   void copy_host_to_device_2d(const CudaHostToDevice2DCopy& copy) const;
   void copy_device_to_device_2d(const Cuda2DCopy& copy) const;
   void copy_device_to_host_2d(const CudaDeviceToHost2DCopy& copy) const;
+  /// Loads one PTX module that can resolve and share ownership across multiple kernels.
+  [[nodiscard]] CudaModule load_module_from_ptx(std::string_view ptx) const;
+  /// Compatibility helper that loads one PTX module and resolves one kernel from it.
   [[nodiscard]] CudaKernel load_kernel_from_ptx(std::string_view ptx,
                                                 std::string_view function_name) const;
   void synchronize() const;
@@ -144,6 +148,7 @@ public:
 private:
   friend class CudaDeviceBuffer;
   friend class CudaSharedMemory;
+  friend class CudaModule;
   friend class CudaKernel;
 
   struct Impl;
@@ -191,6 +196,35 @@ private:
   bool owns_shareable_handle_ = false;
 };
 
+/// Shared owner for one loaded CUDA PTX module.
+///
+/// Kernels resolved from a module keep its driver module alive after this handle is moved,
+/// reset, or destroyed. The driver module unloads when the final module or kernel owner releases
+/// it.
+class CudaModule {
+public:
+  CudaModule() = default;
+  CudaModule(const CudaModule&) = delete;
+  CudaModule& operator=(const CudaModule&) = delete;
+  CudaModule(CudaModule&& other) noexcept;
+  CudaModule& operator=(CudaModule&& other) noexcept;
+  ~CudaModule();
+
+  [[nodiscard]] explicit operator bool() const { return state_ != nullptr; }
+  /// Resolves a kernel while retaining shared ownership of this module.
+  [[nodiscard]] CudaKernel load_kernel(std::string_view function_name) const;
+  void reset();
+
+private:
+  friend class CudaBackend;
+  friend class CudaKernel;
+
+  struct State;
+  explicit CudaModule(std::shared_ptr<State> state);
+
+  std::shared_ptr<State> state_;
+};
+
 class CudaKernel {
 public:
   CudaKernel() = default;
@@ -201,7 +235,7 @@ public:
   ~CudaKernel();
 
   [[nodiscard]] explicit operator bool() const {
-    return context_ != nullptr && module_ != nullptr && function_ != nullptr;
+    return module_state_ != nullptr && function_ != nullptr;
   }
   void launch(const CudaLaunchConfig& config, std::span<void*> args) const;
   void synchronize() const;
@@ -209,12 +243,11 @@ public:
 
 private:
   friend class CudaBackend;
+  friend class CudaModule;
 
-  CudaKernel(std::shared_ptr<CudaBackend::Impl> backend, void* context, void* module, void* function);
+  CudaKernel(std::shared_ptr<CudaModule::State> module, void* function);
 
-  std::shared_ptr<CudaBackend::Impl> backend_;
-  void* context_ = nullptr;
-  void* module_ = nullptr;
+  std::shared_ptr<CudaModule::State> module_state_;
   void* function_ = nullptr;
 };
 

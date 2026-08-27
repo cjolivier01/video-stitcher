@@ -483,4 +483,79 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].right_idx, 0); // matched to d_close
     }
+
+    #[test]
+    fn triangle_downscale_feature_golden() {
+        let w = 3840u32;
+        let h = 192u32;
+        let mut gray = vec![0u8; (w * h) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let cell_x = x / 6;
+                let cell_y = y / 6;
+                let mut hash = cell_x
+                    .wrapping_mul(0x9e37_79b9)
+                    .wrapping_add(cell_y.wrapping_mul(0x85eb_ca6b));
+                hash ^= hash >> 16;
+                hash = hash.wrapping_mul(0x7feb_352d);
+                hash ^= hash >> 15;
+                gray[(y * w + x) as usize] = if hash & 1 == 0 { 0 } else { 255 };
+            }
+        }
+        let rgba = gray_to_rgba(&gray, w, h);
+        let (points, descriptors) = detect_with_border(&rgba, w, h, None, 16, 0.0001, 0);
+        let golden_points = [
+            (3490.589_1, 130.976_36, 0.078_354_82),
+            (953.287_5, 77.089_066, 0.073_465_586),
+            (2177.023_4, 106.958_405, 0.072_100_79),
+            (1012.978_33, 98.228_264, 0.070_630_03),
+            (1355.276_6, 131.111_11, 0.068_403_766),
+            (2870.102_3, 86.022_19, 0.068_134_7),
+            (3158.328_4, 91.927_5, 0.066_853_38),
+            (3143.578_9, 94.641_464, 0.065_145_09),
+            (292.626_04, 95.571_95, 0.065_043_18),
+            (2452.126_7, 85.024_48, 0.064_136_5),
+            (828.253_1, 96.716_56, 0.063_492_08),
+            (2896.912_4, 77.008_835, 0.062_778_68),
+            (803.351_6, 101.150_36, 0.060_621_485),
+            (904.586_3, 58.997_025, 0.060_412_76),
+            (3274.332_3, 95.149_536, 0.060_264_543),
+            (1930.68, 88.560_33, 0.059_688_717),
+        ];
+        let golden_descriptor_hashes = [
+            0x99f6_53f7_7cb9_8a73,
+            0x3d3e_8369_d72e_f5d5,
+            0x40cd_7da9_7675_c37c,
+            0x81b4_800b_8888_c3f6,
+            0xccdf_f312_e6ee_e8e1,
+            0xdd6e_82f6_407f_81ee,
+            0x8f30_7f8e_ed98_6d7c,
+            0x8e82_ac0d_d59c_d1aa,
+            0x6bc2_7d7b_0c3e_15d5,
+            0xbdc1_eede_28da_1165,
+            0x1b42_0c6a_cfcc_d414,
+            0x9b68_0d4c_dabf_0d45,
+            0x56d1_b746_0e2f_4672,
+            0x32d8_3782_9dfe_d7f0,
+            0x8ba3_aaad_96de_75a4,
+            0xf849_fab3_12ab_82e0,
+        ];
+        assert_eq!(points.len(), golden_points.len());
+        assert_eq!(descriptors.len(), golden_descriptor_hashes.len());
+        for ((point, descriptor), (golden, golden_hash)) in points
+            .iter()
+            .zip(descriptors.iter())
+            .zip(golden_points.iter().zip(golden_descriptor_hashes))
+        {
+            assert!((point.x - golden.0).abs() <= 2.0e-4);
+            assert!((point.y - golden.1).abs() <= 2.0e-4);
+            assert!((point.response - golden.2).abs() <= 1.0e-7);
+            let descriptor_hash = descriptor
+                .iter()
+                .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+                    (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+                });
+            assert_eq!(descriptor_hash, golden_hash);
+        }
+    }
 }
