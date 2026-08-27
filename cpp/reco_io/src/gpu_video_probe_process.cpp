@@ -1455,20 +1455,24 @@ public:
       return true;
     }
     const char acknowledge = kGuardianAcknowledge;
-    (void)::send(control_.get(), &acknowledge, 1,
+    ssize_t acknowledged = -1;
+    do {
+      acknowledged = ::send(control_.get(), &acknowledge, 1,
 #if defined(MSG_NOSIGNAL)
-                 MSG_NOSIGNAL
+                            MSG_NOSIGNAL
 #else
-                 0
+                            0
 #endif
-    );
+      );
+    } while (acknowledged < 0 && errno == EINTR);
     control_.reset();
     int status = 0;
     const auto exited = wait_for_process_exit(pid_, &status, deadline_);
     if (exited) {
       pid_ = -1;
     }
-    return exited && (status == 0 || (WIFEXITED(status) && WEXITSTATUS(status) == 0));
+    return acknowledged == 1 && exited &&
+           (status == 0 || (WIFEXITED(status) && WEXITSTATUS(status) == 0));
   }
 
 private:
