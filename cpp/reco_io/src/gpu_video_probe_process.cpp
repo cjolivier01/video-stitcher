@@ -702,7 +702,7 @@ pid_t spawn_guardian_process(const std::string& executable, int control_descript
   } destroy_attributes{&attributes};
 
   sigset_t empty_mask{};
-  (void)::sigemptyset(&empty_mask);
+  (void)sigemptyset(&empty_mask);
   const short flags = POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK;
   const auto flags_error = ::posix_spawnattr_setflags(&attributes, flags);
   const auto group_error = ::posix_spawnattr_setpgroup(&attributes, 0);
