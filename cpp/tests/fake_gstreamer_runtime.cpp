@@ -64,6 +64,14 @@ struct GstBufferAbi {
   void (*qdata_destroy)(void*) = nullptr;
 };
 
+constexpr std::int32_t kGstPadProbeTypeBuffer = 1 << 4;
+constexpr std::int32_t kGstPadProbeTypeBufferList = 1 << 5;
+
+struct FakeBufferList {
+  std::array<GstBufferAbi, 3> buffers{};
+  std::uint32_t length = 0;
+};
+
 enum class ObjectKind {
   Pipeline,
   Sink,
@@ -138,6 +146,7 @@ struct FakePad : FakeObject {
   void* callback_data = nullptr;
   FakeDestroyNotify destroy_notify = nullptr;
   unsigned long probe_id = 0;
+  int probe_type = 0;
   std::uint32_t current_width = 1280;
   std::uint32_t current_height = 720;
   bool output = false;
@@ -157,7 +166,9 @@ struct FakePipeline : FakeObject {
   std::uint64_t seek_generation = 0;
   FakeInputBudget* input_budget = nullptr;
   FakePad* input_budget_pad = nullptr;
+  FakePad* probe_pad = nullptr;
   std::uint64_t compressed_input_count = 0;
+  bool dequeue_race_emitted = false;
 };
 
 constexpr std::uint64_t kFakeCapsMagic = 0x5245434f43415053ULL;
@@ -624,6 +635,22 @@ void push_output_buffer(FakePad* pad, GstBufferAbi& buffer) {
   (void)pad->callback(pad, &info, pad->callback_data);
 }
 
+bool push_compressed_access_unit(FakePipeline* pipeline, GstBufferAbi& buffer) {
+  auto* pad = pipeline->probe_pad;
+  if (pad == nullptr || pad->callback == nullptr ||
+      (pad->probe_type & kGstPadProbeTypeBuffer) == 0) {
+    record("parser-output");
+    return true;
+  }
+  FakePadProbeInfo info{.type = kGstPadProbeTypeBuffer, .data = &buffer};
+  if (pad->callback(pad, &info, pad->callback_data) == 0) {
+    record("access-unit-checkpoint-drop");
+    return false;
+  }
+  record("access-unit-checkpoint");
+  return true;
+}
+
 void release_buffer_qdata(GstBufferAbi& buffer) {
   if (buffer.qdata_destroy != nullptr) {
     buffer.qdata_destroy(buffer.qdata);
@@ -643,16 +670,39 @@ bool push_compressed_input(FakePipeline* pipeline, std::size_t bytes) {
   buffer.offset = static_cast<std::uint64_t>(bytes);
   ++pipeline->compressed_input_count;
   auto* pad = pipeline->input_budget_pad;
-  if (pad == nullptr || pad->callback == nullptr) {
+  if (pad == nullptr || pad->callback == nullptr ||
+      (pad->probe_type & kGstPadProbeTypeBuffer) == 0) {
     record("parser-input");
     return true;
   }
-  FakePadProbeInfo info{.data = &buffer};
+  FakePadProbeInfo info{.type = kGstPadProbeTypeBuffer, .data = &buffer};
   if (pad->callback(pad, &info, pad->callback_data) == 0) {
     record("input-budget-drop");
     return false;
   }
   record("parser-input");
+  return true;
+}
+
+bool push_compressed_input_list(FakePipeline* pipeline, const std::array<std::size_t, 3>& sizes) {
+  FakeBufferList list;
+  list.length = static_cast<std::uint32_t>(sizes.size());
+  for (std::size_t index = 0; index < sizes.size(); ++index) {
+    list.buffers[index].offset = static_cast<std::uint64_t>(sizes[index]);
+  }
+  ++pipeline->compressed_input_count;
+  auto* pad = pipeline->input_budget_pad;
+  if (pad == nullptr || pad->callback == nullptr ||
+      (pad->probe_type & kGstPadProbeTypeBufferList) == 0) {
+    record("parser-input-list");
+    return true;
+  }
+  FakePadProbeInfo info{.type = kGstPadProbeTypeBufferList, .data = &list};
+  if (pad->callback(pad, &info, pad->callback_data) == 0) {
+    record("input-budget-list-drop");
+    return false;
+  }
+  record("parser-input-list");
   return true;
 }
 
@@ -745,6 +795,9 @@ RECO_FAKE_EXPORT void* gst_bin_get_by_name(void* pipeline_pointer, const char* n
   }
   if (name != nullptr && std::strcmp(name, "input_budget") == 0) {
     record("get-input-budget");
+    if (scenario() == "probe-missing-input-budget") {
+      return nullptr;
+    }
     auto* budget = new FakeInputBudget(pipeline);
     pipeline->input_budget = budget;
     return budget;
@@ -787,6 +840,8 @@ RECO_FAKE_EXPORT void* gst_element_get_static_pad(void* element_pointer, const c
     pipeline->output_pad = pad;
   } else if (input_budget) {
     pipeline->input_budget_pad = pad;
+  } else if (probe && !container) {
+    pipeline->probe_pad = pad;
   } else if (!probe) {
     pipeline->display_pad = pad;
   }
@@ -1104,12 +1159,18 @@ RECO_FAKE_EXPORT void gst_object_unref(void* object) {
   }
   case ObjectKind::Pad:
     auto* pad = static_cast<FakePad*>(object);
-    record(pad->input_budget ? "unref-input-budget-pad" : "unref-display-pad");
+    record(pad->input_budget               ? "unref-input-budget-pad"
+           : pad->probe && !pad->container ? "unref-probe-pad"
+                                           : "unref-display-pad");
     if (pad->probe_id != 0) {
       record("probe-leaked");
     }
     if (pad->input_budget && pad->pipeline != nullptr && pad->pipeline->input_budget_pad == pad) {
       pad->pipeline->input_budget_pad = nullptr;
+    }
+    if (pad->probe && !pad->container && pad->pipeline != nullptr &&
+        pad->pipeline->probe_pad == pad) {
+      pad->pipeline->probe_pad = nullptr;
     }
     delete pad;
     break;
@@ -1132,15 +1193,17 @@ RECO_FAKE_EXPORT void* gst_pad_get_current_caps(void* pad_pointer) {
                     : new FakeCaps{.width = pad->current_width, .height = pad->current_height};
 }
 
-RECO_FAKE_EXPORT unsigned long gst_pad_add_probe(void* pad_pointer, int,
+RECO_FAKE_EXPORT unsigned long gst_pad_add_probe(void* pad_pointer, int probe_type,
                                                  FakePadProbeCallback callback, void* user_data,
                                                  FakeDestroyNotify destroy_notify) {
   auto* pad = static_cast<FakePad*>(pad_pointer);
   record(pad->input_budget ? "add-input-budget-probe"
+         : pad->probe      ? "add-access-unit-checkpoint-probe"
          : pad->output     ? "add-output-probe"
                            : "add-display-probe");
   if ((pad->input_budget && scenario() == "probe-input-budget-install-error") ||
-      (!pad->input_budget && !pad->output && scenario() == "probe-install-error") ||
+      (pad->probe && scenario() == "probe-checkpoint-install-error") ||
+      (!pad->input_budget && !pad->output && !pad->probe && scenario() == "probe-install-error") ||
       (pad->output && scenario() == "output-probe-install-error")) {
     return 0;
   }
@@ -1148,12 +1211,14 @@ RECO_FAKE_EXPORT unsigned long gst_pad_add_probe(void* pad_pointer, int,
   pad->callback_data = user_data;
   pad->destroy_notify = destroy_notify;
   pad->probe_id = 1;
+  pad->probe_type = probe_type;
   return pad->probe_id;
 }
 
 RECO_FAKE_EXPORT void gst_pad_remove_probe(void* pad_pointer, unsigned long probe_id) {
   auto* pad = static_cast<FakePad*>(pad_pointer);
   record(pad->input_budget ? "remove-input-budget-probe"
+         : pad->probe      ? "remove-access-unit-checkpoint-probe"
          : pad->output     ? "remove-output-probe"
                            : "remove-display-probe");
   if (pad->probe_id == probe_id) {
@@ -1163,8 +1228,10 @@ RECO_FAKE_EXPORT void gst_pad_remove_probe(void* pad_pointer, unsigned long prob
     pad->callback_data = nullptr;
     pad->destroy_notify = nullptr;
     pad->probe_id = 0;
+    pad->probe_type = 0;
     if (destroy_notify != nullptr) {
       record(pad->input_budget ? "destroy-input-budget-probe-data"
+             : pad->probe      ? "destroy-access-unit-checkpoint-probe-data"
              : pad->output     ? "destroy-output-probe-data"
                                : "destroy-display-probe-data");
       destroy_notify(callback_data);
@@ -1226,7 +1293,19 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
   auto* sink = static_cast<FakeSink*>(sink_pointer);
   if (sink->pipeline->parser_probe) {
     const auto current_scenario = scenario();
-    if (current_scenario == "probe-input-byte-budget-runahead") {
+    if (current_scenario == "probe-input-buffer-list-budget") {
+      constexpr auto kMebibyte = std::size_t{1024} * 1024;
+      if (!push_compressed_input_list(sink->pipeline, {32 * kMebibyte, 32 * kMebibyte, 1})) {
+        return nullptr;
+      }
+    } else if (current_scenario == "probe-input-buffer-list-overflow") {
+      constexpr auto kMebibyte = std::size_t{1024} * 1024;
+      if (!push_compressed_input_list(
+              sink->pipeline,
+              {std::numeric_limits<std::size_t>::max() - 32 * kMebibyte, 64 * kMebibyte, 1})) {
+        return nullptr;
+      }
+    } else if (current_scenario == "probe-input-byte-budget-runahead") {
       constexpr auto kChunkBytes = 8ULL * 1024ULL * 1024ULL;
       for (std::size_t index = 0; index < 8; ++index) {
         if (!push_compressed_input(sink->pipeline, kChunkBytes)) {
@@ -1238,6 +1317,9 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
       }
     } else {
       const auto bytes = current_scenario == "probe-input-byte-budget" ? 65ULL * 1024ULL * 1024ULL
+                         : current_scenario == "probe-input-byte-budget-dequeue-race" &&
+                                 sink->pipeline->compressed_input_count >= 2
+                             ? 64ULL * 1024ULL * 1024ULL
                          : current_scenario == "probe-input-byte-budget-checkpoint" &&
                                  sink->pipeline->compressed_input_count == 0
                              ? 64ULL * 1024ULL * 1024ULL
@@ -1594,6 +1676,20 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     if (current_scenario == "probe-vfr-missing-durations") {
       sample->buffer.duration = std::numeric_limits<std::uint64_t>::max();
     }
+    if (!push_compressed_access_unit(sink->pipeline, sample->buffer)) {
+      delete sample;
+      return nullptr;
+    }
+    if (current_scenario == "probe-input-byte-budget-dequeue-race" &&
+        !sink->pipeline->dequeue_race_emitted) {
+      sink->pipeline->dequeue_race_emitted = true;
+      record("probe-sample-dequeued");
+      if (!push_compressed_input(sink->pipeline, 4'096)) {
+        delete sample;
+        return nullptr;
+      }
+      record("post-dequeue-input-admitted");
+    }
     return sample;
   }
   record("pull");
@@ -1877,6 +1973,15 @@ RECO_FAKE_EXPORT void gst_sample_unref(void* sample) {
 RECO_FAKE_EXPORT std::size_t gst_buffer_get_size(const void* buffer_pointer) {
   const auto* buffer = static_cast<const GstBufferAbi*>(buffer_pointer);
   return buffer->offset == 0 ? 4'096ULL : static_cast<std::size_t>(buffer->offset);
+}
+
+RECO_FAKE_EXPORT std::uint32_t gst_buffer_list_length(void* list_pointer) {
+  return static_cast<const FakeBufferList*>(list_pointer)->length;
+}
+
+RECO_FAKE_EXPORT void* gst_buffer_list_get(void* list_pointer, std::uint32_t index) {
+  auto* list = static_cast<FakeBufferList*>(list_pointer);
+  return index < list->length ? &list->buffers[index] : nullptr;
 }
 
 RECO_FAKE_EXPORT void gst_mini_object_unref(void* object) {

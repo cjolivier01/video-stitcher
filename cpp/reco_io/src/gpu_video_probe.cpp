@@ -50,6 +50,7 @@ constexpr int kGstStateChangeFailure = 0;
 constexpr std::uint32_t kGstMessageError = 1U << 1U;
 constexpr int kGstSeekFlagFlushAccurate = (1 << 0) | (1 << 1);
 constexpr int kGstPadProbeTypeBuffer = 1 << 4;
+constexpr int kGstPadProbeTypeBufferList = 1 << 5;
 constexpr int kGstPadProbeDrop = 0;
 constexpr int kGstPadProbeOk = 1;
 constexpr std::uint64_t kGstClockTimeNone = std::numeric_limits<std::uint64_t>::max();
@@ -314,6 +315,8 @@ public:
   using AppSinkIsEos = int (*)(void*);
   using SampleGetBuffer = void* (*)(void*);
   using BufferGetSize = std::size_t (*)(const void*);
+  using BufferListLength = std::uint32_t (*)(void*);
+  using BufferListGet = void* (*)(void*, std::uint32_t);
   using SampleGetCaps = void* (*)(void*);
   using SampleGetSegment = const void* (*)(void*);
   using SampleUnref = void (*)(void*);
@@ -398,6 +401,8 @@ public:
     app_sink_is_eos = app->symbol<AppSinkIsEos>("gst_app_sink_is_eos");
     sample_get_buffer = core->symbol<SampleGetBuffer>("gst_sample_get_buffer");
     buffer_get_size = core->symbol<BufferGetSize>("gst_buffer_get_size");
+    buffer_list_length = core->symbol<BufferListLength>("gst_buffer_list_length");
+    buffer_list_get = core->symbol<BufferListGet>("gst_buffer_list_get");
     sample_get_caps = core->symbol<SampleGetCaps>("gst_sample_get_caps");
     sample_get_segment = core->symbol<SampleGetSegment>("gst_sample_get_segment");
     sample_unref = core->symbol<SampleUnref>("gst_mini_object_unref");
@@ -440,6 +445,8 @@ public:
   AppSinkIsEos app_sink_is_eos = nullptr;
   SampleGetBuffer sample_get_buffer = nullptr;
   BufferGetSize buffer_get_size = nullptr;
+  BufferListLength buffer_list_length = nullptr;
+  BufferListGet buffer_list_get = nullptr;
   SampleGetCaps sample_get_caps = nullptr;
   SampleGetSegment sample_get_segment = nullptr;
   SampleUnref sample_unref = nullptr;
@@ -640,16 +647,15 @@ std::string pop_pipeline_error(const std::shared_ptr<ProbeApi>& api, void* bus) 
 
 class CompressedSampleBudget {
 public:
-  [[nodiscard]] bool admit_input(std::size_t bytes) noexcept {
+  [[nodiscard]] bool admit_input(std::uint64_t bytes) noexcept {
     if (input_limit_exceeded_.load(std::memory_order_acquire)) {
       return false;
     }
     auto current = input_bytes_.load(std::memory_order_relaxed);
     while (true) {
-      const auto increment = static_cast<std::uint64_t>(bytes);
-      const auto next = increment > std::numeric_limits<std::uint64_t>::max() - current
+      const auto next = bytes > std::numeric_limits<std::uint64_t>::max() - current
                             ? std::numeric_limits<std::uint64_t>::max()
-                            : current + increment;
+                            : current + bytes;
       if (input_bytes_.compare_exchange_weak(current, next, std::memory_order_acq_rel,
                                              std::memory_order_relaxed)) {
         if (next <= kMaximumBytesBeforeCompressedAccessUnit) {
@@ -661,6 +667,17 @@ public:
     }
   }
 
+  [[nodiscard]] bool checkpoint_access_unit() noexcept {
+    const auto observed = input_bytes_.exchange(0, std::memory_order_acq_rel);
+    if (input_limit_exceeded_.load(std::memory_order_acquire) ||
+        observed > kMaximumBytesBeforeCompressedAccessUnit) {
+      input_limit_exceeded_.store(true, std::memory_order_release);
+      return false;
+    }
+    checkpointed_.fetch_add(1, std::memory_order_release);
+    return true;
+  }
+
   void require_input_within_limit() const {
     if (input_limit_exceeded_.load(std::memory_order_acquire) ||
         input_bytes_.load(std::memory_order_acquire) > kMaximumBytesBeforeCompressedAccessUnit) {
@@ -669,14 +686,14 @@ public:
   }
 
   void consume() {
-    const auto observed = input_bytes_.exchange(0, std::memory_order_acq_rel);
-    if (input_limit_exceeded_.load(std::memory_order_acquire) ||
-        observed > kMaximumBytesBeforeCompressedAccessUnit) {
-      throw GpuVideoProbeError("video parser exceeded the compressed bytes-per-access-unit limit");
-    }
+    require_input_within_limit();
     if (consumed_ == kMaximumCompressedSamplePulls) {
       throw GpuVideoProbeError(
           "video parser exceeded the compressed access-unit metadata work limit");
+    }
+    if (consumed_ >= checkpointed_.load(std::memory_order_acquire)) {
+      throw GpuVideoProbeError(
+          "video parser returned a compressed access unit without a budget checkpoint");
     }
     ++consumed_;
   }
@@ -684,6 +701,7 @@ public:
 private:
   std::atomic<std::uint64_t> input_bytes_{0};
   std::atomic<bool> input_limit_exceeded_{false};
+  std::atomic<std::uint64_t> checkpointed_{0};
   std::uint64_t consumed_ = 0;
 };
 
@@ -702,9 +720,35 @@ int input_budget_probe(void*, void* probe_info, void* user_data) noexcept {
   if (info->data == nullptr) {
     return kGstPadProbeDrop;
   }
-  return callback->budget->admit_input(callback->api->buffer_get_size(info->data))
-             ? kGstPadProbeOk
-             : kGstPadProbeDrop;
+  std::uint64_t bytes = 0;
+  if ((info->type & kGstPadProbeTypeBufferList) != 0) {
+    const auto length = callback->api->buffer_list_length(info->data);
+    for (std::uint32_t index = 0; index < length; ++index) {
+      const void* buffer = callback->api->buffer_list_get(info->data, index);
+      if (buffer == nullptr) {
+        return kGstPadProbeDrop;
+      }
+      const auto size = static_cast<std::uint64_t>(callback->api->buffer_get_size(buffer));
+      bytes = size > std::numeric_limits<std::uint64_t>::max() - bytes
+                  ? std::numeric_limits<std::uint64_t>::max()
+                  : bytes + size;
+    }
+  } else if ((info->type & kGstPadProbeTypeBuffer) != 0) {
+    bytes = static_cast<std::uint64_t>(callback->api->buffer_get_size(info->data));
+  } else {
+    return kGstPadProbeDrop;
+  }
+  return callback->budget->admit_input(bytes) ? kGstPadProbeOk : kGstPadProbeDrop;
+}
+
+int access_unit_checkpoint_probe(void*, void* probe_info, void* user_data) noexcept {
+  auto* budget = static_cast<CompressedSampleBudget*>(user_data);
+  const auto* info = static_cast<const GstPadProbeInfoAbi*>(probe_info);
+  if (budget == nullptr || info == nullptr || info->data == nullptr ||
+      (info->type & kGstPadProbeTypeBuffer) == 0) {
+    return kGstPadProbeDrop;
+  }
+  return budget->checkpoint_access_unit() ? kGstPadProbeOk : kGstPadProbeDrop;
 }
 
 std::optional<std::pair<std::uint32_t, std::uint32_t>>
@@ -1852,10 +1896,21 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
   if (input_budget_pad == nullptr) {
     throw GpuVideoProbeError("GStreamer parser-only probe has no compressed-input budget pad");
   }
+  const auto access_unit_probe_id = api->pad_add_probe(
+      probe_pad, kGstPadProbeTypeBuffer, &access_unit_checkpoint_probe, &sample_budget, nullptr);
+  if (access_unit_probe_id == 0) {
+    throw GpuVideoProbeError("failed to attach the compressed access-unit budget checkpoint");
+  }
+  struct RemoveAccessUnitProbe {
+    std::shared_ptr<ProbeApi> api;
+    void* pad = nullptr;
+    unsigned long probe_id = 0;
+    ~RemoveAccessUnitProbe() { api->pad_remove_probe(pad, probe_id); }
+  } remove_access_unit_probe{api, probe_pad, access_unit_probe_id};
   InputBudgetCallbackData input_budget_callback{.api = api.get(), .budget = &sample_budget};
   const auto input_budget_probe_id =
-      api->pad_add_probe(input_budget_pad, kGstPadProbeTypeBuffer, &input_budget_probe,
-                         &input_budget_callback, nullptr);
+      api->pad_add_probe(input_budget_pad, kGstPadProbeTypeBuffer | kGstPadProbeTypeBufferList,
+                         &input_budget_probe, &input_budget_callback, nullptr);
   if (input_budget_probe_id == 0) {
     throw GpuVideoProbeError("failed to attach the compressed-input byte budget");
   }

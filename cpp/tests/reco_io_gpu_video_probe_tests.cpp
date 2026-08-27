@@ -1040,13 +1040,17 @@ void invalid_inputs_fail(const std::filesystem::path& video_path,
       "not a readable regular file", "missing input rejected before probing");
 
   for (const auto& [scenario_name, fragment] :
-       std::array<std::pair<std::string_view, std::string_view>, 19>{
+       std::array<std::pair<std::string_view, std::string_view>, 23>{
            {{"old-version", "1.10 or newer"},
             {"init-error", "fake initialization failure"},
             {"probe-parse-error", "fake parse failure"},
             {"probe-missing-info", "metadata identity"},
             {"probe-missing-pad", "metadata pad"},
             {"probe-missing-sink", "compressed-stream sink"},
+            {"probe-missing-input-budget", "compressed-input budget"},
+            {"probe-input-budget-missing-pad", "compressed-input budget pad"},
+            {"probe-checkpoint-install-error", "access-unit budget checkpoint"},
+            {"probe-input-budget-install-error", "compressed-input byte budget"},
             {"probe-missing-bus", "message bus"},
             {"probe-state-error", "playing state"},
             {"probe-stream-error", "playing state"},
@@ -1066,8 +1070,10 @@ void invalid_inputs_fail(const std::filesystem::path& video_path,
   }
 
   for (const auto& [scenario_name, expected_parser_inputs] :
-       std::array<std::pair<std::string_view, std::size_t>, 2>{
-           {{"probe-input-byte-budget", 0}, {"probe-input-byte-budget-runahead", 8}}}) {
+       std::array<std::pair<std::string_view, std::size_t>, 3>{
+           {{"probe-input-byte-budget", 0},
+            {"probe-input-byte-budget-runahead", 8},
+            {"probe-input-byte-budget-dequeue-race", 2}}}) {
     set_scenario(scenario_name);
     std::filesystem::remove(event_path);
     expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
@@ -1083,6 +1089,31 @@ void invalid_inputs_fail(const std::filesystem::path& video_path,
                 std::string(scenario_name) + " removes the input probe during teardown");
     expect_true(!has_event(events, "probe-leaked"),
                 std::string(scenario_name) + " does not leak the input probe");
+  }
+
+  const auto dequeue_race_events = read_events(event_path);
+  expect_true(has_event(dequeue_race_events, "post-dequeue-input-admitted"),
+              "dequeue race admits the next access unit before the pull returns");
+  expect_true(has_event(dequeue_race_events, "access-unit-checkpoint"),
+              "parser output checkpoints the completed access unit in streaming order");
+
+  for (const auto scenario_name :
+       {"probe-input-buffer-list-budget", "probe-input-buffer-list-overflow"}) {
+    set_scenario(scenario_name);
+    std::filesystem::remove(event_path);
+    expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
+                       "bytes-per-access-unit", scenario_name);
+    const auto events = read_events(event_path);
+    expect_true(has_event(events, "add-input-budget-probe"),
+                std::string(scenario_name) + " installs the buffer-list input probe");
+    expect_eq(count_event(events, "parser-input-list"), std::size_t{0},
+              std::string(scenario_name) + " blocks the complete list before the parser");
+    expect_eq(count_event(events, "input-budget-list-drop"), std::size_t{1},
+              std::string(scenario_name) + " rejects the oversized aggregate");
+    expect_true(has_event(events, "remove-input-budget-probe"),
+                std::string(scenario_name) + " removes the input probe during teardown");
+    expect_true(!has_event(events, "probe-leaked"),
+                std::string(scenario_name) + " does not leak either pad probe");
   }
 
   set_scenario("probe-input-byte-budget-checkpoint");
