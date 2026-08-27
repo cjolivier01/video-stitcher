@@ -62,6 +62,15 @@ bool require_cuda() {
   return value != nullptr && std::string_view(value) == "1";
 }
 
+std::string_view test_shard() {
+  const char* value = std::getenv("RECO_GPU_FEATURE_TEST_SHARD");
+  return value == nullptr || value[0] == '\0' ? std::string_view("all") : std::string_view(value);
+}
+
+bool shard_enabled(std::string_view selected, std::string_view shard) {
+  return selected == "all" || selected == shard;
+}
+
 bool address_sanitizer_build() {
 #if defined(__SANITIZE_ADDRESS__)
   return true;
@@ -578,11 +587,11 @@ void triangle_downscale_matches_rust_golden(CudaBackend& backend,
   }
 }
 
-void full_resolution_adversarial_selection_is_bounded(CudaBackend& backend,
-                                                      const GpuAkazePipeline& pipeline) {
-  constexpr std::uint32_t width = 1920;
-  constexpr std::uint32_t height = 1080;
-  constexpr std::size_t pitch = 1936;
+void adversarial_selection_is_bounded_at_resolution(CudaBackend& backend,
+                                                    const GpuAkazePipeline& pipeline,
+                                                    std::uint32_t width, std::uint32_t height,
+                                                    std::size_t pitch,
+                                                    std::chrono::seconds maximum_latency) {
   std::vector<std::uint8_t> pixels(pitch * height, 0);
   for (std::uint32_t y = 0; y < height; ++y) {
     for (std::uint32_t x = 0; x < width; ++x) {
@@ -614,8 +623,20 @@ void full_resolution_adversarial_selection_is_bounded(CudaBackend& backend,
   const auto elapsed = std::chrono::steady_clock::now() - started;
   expect_eq(feature_count(backend, features), config.max_keypoints,
             "adversarial detector reaches its bounded output cap");
-  expect_true(elapsed < std::chrono::seconds(10),
-              "full-resolution adversarial selection completes without watchdog-scale latency");
+  expect_true(elapsed < maximum_latency,
+              "adversarial selection completes without watchdog-scale latency");
+}
+
+void full_resolution_adversarial_selection_is_bounded(CudaBackend& backend,
+                                                      const GpuAkazePipeline& pipeline) {
+  adversarial_selection_is_bounded_at_resolution(backend, pipeline, 1920, 1080, 1936,
+                                                 std::chrono::seconds(10));
+}
+
+void racecheck_adversarial_selection_is_bounded(CudaBackend& backend,
+                                                const GpuAkazePipeline& pipeline) {
+  adversarial_selection_is_bounded_at_resolution(backend, pipeline, 480, 270, 496,
+                                                 std::chrono::seconds(5));
 }
 
 void roi_boundaries_are_enforced(CudaBackend& backend, const GpuAkazePipeline& pipeline) {
@@ -820,23 +841,46 @@ int main() {
     return EXIT_SUCCESS;
   }
 
+  const auto shard = test_shard();
+  if (shard != "all" && shard != "contracts" && shard != "detection" && shard != "golden" &&
+      shard != "triangle" && shard != "selection" && shard != "selection-race" &&
+      shard != "rotation" && shard != "matching") {
+    std::cerr << "FAIL: unknown CUDA feature test shard: " << shard << '\n';
+    return EXIT_FAILURE;
+  }
+
   try {
     auto backend = CudaBackend::create();
     GpuAkazePipeline pipeline(backend);
-    const auto validation_frame = make_frame(backend, 160, 96, 176);
-    api_validation(backend, pipeline, validation_frame);
-    pipeline_owns_backend_lifetime(backend, validation_frame);
-    blank_image_has_no_features(backend, pipeline);
-    detector_is_bounded_and_deterministic(backend, pipeline);
-    luma_range_boundaries_are_equivalent(backend, pipeline);
-    resize_boundary_maps_to_source_coordinates(backend, pipeline);
-    triangle_downscale_matches_rust_golden(backend, pipeline);
-    full_resolution_adversarial_selection_is_bounded(backend, pipeline);
-    roi_boundaries_are_enforced(backend, pipeline);
-    rotated_descriptors_match_known_vectors(backend, pipeline);
-    matcher_ties_lowe_and_crosscheck(backend, pipeline);
-    matcher_order_is_stable(backend, pipeline);
-    matcher_preserves_double_ratio_boundaries(backend, pipeline);
+    if (shard_enabled(shard, "contracts")) {
+      const auto validation_frame = make_frame(backend, 160, 96, 176);
+      api_validation(backend, pipeline, validation_frame);
+      pipeline_owns_backend_lifetime(backend, validation_frame);
+      blank_image_has_no_features(backend, pipeline);
+    }
+    if (shard_enabled(shard, "detection")) {
+      detector_is_bounded_and_deterministic(backend, pipeline);
+      luma_range_boundaries_are_equivalent(backend, pipeline);
+      resize_boundary_maps_to_source_coordinates(backend, pipeline);
+      roi_boundaries_are_enforced(backend, pipeline);
+    }
+    if (shard_enabled(shard, "golden") || shard == "triangle") {
+      triangle_downscale_matches_rust_golden(backend, pipeline);
+    }
+    if (shard_enabled(shard, "golden") || shard == "selection") {
+      full_resolution_adversarial_selection_is_bounded(backend, pipeline);
+    }
+    if (shard_enabled(shard, "selection-race")) {
+      racecheck_adversarial_selection_is_bounded(backend, pipeline);
+    }
+    if (shard_enabled(shard, "golden") || shard == "rotation") {
+      rotated_descriptors_match_known_vectors(backend, pipeline);
+    }
+    if (shard_enabled(shard, "matching")) {
+      matcher_ties_lowe_and_crosscheck(backend, pipeline);
+      matcher_order_is_stable(backend, pipeline);
+      matcher_preserves_double_ratio_boundaries(backend, pipeline);
+    }
   } catch (const std::exception& error) {
     std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';
     return EXIT_FAILURE;
