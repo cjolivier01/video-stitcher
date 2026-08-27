@@ -1009,7 +1009,7 @@ pid_t spawn_guardian_process_with_fork(const char* executable, int control_descr
 
   sigset_t blocked_mask{};
   sigset_t previous_mask{};
-  if (::sigfillset(&blocked_mask) != 0) {
+  if (sigfillset(&blocked_mask) != 0) {
     throw GpuVideoProbeError("failed to prepare video probe guardian signal mask: " +
                              std::string(std::strerror(errno)));
   }
@@ -1654,7 +1654,7 @@ GpuVideoProbe probe_gpu_video_with_delays(const GpuFileDecodeConfig& config,
 int detail::run_gpu_video_probe_guardian(const char* executable,
                                          std::uint64_t pre_worker_report_delay_ns) {
   sigset_t empty_mask{};
-  if (::sigemptyset(&empty_mask) != 0 ||
+  if (sigemptyset(&empty_mask) != 0 ||
       ::pthread_sigmask(SIG_SETMASK, &empty_mask, nullptr) != 0) {
     return 2;
   }
