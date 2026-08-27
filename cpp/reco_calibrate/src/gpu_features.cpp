@@ -486,17 +486,19 @@ struct GpuAkazePipeline::Impl {
     return output;
   }
 
-  void derivatives(const DeviceImage& source, std::uint32_t sigma_size, DeviceImage& dx,
-                   DeviceImage& dy) const {
+  void derivatives(const DeviceImage& source, std::uint32_t sigma_size, DeviceImage& lx,
+                   DeviceImage& ly) const {
     auto src = source.buffer.ptr();
     auto src_pitch = static_cast<std::uint64_t>(source.pitch);
-    auto dx_ptr = dx.buffer.ptr();
-    auto dx_pitch = static_cast<std::uint64_t>(dx.pitch);
-    auto dy_ptr = dy.buffer.ptr();
-    auto dy_pitch = static_cast<std::uint64_t>(dy.pitch);
+    auto lx_ptr = lx.buffer.ptr();
+    auto lx_pitch = static_cast<std::uint64_t>(lx.pitch);
+    auto ly_ptr = ly.buffer.ptr();
+    auto ly_pitch = static_cast<std::uint64_t>(ly.pitch);
     auto width = source.width;
     auto height = source.height;
-    launch(scharr, image_launch(width, height), src, src_pitch, dx_ptr, dx_pitch, dy_ptr, dy_pitch,
+    // Rust AKAZE names the vertical response lx and the horizontal response ly.
+    // Preserve that convention because it defines orientation and M-LDB bytes.
+    launch(scharr, image_launch(width, height), src, src_pitch, ly_ptr, ly_pitch, lx_ptr, lx_pitch,
            width, height, sigma_size);
   }
 
@@ -511,10 +513,10 @@ struct GpuAkazePipeline::Impl {
     auto width = source.width;
     auto height = source.height;
     if (horizontal) {
-      launch(scharr, image_launch(width, height), src, src_pitch, out, out_pitch, zero, zero_pitch,
+      launch(scharr, image_launch(width, height), src, src_pitch, zero, zero_pitch, out, out_pitch,
              width, height, sigma_size);
     } else {
-      launch(scharr, image_launch(width, height), src, src_pitch, zero, zero_pitch, out, out_pitch,
+      launch(scharr, image_launch(width, height), src, src_pitch, out, out_pitch, zero, zero_pitch,
              width, height, sigma_size);
     }
   }

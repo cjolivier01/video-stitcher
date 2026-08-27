@@ -191,7 +191,7 @@ std::vector<Descriptor> feature_descriptors(CudaBackend& backend, const GpuFeatu
 }
 
 std::uint64_t descriptor_hash(const Descriptor& descriptor) {
-  std::uint64_t hash = 1469598103934665603ULL;
+  std::uint64_t hash = 14695981039346656037ULL;
   for (const auto byte : descriptor) {
     hash ^= byte;
     hash *= 1099511628211ULL;
@@ -533,7 +533,9 @@ void triangle_downscale_matches_rust_golden(CudaBackend& backend,
   config.max_detection_width = 1920;
   const auto features = pipeline.detect(frame.view(), config);
   const auto points = download_points(backend, features);
+  const auto descriptors = feature_descriptors(backend, features);
   expect_eq(points.size(), 16U, "Triangle golden feature count");
+  expect_eq(descriptors.size(), 16U, "Triangle golden descriptor count");
 
   struct GoldenPoint {
     float x;
@@ -558,11 +560,21 @@ void triangle_downscale_matches_rust_golden(CudaBackend& backend,
       {3274.332275391F, 95.149536133F, 0.060264542699F},
       {1930.680053711F, 88.560333252F, 0.059688717127F},
   }};
+  constexpr std::array<std::uint64_t, 16> rust_descriptor_hashes{
+      0x99f653f77cb98a73ULL, 0x3d3e8369d72ef5d5ULL, 0x40cd7da97675c37cULL, 0x81b4800b8888c3f6ULL,
+      0xccdff312e6eee8e1ULL, 0xdd6e82f6407f81eeULL, 0x8f307f8eed986d7cULL, 0x8e82ac0dd59cd1aaULL,
+      0x6bc27d7b0c3e15d5ULL, 0xbdc1eede28da1165ULL, 0x1b420c6acfccd414ULL, 0x9b680d4cdabf0d45ULL,
+      0x56d1b7460e2f4672ULL, 0x32d837829dfed7f0ULL, 0x8ba3aaad96de75a4ULL, 0xf849fab312ab82e0ULL,
+  };
   for (std::size_t index = 0; index < std::min(points.size(), rust_golden.size()); ++index) {
     expect_near(points[index].x, rust_golden[index].x, 2.0e-4F, "Triangle Rust-golden feature x");
     expect_near(points[index].y, rust_golden[index].y, 2.0e-4F, "Triangle Rust-golden feature y");
     expect_near(points[index].response, rust_golden[index].response, 1.0e-7F,
                 "Triangle Rust-golden feature response");
+    if (index < descriptors.size()) {
+      expect_eq(descriptor_hash(descriptors[index]), rust_descriptor_hashes[index],
+                "Triangle Rust-golden descriptor");
+    }
   }
 }
 
@@ -639,10 +651,10 @@ void rotated_descriptors_match_known_vectors(CudaBackend& backend,
   auto pixels = texture(size, size, size, 7, 241, 0);
   const auto config = detector_config(8);
   constexpr std::array<std::uint64_t, 4> expected_hashes{
-      17885243628983993127ULL,
-      14984369198410826671ULL,
-      15870047116826553049ULL,
-      6089946918998727710ULL,
+      0x3e73e22b19638e8fULL,
+      0xa90e0344e8c1aa8aULL,
+      0x46358dee951959e8ULL,
+      0xa686a8518d294ee7ULL,
   };
   std::array<std::uint64_t, 4> hashes{};
   for (std::size_t rotation = 0; rotation < hashes.size(); ++rotation) {
