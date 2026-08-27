@@ -35,6 +35,7 @@ constexpr DWORD_PTR kProcThreadAttributeJobList = ProcThreadAttributeValue(13, F
 #include <cstring>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <spawn.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -1006,7 +1007,32 @@ pid_t spawn_guardian_process_with_fork(const char* executable, int control_descr
     throw GpuVideoProbeError("failed to determine video probe guardian descriptor limit");
   }
 
+  sigset_t blocked_mask{};
+  sigset_t previous_mask{};
+  if (::sigfillset(&blocked_mask) != 0) {
+    throw GpuVideoProbeError("failed to prepare video probe guardian signal mask: " +
+                             std::string(std::strerror(errno)));
+  }
+  const auto block_error = ::pthread_sigmask(SIG_SETMASK, &blocked_mask, &previous_mask);
+  if (block_error != 0) {
+    throw GpuVideoProbeError("failed to block signals for video probe guardian launch: " +
+                             std::string(std::strerror(block_error)));
+  }
   const auto guardian_pid = ::fork();
+  const auto fork_error = errno;
+  if (guardian_pid != 0) {
+    const auto restore_error = ::pthread_sigmask(SIG_SETMASK, &previous_mask, nullptr);
+    if (restore_error != 0) {
+      if (guardian_pid > 0) {
+        (void)::kill(guardian_pid, SIGKILL);
+        int status = 0;
+        while (::waitpid(guardian_pid, &status, 0) < 0 && errno == EINTR) {
+        }
+      }
+      throw GpuVideoProbeError("failed to restore signals after video probe guardian launch: " +
+                               std::string(std::strerror(restore_error)));
+    }
+  }
   if (guardian_pid == 0) {
     const auto report_error = [](int descriptor, int error) {
       const auto write_exact = [descriptor](const void* data, std::size_t size) {
@@ -1027,9 +1053,7 @@ pid_t spawn_guardian_process_with_fork(const char* executable, int control_descr
       write_exact(&error, sizeof(error));
       guardian_exit(127);
     };
-    sigset_t empty_mask{};
-    if (::sigemptyset(&empty_mask) != 0 || ::sigprocmask(SIG_SETMASK, &empty_mask, nullptr) != 0 ||
-        ::setpgid(0, 0) != 0) {
+    if (::setpgid(0, 0) != 0) {
       report_error(control_descriptor, errno);
     }
     for (const auto [source, destination] :
@@ -1048,6 +1072,7 @@ pid_t spawn_guardian_process_with_fork(const char* executable, int control_descr
     report_error(STDOUT_FILENO, errno);
   }
   if (guardian_pid < 0) {
+    errno = fork_error;
     throw GpuVideoProbeError("failed to start video probe worker guardian: " +
                              std::string(std::strerror(errno)));
   }
@@ -1624,6 +1649,11 @@ GpuVideoProbe probe_gpu_video_with_delays(const GpuFileDecodeConfig& config,
 #if !defined(_WIN32)
 int detail::run_gpu_video_probe_guardian(const char* executable,
                                          std::uint64_t pre_worker_report_delay_ns) {
+  sigset_t empty_mask{};
+  if (::sigemptyset(&empty_mask) != 0 ||
+      ::pthread_sigmask(SIG_SETMASK, &empty_mask, nullptr) != 0) {
+    return 2;
+  }
   if (executable == nullptr || executable[0] == '\0' ||
       pre_worker_report_delay_ns >
           static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
