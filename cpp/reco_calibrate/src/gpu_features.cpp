@@ -205,6 +205,10 @@ void validate_frame(const GpuGrayFrame& frame) {
   if (frame.width == 0 || frame.height == 0) {
     throw std::invalid_argument("GPU AKAZE frame dimensions must be non-zero");
   }
+  if (frame.width > reco::core::kMaxCalibrationDimension ||
+      frame.height > reco::core::kMaxCalibrationDimension) {
+    throw std::invalid_argument("GPU AKAZE frame dimensions exceed the supported limit");
+  }
   if (frame.pitch < frame.width) {
     throw std::invalid_argument("GPU AKAZE frame pitch is smaller than its visible width");
   }
@@ -240,6 +244,9 @@ void validate_region(const DetectRegion& region) {
 void validate_config(const GpuAkazeConfig& config) {
   if (config.max_keypoints == 0) {
     throw std::invalid_argument("GPU AKAZE maximum keypoint count must be non-zero");
+  }
+  if (config.max_keypoints > kMaxGpuAkazeFeatures) {
+    throw std::invalid_argument("GPU AKAZE maximum keypoint count exceeds the launch bound");
   }
   if (config.max_detection_width == 0) {
     throw std::invalid_argument("GPU AKAZE maximum detection width must be non-zero");
@@ -410,6 +417,10 @@ void validate_feature_view(const GpuFeatureView& view, const char* label) {
     throw std::invalid_argument(std::string("GPU ") + label +
                                 " feature view capacity must be non-zero");
   }
+  if (view.capacity > kMaxGpuAkazeFeatures) {
+    throw std::invalid_argument(std::string("GPU ") + label +
+                                " feature view capacity exceeds the launch bound");
+  }
   if (view.points == 0 || view.descriptors == 0 || view.count == 0) {
     throw std::invalid_argument(std::string("GPU ") + label +
                                 " feature view has a null device pointer");
@@ -419,8 +430,16 @@ void validate_feature_view(const GpuFeatureView& view, const char* label) {
     throw std::invalid_argument(std::string("GPU ") + label +
                                 " feature view has a misaligned device pointer");
   }
-  (void)checked_multiply(view.capacity, sizeof(GpuFeaturePoint), "GPU feature points");
-  (void)checked_multiply(view.capacity, kDescriptorBytes, "GPU feature descriptors");
+  const auto points_bytes =
+      checked_multiply(view.capacity, sizeof(GpuFeaturePoint), "GPU feature points");
+  const auto descriptor_bytes =
+      checked_multiply(view.capacity, kDescriptorBytes, "GPU feature descriptors");
+  const auto maximum = std::numeric_limits<reco::core::CudaDevicePtr>::max();
+  if (view.points > maximum - points_bytes || view.descriptors > maximum - descriptor_bytes ||
+      view.count > maximum - sizeof(std::uint32_t)) {
+    throw std::invalid_argument(std::string("GPU ") + label +
+                                " feature view device pointer range overflows");
+  }
 }
 
 } // namespace
@@ -457,6 +476,7 @@ struct GpuAkazePipeline::Impl {
     akaze_scan_add = akaze_module.load_kernel("akaze_scan_add");
     scatter_candidates = akaze_module.load_kernel("akaze_scatter_candidates");
     select_scale_extrema = akaze_module.load_kernel("akaze_select_scale_extrema");
+    discard_lower_scale_extrema = akaze_module.load_kernel("akaze_discard_lower_scale_extrema");
     prepare_feature_keys = akaze_module.load_kernel("akaze_prepare_feature_keys");
     radix_zero_flags = akaze_module.load_kernel("akaze_radix_zero_flags");
     radix_scatter = akaze_module.load_kernel("akaze_radix_scatter");
@@ -619,6 +639,7 @@ struct GpuAkazePipeline::Impl {
   reco::core::CudaKernel akaze_scan_add;
   reco::core::CudaKernel scatter_candidates;
   reco::core::CudaKernel select_scale_extrema;
+  reco::core::CudaKernel discard_lower_scale_extrema;
   reco::core::CudaKernel prepare_feature_keys;
   reco::core::CudaKernel radix_zero_flags;
   reco::core::CudaKernel radix_scatter;
@@ -938,6 +959,9 @@ GpuFeatureSet GpuAkazePipeline::detect(const GpuGrayFrame& frame,
              level_count, cache_indices_ptr, cache_cells_ptr, cache_count_ptr, selected_flags_ptr);
       candidate_begin += batch_count;
     }
+    launch(impl_->discard_lower_scale_extrema, linear_launch(candidate_count), candidates_ptr,
+           candidate_count_arg, selection_levels_ptr, level_count, cache_indices_ptr,
+           cache_cells_ptr, cache_count_ptr, selected_flags_ptr);
 
     auto inverse_detection_scale = 1.0F / geometry.detector_scale;
     auto crop_x_float = static_cast<float>(geometry.crop_x);

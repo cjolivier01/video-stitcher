@@ -16,6 +16,7 @@
 #if defined(_WIN32)
 #include <windows.h>
 #else
+#include <dlfcn.h>
 #include <unistd.h>
 #endif
 
@@ -119,6 +120,64 @@ void close_released_handle(CudaShareableHandle handle) {
 #endif
 }
 
+void primary_context_replaces_same_device_secondary(const CudaBackend& backend) {
+#if defined(__linux__)
+  void* driver = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+  if (driver == nullptr) {
+    throw std::runtime_error("failed to load CUDA driver for context ownership test");
+  }
+  struct DriverCloser {
+    void* driver;
+    ~DriverCloser() { dlclose(driver); }
+  } closer{driver};
+  const auto symbol = [driver](const char* name) {
+    auto* value = dlsym(driver, name);
+    if (value == nullptr) {
+      throw std::runtime_error(std::string("missing CUDA test symbol ") + name);
+    }
+    return value;
+  };
+  using Result = int;
+  using Device = int;
+  using Context = void*;
+  const auto device_get = reinterpret_cast<Result (*)(Device*, int)>(symbol("cuDeviceGet"));
+  const auto context_create =
+      reinterpret_cast<Result (*)(Context*, unsigned int, Device)>(symbol("cuCtxCreate_v2"));
+  const auto context_destroy = reinterpret_cast<Result (*)(Context)>(symbol("cuCtxDestroy_v2"));
+  const auto context_get_current =
+      reinterpret_cast<Result (*)(Context*)>(symbol("cuCtxGetCurrent"));
+  const auto context_set_current = reinterpret_cast<Result (*)(Context)>(symbol("cuCtxSetCurrent"));
+  Device device = 0;
+  Context secondary = nullptr;
+  if (device_get(&device, 0) != 0 || context_create(&secondary, 0, device) != 0 ||
+      secondary == nullptr) {
+    throw std::runtime_error("failed to create CUDA secondary context for ownership test");
+  }
+  try {
+    backend.ensure_primary_context(0);
+    Context observed = nullptr;
+    if (context_get_current(&observed) != 0) {
+      throw std::runtime_error("failed to inspect CUDA context after primary selection");
+    }
+    expect_true(observed != secondary,
+                "primary context replaces a current same-device secondary context");
+    if (context_set_current(secondary) != 0 || context_destroy(secondary) != 0) {
+      throw std::runtime_error("failed to destroy CUDA secondary context");
+    }
+    secondary = nullptr;
+    backend.ensure_primary_context(0);
+  } catch (...) {
+    if (secondary != nullptr) {
+      (void)context_set_current(secondary);
+      (void)context_destroy(secondary);
+    }
+    throw;
+  }
+#else
+  (void)backend;
+#endif
+}
+
 constexpr char kFillBytesPtx[] = R"ptx(
 .version 8.0
 .target sm_50
@@ -218,6 +277,7 @@ int main() {
 
     backend.ensure_primary_context(0);
     backend.ensure_primary_context(0);
+    primary_context_replaces_same_device_secondary(backend);
     const auto before = backend.memory_info();
     expect_true(before.total_bytes > 0, "total device memory");
     expect_true(before.free_bytes > 0, "free device memory");

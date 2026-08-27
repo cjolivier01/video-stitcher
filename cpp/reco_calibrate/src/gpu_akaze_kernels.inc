@@ -895,23 +895,44 @@ extern "C" __global__ void akaze_select_scale_extrema(
     selected[index] = 1U;
   }
 
-  if (candidate_end == candidate_count) {
-    // Rust performs a second pass over the completed cache. A lower-scale
-    // entry is discarded when a later cache slot from the next scale overlaps
-    // it, including entries that replaced an earlier cache value in place.
-    for (unsigned int slot = 0U; slot < *count; ++slot) {
-      const unsigned int index = indices[slot];
-      const AkazeCandidate current = values[index];
-      if (current.level + 1U >= level_count) {
-        continue;
-      }
-      const unsigned int upper_slot = akaze_first_cached_overlap(
-          current, current.level + 1U, selection_levels, values, indices, cells, *count, slot,
-          true);
-      if (upper_slot != 0xffffffffU) {
-        selected[index] = 0U;
-      }
-    }
+}
+
+extern "C" __global__ void akaze_discard_lower_scale_extrema(
+    unsigned long long candidates,
+    unsigned int candidate_count,
+    unsigned long long levels,
+    unsigned int level_count,
+    unsigned long long cache_indices,
+    unsigned long long cache_cells,
+    unsigned long long cache_count,
+    unsigned long long selected_flags) {
+  const unsigned int slot = blockIdx.x * blockDim.x + threadIdx.x;
+  const AkazeCandidate* values = akaze_const_pointer<AkazeCandidate>(candidates);
+  const AkazeSelectionLevel* selection_levels =
+      akaze_const_pointer<AkazeSelectionLevel>(levels);
+  const unsigned int* indices = akaze_const_pointer<unsigned int>(cache_indices);
+  const unsigned int* cells = akaze_const_pointer<unsigned int>(cache_cells);
+  const unsigned int count = *akaze_const_pointer<unsigned int>(cache_count);
+  unsigned int* selected = akaze_pointer<unsigned int>(selected_flags);
+  const unsigned int bounded_count = count < candidate_count ? count : candidate_count;
+  if (slot >= bounded_count) {
+    return;
+  }
+
+  // Rust performs a second pass over the completed cache. A lower-scale entry
+  // is discarded when a later cache slot from the next scale overlaps it,
+  // including entries that replaced an earlier cache value in place. Each slot
+  // only clears its own selected flag, so this pass is scheduling-independent.
+  const unsigned int index = indices[slot];
+  const AkazeCandidate current = values[index];
+  if (current.level + 1U >= level_count) {
+    return;
+  }
+  const unsigned int upper_slot = akaze_first_cached_overlap(
+      current, current.level + 1U, selection_levels, values, indices, cells, bounded_count, slot,
+      true);
+  if (upper_slot != 0xffffffffU) {
+    selected[index] = 0U;
   }
 }
 

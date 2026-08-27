@@ -362,6 +362,10 @@ void api_validation(CudaBackend& backend, const GpuAkazePipeline& pipeline,
   expect_invalid_argument([&] { (void)pipeline.detect(valid_frame.view(), invalid_config); },
                           "detector zero output limit");
   invalid_config = config;
+  invalid_config.max_keypoints = kMaxGpuAkazeFeatures + 1U;
+  expect_invalid_argument([&] { (void)pipeline.detect(valid_frame.view(), invalid_config); },
+                          "detector output limit is launch-bounded");
+  invalid_config = config;
   invalid_config.max_detection_width = 0;
   expect_invalid_argument([&] { (void)pipeline.detect(valid_frame.view(), invalid_config); },
                           "detector zero resize limit");
@@ -437,6 +441,22 @@ void api_validation(CudaBackend& backend, const GpuAkazePipeline& pipeline,
   bad_view.count = 0;
   expect_invalid_argument([&] { (void)pipeline.match(bad_view, fixture.view(), 1.0F); },
                           "matcher null count");
+  bad_view = fixture.view();
+  bad_view.capacity = kMaxGpuAkazeFeatures + 1U;
+  expect_invalid_argument([&] { (void)pipeline.match(bad_view, fixture.view(), 1.0F); },
+                          "matcher input capacity is launch-bounded");
+  bad_view = fixture.view();
+  bad_view.points = std::numeric_limits<CudaDevicePtr>::max() - 3U;
+  expect_invalid_argument([&] { (void)pipeline.match(bad_view, fixture.view(), 1.0F); },
+                          "matcher point pointer range overflow");
+  bad_view = fixture.view();
+  bad_view.descriptors = std::numeric_limits<CudaDevicePtr>::max() - 7U;
+  expect_invalid_argument([&] { (void)pipeline.match(fixture.view(), bad_view, 1.0F); },
+                          "matcher descriptor pointer range overflow");
+  bad_view = fixture.view();
+  bad_view.count = std::numeric_limits<CudaDevicePtr>::max() - 3U;
+  expect_invalid_argument([&] { (void)pipeline.match(bad_view, fixture.view(), 1.0F); },
+                          "matcher count pointer range overflow");
   expect_invalid_argument([&] { (void)pipeline.match(fixture.view(), fixture.view(), 0.0F); },
                           "matcher zero Lowe ratio");
   expect_invalid_argument([&] { (void)pipeline.match(fixture.view(), fixture.view(), 1.01F); },
@@ -713,8 +733,8 @@ void adversarial_selection_is_bounded_at_resolution(CudaBackend& backend,
   auto config = detector_config(64);
   config.threshold = 1.0e-8F;
   config.max_detection_width = width;
-  config.num_sublevels = 1;
-  config.max_octaves = 1;
+  config.num_sublevels = 2;
+  config.max_octaves = 3;
 
   const auto started = std::chrono::steady_clock::now();
   const auto features = pipeline.detect(frame.view(), config);

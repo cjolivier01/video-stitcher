@@ -235,6 +235,8 @@ struct CudaBackend::Impl {
     cu_device_get_uuid = driver.symbol<decltype(cu_device_get_uuid)>("cuDeviceGetUuid");
     cu_device_primary_ctx_retain =
         driver.symbol<decltype(cu_device_primary_ctx_retain)>("cuDevicePrimaryCtxRetain");
+    cu_device_primary_ctx_release =
+        driver.symbol<decltype(cu_device_primary_ctx_release)>("cuDevicePrimaryCtxRelease_v2");
     cu_ctx_get_current = driver.symbol<decltype(cu_ctx_get_current)>("cuCtxGetCurrent");
     cu_ctx_get_device = driver.symbol<decltype(cu_ctx_get_device)>("cuCtxGetDevice");
     cu_ctx_set_current = driver.symbol<decltype(cu_ctx_set_current)>("cuCtxSetCurrent");
@@ -264,6 +266,16 @@ struct CudaBackend::Impl {
     check_cuda("cuInit", cu_init(0));
   }
 
+  ~Impl() {
+    for (const auto& [ordinal, context] : retained_contexts) {
+      (void)context;
+      CUdevice retained_device = 0;
+      if (cu_device_get(&retained_device, ordinal) == kCudaSuccess) {
+        (void)cu_device_primary_ctx_release(retained_device);
+      }
+    }
+  }
+
   CUdevice device(int ordinal) const {
     CUdevice device = 0;
     check_cuda("cuDeviceGet", cu_device_get(&device, ordinal));
@@ -272,16 +284,6 @@ struct CudaBackend::Impl {
 
   void ensure_primary_context(int ordinal) {
     const CUdevice requested_device = device(ordinal);
-    CUcontext current = nullptr;
-    check_cuda("cuCtxGetCurrent", cu_ctx_get_current(&current));
-    if (current != nullptr) {
-      CUdevice current_device = 0;
-      check_cuda("cuCtxGetDevice", cu_ctx_get_device(&current_device));
-      if (current_device == requested_device) {
-        return;
-      }
-    }
-
     CUcontext context = nullptr;
     {
       std::lock_guard<std::mutex> lock(context_mutex);
@@ -294,17 +296,15 @@ struct CudaBackend::Impl {
         context = it->second;
       }
     }
+    CUcontext current = nullptr;
+    check_cuda("cuCtxGetCurrent", cu_ctx_get_current(&current));
+    if (current == context) {
+      return;
+    }
     check_cuda("cuCtxSetCurrent", cu_ctx_set_current(context));
   }
 
-  void ensure_current_context_for_copy() {
-    CUcontext current = nullptr;
-    check_cuda("cuCtxGetCurrent", cu_ctx_get_current(&current));
-    if (current != nullptr) {
-      return;
-    }
-    ensure_primary_context(0);
-  }
+  void ensure_current_context_for_copy() { ensure_primary_context(0); }
 
   CUcontext current_context() {
     CUcontext current = nullptr;
@@ -325,6 +325,7 @@ struct CudaBackend::Impl {
   CUresult (*cu_device_get_name)(char*, int, CUdevice) = nullptr;
   CUresult (*cu_device_get_uuid)(CUuuid*, CUdevice) = nullptr;
   CUresult (*cu_device_primary_ctx_retain)(CUcontext*, CUdevice) = nullptr;
+  CUresult (*cu_device_primary_ctx_release)(CUdevice) = nullptr;
   CUresult (*cu_ctx_get_current)(CUcontext*) = nullptr;
   CUresult (*cu_ctx_get_device)(CUdevice*) = nullptr;
   CUresult (*cu_ctx_set_current)(CUcontext) = nullptr;

@@ -40,7 +40,8 @@ extern "C" __global__ void undistort_y_plane(
     float k0,
     float k1,
     float k2,
-    float k3) {
+    float k3,
+    unsigned int black_level) {
   const unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
   const unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
   if (x >= dst_width || y >= dst_height) {
@@ -65,7 +66,7 @@ extern "C" __global__ void undistort_y_plane(
   const float sx = src_fx * nx * scale + src_cx;
   const float sy = src_fy * ny * scale + src_cy;
 
-  unsigned char value = 0;
+  unsigned char value = (unsigned char)black_level;
   if (sx >= 0.0f && sy >= 0.0f && sx < (float)(src_width - 1) &&
       sy < (float)(src_height - 1)) {
     const unsigned int x0 = (unsigned int)floorf(sx);
@@ -249,11 +250,12 @@ void GpuCalibrationUndistorter::undistort_y(const GpuGrayFrame& src,
   auto k1 = static_cast<float>(config.camera.d[1]);
   auto k2 = static_cast<float>(config.camera.d[2]);
   auto k3 = static_cast<float>(config.camera.d[3]);
+  std::uint32_t black_level = src.color_range == reco::core::YuvColorRange::Limited ? 16U : 0U;
 
-  std::array<void*, 20> args{
+  std::array<void*, 21> args{
       &src_ptr,    &src_pitch, &src_width, &src_height, &dst_ptr, &dst_pitch, &dst_width,
       &dst_height, &src_fx,    &src_fy,    &src_cx,     &src_cy,  &out_fx,    &out_fy,
-      &out_cx,     &out_cy,    &k0,        &k1,         &k2,      &k3,
+      &out_cx,     &out_cy,    &k0,        &k1,         &k2,      &k3,        &black_level,
   };
   impl_->kernel.launch({.grid = {.x = (dst.width + 15U) / 16U, .y = (dst.height + 15U) / 16U},
                         .block = {.x = 16, .y = 16}},

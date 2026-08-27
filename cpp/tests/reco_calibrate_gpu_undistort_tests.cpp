@@ -298,6 +298,31 @@ int main() {
       }
     }
 
+    auto limited_dst = backend.allocate(dst_pitch * height);
+    undistorter.undistort_y({.ptr = src.ptr(),
+                             .pitch = src_pitch,
+                             .width = width,
+                             .height = height,
+                             .color_range = YuvColorRange::Limited},
+                            {.ptr = limited_dst.ptr(),
+                             .pitch = dst_pitch,
+                             .width = width,
+                             .height = height,
+                             .color_range = YuvColorRange::Limited});
+    backend.synchronize();
+    const auto limited = download_y_plane(backend, limited_dst, dst_pitch, width, height);
+    bool checked_limited_black = false;
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+      if (expected[index] == 0U) {
+        expect_eq(limited[index], 16U, "limited-range undistort uses legal black fill");
+        checked_limited_black = true;
+      }
+    }
+    if (!checked_limited_black) {
+      std::cerr << "FAIL: undistort fixture did not exercise out-of-source fill\n";
+      ++failures;
+    }
+
     const auto make_owned_undistorter = [width, height] {
       auto short_lived_backend = CudaBackend::create();
       return GpuCalibrationUndistorter(

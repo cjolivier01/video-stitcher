@@ -11,6 +11,9 @@
 
 namespace reco::calibrate {
 
+/// Hard upper bound for detector output and matcher input capacities.
+inline constexpr std::uint32_t kMaxGpuAkazeFeatures = 8'192;
+
 /// Device ABI for an AKAZE keypoint. Descriptors are stored separately.
 struct GpuFeaturePoint {
   /// Source-image x coordinate.
@@ -51,7 +54,7 @@ struct GpuMatchedPoint {
 
 /// Explicit AKAZE detection and matching limits.
 struct GpuAkazeConfig {
-  /// Maximum number of retained keypoints.
+  /// Maximum number of retained keypoints, in `[1, kMaxGpuAkazeFeatures]`.
   std::uint32_t max_keypoints = 2'000;
   /// Maximum detector-space width before luma downscaling.
   std::uint32_t max_detection_width = 1'920;
