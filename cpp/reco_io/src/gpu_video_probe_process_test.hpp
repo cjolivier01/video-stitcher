@@ -19,4 +19,11 @@ namespace reco::io::detail {
     const GpuFileDecodeConfig& config, const std::filesystem::path& worker_path,
     std::uint64_t timeout_ns, std::uint64_t pre_worker_report_delay_ns);
 
+#if !defined(_WIN32)
+[[nodiscard]] bool guardian_watchdog_exit_is_fatal_for_test(bool memory_termination_sent,
+                                                            int wait_result, int wait_error,
+                                                            std::int64_t observed_pid,
+                                                            std::int64_t watchdog_pid);
+#endif
+
 } // namespace reco::io::detail

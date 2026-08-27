@@ -1993,6 +1993,21 @@ void worker_address_space_is_limited(const std::filesystem::path& video_path) {
 #endif
 }
 
+void watchdog_exit_after_memory_termination_is_expected() {
+#if !defined(_WIN32)
+  constexpr std::int64_t watchdog_pid = 73;
+  expect_true(reco::io::detail::guardian_watchdog_exit_is_fatal_for_test(
+                  false, 0, 0, watchdog_pid, watchdog_pid),
+              "watchdog exit before memory termination is fatal");
+  expect_true(!reco::io::detail::guardian_watchdog_exit_is_fatal_for_test(
+                  true, 0, 0, watchdog_pid, watchdog_pid),
+              "watchdog-first exit after memory termination is expected");
+  expect_true(!reco::io::detail::guardian_watchdog_exit_is_fatal_for_test(
+                  true, -1, ECHILD, 0, watchdog_pid),
+              "reaped watchdog after memory termination is expected");
+#endif
+}
+
 void non_utf8_path_round_trips() {
 #if defined(__linux__)
   auto filename = std::string("reco_gpu_probe_non_utf8_");
@@ -2172,6 +2187,7 @@ int main(int argc, char** argv) {
   guardian_initializers_cannot_observe_unrelated_descriptors(video_path);
   lowered_file_limit_does_not_leak_high_descriptors(video_path);
   worker_address_space_is_limited(video_path);
+  watchdog_exit_after_memory_termination_is_expected();
   unrelated_descriptor_writer_does_not_delay_pipe_eof(video_path);
   parent_death_reclaims_worker(video_path);
   caller_death_reclaims_worker_and_descendant(video_path);

@@ -643,6 +643,7 @@ constexpr char kGuardianRelease = 'G';
 constexpr char kGuardianExited = 'E';
 constexpr char kGuardianAcknowledge = 'A';
 constexpr char kGuardianTerminate = 'T';
+constexpr char kGuardianLaunchFailed = 'F';
 
 long descriptor_scan_limit();
 
@@ -660,6 +661,13 @@ pid_t spawn_guardian_process_with_fork(const char* executable, int control_descr
                                        int worker_input_descriptor, int worker_output_descriptor,
                                        char* const arguments[], char* const environment[]);
 #endif
+
+bool guardian_watchdog_exit_is_fatal(bool memory_termination_sent, int wait_result, int wait_error,
+                                     pid_t observed_pid, pid_t watchdog_pid) {
+  return !memory_termination_sent &&
+         ((wait_result == 0 && observed_pid == watchdog_pid) ||
+          (wait_result < 0 && wait_error != EINTR));
+}
 
 UniqueFd duplicate_for_guardian(int descriptor) {
 #if defined(F_DUPFD_CLOEXEC)
@@ -910,76 +918,119 @@ bool guardian_sleep(std::chrono::nanoseconds delay) {
   return true;
 }
 
-void guardian_close_from(int descriptor, long maximum_descriptor) {
-#if defined(__linux__) && defined(SYS_close_range)
+bool guardian_close_from(int descriptor, long maximum_descriptor) {
+#if defined(__linux__) && defined(SYS_getdents64)
+  (void)maximum_descriptor;
+#endif
+#if defined(__linux__) && defined(SYS_close_range) && \
+    !defined(RECO_GUARDIAN_FORCE_DESCRIPTOR_SCAN)
   if (::syscall(SYS_close_range, static_cast<unsigned int>(descriptor),
                 std::numeric_limits<unsigned int>::max(), 0U) == 0) {
-    return;
+    return true;
   }
 #endif
 #if defined(F_CLOSEM)
   if (::fcntl(descriptor, F_CLOSEM, 0) == 0) {
-    return;
+    return true;
   }
 #endif
+#if defined(__linux__) && defined(SYS_getdents64)
+  const auto directory = ::open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (directory < 0) {
+    return false;
+  }
+  struct LinuxDirectoryEntry {
+    std::uint64_t inode;
+    std::int64_t offset;
+    unsigned short record_length;
+    unsigned char type;
+    char name[1];
+  };
+  alignas(std::uint64_t) std::array<char, 4096> entries{};
+  while (true) {
+    const auto count = ::syscall(SYS_getdents64, directory, entries.data(), entries.size());
+    if (count == 0) {
+      (void)::close(directory);
+      return true;
+    }
+    if (count < 0) {
+      const auto saved_error = errno;
+      (void)::close(directory);
+      errno = saved_error;
+      return false;
+    }
+    std::size_t offset = 0;
+    while (offset < static_cast<std::size_t>(count)) {
+      const auto* entry = reinterpret_cast<const LinuxDirectoryEntry*>(entries.data() + offset);
+      constexpr auto name_offset = offsetof(LinuxDirectoryEntry, name);
+      if (entry->record_length <= name_offset ||
+          entry->record_length > static_cast<std::size_t>(count) - offset) {
+        (void)::close(directory);
+        errno = EIO;
+        return false;
+      }
+      int value = 0;
+      bool numeric = entry->name[0] != '\0';
+      for (std::size_t index = 0; index < entry->record_length - name_offset; ++index) {
+        const auto character = entry->name[index];
+        if (character == '\0') {
+          break;
+        }
+        if (character < '0' || character > '9' ||
+            value > (std::numeric_limits<int>::max() - (character - '0')) / 10) {
+          numeric = false;
+          break;
+        }
+        value = value * 10 + (character - '0');
+      }
+      if (numeric && value >= descriptor && value != directory) {
+        (void)::close(value);
+      }
+      offset += entry->record_length;
+    }
+  }
+#else
   for (long value = descriptor; value < maximum_descriptor; ++value) {
     (void)::close(static_cast<int>(value));
   }
+  return true;
+#endif
 }
 
 #if !defined(RECO_GUARDIAN_HAS_ATOMIC_SPAWN_CLOSE)
 pid_t spawn_guardian_process_with_fork(const char* executable, int control_descriptor,
                                        int worker_input_descriptor, int worker_output_descriptor,
                                        char* const arguments[], char* const environment[]) {
-  int error_pipe[2] = {-1, -1};
-#if defined(__linux__) && defined(O_CLOEXEC)
-  if (::pipe2(error_pipe, O_CLOEXEC) != 0) {
-    throw GpuVideoProbeError("failed to create video probe guardian launch pipe: " +
-                             std::string(std::strerror(errno)));
-  }
-#else
-  if (::pipe(error_pipe) != 0) {
-    throw GpuVideoProbeError("failed to create video probe guardian launch pipe: " +
-                             std::string(std::strerror(errno)));
-  }
-  try {
-    make_close_on_exec(error_pipe[0]);
-    make_close_on_exec(error_pipe[1]);
-  } catch (...) {
-    const auto saved_error = errno;
-    (void)::close(error_pipe[0]);
-    (void)::close(error_pipe[1]);
-    errno = saved_error;
-    throw;
-  }
-#endif
-  UniqueFd launch_error_input(error_pipe[0]);
-  UniqueFd launch_error_output(error_pipe[1]);
   const auto maximum_descriptor = descriptor_scan_limit();
-  if (maximum_descriptor < kGuardianFirstUnusedDescriptor + 1) {
+  if (maximum_descriptor < kGuardianFirstUnusedDescriptor) {
     throw GpuVideoProbeError("failed to determine video probe guardian descriptor limit");
   }
 
   const auto guardian_pid = ::fork();
   if (guardian_pid == 0) {
-    constexpr int kLaunchErrorDescriptor = kGuardianFirstUnusedDescriptor;
     const auto report_error = [](int descriptor, int error) {
-      ssize_t written = -1;
-      do {
-        written = ::write(descriptor, &error, sizeof(error));
-      } while (written < 0 && errno == EINTR);
+      const auto write_exact = [descriptor](const void* data, std::size_t size) {
+        const auto* bytes = static_cast<const char*>(data);
+        std::size_t offset = 0;
+        while (offset < size) {
+          ssize_t written = -1;
+          do {
+            written = ::write(descriptor, bytes + offset, size - offset);
+          } while (written < 0 && errno == EINTR);
+          if (written <= 0) {
+            guardian_exit(127);
+          }
+          offset += static_cast<std::size_t>(written);
+        }
+      };
+      write_exact(&kGuardianLaunchFailed, 1);
+      write_exact(&error, sizeof(error));
       guardian_exit(127);
     };
-    if (::dup2(launch_error_output.get(), kLaunchErrorDescriptor) < 0) {
-      report_error(launch_error_output.get(), errno);
-    }
-    if (::fcntl(kLaunchErrorDescriptor, F_SETFD, FD_CLOEXEC) != 0) {
-      report_error(kLaunchErrorDescriptor, errno);
-    }
     sigset_t empty_mask{};
     if (::sigemptyset(&empty_mask) != 0 || ::sigprocmask(SIG_SETMASK, &empty_mask, nullptr) != 0 ||
         ::setpgid(0, 0) != 0) {
-      report_error(kLaunchErrorDescriptor, errno);
+      report_error(control_descriptor, errno);
     }
     for (const auto [source, destination] :
          {std::pair(control_descriptor, STDIN_FILENO),
@@ -987,39 +1038,20 @@ pid_t spawn_guardian_process_with_fork(const char* executable, int control_descr
           std::pair(worker_input_descriptor, kGuardianWorkerInput),
           std::pair(worker_output_descriptor, kGuardianWorkerOutput)}) {
       if (::dup2(source, destination) < 0) {
-        report_error(kLaunchErrorDescriptor, errno);
+        report_error(control_descriptor, errno);
       }
     }
-    guardian_close_from(kLaunchErrorDescriptor + 1, maximum_descriptor);
+    if (!guardian_close_from(kGuardianFirstUnusedDescriptor, maximum_descriptor)) {
+      report_error(STDOUT_FILENO, errno);
+    }
     ::execve(executable, arguments, environment);
-    report_error(kLaunchErrorDescriptor, errno);
+    report_error(STDOUT_FILENO, errno);
   }
   if (guardian_pid < 0) {
     throw GpuVideoProbeError("failed to start video probe worker guardian: " +
                              std::string(std::strerror(errno)));
   }
-  launch_error_output.reset();
-
-  int launch_error = 0;
-  ssize_t launch_error_size = -1;
-  do {
-    launch_error_size = ::read(launch_error_input.get(), &launch_error, sizeof(launch_error));
-  } while (launch_error_size < 0 && errno == EINTR);
-  if (launch_error_size == 0) {
-    return guardian_pid;
-  }
-
-  if (launch_error_size < 0) {
-    (void)::kill(guardian_pid, SIGKILL);
-  }
-  int status = 0;
-  while (::waitpid(guardian_pid, &status, 0) < 0 && errno == EINTR) {
-  }
-  if (launch_error_size == static_cast<ssize_t>(sizeof(launch_error))) {
-    throw GpuVideoProbeError("failed to start video probe worker guardian: " +
-                             std::string(std::strerror(launch_error)));
-  }
-  throw GpuVideoProbeError("failed to read video probe guardian launch status");
+  return guardian_pid;
 }
 #endif
 
@@ -1037,6 +1069,11 @@ long descriptor_scan_limit() {
       kernel_maximum > 0) {
     maximum = std::max(maximum, static_cast<long>(kernel_maximum));
   }
+#endif
+#if defined(__linux__) && defined(SYS_getdents64)
+  // Linux closes the actual /proc/self/fd set when close_range is unavailable,
+  // so the numeric fallback bound is irrelevant on this path.
+  maximum = std::max(maximum, static_cast<long>(kGuardianFirstUnusedDescriptor));
 #endif
   return maximum;
 }
@@ -1143,7 +1180,9 @@ std::size_t format_guardian_parent_argument(char* destination, std::size_t capac
       ::dup2(worker_output_descriptor, kGuardianWorkerOutput) < 0) {
     guardian_exit(2);
   }
-  guardian_close_from(kGuardianFirstUnusedDescriptor, maximum_descriptor);
+  if (!guardian_close_from(kGuardianFirstUnusedDescriptor, maximum_descriptor)) {
+    guardian_exit(2);
+  }
   struct sigaction child_action{};
   child_action.sa_handler = SIG_DFL;
   (void)sigemptyset(&child_action.sa_mask);
@@ -1202,7 +1241,9 @@ std::size_t format_guardian_parent_argument(char* destination, std::size_t capac
       guardian_exit(127);
     }
     (void)::close(start_gate[0]);
-    guardian_close_from(kGuardianWorkerInput, maximum_descriptor);
+    if (!guardian_close_from(kGuardianWorkerInput, maximum_descriptor)) {
+      guardian_exit(127);
+    }
     char parent_argument[40]{};
     if (format_guardian_parent_argument(parent_argument, sizeof(parent_argument), guardian_pid) ==
         0) {
@@ -1243,7 +1284,9 @@ std::size_t format_guardian_parent_argument(char* destination, std::size_t capac
     if (::dup2(lifetime_gate[0], STDIN_FILENO) < 0 || ::dup2(watchdog_gate[0], STDOUT_FILENO) < 0) {
       guardian_exit(127);
     }
-    guardian_close_from(STDERR_FILENO + 1, maximum_descriptor);
+    if (!guardian_close_from(STDERR_FILENO + 1, maximum_descriptor)) {
+      guardian_exit(127);
+    }
     char ready = '\0';
     ssize_t ready_size = -1;
     do {
@@ -1326,8 +1369,9 @@ std::size_t format_guardian_parent_argument(char* destination, std::size_t capac
     siginfo_t watchdog_info{};
     const auto watchdog_wait = ::waitid(P_PID, static_cast<id_t>(watchdog_pid), &watchdog_info,
                                         WEXITED | WNOHANG | WNOWAIT);
-    if (!memory_termination_sent && ((watchdog_wait == 0 && watchdog_info.si_pid == watchdog_pid) ||
-                                     (watchdog_wait < 0 && errno != EINTR))) {
+    const auto watchdog_error = errno;
+    if (guardian_watchdog_exit_is_fatal(memory_termination_sent, watchdog_wait, watchdog_error,
+                                        watchdog_info.si_pid, watchdog_pid)) {
       guardian_terminate_worker(worker_pid, watchdog_pid);
       guardian_exit(2);
     }
@@ -1484,6 +1528,13 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   guard_output.reset();
   char lifecycle = '\0';
   read_exact(guardian.control(), &lifecycle, 1, deadline);
+  if (lifecycle == kGuardianLaunchFailed) {
+    int launch_error = 0;
+    read_exact(guardian.control(), reinterpret_cast<char*>(&launch_error), sizeof(launch_error),
+               deadline);
+    throw GpuVideoProbeError("failed to start video probe worker guardian: " +
+                             std::string(std::strerror(launch_error)));
+  }
   if (lifecycle != kGuardianReady) {
     throw GpuVideoProbeError("video probe guardian failed its readiness handshake");
   }
@@ -1622,5 +1673,22 @@ GpuVideoProbe detail::probe_gpu_video_with_pre_worker_report_delay_for_test(
       config, worker_path, timeout_ns, std::chrono::nanoseconds::zero(),
       std::chrono::nanoseconds::zero(), std::chrono::nanoseconds(pre_worker_report_delay_ns));
 }
+
+#if !defined(_WIN32)
+bool detail::guardian_watchdog_exit_is_fatal_for_test(bool memory_termination_sent,
+                                                      int wait_result, int wait_error,
+                                                      std::int64_t observed_pid,
+                                                      std::int64_t watchdog_pid) {
+  if (observed_pid < std::numeric_limits<pid_t>::min() ||
+      observed_pid > std::numeric_limits<pid_t>::max() ||
+      watchdog_pid < std::numeric_limits<pid_t>::min() ||
+      watchdog_pid > std::numeric_limits<pid_t>::max()) {
+    return true;
+  }
+  return guardian_watchdog_exit_is_fatal(memory_termination_sent, wait_result, wait_error,
+                                         static_cast<pid_t>(observed_pid),
+                                         static_cast<pid_t>(watchdog_pid));
+}
+#endif
 
 } // namespace reco::io
