@@ -130,6 +130,22 @@ cc_test(
 )
 
 cc_test(
+    name = "reco_io_gpu_video_probe_fallback_tests",
+    size = "medium",
+    srcs = ["reco_io_gpu_video_probe_tests.cpp"],
+    data = [
+        ":fake_video_probe_worker",
+        ":libfake_gstreamer_runtime.so",
+        "//cpp/reco_io:reco_video_probe_worker",
+    ],
+    deps = [
+        "//cpp/reco_io:gpu_video_probe_fallback_test_support",
+        "//cpp/reco_io:reco_io_forced_guardian_fallbacks",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
+cc_test(
     name = "reco_io_nvmm_tests",
     size = "small",
     srcs = ["reco_io_nvmm_tests.cpp"],
