@@ -1,32 +1,105 @@
-load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
+
+_RECO_IO_SRCS = [
+    "src/gstreamer.cpp",
+    "src/gstreamer_gpu_decode.cpp",
+    "src/gpu_decode.cpp",
+    "src/gpu_video_probe.cpp",
+    "src/gpu_video_probe_internal.hpp",
+    "src/gpu_video_probe_process.cpp",
+    "src/gpu_video_probe_process_test.hpp",
+    "src/gpu_video_probe_protocol.cpp",
+    "src/gpu_video_probe_protocol.hpp",
+    "src/jsonl_sink.cpp",
+    "src/nvmm.cpp",
+    "src/output.cpp",
+    "src/settings.cpp",
+    "src/stacked_video.cpp",
+]
+
+_RECO_IO_HDRS = [
+    "include/reco/io/gstreamer.hpp",
+    "include/reco/io/gpu_decode.hpp",
+    "include/reco/io/gpu_video_probe.hpp",
+    "include/reco/io/detail/nvbufsurface_7_1.hpp",
+    "include/reco/io/detail/nvbufsurface_9_1.hpp",
+    "include/reco/io/jsonl_sink.hpp",
+    "include/reco/io/nvmm.hpp",
+    "include/reco/io/output.hpp",
+    "include/reco/io/settings.hpp",
+    "include/reco/io/stacked_video.hpp",
+]
+
+_RECO_IO_DEPS = [
+    "//cpp/reco_core",
+    "@nlohmann_json//:json",
+]
 
 cc_library(
     name = "reco_io",
-    srcs = [
-        "src/gstreamer.cpp",
-        "src/gstreamer_gpu_decode.cpp",
-        "src/gpu_decode.cpp",
-        "src/jsonl_sink.cpp",
-        "src/nvmm.cpp",
-        "src/output.cpp",
-        "src/settings.cpp",
-        "src/stacked_video.cpp",
-    ],
-    hdrs = [
-        "include/reco/io/gstreamer.hpp",
-        "include/reco/io/gpu_decode.hpp",
-        "include/reco/io/detail/nvbufsurface_7_1.hpp",
-        "include/reco/io/detail/nvbufsurface_9_1.hpp",
-        "include/reco/io/jsonl_sink.hpp",
-        "include/reco/io/nvmm.hpp",
-        "include/reco/io/output.hpp",
-        "include/reco/io/settings.hpp",
-        "include/reco/io/stacked_video.hpp",
-    ],
+    srcs = _RECO_IO_SRCS,
+    hdrs = _RECO_IO_HDRS,
     includes = ["include"],
     visibility = ["//visibility:public"],
+    deps = _RECO_IO_DEPS,
+)
+
+cc_library(
+    name = "gpu_video_probe_test_support",
+    testonly = True,
+    hdrs = ["src/gpu_video_probe_process_test.hpp"],
+    strip_include_prefix = "src",
+    visibility = ["//cpp/tests:__pkg__"],
+    deps = [":reco_io"],
+)
+
+cc_library(
+    name = "reco_io_forced_guardian_fallbacks",
+    testonly = True,
+    srcs = _RECO_IO_SRCS,
+    hdrs = _RECO_IO_HDRS,
+    includes = ["include"],
+    local_defines = [
+        "RECO_GUARDIAN_FORCE_DESCRIPTOR_SCAN",
+        "RECO_GUARDIAN_FORCE_FORK_SPAWN",
+    ],
+    visibility = ["//cpp/tests:__pkg__"],
+    deps = _RECO_IO_DEPS,
+)
+
+cc_library(
+    name = "gpu_video_probe_fallback_test_support",
+    testonly = True,
+    hdrs = ["src/gpu_video_probe_process_test.hpp"],
+    strip_include_prefix = "src",
+    visibility = ["//cpp/tests:__pkg__"],
+    deps = [":reco_io_forced_guardian_fallbacks"],
+)
+
+cc_binary(
+    name = "reco_video_probe_worker",
+    srcs = [
+        "src/gpu_video_probe_internal.hpp",
+        "src/gpu_video_probe_protocol.hpp",
+        "src/gpu_video_probe_worker.cpp",
+        "src/gpu_video_probe_worker_main.cpp",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [":reco_io"],
+)
+
+cc_test(
+    name = "gpu_video_probe_protocol_tests",
+    size = "small",
+    srcs = ["src/gpu_video_probe_protocol_tests.cpp"],
     deps = [
-        "//cpp/reco_core",
+        ":reco_io",
         "@nlohmann_json//:json",
     ],
+)
+
+filegroup(
+    name = "reco_video_probe_runtime",
+    srcs = [":reco_video_probe_worker"],
+    visibility = ["//visibility:public"],
 )
