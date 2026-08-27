@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
@@ -1194,6 +1195,66 @@ void worker_ipc_failures_are_bounded(const std::filesystem::path& video_path) {
   }
 }
 
+void aggregate_worker_memory_budget_is_enforced() {
+  constexpr std::uint64_t kExpectedWorkerBytes = 512ULL * 1024ULL * 1024ULL;
+  constexpr std::uint64_t kExpectedAggregateBytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+  const auto worker_bytes = reco::io::detail::maximum_probe_worker_address_space_bytes_for_test();
+  const auto aggregate_bytes =
+      reco::io::detail::maximum_aggregate_probe_worker_address_space_bytes_for_test();
+  expect_eq(worker_bytes, kExpectedWorkerBytes,
+            "probe worker memory reservation matches its limit");
+  expect_eq(aggregate_bytes, kExpectedAggregateBytes,
+            "aggregate probe worker memory budget leaves caller headroom");
+  if (worker_bytes == 0 || aggregate_bytes == 0 || aggregate_bytes % worker_bytes != 0) {
+    expect_true(false, "aggregate probe worker memory budget is composed of whole reservations");
+    return;
+  }
+
+  const auto reservation_count = static_cast<std::size_t>(aggregate_bytes / worker_bytes);
+  std::atomic<std::size_t> ready{0};
+  std::atomic<bool> start{false};
+  std::atomic<bool> reservation_failed{false};
+  std::vector<std::thread> reservations;
+  reservations.reserve(reservation_count);
+  for (std::size_t index = 0; index < reservation_count; ++index) {
+    reservations.emplace_back([&] {
+      ready.fetch_add(1, std::memory_order_release);
+      while (!start.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      try {
+        reco::io::detail::hold_probe_worker_memory_reservation_for_test(2'000'000'000ULL);
+      } catch (...) {
+        reservation_failed.store(true, std::memory_order_release);
+      }
+    });
+  }
+  while (ready.load(std::memory_order_acquire) != reservation_count) {
+    std::this_thread::yield();
+  }
+  start.store(true, std::memory_order_release);
+
+  const auto saturation_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (reco::io::detail::reserved_probe_worker_address_space_bytes_for_test() !=
+             aggregate_bytes &&
+         std::chrono::steady_clock::now() < saturation_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), aggregate_bytes,
+            "all aggregate probe worker memory reservations are admitted");
+  expect_probe_error([] { reco::io::detail::hold_probe_worker_memory_reservation_for_test(0); },
+                     "aggregate video probe worker memory budget",
+                     "an additional probe is rejected at the aggregate worker memory boundary");
+
+  for (auto& reservation : reservations) {
+    reservation.join();
+  }
+  expect_true(!reservation_failed.load(std::memory_order_acquire),
+              "every reservation within the aggregate worker memory budget succeeds");
+  expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
+            "probe worker memory reservations are released after completion");
+}
+
 void delayed_supervision_cannot_launch_worker(const std::filesystem::path& video_path) {
   const auto marker_path =
       video_path.parent_path() / (video_path.filename().string() + ".delayed-worker-startup");
@@ -1257,9 +1318,13 @@ void guardian_death_before_pid_report_reclaims_worker(const std::filesystem::pat
   }
 
   const auto discovery_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-  const auto guardian = wait_for_direct_child(caller, discovery_deadline);
+  const auto supervisor = wait_for_direct_child(caller, discovery_deadline);
+  const auto guardian = supervisor.has_value()
+                            ? wait_for_direct_child(*supervisor, discovery_deadline)
+                            : std::nullopt;
   const auto worker =
       guardian.has_value() ? wait_for_direct_child(*guardian, discovery_deadline) : std::nullopt;
+  expect_true(supervisor.has_value(), "pre-exec guardian supervisor starts");
   expect_true(guardian.has_value(), "guardian starts before the delayed PID report");
   expect_true(worker.has_value(), "start-gated worker exists before its PID is reported");
   if (guardian.has_value()) {
@@ -1642,6 +1707,67 @@ void guardian_death_after_worker_release_reclaims_group(const std::filesystem::p
 #endif
 }
 
+void caller_death_before_guardian_main(const std::filesystem::path& video_path) {
+#if !defined(_WIN32)
+  const auto marker_path =
+      video_path.parent_path() / (video_path.filename().string() + ".pre-main-guardian");
+  std::filesystem::remove(marker_path);
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+  const auto caller = ::fork();
+  if (caller == 0) {
+    try {
+      (void)reco::io::detail::probe_gpu_video_with_pre_guardian_exec_delay_for_test(
+          container_config(video_path), fake_probe_worker_path, 30'000'000'000ULL,
+          30'000'000'000ULL, marker_path);
+    } catch (...) {
+    }
+    std::_Exit(EXIT_SUCCESS);
+  }
+  expect_true(caller > 0, "POSIX pre-main guardian caller starts");
+  if (caller <= 0) {
+    return;
+  }
+
+  const auto guardian = wait_for_process_marker(marker_path, std::chrono::steady_clock::now() +
+                                                                 std::chrono::seconds(2));
+  expect_true(guardian.has_value(), "POSIX guardian reaches its pre-main stall");
+  if (guardian.has_value() &&
+      *guardian <= static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max())) {
+    errno = 0;
+    expect_true(::kill(static_cast<pid_t>(*guardian), 0) == 0,
+                "POSIX pre-main guardian is live before caller death");
+  }
+
+  (void)::kill(caller, SIGKILL);
+  int caller_status = 0;
+  while (::waitpid(caller, &caller_status, 0) < 0 && errno == EINTR) {
+  }
+
+  bool guardian_exited = false;
+  const auto exit_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (guardian.has_value() &&
+         *guardian <= static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max()) &&
+         std::chrono::steady_clock::now() < exit_deadline) {
+    errno = 0;
+    if (::kill(static_cast<pid_t>(*guardian), 0) != 0 && errno == ESRCH) {
+      guardian_exited = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  expect_true(guardian_exited,
+              "POSIX caller death reclaims the guardian before guardian main or loader completion");
+  if (guardian.has_value() && !guardian_exited &&
+      *guardian <= static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max())) {
+    (void)::kill(static_cast<pid_t>(*guardian), SIGKILL);
+  }
+  std::filesystem::remove(marker_path);
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+#else
+  (void)video_path;
+#endif
+}
+
 void caller_death_before_worker_main(const std::filesystem::path& video_path) {
 #if defined(_WIN32)
   const auto worker_marker =
@@ -1996,14 +2122,14 @@ void worker_address_space_is_limited(const std::filesystem::path& video_path) {
 void watchdog_exit_after_memory_termination_is_expected() {
 #if !defined(_WIN32)
   constexpr std::int64_t watchdog_pid = 73;
-  expect_true(reco::io::detail::guardian_watchdog_exit_is_fatal_for_test(
-                  false, 0, 0, watchdog_pid, watchdog_pid),
+  expect_true(reco::io::detail::guardian_watchdog_exit_is_fatal_for_test(false, 0, 0, watchdog_pid,
+                                                                         watchdog_pid),
               "watchdog exit before memory termination is fatal");
-  expect_true(!reco::io::detail::guardian_watchdog_exit_is_fatal_for_test(
-                  true, 0, 0, watchdog_pid, watchdog_pid),
+  expect_true(!reco::io::detail::guardian_watchdog_exit_is_fatal_for_test(true, 0, 0, watchdog_pid,
+                                                                          watchdog_pid),
               "watchdog-first exit after memory termination is expected");
-  expect_true(!reco::io::detail::guardian_watchdog_exit_is_fatal_for_test(
-                  true, -1, ECHILD, 0, watchdog_pid),
+  expect_true(!reco::io::detail::guardian_watchdog_exit_is_fatal_for_test(true, -1, ECHILD, 0,
+                                                                          watchdog_pid),
               "reaped watchdog after memory termination is expected");
 #endif
 }
@@ -2095,21 +2221,15 @@ void parent_death_reclaims_worker(const std::filesystem::path& video_path) {
     return;
   }
 
-  std::optional<pid_t> worker;
   const auto discovery_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-  const auto task_path = std::filesystem::path("/proc") / std::to_string(caller) / "task";
-  while (std::chrono::steady_clock::now() < discovery_deadline && !worker.has_value()) {
-    std::error_code directory_error;
-    for (const auto& task : std::filesystem::directory_iterator(task_path, directory_error)) {
-      std::ifstream children(task.path() / "children");
-      pid_t child = -1;
-      if (children >> child && child > 0) {
-        worker = child;
-        break;
-      }
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
+  const auto supervisor = wait_for_direct_child(caller, discovery_deadline);
+  const auto guardian = supervisor.has_value()
+                            ? wait_for_direct_child(*supervisor, discovery_deadline)
+                            : std::nullopt;
+  const auto worker =
+      guardian.has_value() ? wait_for_direct_child(*guardian, discovery_deadline) : std::nullopt;
+  expect_true(supervisor.has_value(), "parent-death probe supervisor starts");
+  expect_true(guardian.has_value(), "parent-death probe guardian starts");
   expect_true(worker.has_value(), "isolated worker starts before parent-death test");
   (void)kill(caller, SIGKILL);
   int caller_status = 0;
@@ -2177,6 +2297,7 @@ int main(int argc, char** argv) {
   windows_unicode_path_round_trips();
   windows_path_runtime_discovery(video_path, runtime);
   worker_ipc_failures_are_bounded(video_path);
+  aggregate_worker_memory_budget_is_enforced();
   delayed_supervision_cannot_launch_worker(video_path);
   launch_gate_prevents_post_timeout_process_start(video_path);
   guardian_death_before_pid_report_reclaims_worker(video_path);
@@ -2191,6 +2312,7 @@ int main(int argc, char** argv) {
   unrelated_descriptor_writer_does_not_delay_pipe_eof(video_path);
   parent_death_reclaims_worker(video_path);
   caller_death_reclaims_worker_and_descendant(video_path);
+  caller_death_before_guardian_main(video_path);
   caller_death_before_worker_main(video_path);
   pre_main_loader_stall_respects_timeout(video_path);
   expect_no_unreaped_children();

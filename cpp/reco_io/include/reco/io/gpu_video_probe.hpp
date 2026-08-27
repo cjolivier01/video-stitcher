@@ -71,7 +71,9 @@ public:
 /// termination, and reaping, with a bounded cleanup reserve. Kernel process
 /// creation itself is synchronous and cannot be preempted by this API, so
 /// `worker_path` should name a trusted local executable. The timeout must be
-/// between one second and one hour, inclusive.
+/// between one second and one hour, inclusive. Each admitted worker reserves
+/// its 512 MiB allowance against a 2 GiB process-wide aggregate; calls beyond
+/// that budget fail before another process is launched.
 [[nodiscard]] GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config,
                                             const std::filesystem::path& worker_path,
                                             std::uint64_t timeout_ns);
