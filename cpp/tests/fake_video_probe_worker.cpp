@@ -40,9 +40,33 @@ namespace {
 class PreMainWorkerBlock {
 public:
   PreMainWorkerBlock() {
+#if !defined(_WIN32)
+    const char* guardian_process = std::getenv("RECO_VIDEO_PROBE_GUARDIAN_PROCESS");
+    const char* forbidden_descriptor = std::getenv("RECO_FAKE_PROBE_PRE_MAIN_FORBIDDEN_FD");
+    const char* leak_marker = std::getenv("RECO_FAKE_PROBE_PRE_MAIN_DESCRIPTOR_LEAK_PATH");
+    if (guardian_process != nullptr && std::strcmp(guardian_process, "1") == 0 &&
+        forbidden_descriptor != nullptr && forbidden_descriptor[0] != '\0' &&
+        leak_marker != nullptr && leak_marker[0] != '\0') {
+      char* end = nullptr;
+      errno = 0;
+      const auto descriptor = std::strtol(forbidden_descriptor, &end, 10);
+      if (errno == 0 && end != forbidden_descriptor && end != nullptr && *end == '\0' &&
+          descriptor >= 0 && descriptor <= std::numeric_limits<int>::max() &&
+          ::fcntl(static_cast<int>(descriptor), F_GETFD) >= 0) {
+        const auto marker = ::open(leak_marker, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (marker >= 0) {
+          constexpr std::string_view leaked = "leaked";
+          (void)::write(marker, leaked.data(), leaked.size());
+          (void)::close(marker);
+        }
+      }
+    }
+#endif
     const char* scenario = std::getenv("RECO_FAKE_PROBE_WORKER_SCENARIO");
     const char* marker_path = std::getenv("RECO_FAKE_PROBE_WORKER_PID_PATH");
+#if defined(_WIN32)
     const char* guardian_process = std::getenv("RECO_VIDEO_PROBE_GUARDIAN_PROCESS");
+#endif
     if (scenario == nullptr || std::strcmp(scenario, "pre-main-block") != 0 ||
         marker_path == nullptr || marker_path[0] == '\0' ||
         (guardian_process != nullptr && std::strcmp(guardian_process, "1") == 0)) {

@@ -1880,6 +1880,45 @@ void unrelated_descriptors_are_not_inherited(const std::filesystem::path& video_
 #endif
 }
 
+void guardian_initializers_cannot_observe_unrelated_descriptors(
+    const std::filesystem::path& video_path) {
+#if !defined(_WIN32)
+  const auto leak_path =
+      video_path.parent_path() / (video_path.filename().string() + ".pre-main-descriptor-leak");
+  std::filesystem::remove(leak_path);
+  const auto base_descriptor = ::open("/dev/null", O_RDONLY);
+  expect_true(base_descriptor >= 0, "pre-main descriptor-isolation source opens");
+  const auto forbidden_descriptor =
+      base_descriptor >= 0 ? ::fcntl(base_descriptor, F_DUPFD, 256) : -1;
+  expect_true(forbidden_descriptor >= 256, "pre-main descriptor-isolation high descriptor opens");
+  if (base_descriptor >= 0) {
+    (void)::close(base_descriptor);
+  }
+  if (forbidden_descriptor >= 256) {
+    set_environment("RECO_FAKE_PROBE_PRE_MAIN_FORBIDDEN_FD", std::to_string(forbidden_descriptor));
+    set_environment("RECO_FAKE_PROBE_PRE_MAIN_DESCRIPTOR_LEAK_PATH", leak_path.string());
+    set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+    try {
+      expect_eq(reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
+                                          5'000'000'000ULL)
+                    .width,
+                854U, "guardian starts with isolated descriptors");
+    } catch (const std::exception& error) {
+      std::cerr << "FAIL: pre-main guardian descriptor isolation threw: " << error.what() << '\n';
+      ++failures;
+    }
+    expect_true(!std::filesystem::exists(leak_path),
+                "guardian pre-main initializer cannot observe an unrelated descriptor");
+    (void)::close(forbidden_descriptor);
+  }
+  set_environment("RECO_FAKE_PROBE_PRE_MAIN_FORBIDDEN_FD", "");
+  set_environment("RECO_FAKE_PROBE_PRE_MAIN_DESCRIPTOR_LEAK_PATH", "");
+  std::filesystem::remove(leak_path);
+#else
+  (void)video_path;
+#endif
+}
+
 void lowered_file_limit_does_not_leak_high_descriptors(const std::filesystem::path& video_path) {
 #if defined(__APPLE__)
   const auto marker_path =
@@ -1934,7 +1973,8 @@ void worker_address_space_is_limited(const std::filesystem::path& video_path) {
         (void)reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
                                         5'000'000'000ULL);
       },
-      "abnormally", "macOS guardian terminates a worker above its physical-memory ceiling");
+      "video probe worker exited abnormally",
+      "macOS watchdog-first memory termination reports the worker status");
   set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
 #elif !defined(_WIN32) && !defined(RECO_PROBE_WIDE_ADDRESS_SANITIZER)
   set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "memory-limit");
@@ -2129,6 +2169,7 @@ int main(int argc, char** argv) {
   windows_job_reclaims_worker_descendants(video_path);
   guardian_death_after_worker_release_reclaims_group(video_path);
   unrelated_descriptors_are_not_inherited(video_path);
+  guardian_initializers_cannot_observe_unrelated_descriptors(video_path);
   lowered_file_limit_does_not_leak_high_descriptors(video_path);
   worker_address_space_is_limited(video_path);
   unrelated_descriptor_writer_does_not_delay_pipe_eof(video_path);
