@@ -5,6 +5,10 @@
 
 namespace reco::calibrate::detail {
 
+struct NvrtcCompileOptions {
+  bool disable_fmad = false;
+};
+
 class NvrtcCompiler {
 public:
   NvrtcCompiler();
@@ -15,7 +19,8 @@ public:
   NvrtcCompiler(NvrtcCompiler&&) noexcept;
   NvrtcCompiler& operator=(NvrtcCompiler&&) noexcept;
 
-  [[nodiscard]] std::string compile(std::string_view source, std::string_view source_name) const;
+  [[nodiscard]] std::string compile(std::string_view source, std::string_view source_name,
+                                    NvrtcCompileOptions options = {}) const;
 
 private:
   struct Impl;

@@ -196,17 +196,22 @@ extern "C" __global__ void akaze_triangle_vertical_y(
   first = akaze_clamp_int(first, 0, (int)crop_height - 1);
   last = akaze_clamp_int(last, first + 1, (int)crop_height);
   const float center = input - 0.5f;
-  float weighted_sum = 0.0f;
   float weight_sum = 0.0f;
+  for (int source_y = first; source_y < last; ++source_y) {
+    const float distance = fabsf(((float)source_y - center) / sample_ratio);
+    const float weight = distance < 1.0f ? 1.0f - distance : 0.0f;
+    weight_sum += weight;
+  }
+  float weighted_sum = 0.0f;
   for (int source_y = first; source_y < last; ++source_y) {
     const float distance = fabsf(((float)source_y - center) / sample_ratio);
     const float weight = distance < 1.0f ? 1.0f - distance : 0.0f;
     const unsigned char value = akaze_const_row<unsigned char>(
         src, src_pitch, crop_y + (unsigned int)source_y)[crop_x + x];
-    weighted_sum += weight * akaze_normalize_y(value, limited_range);
-    weight_sum += weight;
+    weighted_sum += (akaze_normalize_y(value, limited_range) * 255.0f) *
+        (weight / weight_sum);
   }
-  akaze_row<float>(dst, dst_pitch, y)[x] = weighted_sum / weight_sum;
+  akaze_row<float>(dst, dst_pitch, y)[x] = weighted_sum;
 }
 
 // Horizontal Triangle pass. Quantizing the final normalized sample to an
@@ -234,17 +239,20 @@ extern "C" __global__ void akaze_triangle_horizontal(
   first = akaze_clamp_int(first, 0, (int)src_width - 1);
   last = akaze_clamp_int(last, first + 1, (int)src_width);
   const float center = input - 0.5f;
-  float weighted_sum = 0.0f;
   float weight_sum = 0.0f;
+  for (int source_x = first; source_x < last; ++source_x) {
+    const float distance = fabsf(((float)source_x - center) / sample_ratio);
+    const float weight = distance < 1.0f ? 1.0f - distance : 0.0f;
+    weight_sum += weight;
+  }
+  float weighted_sum = 0.0f;
   const float* row = akaze_const_row<float>(src, src_pitch, y);
   for (int source_x = first; source_x < last; ++source_x) {
     const float distance = fabsf(((float)source_x - center) / sample_ratio);
     const float weight = distance < 1.0f ? 1.0f - distance : 0.0f;
-    weighted_sum += weight * row[source_x];
-    weight_sum += weight;
+    weighted_sum += row[source_x] * (weight / weight_sum);
   }
-  const float filtered = weighted_sum / weight_sum;
-  const float quantized = roundf(fminf(fmaxf(filtered, 0.0f), 1.0f) * 255.0f) *
+  const float quantized = roundf(fminf(fmaxf(weighted_sum, 0.0f), 255.0f)) *
       (1.0f / 255.0f);
   akaze_row<float>(dst, dst_pitch, y)[x] = quantized;
 }
@@ -690,23 +698,6 @@ __device__ __forceinline__ float akaze_global_coordinate(float local, float rati
   return local * ratio + 0.5f * (ratio - 1.0f);
 }
 
-__device__ __forceinline__ bool akaze_overlaps(
-    const AkazeCandidate& current, const AkazeCandidate& previous) {
-  if (!(current.level == previous.level ||
-        (current.level != 0U && current.level - 1U == previous.level))) {
-    return false;
-  }
-  const float current_ratio = akaze_octave_ratio(current.octave);
-  const float previous_ratio = akaze_octave_ratio(previous.octave);
-  const float current_x = akaze_global_coordinate(current.x, current_ratio);
-  const float current_y = akaze_global_coordinate(current.y, current_ratio);
-  const float previous_x = akaze_global_coordinate(previous.x, previous_ratio);
-  const float previous_y = akaze_global_coordinate(previous.y, previous_ratio);
-  const float dx = current_x - previous_x;
-  const float dy = current_y - previous_y;
-  return dx * dx + dy * dy <= current.size * current.size;
-}
-
 __device__ __forceinline__ bool akaze_descriptor_bounds_ok(const AkazeCandidate& candidate) {
   const float ratio = akaze_octave_ratio(candidate.octave);
   const float sigma_size = roundf(candidate.size / ratio);
@@ -773,25 +764,24 @@ __device__ __forceinline__ bool akaze_border_ok(
   return true;
 }
 
-__device__ __forceinline__ bool akaze_response_precedes(
-    const AkazeCandidate& candidate, const AkazeCandidate& current) {
-  return candidate.response > current.response ||
-      (candidate.response == current.response && candidate.order < current.order);
-}
-
-// Searches only the geometrically possible overlap window in one scale-space
-// level. AKAZE feature radius divided by the target octave ratio is bounded by
-// the configured sublevel range, so work does not grow with candidate_count.
-__device__ bool akaze_has_scale_dominator(
+__device__ unsigned int akaze_first_cached_overlap(
     const AkazeCandidate& current,
-    const AkazeSelectionLevel& level,
-    unsigned long long nms_flags,
-    unsigned long long nms_offsets,
-    unsigned long long candidates,
-    unsigned int candidate_count) {
+    unsigned int target_level,
+    const AkazeSelectionLevel* levels,
+    const AkazeCandidate* candidates,
+    const unsigned int* cache_indices,
+    const unsigned int* cache_cells,
+    unsigned int cache_count,
+    unsigned int first_slot,
+    bool current_is_cached) {
+  const AkazeSelectionLevel level = levels[target_level];
+  // Rust compares the current local point scaled by its octave against
+  // previously accepted points after their half-pixel octave mapping. Its
+  // final upper-level pass compares two already-mapped cache entries.
   const float current_ratio = akaze_octave_ratio(current.octave);
-  const float current_x = akaze_global_coordinate(current.x, current_ratio);
-  const float current_y = akaze_global_coordinate(current.y, current_ratio);
+  const float current_offset = current_is_cached ? 0.5f * (current_ratio - 1.0f) : 0.0f;
+  const float current_x = current.x * current_ratio + current_offset;
+  const float current_y = current.y * current_ratio + current_offset;
   const float target_ratio = akaze_octave_ratio(level.octave);
   const float target_offset = 0.5f * (target_ratio - 1.0f);
   const float target_x = (current_x - target_offset) / target_ratio;
@@ -805,150 +795,115 @@ __device__ bool akaze_has_scale_dominator(
       (int)floorf(target_y - local_radius), 0, (int)level.height - 1);
   const int last_y = akaze_clamp_int(
       (int)ceilf(target_y + local_radius), 0, (int)level.height - 1);
-  const unsigned int* flags = akaze_const_pointer<unsigned int>(nms_flags);
-  const unsigned int* offsets = akaze_const_pointer<unsigned int>(nms_offsets);
-  const AkazeCandidate* values = akaze_const_pointer<AkazeCandidate>(candidates);
+  unsigned int matched_slot = 0xffffffffU;
   for (int y = first_y; y <= last_y; ++y) {
     for (int x = first_x; x <= last_x; ++x) {
-      const unsigned int pixel = level.pixel_base +
-          (unsigned int)y * level.width + (unsigned int)x;
-      if (flags[pixel] == 0U) {
-        continue;
-      }
-      const unsigned int candidate_index = offsets[pixel];
-      if (candidate_index >= candidate_count) {
-        continue;
-      }
-      const AkazeCandidate candidate = values[candidate_index];
-      if (candidate.order == current.order ||
-          !akaze_descriptor_bounds_ok(candidate) ||
-          !akaze_response_precedes(candidate, current)) {
-        continue;
-      }
-      const float ratio = akaze_octave_ratio(candidate.octave);
-      const float dx = current_x - akaze_global_coordinate(candidate.x, ratio);
-      const float dy = current_y - akaze_global_coordinate(candidate.y, ratio);
-      if (dx * dx + dy * dy <= current.size * current.size) {
-        return true;
+      const unsigned int slot = cache_cells[
+          level.pixel_base + (unsigned int)y * level.width + (unsigned int)x];
+      if (slot >= first_slot && slot < cache_count && slot < matched_slot) {
+        const AkazeCandidate previous = candidates[cache_indices[slot]];
+        const float previous_ratio = akaze_octave_ratio(previous.octave);
+        const float dx = current_x - akaze_global_coordinate(previous.x, previous_ratio);
+        const float dy = current_y - akaze_global_coordinate(previous.y, previous_ratio);
+        if (dx * dx + dy * dy <= current.size * current.size) {
+          matched_slot = slot;
+        }
       }
     }
   }
-  return false;
+  return matched_slot;
 }
 
-extern "C" __global__ void akaze_mark_scale_extrema(
+// Executes Rust's accepted-cache replacement semantics in candidate order.
+// Spatial cell lookup keeps each comparison bounded by the feature radius;
+// the kernel never scans all preceding raw NMS candidates.
+extern "C" __global__ void akaze_select_scale_extrema(
     unsigned long long candidates,
     unsigned int candidate_count,
     unsigned long long levels,
     unsigned int level_count,
-    unsigned long long nms_flags,
-    unsigned long long nms_offsets,
+    unsigned long long cache_indices,
+    unsigned long long cache_cells,
+    unsigned long long cache_count,
     unsigned long long selected_flags) {
-  const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= candidate_count) {
+  if (blockIdx.x != 0U || threadIdx.x != 0U) {
     return;
   }
-  const AkazeCandidate current = akaze_const_pointer<AkazeCandidate>(candidates)[index];
-  unsigned int keep = akaze_descriptor_bounds_ok(current) ? 1U : 0U;
-  if (keep != 0U && current.level < level_count) {
-    const AkazeSelectionLevel* selection_levels =
-        akaze_const_pointer<AkazeSelectionLevel>(levels);
-    keep = akaze_has_scale_dominator(
-               current, selection_levels[current.level], nms_flags, nms_offsets,
-               candidates, candidate_count)
-        ? 0U
-        : 1U;
-    if (keep != 0U && current.level != 0U) {
-      keep = akaze_has_scale_dominator(
-                 current, selection_levels[current.level - 1U], nms_flags, nms_offsets,
-                 candidates, candidate_count)
-          ? 0U
-          : 1U;
-    }
-  }
-  akaze_pointer<unsigned int>(selected_flags)[index] = keep;
-}
-
-__device__ bool akaze_has_upper_level_overlap(
-    const AkazeCandidate& current,
-    const AkazeSelectionLevel& level,
-    unsigned long long nms_flags,
-    unsigned long long nms_offsets,
-    unsigned long long candidates,
-    unsigned int candidate_count,
-    unsigned long long scale_flags) {
-  const float current_ratio = akaze_octave_ratio(current.octave);
-  const float current_x = akaze_global_coordinate(current.x, current_ratio);
-  const float current_y = akaze_global_coordinate(current.y, current_ratio);
-  const float target_ratio = akaze_octave_ratio(level.octave);
-  const float target_offset = 0.5f * (target_ratio - 1.0f);
-  const float target_x = (current_x - target_offset) / target_ratio;
-  const float target_y = (current_y - target_offset) / target_ratio;
-  const float local_radius = current.size / target_ratio;
-  const int first_x = akaze_clamp_int(
-      (int)floorf(target_x - local_radius), 0, (int)level.width - 1);
-  const int last_x = akaze_clamp_int(
-      (int)ceilf(target_x + local_radius), 0, (int)level.width - 1);
-  const int first_y = akaze_clamp_int(
-      (int)floorf(target_y - local_radius), 0, (int)level.height - 1);
-  const int last_y = akaze_clamp_int(
-      (int)ceilf(target_y + local_radius), 0, (int)level.height - 1);
-  const unsigned int* flags = akaze_const_pointer<unsigned int>(nms_flags);
-  const unsigned int* offsets = akaze_const_pointer<unsigned int>(nms_offsets);
-  const unsigned int* extrema = akaze_const_pointer<unsigned int>(scale_flags);
   const AkazeCandidate* values = akaze_const_pointer<AkazeCandidate>(candidates);
-  for (int y = first_y; y <= last_y; ++y) {
-    for (int x = first_x; x <= last_x; ++x) {
-      const unsigned int pixel = level.pixel_base +
-          (unsigned int)y * level.width + (unsigned int)x;
-      if (flags[pixel] == 0U) {
-        continue;
-      }
-      const unsigned int candidate_index = offsets[pixel];
-      if (candidate_index >= candidate_count || extrema[candidate_index] == 0U) {
-        continue;
-      }
-      const AkazeCandidate candidate = values[candidate_index];
-      const float ratio = akaze_octave_ratio(candidate.octave);
-      const float dx = current_x - akaze_global_coordinate(candidate.x, ratio);
-      const float dy = current_y - akaze_global_coordinate(candidate.y, ratio);
-      if (dx * dx + dy * dy <= current.size * current.size) {
-        return true;
+  const AkazeSelectionLevel* selection_levels =
+      akaze_const_pointer<AkazeSelectionLevel>(levels);
+  unsigned int* indices = akaze_pointer<unsigned int>(cache_indices);
+  unsigned int* cells = akaze_pointer<unsigned int>(cache_cells);
+  unsigned int* count = akaze_pointer<unsigned int>(cache_count);
+  unsigned int* selected = akaze_pointer<unsigned int>(selected_flags);
+
+  for (unsigned int index = 0U; index < candidate_count; ++index) {
+    const AkazeCandidate current = values[index];
+    if (current.level >= level_count) {
+      continue;
+    }
+    unsigned int repeated_slot = akaze_first_cached_overlap(
+        current, current.level, selection_levels, values, indices, cells, *count, 0U, false);
+    if (current.level != 0U) {
+      const unsigned int previous_slot = akaze_first_cached_overlap(
+          current, current.level - 1U, selection_levels, values, indices, cells, *count, 0U,
+          false);
+      if (previous_slot < repeated_slot) {
+        repeated_slot = previous_slot;
       }
     }
-  }
-  return false;
-}
+    if (repeated_slot != 0xffffffffU) {
+      const AkazeCandidate previous = values[indices[repeated_slot]];
+      if (!(current.response > previous.response)) {
+        continue;
+      }
+    }
+    if (!akaze_descriptor_bounds_ok(current)) {
+      continue;
+    }
 
-extern "C" __global__ void akaze_mark_upper_level(
-    unsigned long long candidates,
-    unsigned int candidate_count,
-    unsigned long long levels,
-    unsigned int level_count,
-    unsigned long long nms_flags,
-    unsigned long long nms_offsets,
-    unsigned long long scale_flags,
-    unsigned long long selected_flags) {
-  const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= candidate_count) {
-    return;
+    unsigned int slot = repeated_slot;
+    if (slot == 0xffffffffU) {
+      slot = *count;
+      if (slot >= candidate_count) {
+        return;
+      }
+      *count = slot + 1U;
+    } else {
+      const unsigned int old_index = indices[slot];
+      const AkazeCandidate old = values[old_index];
+      if (old.level < level_count && old.x >= 0.0f && old.y >= 0.0f &&
+          old.x < (float)selection_levels[old.level].width &&
+          old.y < (float)selection_levels[old.level].height) {
+        const AkazeSelectionLevel old_level = selection_levels[old.level];
+        cells[old_level.pixel_base + (unsigned int)old.y * old_level.width +
+              (unsigned int)old.x] = 0xffffffffU;
+      }
+      selected[old_index] = 0U;
+    }
+    indices[slot] = index;
+    const AkazeSelectionLevel level = selection_levels[current.level];
+    cells[level.pixel_base + (unsigned int)current.y * level.width +
+          (unsigned int)current.x] = slot;
+    selected[index] = 1U;
   }
-  const unsigned int keep = akaze_const_pointer<unsigned int>(scale_flags)[index];
-  if (keep == 0U) {
-    akaze_pointer<unsigned int>(selected_flags)[index] = 0U;
-    return;
+
+  // Rust performs a second pass over the completed cache. A lower-scale
+  // entry is discarded when a later cache slot from the next scale overlaps
+  // it, including entries that replaced an earlier cache value in place.
+  for (unsigned int slot = 0U; slot < *count; ++slot) {
+    const unsigned int index = indices[slot];
+    const AkazeCandidate current = values[index];
+    if (current.level + 1U >= level_count) {
+      continue;
+    }
+    const unsigned int upper_slot = akaze_first_cached_overlap(
+        current, current.level + 1U, selection_levels, values, indices, cells, *count, slot,
+        true);
+    if (upper_slot != 0xffffffffU) {
+      selected[index] = 0U;
+    }
   }
-  const AkazeCandidate current = akaze_const_pointer<AkazeCandidate>(candidates)[index];
-  unsigned int output = keep;
-  if (current.level + 1U < level_count) {
-    const AkazeSelectionLevel upper =
-        akaze_const_pointer<AkazeSelectionLevel>(levels)[current.level + 1U];
-    output = akaze_has_upper_level_overlap(
-                 current, upper, nms_flags, nms_offsets, candidates, candidate_count, scale_flags)
-        ? 0U
-        : 1U;
-  }
-  akaze_pointer<unsigned int>(selected_flags)[index] = output;
 }
 
 __device__ bool akaze_make_feature(
@@ -967,7 +922,9 @@ __device__ bool akaze_make_feature(
     unsigned int border_height,
     unsigned int border_margin,
     unsigned int black_threshold,
-    AkazeFeaturePoint* point) {
+    AkazeFeaturePoint* point,
+    float* detector_x_out,
+    float* detector_y_out) {
   float refined_x;
   float refined_y;
   if (!akaze_refine(candidate, &refined_x, &refined_y)) {
@@ -993,6 +950,8 @@ __device__ bool akaze_make_feature(
   point->size = candidate.size;
   point->octave = candidate.octave;
   point->level = candidate.level;
+  *detector_x_out = detector_x;
+  *detector_y_out = detector_y;
   return true;
 }
 
@@ -1028,10 +987,12 @@ extern "C" __global__ void akaze_prepare_feature_keys(
   if (akaze_const_pointer<unsigned int>(selected_flags)[index] != 0U) {
     const AkazeCandidate candidate = akaze_const_pointer<AkazeCandidate>(candidates)[index];
     AkazeFeaturePoint point;
+    float detector_x;
+    float detector_y;
     if (akaze_make_feature(candidate, inverse_detection_scale, crop_x, crop_y,
                            use_roi, roi_x_min, roi_x_max, roi_y_min, roi_y_max,
                            border_y, border_pitch, border_width, border_height,
-                           border_margin, black_threshold, &point)) {
+                           border_margin, black_threshold, &point, &detector_x, &detector_y)) {
       key = ~__float_as_uint(candidate.response);
       atomicAdd(akaze_pointer<unsigned int>(valid_count), 1U);
     }
@@ -1080,6 +1041,7 @@ extern "C" __global__ void akaze_emit_features(
     unsigned long long sorted_indices,
     unsigned long long valid_count,
     unsigned long long features,
+    unsigned long long detector_positions,
     unsigned int max_features,
     unsigned long long feature_count,
     float inverse_detection_scale,
@@ -1110,11 +1072,16 @@ extern "C" __global__ void akaze_emit_features(
   const AkazeCandidate candidate =
       akaze_const_pointer<AkazeCandidate>(candidates)[candidate_index];
   AkazeFeaturePoint point;
+  float detector_x;
+  float detector_y;
   if (akaze_make_feature(candidate, inverse_detection_scale, crop_x, crop_y,
                          use_roi, roi_x_min, roi_x_max, roi_y_min, roi_y_max,
                          border_y, border_pitch, border_width, border_height,
-                         border_margin, black_threshold, &point)) {
+                         border_margin, black_threshold, &point, &detector_x, &detector_y)) {
     akaze_pointer<AkazeFeaturePoint>(features)[index] = point;
+    float* positions = akaze_pointer<float>(detector_positions);
+    positions[index * 2U] = detector_x;
+    positions[index * 2U + 1U] = detector_y;
   }
 }
 
@@ -1141,9 +1108,8 @@ __device__ __forceinline__ float akaze_level_sample(
 __device__ float akaze_orientation(
     const AkazeFeaturePoint& point,
     const AkazeLevelView& level,
-    float detector_scale,
-    float crop_x,
-    float crop_y) {
+    float detector_x,
+    float detector_y) {
   float responses_x[109];
   float responses_y[109];
   float angles[109];
@@ -1151,8 +1117,6 @@ __device__ float akaze_orientation(
   const int gaussian_index[13] = {6, 5, 4, 3, 2, 1, 0, 1, 2, 3, 4, 5, 6};
   const float ratio = akaze_octave_ratio(point.octave);
   const float scale = roundf(0.5f * point.size / ratio);
-  const float detector_x = (point.x - crop_x) * detector_scale;
-  const float detector_y = (point.y - crop_y) * detector_scale;
   const float xf = detector_x / ratio;
   const float yf = detector_y / ratio;
   unsigned int index = 0U;
@@ -1271,12 +1235,10 @@ __device__ void akaze_mldb_compare(
 
 extern "C" __global__ void akaze_describe_features(
     unsigned long long features,
+    unsigned long long detector_positions,
     unsigned long long feature_count,
     unsigned long long levels,
     unsigned int level_count,
-    float detector_scale,
-    float crop_x,
-    float crop_y,
     unsigned long long descriptors,
     unsigned long long descriptor_pitch) {
   const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1295,14 +1257,14 @@ extern "C" __global__ void akaze_describe_features(
     descriptor[byte] = 0U;
   }
 
-  const float angle = akaze_orientation(
-      point, level, detector_scale, crop_x, crop_y);
+  const float* positions = akaze_const_pointer<float>(detector_positions);
+  const float detector_x = positions[index * 2U];
+  const float detector_y = positions[index * 2U + 1U];
+  const float angle = akaze_orientation(point, level, detector_x, detector_y);
   const float cosine = cosf(angle);
   const float sine = sinf(angle);
   const float ratio = akaze_octave_ratio(point.octave);
   const float scale = roundf(0.5f * point.size / ratio);
-  const float detector_x = (point.x - crop_x) * detector_scale;
-  const float detector_y = (point.y - crop_y) * detector_scale;
   const float xf = detector_x / ratio;
   const float yf = detector_y / ratio;
   const unsigned int sample_steps[3] = {10U, 7U, 5U};

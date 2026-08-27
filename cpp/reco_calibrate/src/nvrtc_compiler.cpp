@@ -109,7 +109,8 @@ struct NvrtcCompiler::Impl {
     get_error_string = library.symbol<decltype(get_error_string)>("nvrtcGetErrorString");
   }
 
-  [[nodiscard]] std::string compile(std::string_view source, std::string_view source_name) const {
+  [[nodiscard]] std::string compile(std::string_view source, std::string_view source_name,
+                                    NvrtcCompileOptions compile_options) const {
     validate_text(source, "source");
     validate_text(source_name, "source name");
     const std::string source_text(source);
@@ -128,7 +129,8 @@ struct NvrtcCompiler::Impl {
     } guard{program, destroy_program};
 
     const char* options[] = {"--std=c++11", "--fmad=false"};
-    const auto result = compile_program(program, 2, options);
+    const auto option_count = compile_options.disable_fmad ? 2 : 1;
+    const auto result = compile_program(program, option_count, options);
     if (static_cast<int>(result) != 0) {
       throw std::runtime_error("nvrtcCompileProgram failed for " + source_name_text + ": " +
                                program_log(program));
@@ -191,11 +193,12 @@ NvrtcCompiler& NvrtcCompiler::operator=(NvrtcCompiler&& other) noexcept {
   return *this;
 }
 
-std::string NvrtcCompiler::compile(std::string_view source, std::string_view source_name) const {
+std::string NvrtcCompiler::compile(std::string_view source, std::string_view source_name,
+                                   NvrtcCompileOptions options) const {
   if (impl_ == nullptr) {
     throw std::logic_error("cannot use a moved-from NVRTC compiler");
   }
-  return impl_->compile(source, source_name);
+  return impl_->compile(source, source_name, options);
 }
 
 } // namespace reco::calibrate::detail

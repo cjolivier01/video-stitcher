@@ -587,6 +587,48 @@ void triangle_downscale_matches_rust_golden(CudaBackend& backend,
   }
 }
 
+void crop_and_non_power_resize_matches_rust_golden(CudaBackend& backend,
+                                                   const GpuAkazePipeline& pipeline) {
+  constexpr std::uint32_t width = 5003;
+  constexpr std::uint32_t height = 384;
+  const auto frame = make_frame(backend, width, height, 5024);
+  auto config = detector_config(5);
+  config.max_detection_width = 1920;
+  config.use_region = true;
+  config.region = {.x_min = 0.25F, .x_max = 0.75F, .y_min = 0.2F, .y_max = 0.8F};
+  const auto features = pipeline.detect(frame.view(), config);
+  const auto points = download_points(backend, features);
+  const auto descriptors = feature_descriptors(backend, features);
+  expect_eq(points.size(), 5U, "crop-resize Rust-golden feature count");
+  expect_eq(descriptors.size(), 5U, "crop-resize Rust-golden descriptor count");
+
+  struct GoldenFeature {
+    float x;
+    float y;
+    float response;
+    std::uint64_t descriptor_hash;
+  };
+  constexpr std::array<GoldenFeature, 5> rust_golden{{
+      {2081.472167968750F, 191.047607421875F, 0.125226318836F, 0x13c72e999d478afcULL},
+      {3491.037841796875F, 131.094146728516F, 0.118464715779F, 0x2344d1de8c293859ULL},
+      {2177.248779296875F, 107.127502441406F, 0.113023869693F, 0xda39e887f2406c31ULL},
+      {2135.087158203125F, 167.164428710938F, 0.110071659088F, 0xa3afa2b01fabbf11ULL},
+      {1355.444580078125F, 131.047775268555F, 0.108458556235F, 0x026495fbdf9cb253ULL},
+  }};
+  for (std::size_t index = 0; index < std::min(points.size(), rust_golden.size()); ++index) {
+    expect_near(points[index].x, rust_golden[index].x, 4.0e-4F,
+                "crop-resize Rust-golden feature x");
+    expect_near(points[index].y, rust_golden[index].y, 4.0e-4F,
+                "crop-resize Rust-golden feature y");
+    expect_near(points[index].response, rust_golden[index].response, 1.0e-7F,
+                "crop-resize Rust-golden feature response");
+    if (index < descriptors.size()) {
+      expect_eq(descriptor_hash(descriptors[index]), rust_golden[index].descriptor_hash,
+                "crop-resize Rust-golden descriptor");
+    }
+  }
+}
+
 void adversarial_selection_is_bounded_at_resolution(CudaBackend& backend,
                                                     const GpuAkazePipeline& pipeline,
                                                     std::uint32_t width, std::uint32_t height,
@@ -843,8 +885,8 @@ int main() {
 
   const auto shard = test_shard();
   if (shard != "all" && shard != "contracts" && shard != "detection" && shard != "golden" &&
-      shard != "triangle" && shard != "selection" && shard != "selection-race" &&
-      shard != "rotation" && shard != "matching") {
+      shard != "triangle" && shard != "crop" && shard != "selection" && shard != "selection-race" &&
+      shard != "selection-full" && shard != "rotation" && shard != "matching") {
     std::cerr << "FAIL: unknown CUDA feature test shard: " << shard << '\n';
     return EXIT_FAILURE;
   }
@@ -867,10 +909,13 @@ int main() {
     if (shard_enabled(shard, "golden") || shard == "triangle") {
       triangle_downscale_matches_rust_golden(backend, pipeline);
     }
-    if (shard_enabled(shard, "golden") || shard == "selection") {
+    if (shard_enabled(shard, "golden") || shard == "crop") {
+      crop_and_non_power_resize_matches_rust_golden(backend, pipeline);
+    }
+    if (shard == "selection-full") {
       full_resolution_adversarial_selection_is_bounded(backend, pipeline);
     }
-    if (shard_enabled(shard, "selection-race")) {
+    if (shard == "all" || shard == "selection" || shard == "selection-race") {
       racecheck_adversarial_selection_is_bounded(backend, pipeline);
     }
     if (shard_enabled(shard, "golden") || shard == "rotation") {

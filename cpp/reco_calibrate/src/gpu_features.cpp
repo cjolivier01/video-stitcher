@@ -432,7 +432,8 @@ struct GpuAkazePipeline::Impl {
   explicit Impl(reco::core::CudaBackend& backend_in) : backend(backend_in) {
     backend.ensure_primary_context();
     detail::NvrtcCompiler compiler;
-    const auto akaze_ptx = compiler.compile(kGpuAkazeKernelSource, "reco_calibrate_gpu_akaze.cu");
+    const auto akaze_ptx = compiler.compile(kGpuAkazeKernelSource, "reco_calibrate_gpu_akaze.cu",
+                                            {.disable_fmad = true});
     y_to_float = backend.load_kernel_from_ptx(akaze_ptx, "akaze_y_to_float");
     triangle_vertical_y = backend.load_kernel_from_ptx(akaze_ptx, "akaze_triangle_vertical_y");
     triangle_horizontal = backend.load_kernel_from_ptx(akaze_ptx, "akaze_triangle_horizontal");
@@ -450,8 +451,7 @@ struct GpuAkazePipeline::Impl {
     akaze_scan_block = backend.load_kernel_from_ptx(akaze_ptx, "akaze_scan_block");
     akaze_scan_add = backend.load_kernel_from_ptx(akaze_ptx, "akaze_scan_add");
     scatter_candidates = backend.load_kernel_from_ptx(akaze_ptx, "akaze_scatter_candidates");
-    mark_scale_extrema = backend.load_kernel_from_ptx(akaze_ptx, "akaze_mark_scale_extrema");
-    mark_upper_level = backend.load_kernel_from_ptx(akaze_ptx, "akaze_mark_upper_level");
+    select_scale_extrema = backend.load_kernel_from_ptx(akaze_ptx, "akaze_select_scale_extrema");
     prepare_feature_keys = backend.load_kernel_from_ptx(akaze_ptx, "akaze_prepare_feature_keys");
     radix_zero_flags = backend.load_kernel_from_ptx(akaze_ptx, "akaze_radix_zero_flags");
     radix_scatter = backend.load_kernel_from_ptx(akaze_ptx, "akaze_radix_scatter");
@@ -610,8 +610,7 @@ struct GpuAkazePipeline::Impl {
   reco::core::CudaKernel akaze_scan_block;
   reco::core::CudaKernel akaze_scan_add;
   reco::core::CudaKernel scatter_candidates;
-  reco::core::CudaKernel mark_scale_extrema;
-  reco::core::CudaKernel mark_upper_level;
+  reco::core::CudaKernel select_scale_extrema;
   reco::core::CudaKernel prepare_feature_keys;
   reco::core::CudaKernel radix_zero_flags;
   reco::core::CudaKernel radix_scatter;
@@ -893,8 +892,14 @@ GpuFeatureSet GpuAkazePipeline::detect(const GpuGrayFrame& frame,
 
     const auto candidate_bytes =
         checked_multiply(candidate_count, sizeof(std::uint32_t), "GPU AKAZE candidate selection");
-    auto scale_flags = backend.allocate(candidate_bytes);
     auto selected_flags = backend.allocate(candidate_bytes);
+    auto cache_indices = backend.allocate(candidate_bytes);
+    auto cache_cells = backend.allocate(
+        checked_multiply(total_pixels, sizeof(std::uint32_t), "GPU AKAZE selection cells"));
+    auto cache_count = backend.allocate(sizeof(std::uint32_t));
+    backend.memset_d8(selected_flags, 0U);
+    backend.memset_d8(cache_cells, 0xffU);
+    backend.memset_d8(cache_count, 0U);
     auto keys_a = backend.allocate(candidate_bytes);
     auto keys_b = backend.allocate(candidate_bytes);
     auto indices_a = backend.allocate(candidate_bytes);
@@ -908,16 +913,14 @@ GpuFeatureSet GpuAkazePipeline::detect(const GpuGrayFrame& frame,
     auto candidate_count_arg = candidate_count;
     auto selection_levels_ptr = selection_levels.ptr();
     auto level_count = checked_u32(levels.size(), "GPU AKAZE selection level count");
-    auto nms_flags_ptr = flags.ptr();
-    auto nms_offsets_ptr = offsets.ptr();
-    auto scale_flags_ptr = scale_flags.ptr();
     auto selected_flags_ptr = selected_flags.ptr();
-    launch(impl_->mark_scale_extrema, linear_launch(candidate_count), candidates_ptr,
-           candidate_count_arg, selection_levels_ptr, level_count, nms_flags_ptr, nms_offsets_ptr,
-           scale_flags_ptr);
-    launch(impl_->mark_upper_level, linear_launch(candidate_count), candidates_ptr,
-           candidate_count_arg, selection_levels_ptr, level_count, nms_flags_ptr, nms_offsets_ptr,
-           scale_flags_ptr, selected_flags_ptr);
+    auto cache_indices_ptr = cache_indices.ptr();
+    auto cache_cells_ptr = cache_cells.ptr();
+    auto cache_count_ptr = cache_count.ptr();
+    launch(impl_->select_scale_extrema,
+           {.grid = {.x = 1, .y = 1, .z = 1}, .block = {.x = 1, .y = 1, .z = 1}}, candidates_ptr,
+           candidate_count_arg, selection_levels_ptr, level_count, cache_indices_ptr,
+           cache_cells_ptr, cache_count_ptr, selected_flags_ptr);
 
     auto inverse_detection_scale = 1.0F / geometry.detector_scale;
     auto crop_x_float = static_cast<float>(geometry.crop_x);
@@ -961,12 +964,17 @@ GpuFeatureSet GpuAkazePipeline::detect(const GpuGrayFrame& frame,
     }
 
     auto features_ptr = result->points.ptr();
+    auto descriptor_positions = backend.allocate(
+        checked_multiply(checked_multiply(allocated_capacity, 2U, "GPU AKAZE descriptor positions"),
+                         sizeof(float), "GPU AKAZE descriptor positions"));
+    auto descriptor_positions_ptr = descriptor_positions.ptr();
     auto max_features = config.max_keypoints;
     auto feature_count = result->count.ptr();
     launch(impl_->emit_features, linear_launch(max_features), candidates_ptr, indices_input,
-           valid_count_ptr, features_ptr, max_features, feature_count, inverse_detection_scale,
-           crop_x_float, crop_y_float, use_roi, roi_x_min, roi_x_max, roi_y_min, roi_y_max,
-           border_y, border_pitch, border_width, border_height, border_margin, black_threshold);
+           valid_count_ptr, features_ptr, descriptor_positions_ptr, max_features, feature_count,
+           inverse_detection_scale, crop_x_float, crop_y_float, use_roi, roi_x_min, roi_x_max,
+           roi_y_min, roi_y_max, border_y, border_pitch, border_width, border_height, border_margin,
+           black_threshold);
 
     if (config.max_keypoints != 0U) {
       std::vector<GpuLevelView> host_views;
@@ -989,12 +997,11 @@ GpuFeatureSet GpuAkazePipeline::detect(const GpuGrayFrame& frame,
                    device_views);
       auto level_views = device_views.ptr();
       auto level_count = checked_u32(host_views.size(), "GPU AKAZE level count");
-      auto detector_scale = geometry.detector_scale;
       auto descriptors = result->descriptors.ptr();
       std::uint64_t descriptor_pitch = kDescriptorBytes;
       launch(impl_->describe_features, linear_launch(config.max_keypoints), features_ptr,
-             feature_count, level_views, level_count, detector_scale, crop_x_float, crop_y_float,
-             descriptors, descriptor_pitch);
+             descriptor_positions_ptr, feature_count, level_views, level_count, descriptors,
+             descriptor_pitch);
       impl_->describe_features.synchronize();
     } else {
       impl_->emit_features.synchronize();
