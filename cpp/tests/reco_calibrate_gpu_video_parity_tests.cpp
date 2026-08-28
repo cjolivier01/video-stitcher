@@ -69,6 +69,20 @@ bool require_gpu() {
   return value != nullptr && std::string_view(value) == "1";
 }
 
+bool address_sanitizer_build() {
+#if defined(__SANITIZE_ADDRESS__)
+  return true;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+  return true;
+#else
+  return false;
+#endif
+#else
+  return false;
+#endif
+}
+
 std::filesystem::path runfile(std::string path) {
   const char* workspace = std::getenv("TEST_WORKSPACE");
   if (workspace == nullptr || workspace[0] == '\0') {
@@ -449,13 +463,19 @@ int main() {
   std::cerr << "SKIP: decoded NVMM calibration parity requires Linux\n";
   return EXIT_SUCCESS;
 #else
+  if (address_sanitizer_build() && !require_gpu()) {
+    std::cerr
+        << "SKIP: GPU decoded-video parity is skipped under ASan unless explicitly required\n";
+    return EXIT_SUCCESS;
+  }
   try {
     const auto gstreamer = probe_gstreamer_runtime();
+    const bool cuda_available = CudaBackend::is_available();
     const bool available =
-        CudaBackend::is_available() && gstreamer.available && is_nvmm_cuda_interop_available();
+        cuda_available && gstreamer.available && is_nvmm_cuda_interop_available();
     if (!available) {
-      const std::string detail = !CudaBackend::is_available() ? CudaBackend::availability_error()
-                                 : !gstreamer.available       ? gstreamer.error
+      const std::string detail = !cuda_available        ? CudaBackend::availability_error()
+                                 : !gstreamer.available ? gstreamer.error
                                                         : nvmm_cuda_interop_availability_error();
       if (require_gpu()) {
         std::cerr << "FAIL: GPU decoded-video parity unavailable: " << detail << '\n';
