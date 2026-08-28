@@ -3014,13 +3014,33 @@ private:
 #if defined(RECO_CALIBRATION_THREAD_SANITIZER)
   // TSan may self-reexec and cannot reliably recover an AT_EMPTY_PATH image. Give it a stable
   // procfs name for the sealed executable snapshot while preserving descriptor-pinned execution.
+  // The sanitizer-only early constructor closes this descriptor before application startup.
   char snapshot_path[64]{};
   const auto snapshot_path_size =
       std::snprintf(snapshot_path, sizeof(snapshot_path), "/proc/%lld/fd/%d",
                     static_cast<long long>(::getpid()), executable);
   if (snapshot_path_size > 0 &&
       static_cast<std::size_t>(snapshot_path_size) < sizeof(snapshot_path)) {
-    (void)::execve(snapshot_path, argv, environment);
+    std::array<char*, 8> sanitizer_argv{};
+    std::array<char*, 4098> sanitizer_environment{};
+    std::size_t argument_count = 0;
+    while (argument_count + 1U < sanitizer_argv.size() && argv[argument_count] != nullptr) {
+      sanitizer_argv[argument_count] = argv[argument_count];
+      ++argument_count;
+    }
+    std::size_t environment_count = 0;
+    while (environment_count + 2U < sanitizer_environment.size() &&
+           environment[environment_count] != nullptr) {
+      sanitizer_environment[environment_count] = environment[environment_count];
+      ++environment_count;
+    }
+    static char retained_descriptor[] = "RECO_CALIBRATION_TSAN_EXEC_FD=3";
+    if (argv[argument_count] == nullptr && argument_count > 0 &&
+        environment[environment_count] == nullptr && ::fcntl(executable, F_SETFD, 0) == 0) {
+      sanitizer_argv[0] = snapshot_path;
+      sanitizer_environment[environment_count] = retained_descriptor;
+      (void)::execve(snapshot_path, sanitizer_argv.data(), sanitizer_environment.data());
+    }
   }
 #elif defined(SYS_execveat)
   if (!install_initial_exec_filter(executable)) {
@@ -3307,7 +3327,8 @@ private:
            name == "GST_PLUGIN_PATH_1_0" || name == "GST_PLUGIN_SYSTEM_PATH" ||
            name == "GST_PLUGIN_SYSTEM_PATH_1_0" || name == "GST_PLUGIN_SCANNER" ||
            name == "GST_PRELOAD" || name == "GST_REGISTRY" || name == "GST_REGISTRY_1_0" ||
-           name == "CUDA_INJECTION32_PATH" || name == "CUDA_INJECTION64_PATH";
+           name == "CUDA_INJECTION32_PATH" || name == "CUDA_INJECTION64_PATH" ||
+           name == "RECO_CALIBRATION_TSAN_EXEC_FD";
   }
 
   [[nodiscard]] static bool overridden_worker_name(std::string_view name) {
@@ -3552,6 +3573,20 @@ supervise_worker(int caller_socket, const std::string& executable, int executabl
 }
 
 } // namespace
+
+#if defined(__linux__) && defined(RECO_CALIBRATION_THREAD_SANITIZER)
+extern "C"
+    __attribute__((constructor(101))) void reco_close_calibration_tsan_exec_descriptor() noexcept {
+  const char* raw_descriptor = std::getenv("RECO_CALIBRATION_TSAN_EXEC_FD");
+  if (raw_descriptor == nullptr) {
+    return;
+  }
+  if (std::string_view(raw_descriptor) == "3") {
+    (void)::close(3);
+  }
+  (void)::unsetenv("RECO_CALIBRATION_TSAN_EXEC_FD");
+}
+#endif
 
 bool install_calibration_worker_sandbox() noexcept { return install_worker_syscall_filter(); }
 

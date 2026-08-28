@@ -61,7 +61,8 @@ const bool ipc_closed_during_static_initialization = [] {
 
 const bool environment_sanitized_during_static_initialization = [] {
   return std::getenv("LD_AUDIT") == nullptr && std::getenv("LD_PRELOAD") == nullptr &&
-         std::getenv("GST_PLUGIN_PATH") == nullptr;
+         std::getenv("GST_PLUGIN_PATH") == nullptr &&
+         std::getenv("RECO_CALIBRATION_TSAN_EXEC_FD") == nullptr;
 }();
 
 const bool worker_environment_sanitized_during_static_initialization = [] {
