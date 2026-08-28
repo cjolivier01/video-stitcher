@@ -154,7 +154,7 @@ void runtime_abi_discovery_is_fail_closed() {
 }
 
 template <typename Params> Params make_params_as() {
-  Params params;
+  Params params{};
   params.width = 1280;
   params.height = 720;
   params.pitch = 1280;
@@ -181,7 +181,7 @@ template <typename Params> Params make_params_as() {
 abi::SurfaceParams make_params() { return make_params_as<abi::SurfaceParams>(); }
 
 template <typename Surface, typename Params> Surface make_surface_as(Params& params) {
-  Surface surface;
+  Surface surface{};
   surface.gpu_id = 0;
   surface.batch_size = 1;
   surface.num_filled = 1;

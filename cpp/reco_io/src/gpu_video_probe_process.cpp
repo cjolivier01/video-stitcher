@@ -833,6 +833,7 @@ constexpr char kGuardianAcknowledge = 'A';
 constexpr char kGuardianTerminate = 'T';
 constexpr char kGuardianLaunchFailed = 'F';
 constexpr char kSupervisorCertified = 'C';
+constexpr char kWorkerGroupCertified = 'C';
 
 long descriptor_scan_limit();
 
@@ -1589,7 +1590,8 @@ void guardian_wait_for_worker_group_cleanup(pid_t worker_pid) {
   }
 }
 
-void guardian_terminate_worker(pid_t worker_pid, pid_t watchdog_pid = -1) {
+void guardian_terminate_worker(pid_t worker_pid, pid_t watchdog_pid = -1,
+                               bool authority_reported = false) {
   kill_worker_process_group(worker_pid);
   if (watchdog_pid > 0) {
     (void)::kill(watchdog_pid, SIGKILL);
@@ -1607,6 +1609,12 @@ void guardian_terminate_worker(pid_t worker_pid, pid_t watchdog_pid = -1) {
   } while (wait_result < 0 && errno == EINTR);
   if (wait_result == 0 && worker_info.si_pid == worker_pid) {
     guardian_wait_for_worker_group_cleanup(worker_pid);
+    if (authority_reported) {
+      if (!guardian_pipe_write(kGuardianWorkerAuthority, kWorkerGroupCertified)) {
+        guardian_exit(2);
+      }
+      (void)::close(kGuardianWorkerAuthority);
+    }
     int worker_status = 0;
     while (::waitpid(worker_pid, &worker_status, 0) < 0 && errno == EINTR) {
     }
@@ -2134,7 +2142,7 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int control
   }
 
   constexpr timespec kSupervisorPollPause{.tv_sec = 0, .tv_nsec = 2'000'000};
-  std::array<char, sizeof(pid_t)> worker_group_bytes{};
+  std::array<char, sizeof(pid_t) + 1U> worker_group_bytes{};
   std::size_t worker_group_size = 0;
   bool worker_authority_closed = false;
   bool worker_authority_invalid = false;
@@ -2199,8 +2207,9 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int control
       (void)::nanosleep(&kSupervisorPollPause, nullptr);
     }
   }
-  if (worker_authority_invalid ||
-      (worker_group_size != 0 && worker_group_size != worker_group_bytes.size())) {
+  if (worker_authority_invalid || (worker_group_size != 0 && worker_group_size < sizeof(pid_t)) ||
+      (worker_group_size == worker_group_bytes.size() &&
+       worker_group_bytes.back() != kWorkerGroupCertified)) {
     // An incomplete authority report cannot prove that no worker group exists.
     while (true) {
       (void)::nanosleep(&kSupervisorPollPause, nullptr);
@@ -2208,15 +2217,18 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int control
   }
 
   pid_t worker_group = -1;
-  if (worker_group_size == worker_group_bytes.size()) {
+  if (worker_group_size >= sizeof(pid_t)) {
     std::memcpy(&worker_group, worker_group_bytes.data(), sizeof(worker_group));
     if (worker_group <= 0) {
       while (true) {
         (void)::nanosleep(&kSupervisorPollPause, nullptr);
       }
     }
-    kill_worker_process_group(worker_group);
-    while (worker_process_group_exists(worker_group)) {
+    const bool cleanup_certified = worker_group_size == worker_group_bytes.size();
+    if (!cleanup_certified) {
+      kill_worker_process_group(worker_group);
+    }
+    while (!cleanup_certified && worker_process_group_exists(worker_group)) {
 #if defined(__linux__)
       int worker_status = 0;
       while (::waitpid(-worker_group, &worker_status, WNOHANG) > 0) {
@@ -2303,17 +2315,16 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int control
     (void)::close(lifetime_gate[1]);
     (void)::close(watchdog_gate[0]);
     (void)::close(watchdog_gate[1]);
+    (void)::close(kGuardianWorkerAuthority);
 #if defined(__linux__)
     if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || ::getppid() != guardian_pid) {
       guardian_exit(127);
     }
 #endif
     if (::setpgid(0, 0) != 0 || ::dup2(kGuardianWorkerInput, STDIN_FILENO) < 0 ||
-        ::dup2(kGuardianWorkerOutput, STDOUT_FILENO) < 0 ||
-        !guardian_pipe_write_process_id(kGuardianWorkerAuthority, ::getpid())) {
+        ::dup2(kGuardianWorkerOutput, STDOUT_FILENO) < 0) {
       guardian_exit(127);
     }
-    (void)::close(kGuardianWorkerAuthority);
     if (!guardian_restrict_worker_process_creation()) {
       guardian_exit(127);
     }
@@ -2340,7 +2351,6 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int control
     ::execve(executable, arguments, environ);
     guardian_exit(127);
   }
-  (void)::close(kGuardianWorkerAuthority);
   (void)::close(start_gate[0]);
   if (worker_pid < 0) {
     (void)::close(start_gate[1]);
@@ -2402,11 +2412,18 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int control
   (void)::close(watchdog_gate[1]);
   const auto encoded_worker_pid = static_cast<std::uint64_t>(worker_pid);
   if (!guardian_sleep(pre_worker_report_delay) ||
-      !guardian_write(STDOUT_FILENO, &kGuardianStarted, 1) ||
-      !guardian_write(STDOUT_FILENO, &encoded_worker_pid, sizeof(encoded_worker_pid))) {
+      !guardian_pipe_write_process_id(kGuardianWorkerAuthority, worker_pid)) {
     (void)::close(start_gate[1]);
     (void)::close(lifetime_gate[1]);
     guardian_terminate_worker(worker_pid, watchdog_pid);
+    guardian_exit(2);
+  }
+  const bool authority_reported = true;
+  if (!guardian_write(STDOUT_FILENO, &kGuardianStarted, 1) ||
+      !guardian_write(STDOUT_FILENO, &encoded_worker_pid, sizeof(encoded_worker_pid))) {
+    (void)::close(start_gate[1]);
+    (void)::close(lifetime_gate[1]);
+    guardian_terminate_worker(worker_pid, watchdog_pid, authority_reported);
     guardian_exit(2);
   }
 
@@ -2418,7 +2435,7 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int control
       !guardian_pipe_write(start_gate[1], kGuardianRelease)) {
     (void)::close(start_gate[1]);
     (void)::close(lifetime_gate[1]);
-    guardian_terminate_worker(worker_pid, watchdog_pid);
+    guardian_terminate_worker(worker_pid, watchdog_pid, authority_reported);
     guardian_exit(received == 1 && command == kGuardianTerminate ? 0 : 2);
   }
   (void)::close(start_gate[1]);
@@ -2438,6 +2455,10 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int control
       while (::waitpid(watchdog_pid, &watchdog_status, 0) < 0 && errno == EINTR) {
       }
       guardian_wait_for_worker_group_cleanup(worker_pid);
+      if (!guardian_pipe_write(kGuardianWorkerAuthority, kWorkerGroupCertified)) {
+        guardian_exit(2);
+      }
+      (void)::close(kGuardianWorkerAuthority);
       while (::waitpid(worker_pid, &worker_status, 0) < 0 && errno == EINTR) {
       }
       break;
@@ -2448,11 +2469,15 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int control
       int watchdog_status = 0;
       while (::waitpid(watchdog_pid, &watchdog_status, 0) < 0 && errno == EINTR) {
       }
+      if (!guardian_pipe_write(kGuardianWorkerAuthority, kWorkerGroupCertified)) {
+        guardian_exit(2);
+      }
+      (void)::close(kGuardianWorkerAuthority);
       worker_status = 0;
       break;
     }
     if (wait_result < 0 && errno != EINTR) {
-      guardian_terminate_worker(worker_pid, watchdog_pid);
+      guardian_terminate_worker(worker_pid, watchdog_pid, authority_reported);
       guardian_exit(2);
     }
     siginfo_t watchdog_info{};
@@ -2461,7 +2486,7 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int control
     const auto watchdog_error = errno;
     if (guardian_watchdog_exit_is_fatal(memory_termination_sent, watchdog_wait, watchdog_error,
                                         watchdog_info.si_pid, watchdog_pid)) {
-      guardian_terminate_worker(worker_pid, watchdog_pid);
+      guardian_terminate_worker(worker_pid, watchdog_pid, authority_reported);
       guardian_exit(2);
     }
 #if defined(__linux__) || defined(__APPLE__)
@@ -2487,7 +2512,7 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int control
         received = ::recv(STDIN_FILENO, &command, 1, 0);
       } while (received < 0 && errno == EINTR);
       if (received != 1 || command == kGuardianTerminate) {
-        guardian_terminate_worker(worker_pid, watchdog_pid);
+        guardian_terminate_worker(worker_pid, watchdog_pid, authority_reported);
         guardian_exit(0);
       }
     }

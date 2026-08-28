@@ -27,8 +27,10 @@
 
 #if defined(__linux__)
 #include <fcntl.h>
+#include <linux/io_uring.h>
 #include <linux/memfd.h>
 #include <pthread.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
@@ -68,7 +70,7 @@ const bool worker_environment_sanitized_during_static_initialization = [] {
   const char* plugin_path = std::getenv("GST_PLUGIN_SYSTEM_PATH_1_0");
   const char* registry = std::getenv("GST_REGISTRY");
   const char* versioned_registry = std::getenv("GST_REGISTRY_1_0");
-  return whitelist != nullptr &&
+  return std::getenv("AWS_SECRET_ACCESS_KEY") == nullptr && whitelist != nullptr &&
          std::string_view(whitelist) ==
              "coreelements,isomp4,playback,videoparsersbad,app,nvvideo4linux2,nvvideoconvert,"
              "typefindfunctions" &&
@@ -283,14 +285,6 @@ int main(int argc, char** argv) {
   if (!is_worker) {
     return EXIT_FAILURE;
   }
-  int admission = -1;
-  try {
-    admission = receive_calibration_admission_fd(descriptor, deadline);
-  } catch (...) {
-    static constexpr char failure[] = "fake calibration worker did not receive admission FD\n";
-    write_stderr(failure);
-    return EXIT_FAILURE;
-  }
   if (const char* raw_delay = std::getenv("RECO_FAKE_CALIBRATION_PRE_REQUEST_DELAY_MS");
       raw_delay != nullptr) {
     std::uint64_t delay = 0;
@@ -318,7 +312,6 @@ int main(int argc, char** argv) {
     const int right_input = receive_calibration_right_input_fd(descriptor, deadline);
     request.right.retained_path = retained_path(right_input);
   }
-  (void)admission;
   write_environment_pid_marker("RECO_FAKE_CALIBRATION_WORKER_PID_PATH", host_process_id());
   const char* raw_scenario = std::getenv("RECO_FAKE_CALIBRATION_WORKER_SCENARIO");
   const std::string_view scenario = raw_scenario == nullptr ? "success" : raw_scenario;
@@ -542,18 +535,67 @@ int main(int argc, char** argv) {
       return EXIT_FAILURE;
     }
 #endif
+#if defined(SYS_io_uring_setup)
+    io_uring_params ring_parameters{};
+    errno = 0;
+    if (::syscall(SYS_io_uring_setup, 2U, &ring_parameters) >= 0 || errno != EPERM) {
+      return EXIT_FAILURE;
+    }
+#endif
+#if defined(SYS_io_uring_register)
+    errno = 0;
+    if (::syscall(SYS_io_uring_register, -1, 0U, nullptr, 0U) >= 0 || errno != EPERM) {
+      return EXIT_FAILURE;
+    }
+#endif
+#if defined(SYS_io_uring_enter)
+    errno = 0;
+    if (::syscall(SYS_io_uring_enter, -1, 0U, 0U, 0U, nullptr, 0U) >= 0 || errno != EPERM) {
+      return EXIT_FAILURE;
+    }
+#endif
     const char* metadata_target = std::getenv("RECO_FAKE_CALIBRATION_METADATA_TARGET");
     if (metadata_target == nullptr || metadata_target[0] != '/') {
       return EXIT_FAILURE;
     }
-    const auto metadata_descriptor = ::open(metadata_target, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    errno = 0;
+    const auto forbidden_read = ::open(metadata_target, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (forbidden_read >= 0 || (errno != EACCES && errno != EPERM)) {
+      if (forbidden_read >= 0) {
+        (void)::close(forbidden_read);
+      }
+      return EXIT_FAILURE;
+    }
+    const auto target_mem = "/proc/" + std::to_string(target) + "/mem";
+    errno = 0;
+    const auto forbidden_process_memory = ::open(target_mem.c_str(), O_RDWR | O_CLOEXEC);
+    if (forbidden_process_memory >= 0 || (errno != EACCES && errno != EPERM)) {
+      if (forbidden_process_memory >= 0) {
+        (void)::close(forbidden_process_memory);
+      }
+      return EXIT_FAILURE;
+    }
+    const char* scratch = std::getenv("TMPDIR");
+    if (scratch == nullptr) {
+      return EXIT_FAILURE;
+    }
+    const auto metadata_scratch_path = std::string(scratch) + "/worker-metadata";
+    const auto metadata_descriptor = ::open(
+        metadata_scratch_path.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, S_IRUSR | S_IWUSR);
     if (metadata_descriptor < 0) {
       return EXIT_FAILURE;
     }
     const auto metadata_failure = [&] {
       (void)::close(metadata_descriptor);
+      (void)::unlink(metadata_scratch_path.c_str());
       return EXIT_FAILURE;
     };
+#if defined(SYS_flock)
+    errno = 0;
+    if (::syscall(SYS_flock, metadata_descriptor, LOCK_UN) >= 0 || errno != EPERM) {
+      return metadata_failure();
+    }
+#endif
     const struct utimbuf legacy_times{.actime = 1, .modtime = 2};
     const std::array<timeval, 2> microsecond_times{
         timeval{.tv_sec = 3, .tv_usec = 4},
@@ -639,6 +681,9 @@ int main(int argc, char** argv) {
 #endif
 #undef RECO_REQUIRE_METADATA_DENIED
     (void)::close(metadata_descriptor);
+    if (::unlink(metadata_scratch_path.c_str()) != 0) {
+      return EXIT_FAILURE;
+    }
     errno = 0;
     const auto network = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (network >= 0 || errno != EPERM) {
@@ -723,10 +768,6 @@ int main(int argc, char** argv) {
         (void)::close(forbidden_write);
         (void)::unlink(write_target);
       }
-      return EXIT_FAILURE;
-    }
-    const char* scratch = std::getenv("TMPDIR");
-    if (scratch == nullptr) {
       return EXIT_FAILURE;
     }
     const auto scratch_file = std::string(scratch) + "/worker-write";

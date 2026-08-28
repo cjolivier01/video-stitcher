@@ -162,6 +162,10 @@ void write_frame(std::string_view payload) {
   const auto header = frame_header(payload.size());
   std::cout.write(header.data(), static_cast<std::streamsize>(header.size()));
   std::cout.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+  std::cout.flush();
+  if (!std::cout) {
+    throw std::runtime_error("failed to write video probe worker response");
+  }
 }
 
 bool write_process_marker(const char* environment_name, std::uint64_t process_id) {

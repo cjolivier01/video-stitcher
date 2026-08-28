@@ -455,10 +455,26 @@ void write_calibration_json_atomically_impl(std::string_view json,
         error.has_value()) {
       throw std::runtime_error("refusing to publish calibration output: " + *error);
     }
-    if (MoveFileExW(temporary.c_str(), destination.c_str(),
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0) {
+    constexpr DWORD retry_delay_ms = 10;
+    constexpr int maximum_replace_attempts = 200;
+    DWORD replace_error = ERROR_SUCCESS;
+    for (int attempt = 0; attempt < maximum_replace_attempts; ++attempt) {
+      if (MoveFileExW(temporary.c_str(), destination.c_str(),
+                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0) {
+        replace_error = ERROR_SUCCESS;
+        break;
+      }
+      replace_error = GetLastError();
+      if (replace_error != ERROR_SHARING_VIOLATION && replace_error != ERROR_ACCESS_DENIED) {
+        break;
+      }
+      if (attempt + 1 < maximum_replace_attempts) {
+        Sleep(retry_delay_ms);
+      }
+    }
+    if (replace_error != ERROR_SUCCESS) {
       throw_file_error("failed to replace calibration output", destination,
-                       static_cast<int>(GetLastError()));
+                       static_cast<int>(replace_error));
     }
     temporary_exists = false;
   } catch (...) {

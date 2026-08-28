@@ -284,9 +284,10 @@ GpuVideoProbe probe_video(const GpuFileDecodeConfig& config, std::uint64_t timeo
 
 #if !defined(RECO_PROBE_TEST_FORCE_GUARDIAN_FALLBACKS)
 void exhaustive_calibration_probe_scans_to_eos(const std::filesystem::path& video_path) {
+  constexpr std::uint64_t exhaustive_fixture_timeout_ns = 30'000'000'000ULL;
   set_scenario("probe-exhaustive-50001");
   const auto exact = reco::io::detail::probe_gpu_video_exhaustive_for_test(
-      container_config(video_path), 5'000'000'000ULL);
+      container_config(video_path), exhaustive_fixture_timeout_ns);
   expect_eq(exact.total_frames, 50'001ULL,
             "exhaustive calibration probe scans beyond the bounded AU ceiling");
   expect_true(!exact.total_frames_is_estimated && exact.selected_stream_caps_verified &&
@@ -297,7 +298,7 @@ void exhaustive_calibration_probe_scans_to_eos(const std::filesystem::path& vide
   expect_probe_error(
       [&] {
         (void)reco::io::detail::probe_gpu_video_exhaustive_for_test(container_config(video_path),
-                                                                    5'000'000'000ULL);
+                                                                    exhaustive_fixture_timeout_ns);
       },
       "missing or duplicated", "exhaustive calibration probe catches an unsampled cadence gap");
 

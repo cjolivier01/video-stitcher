@@ -407,6 +407,7 @@ void worker_allows_threads_but_blocks_process_descendants() {
     expect_true(::setxattr(metadata_target.c_str(), original_xattr, original_xattr_value,
                            sizeof(original_xattr_value) - 1U, 0U) == 0,
                 "sandbox metadata fixture creates its original xattr");
+    (void)::setenv("AWS_SECRET_ACCESS_KEY", "must-not-reach-worker", 1);
     const std::array<timespec, 2> original_times{
         timespec{.tv_sec = 946'684'800, .tv_nsec = 123'456'789},
         timespec{.tv_sec = 946'684'801, .tv_nsec = 987'654'321},
@@ -430,6 +431,7 @@ void worker_allows_threads_but_blocks_process_descendants() {
       expect_eq(run_gpu_calibration(request_fixture(), ready_backends()).total_matches, 12U,
                 "worker blocks process, network, host filesystem, and metadata mutation");
     }
+    (void)::unsetenv("AWS_SECRET_ACCESS_KEY");
     expect_true(process_exists(target), "worker cannot signal the same-UID target");
     expect_true(!std::filesystem::exists(write_target), "worker cannot create host files");
     struct stat metadata_after{};
@@ -607,7 +609,7 @@ void worker_descriptors_are_isolated_across_exec() {
 
   Scenario scenario("process-spawn-blocked");
   expect_eq(run_gpu_calibration(request_fixture(), ready_backends()).total_matches, 12U,
-            "post-exec IPC and admission descriptors are close-on-exec");
+            "post-exec IPC descriptors are close-on-exec");
 }
 
 #if !defined(RECO_CALIBRATION_THREAD_SANITIZER)
@@ -932,8 +934,13 @@ void active_worker_retains_cross_process_admission() {
 void invalid_worker_paths_fail_before_launch() {
   auto request = request_fixture();
   request.calibration_worker_path = "/definitely/missing/reco_calibration_worker";
+#if defined(__linux__)
   expect_execution_error([&] { (void)run_gpu_calibration(request, ready_backends()); },
                          "executable regular file", "missing worker fails closed");
+#else
+  expect_execution_error([&] { (void)run_gpu_calibration(request, ready_backends()); },
+                         "only supported on Linux", "unsupported platform fails closed");
+#endif
 }
 
 } // namespace

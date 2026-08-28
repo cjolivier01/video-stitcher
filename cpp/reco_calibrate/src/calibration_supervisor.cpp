@@ -1876,9 +1876,27 @@ void close_child_descriptors_except(int preserved) noexcept {
       RECO_PRE_MAIN_DENY(SYS_pivot_root),
       RECO_PRE_MAIN_DENY(SYS_setns),
       RECO_PRE_MAIN_DENY(SYS_unshare),
+#if defined(SYS_io_uring_setup)
+      RECO_PRE_MAIN_DENY(SYS_io_uring_setup),
+#endif
+#if defined(SYS_io_uring_register)
+      RECO_PRE_MAIN_DENY(SYS_io_uring_register),
+#endif
+#if defined(SYS_io_uring_enter)
+      RECO_PRE_MAIN_DENY(SYS_io_uring_enter),
+#endif
+#if defined(SYS_flock)
+      RECO_PRE_MAIN_DENY(SYS_flock),
+#endif
+#if defined(SYS_chmod)
       RECO_PRE_MAIN_DENY(SYS_chmod),
+#endif
+#if defined(SYS_fchmod)
       RECO_PRE_MAIN_DENY(SYS_fchmod),
+#endif
+#if defined(SYS_fchmodat)
       RECO_PRE_MAIN_DENY(SYS_fchmodat),
+#endif
 #if defined(SYS_fchmodat2)
       RECO_PRE_MAIN_DENY(SYS_fchmodat2),
 #endif
@@ -1960,10 +1978,13 @@ void close_child_descriptors_except(int preserved) noexcept {
 #endif
 }
 
-[[nodiscard]] bool install_worker_filesystem_boundary(const char* scratch) noexcept {
+[[nodiscard]] bool install_worker_filesystem_boundary(const char* scratch, int left_input,
+                                                      int right_input) noexcept {
 #if !defined(SYS_landlock_create_ruleset) || !defined(SYS_landlock_add_rule) ||                    \
     !defined(SYS_landlock_restrict_self)
   (void)scratch;
+  (void)left_input;
+  (void)right_input;
   return false;
 #else
   if (scratch == nullptr || scratch[0] != '/') {
@@ -1989,18 +2010,64 @@ void close_child_descriptors_except(int preserved) noexcept {
     write_access |= LANDLOCK_ACCESS_FS_TRUNCATE;
   }
 #endif
-  const landlock_ruleset_attr ruleset_attributes{.handled_access_fs = write_access};
+  constexpr std::uint64_t read_access =
+      LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
+  const landlock_ruleset_attr ruleset_attributes{.handled_access_fs = write_access | read_access};
   UniqueFd ruleset(static_cast<int>(
       ::syscall(SYS_landlock_create_ruleset, &ruleset_attributes, sizeof(ruleset_attributes), 0U)));
   if (!ruleset) {
     return false;
   }
   const auto allow_path = [&](const char* path, std::uint64_t access) {
-    UniqueFd parent(::open(path, O_PATH | O_CLOEXEC | O_NOFOLLOW));
+    UniqueFd parent(::open(path, O_PATH | O_CLOEXEC));
     if (!parent) {
       return false;
     }
     const landlock_path_beneath_attr rule{.allowed_access = access, .parent_fd = parent.get()};
+    return ::syscall(SYS_landlock_add_rule, ruleset.get(), LANDLOCK_RULE_PATH_BENEATH, &rule, 0U) ==
+           0;
+  };
+  const auto allow_input = [&](int descriptor) {
+    if (descriptor < 0) {
+      return true;
+    }
+    struct stat status{};
+    if (::fstat(descriptor, &status) != 0 || !S_ISREG(status.st_mode)) {
+      return false;
+    }
+    const landlock_path_beneath_attr rule{.allowed_access = LANDLOCK_ACCESS_FS_READ_FILE,
+                                          .parent_fd = descriptor};
+    return ::syscall(SYS_landlock_add_rule, ruleset.get(), LANDLOCK_RULE_PATH_BENEATH, &rule, 0U) ==
+           0;
+  };
+  const auto allow_optional_system_directory = [&](const char* path) {
+    UniqueFd directory(::open(path, O_PATH | O_CLOEXEC));
+    if (!directory) {
+      return errno == ENOENT;
+    }
+    struct stat status{};
+    if (::fstat(directory.get(), &status) != 0 || !S_ISDIR(status.st_mode) || status.st_uid != 0 ||
+        (status.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+      return false;
+    }
+    const landlock_path_beneath_attr rule{.allowed_access = read_access,
+                                          .parent_fd = directory.get()};
+    return ::syscall(SYS_landlock_add_rule, ruleset.get(), LANDLOCK_RULE_PATH_BENEATH, &rule, 0U) ==
+           0;
+  };
+  const auto allow_optional_system_file = [&](const char* path) {
+    UniqueFd file(::open(path, O_PATH | O_CLOEXEC));
+    if (!file) {
+      return errno == ENOENT;
+    }
+    struct stat status{};
+    if (::fstat(file.get(), &status) != 0 || !S_ISREG(status.st_mode) || status.st_uid != 0 ||
+        (status.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+      return false;
+    }
+    const landlock_path_beneath_attr rule{.allowed_access = LANDLOCK_ACCESS_FS_EXECUTE |
+                                                            LANDLOCK_ACCESS_FS_READ_FILE,
+                                          .parent_fd = file.get()};
     return ::syscall(SYS_landlock_add_rule, ruleset.get(), LANDLOCK_RULE_PATH_BENEATH, &rule, 0U) ==
            0;
   };
@@ -2013,7 +2080,8 @@ void close_child_descriptors_except(int preserved) noexcept {
     if (::fstat(device.get(), &status) != 0 || !S_ISCHR(status.st_mode)) {
       return false;
     }
-    const landlock_path_beneath_attr rule{.allowed_access = LANDLOCK_ACCESS_FS_WRITE_FILE,
+    const landlock_path_beneath_attr rule{.allowed_access = LANDLOCK_ACCESS_FS_READ_FILE |
+                                                            LANDLOCK_ACCESS_FS_WRITE_FILE,
                                           .parent_fd = device.get()};
     return ::syscall(SYS_landlock_add_rule, ruleset.get(), LANDLOCK_RULE_PATH_BENEATH, &rule, 0U) ==
            0;
@@ -2027,7 +2095,9 @@ void close_child_descriptors_except(int preserved) noexcept {
     if (::fstat(directory.get(), &status) != 0 || !S_ISDIR(status.st_mode)) {
       return false;
     }
-    const landlock_path_beneath_attr rule{.allowed_access = LANDLOCK_ACCESS_FS_WRITE_FILE,
+    const landlock_path_beneath_attr rule{.allowed_access = LANDLOCK_ACCESS_FS_READ_FILE |
+                                                            LANDLOCK_ACCESS_FS_READ_DIR |
+                                                            LANDLOCK_ACCESS_FS_WRITE_FILE,
                                           .parent_fd = directory.get()};
     return ::syscall(SYS_landlock_add_rule, ruleset.get(), LANDLOCK_RULE_PATH_BENEATH, &rule, 0U) ==
            0;
@@ -2038,18 +2108,36 @@ void close_child_descriptors_except(int preserved) noexcept {
     proc_access |= LANDLOCK_ACCESS_FS_TRUNCATE;
   }
 #endif
-  bool devices_allowed = allow_optional_device("/dev/nvidiactl") &&
-                         allow_optional_device("/dev/nvidia-uvm") &&
-                         allow_optional_device("/dev/nvidia-uvm-tools") &&
-                         allow_optional_device("/dev/nvidia-modeset") &&
-                         allow_optional_device_directory("/dev/nvidia-caps");
+  proc_access |= read_access;
+  char worker_proc[64]{};
+  const auto worker_proc_size = std::snprintf(worker_proc, sizeof(worker_proc), "/proc/%lld",
+                                              static_cast<long long>(::getpid()));
+  const bool system_reads_allowed =
+      allow_optional_system_directory("/usr") && allow_optional_system_directory("/lib") &&
+      allow_optional_system_directory("/lib64") && allow_optional_system_directory("/opt/nvidia") &&
+      allow_optional_system_directory("/sys") &&
+      allow_optional_system_directory("/proc/driver/nvidia") &&
+      allow_optional_system_file("/etc/ld.so.cache") &&
+      allow_optional_system_file("/etc/localtime") && allow_optional_system_file("/proc/cpuinfo") &&
+      allow_optional_system_file("/proc/devices") &&
+      allow_optional_system_file("/proc/filesystems") &&
+      allow_optional_system_file("/proc/meminfo") && allow_optional_system_file("/proc/version");
+  bool devices_allowed =
+      allow_optional_device("/dev/null") && allow_optional_device("/dev/urandom") &&
+      allow_optional_device("/dev/zero") && allow_optional_device("/dev/nvidiactl") &&
+      allow_optional_device("/dev/nvidia-uvm") && allow_optional_device("/dev/nvidia-uvm-tools") &&
+      allow_optional_device("/dev/nvidia-modeset") &&
+      allow_optional_device_directory("/dev/nvidia-caps");
   for (unsigned int index = 0; devices_allowed && index < 32U; ++index) {
     char path[32]{};
     const auto size = std::snprintf(path, sizeof(path), "/dev/nvidia%u", index);
     devices_allowed =
         size > 0 && static_cast<std::size_t>(size) < sizeof(path) && allow_optional_device(path);
   }
-  if (!devices_allowed || !allow_path("/proc", proc_access) || !allow_path(scratch, write_access) ||
+  if (!devices_allowed || !system_reads_allowed || worker_proc_size <= 0 ||
+      static_cast<std::size_t>(worker_proc_size) >= sizeof(worker_proc) ||
+      !allow_path(worker_proc, proc_access) || !allow_input(left_input) ||
+      !allow_input(right_input) || !allow_path(scratch, write_access | read_access) ||
       ::prctl(PR_SET_NO_NEW_PRIVS, 1L, 0L, 0L, 0L) != 0 ||
       ::syscall(SYS_landlock_restrict_self, ruleset.get(), 0U) != 0) {
     return false;
@@ -2091,9 +2179,27 @@ void close_child_descriptors_except(int preserved) noexcept {
       RECO_WORKER_DENY(SYS_pivot_root, EPERM),
       RECO_WORKER_DENY(SYS_setns, EPERM),
       RECO_WORKER_DENY(SYS_unshare, EPERM),
+#if defined(SYS_io_uring_setup)
+      RECO_WORKER_DENY(SYS_io_uring_setup, EPERM),
+#endif
+#if defined(SYS_io_uring_register)
+      RECO_WORKER_DENY(SYS_io_uring_register, EPERM),
+#endif
+#if defined(SYS_io_uring_enter)
+      RECO_WORKER_DENY(SYS_io_uring_enter, EPERM),
+#endif
+#if defined(SYS_flock)
+      RECO_WORKER_DENY(SYS_flock, EPERM),
+#endif
+#if defined(SYS_chmod)
       RECO_WORKER_DENY(SYS_chmod, EPERM),
+#endif
+#if defined(SYS_fchmod)
       RECO_WORKER_DENY(SYS_fchmod, EPERM),
+#endif
+#if defined(SYS_fchmodat)
       RECO_WORKER_DENY(SYS_fchmodat, EPERM),
+#endif
 #if defined(SYS_fchmodat2)
       RECO_WORKER_DENY(SYS_fchmodat2, EPERM),
 #endif
@@ -2223,8 +2329,24 @@ void close_child_descriptors_except(int preserved) noexcept {
       RECO_WORKER_DENY(SYS_pivot_root, EPERM),
       RECO_WORKER_DENY(SYS_setns, EPERM),
       RECO_WORKER_DENY(SYS_unshare, EPERM),
+#if defined(SYS_io_uring_setup)
+      RECO_WORKER_DENY(SYS_io_uring_setup, EPERM),
+#endif
+#if defined(SYS_io_uring_register)
+      RECO_WORKER_DENY(SYS_io_uring_register, EPERM),
+#endif
+#if defined(SYS_io_uring_enter)
+      RECO_WORKER_DENY(SYS_io_uring_enter, EPERM),
+#endif
+#if defined(SYS_flock)
+      RECO_WORKER_DENY(SYS_flock, EPERM),
+#endif
+#if defined(SYS_fchmod)
       RECO_WORKER_DENY(SYS_fchmod, EPERM),
+#endif
+#if defined(SYS_fchmodat)
       RECO_WORKER_DENY(SYS_fchmodat, EPERM),
+#endif
 #if defined(SYS_fchmodat2)
       RECO_WORKER_DENY(SYS_fchmodat2, EPERM),
 #endif
@@ -2377,6 +2499,7 @@ public:
             errno_message("cannot create calibration worker plugin directory"));
       }
       populate_plugin_directory();
+      populate_runtime_overrides();
       if (::chmod(plugin_directory_.c_str(), S_IRUSR | S_IXUSR) != 0) {
         throw CalibrationExecutionError(
             errno_message("cannot seal calibration worker plugin directory"));
@@ -2393,6 +2516,9 @@ public:
 
   [[nodiscard]] const std::filesystem::path& scratch() const { return scratch_; }
   [[nodiscard]] const std::filesystem::path& plugin_directory() const { return plugin_directory_; }
+  [[nodiscard]] const std::vector<std::pair<std::string, std::string>>& runtime_overrides() const {
+    return runtime_overrides_;
+  }
 
 private:
   [[nodiscard]] static bool trusted_system_path(const std::filesystem::path& path) {
@@ -2469,10 +2595,92 @@ private:
     }
   }
 
+  void populate_runtime_overrides() {
+    static constexpr std::array environment_names{
+        "RECO_CUDA_DRIVER_DYLIB_PATH", "RECO_GSTREAMER_DYLIB_PATH", "RECO_GSTAPP_DYLIB_PATH",
+        "RECO_GLIB_DYLIB_PATH",        "RECO_GOBJECT_DYLIB_PATH",   "RECO_NVBUFSURFACE_DYLIB_PATH",
+        "RECO_NVDS_UTILS_DYLIB_PATH",
+    };
+    const auto runtime_directory = scratch_ / "runtime";
+    if (::mkdir(runtime_directory.c_str(), S_IRWXU) != 0) {
+      throw CalibrationExecutionError(
+          errno_message("cannot create calibration worker runtime directory"));
+    }
+    constexpr std::uint64_t maximum_runtime_bytes = 256ULL * 1024ULL * 1024ULL;
+    std::size_t runtime_index = 0;
+    for (const char* name : environment_names) {
+      const char* raw_path = std::getenv(name);
+      if (raw_path == nullptr || raw_path[0] == '\0') {
+        continue;
+      }
+      const std::filesystem::path source_path(raw_path);
+      if (!source_path.is_absolute()) {
+        throw CalibrationExecutionError("calibration worker runtime path must be absolute");
+      }
+      UniqueFd source(::open(source_path.c_str(), O_RDONLY | O_CLOEXEC));
+      struct stat before{};
+      if (!source || ::fstat(source.get(), &before) != 0 || !S_ISREG(before.st_mode) ||
+          before.st_size <= 0 ||
+          static_cast<std::uint64_t>(before.st_size) > maximum_runtime_bytes) {
+        throw CalibrationExecutionError("calibration worker runtime path must name a regular file");
+      }
+      const auto destination = runtime_directory / ("runtime-" + std::to_string(runtime_index++));
+      UniqueFd output(::open(destination.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0500));
+      if (!output) {
+        throw CalibrationExecutionError(
+            errno_message("cannot create calibration worker runtime snapshot"));
+      }
+      std::array<char, 64U * 1024U> buffer{};
+      while (true) {
+        ssize_t received = -1;
+        do {
+          received = ::read(source.get(), buffer.data(), buffer.size());
+        } while (received < 0 && errno == EINTR);
+        if (received < 0) {
+          throw CalibrationExecutionError(
+              errno_message("cannot read calibration worker runtime snapshot"));
+        }
+        if (received == 0) {
+          break;
+        }
+        std::size_t offset = 0;
+        while (offset < static_cast<std::size_t>(received)) {
+          ssize_t written = -1;
+          do {
+            written = ::write(output.get(), buffer.data() + offset,
+                              static_cast<std::size_t>(received) - offset);
+          } while (written < 0 && errno == EINTR);
+          if (written <= 0) {
+            throw CalibrationExecutionError(
+                errno_message("cannot write calibration worker runtime snapshot"));
+          }
+          offset += static_cast<std::size_t>(written);
+        }
+      }
+      struct stat after{};
+      struct stat snapshot{};
+      if (::fstat(source.get(), &after) != 0 || ::fstat(output.get(), &snapshot) != 0 ||
+          before.st_dev != after.st_dev || before.st_ino != after.st_ino ||
+          before.st_size != after.st_size || before.st_mtim.tv_sec != after.st_mtim.tv_sec ||
+          before.st_mtim.tv_nsec != after.st_mtim.tv_nsec || snapshot.st_size != before.st_size ||
+          ::fchmod(output.get(), S_IRUSR | S_IXUSR) != 0) {
+        throw CalibrationExecutionError("calibration worker runtime changed while snapshotted");
+      }
+      runtime_overrides_.emplace_back(name, destination.string());
+    }
+    if (::chmod(runtime_directory.c_str(), S_IRUSR | S_IXUSR) != 0) {
+      throw CalibrationExecutionError(
+          errno_message("cannot seal calibration worker runtime directory"));
+    }
+  }
+
   void cleanup() noexcept {
     try {
       if (!plugin_directory_.empty()) {
         (void)::chmod(plugin_directory_.c_str(), S_IRWXU);
+      }
+      if (!scratch_.empty()) {
+        (void)::chmod((scratch_ / "runtime").c_str(), S_IRWXU);
       }
       std::error_code error;
       (void)std::filesystem::remove_all(root_, error);
@@ -2483,6 +2691,7 @@ private:
   std::filesystem::path root_;
   std::filesystem::path scratch_;
   std::filesystem::path plugin_directory_;
+  std::vector<std::pair<std::string, std::string>> runtime_overrides_;
 };
 
 [[noreturn]] void exec_child(int executable, char* const* argv, char* const* environment) noexcept {
@@ -2541,7 +2750,8 @@ private:
 
 [[noreturn]] void worker_child(int executable, char* const* argv, char* const* environment,
                                std::uint64_t memory_limit, int child_gate, int parent_gate,
-                               const std::filesystem::path& scratch) noexcept {
+                               const std::filesystem::path& scratch, int left_input,
+                               int right_input) noexcept {
   (void)::close(parent_gate);
   char mapped = '\0';
   ssize_t map_received = -1;
@@ -2551,7 +2761,7 @@ private:
   if (map_received != 1 || mapped != 'S' || ::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) {
     child_exit();
   }
-  if (!install_worker_filesystem_boundary(scratch.c_str())) {
+  if (!install_worker_filesystem_boundary(scratch.c_str(), left_input, right_input)) {
     child_exit();
   }
   apply_worker_limit(memory_limit);
@@ -2723,7 +2933,8 @@ public:
         continue;
       }
       const auto name = entry.substr(0, separator);
-      if (unsafe_name(name) || (worker && overridden_worker_name(name))) {
+      if (unsafe_name(name) ||
+          (worker && (overridden_worker_name(name) || !allowed_worker_name(name)))) {
         continue;
       }
       if (storage_.size() >= maximum_entries || entry.size() > maximum_bytes - bytes) {
@@ -2759,6 +2970,9 @@ public:
       storage_.emplace_back("TMPDIR=" + scratch);
       storage_.emplace_back("TMP=" + scratch);
       storage_.emplace_back("TEMP=" + scratch);
+      for (const auto& [name, path] : worker_scratch->runtime_overrides()) {
+        storage_.emplace_back(name + "=" + path);
+      }
     }
     pointers_.reserve(storage_.size() + 1U);
     for (auto& entry : storage_) {
@@ -2788,7 +3002,28 @@ private:
            name == "GST_PLUGIN_SYSTEM_PATH_1_0" || name == "__GL_SHADER_DISK_CACHE" ||
            name == "RECO_CALIBRATION_PRE_MAIN_RESTRICTED" || name == "CUDA_CACHE_PATH" ||
            name == "HOME" || name == "XDG_CACHE_HOME" || name == "TMPDIR" || name == "TMP" ||
-           name == "TEMP";
+           name == "TEMP" || name == "RECO_CUDA_DRIVER_DYLIB_PATH" ||
+           name == "RECO_GSTREAMER_DYLIB_PATH" || name == "RECO_GSTAPP_DYLIB_PATH" ||
+           name == "RECO_GLIB_DYLIB_PATH" || name == "RECO_GOBJECT_DYLIB_PATH" ||
+           name == "RECO_NVBUFSURFACE_DYLIB_PATH" || name == "RECO_NVDS_UTILS_DYLIB_PATH";
+  }
+
+  [[nodiscard]] static bool allowed_worker_name(std::string_view name) {
+    return name == "ASAN_OPTIONS" || name == "LSAN_OPTIONS" || name == "MSAN_OPTIONS" ||
+           name == "TSAN_OPTIONS" || name == "UBSAN_OPTIONS" || name == "CUDA_DEVICE_ORDER" ||
+           name == "CUDA_MODULE_LOADING" || name == "CUDA_VISIBLE_DEVICES" ||
+           name == "NVIDIA_DRIVER_CAPABILITIES" || name == "NVIDIA_VISIBLE_DEVICES" ||
+           name == "RECO_CUDA_DRIVER_DYLIB_PATH" || name == "RECO_NVBUFSURFACE_DYLIB_PATH" ||
+           name == "RECO_NVDS_UTILS_DYLIB_PATH" || name == "RECO_GSTREAMER_DYLIB_PATH" ||
+           name == "RECO_GSTAPP_DYLIB_PATH" || name == "RECO_GLIB_DYLIB_PATH" ||
+           name == "RECO_GOBJECT_DYLIB_PATH" || name == "RECO_FAKE_GST_EVENT_PATH" ||
+           name == "RECO_FAKE_GST_SCENARIO" || name == "RECO_FAKE_CALIBRATION_FORBIDDEN_FD" ||
+           name == "RECO_FAKE_CALIBRATION_METADATA_TARGET" ||
+           name == "RECO_FAKE_CALIBRATION_PRE_REQUEST_DELAY_MS" ||
+           name == "RECO_FAKE_CALIBRATION_SIGNAL_TARGET_PID" ||
+           name == "RECO_FAKE_CALIBRATION_WORKER_PID_PATH" ||
+           name == "RECO_FAKE_CALIBRATION_WORKER_SCENARIO" ||
+           name == "RECO_FAKE_CALIBRATION_WRITE_TARGET";
   }
 
   std::vector<std::string> storage_;
@@ -2863,7 +3098,8 @@ private:
                                        int cgroup_fd, std::string_view address,
                                        Clock::time_point deadline,
                                        Clock::time_point cleanup_deadline,
-                                       std::uint64_t memory_limit) {
+                                       std::uint64_t memory_limit, int left_input,
+                                       int right_input) {
   std::vector<std::string> arguments{std::string(kCalibrationWorkerIpcArgument),
                                      std::string(address),
                                      std::to_string(time_point_nanoseconds(deadline))};
@@ -2880,7 +3116,7 @@ private:
       0,
       [&] {
         worker_child(executable_fd, argv.data(), environment.data(), memory_limit, child_gate.get(),
-                     parent_gate.get(), scratch->scratch());
+                     parent_gate.get(), scratch->scratch(), left_input, right_input);
       },
       cgroup_fd, cleanup_deadline);
   child_gate.reset();
@@ -2934,12 +3170,11 @@ void certify_channel_eof(int descriptor) {
 supervise_worker(int caller_socket, const std::string& executable, int executable_fd, int cgroup_fd,
                  const std::string& encoded_request, const GpuCalibrationRequest& request,
                  Clock::time_point worker_deadline, Clock::time_point cleanup_deadline,
-                 int admission_fd, int left_input_fd, int right_input_fd,
-                 bool* authority_reported) {
+                 int left_input_fd, int right_input_fd, bool* authority_reported) {
   auto listener = create_listener();
-  auto worker =
-      spawn_worker(executable, executable_fd, cgroup_fd, listener.address, worker_deadline,
-                   cleanup_deadline, request.calibration_host_memory_limit_bytes);
+  auto worker = spawn_worker(
+      executable, executable_fd, cgroup_fd, listener.address, worker_deadline, cleanup_deadline,
+      request.calibration_host_memory_limit_bytes, left_input_fd, right_input_fd);
   try {
     send_file_fd(caller_socket, worker.process(), 'P', worker.process().pidfd(), worker_deadline,
                  -1, request.calibration_host_memory_limit_bytes);
@@ -2947,8 +3182,6 @@ supervise_worker(int caller_socket, const std::string& executable, int executabl
     worker.release(worker_deadline);
     auto channel = accept_authenticated(listener, worker.process(), worker_deadline,
                                         request.calibration_host_memory_limit_bytes);
-    send_file_fd(channel.get(), worker.process(), 'L', admission_fd, worker_deadline, caller_socket,
-                 request.calibration_host_memory_limit_bytes);
     write_all(channel.get(), worker.process(), encoded_request, worker_deadline, caller_socket,
               request.calibration_host_memory_limit_bytes);
     if (left_input_fd >= 0) {
@@ -3022,7 +3255,7 @@ int run_calibration_guardian_fd(int descriptor, const char* executable,
     const auto response =
         supervise_worker(descriptor, executable, executable_image.get(), cgroup.get(),
                          encoded_request, request, deadline - kCleanupReserve, deadline,
-                         admission.get(), left_input.get(), right_input.get(), &authority_reported);
+                         left_input.get(), right_input.get(), &authority_reported);
     write_plain_all(descriptor, response, deadline);
     return EXIT_SUCCESS;
   } catch (const std::exception& error) {

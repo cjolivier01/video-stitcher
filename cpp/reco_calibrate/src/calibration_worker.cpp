@@ -378,7 +378,6 @@ int run_calibration_worker_fd(int descriptor, std::uint64_t deadline_nanoseconds
   if (descriptor < 0) {
     return EXIT_FAILURE;
   }
-  int admission = -1;
   int left_input = -1;
   int right_input = -1;
   try {
@@ -386,7 +385,6 @@ int run_calibration_worker_fd(int descriptor, std::uint64_t deadline_nanoseconds
     if (!deadline.has_value()) {
       return EXIT_FAILURE;
     }
-    admission = receive_calibration_admission_fd(descriptor, deadline_nanoseconds);
     const auto result = run_calibration_worker_io(
         [descriptor, deadline](char* destination, std::size_t size) {
           read_fd_exact(descriptor, destination, size, *deadline);
@@ -409,7 +407,6 @@ int run_calibration_worker_fd(int descriptor, std::uint64_t deadline_nanoseconds
             request.right.retained_path = retained_path(right_input);
           }
         });
-    (void)::close(admission);
     if (left_input >= 0) {
       (void)::close(left_input);
     }
@@ -418,9 +415,6 @@ int run_calibration_worker_fd(int descriptor, std::uint64_t deadline_nanoseconds
     }
     return result;
   } catch (...) {
-    if (admission >= 0) {
-      (void)::close(admission);
-    }
     if (left_input >= 0) {
       (void)::close(left_input);
     }
