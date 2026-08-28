@@ -809,8 +809,21 @@ public:
   [[nodiscard]] std::string_view pipeline() const override { return pipeline_description_; }
   [[nodiscard]] bool gpu_resident() const override { return true; }
 
+  void request_stop() noexcept override {
+    bool expected = false;
+    if (!stop_requested_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+      return;
+    }
+    if (pipeline_ != nullptr) {
+      (void)api_->element_set_state(pipeline_, kGstStateNull);
+    }
+  }
+
   void seek_to_frame(std::uint64_t frame_index) override {
     std::lock_guard lock(read_mutex_);
+    if (stop_requested_.load(std::memory_order_acquire)) {
+      throw GpuDecodeError("GStreamer GPU decode source has been stopped");
+    }
     if (terminal_error_.has_value()) {
       throw GpuDecodeError(*terminal_error_);
     }
@@ -828,6 +841,10 @@ public:
     std::lock_guard lock(read_mutex_);
     if (terminal_error_.has_value()) {
       throw GpuDecodeError(*terminal_error_);
+    }
+    if (stop_requested_.load(std::memory_order_acquire)) {
+      ended_ = true;
+      return make_gpu_decode_eos();
     }
     throw_if_geometry_probe_failed();
     if (ended_) {
@@ -849,6 +866,13 @@ public:
       const auto poll_timeout =
           std::min<std::uint64_t>(kSamplePollTimeoutNs, static_cast<std::uint64_t>(remaining));
       sample = api_->app_sink_try_pull_sample(sink_, poll_timeout);
+      if (stop_requested_.load(std::memory_order_acquire)) {
+        if (sample != nullptr) {
+          api_->sample_unref(sample);
+        }
+        ended_ = true;
+        return make_gpu_decode_eos();
+      }
       if (sample != nullptr) {
         break;
       }
@@ -1249,6 +1273,7 @@ private:
   std::uint64_t frames_emitted_ = 0;
   std::uint16_t rotation_degrees_ = 0;
   std::optional<std::string> terminal_error_;
+  std::atomic<bool> stop_requested_{false};
   bool ended_ = false;
 };
 

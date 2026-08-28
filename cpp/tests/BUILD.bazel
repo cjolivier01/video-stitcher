@@ -166,6 +166,13 @@ cc_test(
 )
 
 cc_test(
+    name = "reco_io_gpu_decode_session_tests",
+    size = "small",
+    srcs = ["reco_io_gpu_decode_session_tests.cpp"],
+    deps = ["//cpp/reco_io"],
+)
+
+cc_test(
     name = "reco_io_gpu_video_probe_tests",
     size = "medium",
     srcs = ["reco_io_gpu_video_probe_tests.cpp"],

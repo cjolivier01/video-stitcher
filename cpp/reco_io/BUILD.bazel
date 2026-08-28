@@ -4,6 +4,7 @@ _RECO_IO_SRCS = [
     "src/gstreamer.cpp",
     "src/gstreamer_gpu_decode.cpp",
     "src/gpu_decode.cpp",
+    "src/gpu_decode_session.cpp",
     "src/gpu_video_probe.cpp",
     "src/gpu_video_probe_internal.hpp",
     "src/gpu_video_probe_process.cpp",
