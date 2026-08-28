@@ -380,10 +380,10 @@ class StableCalibrationProfiles {
 public:
   explicit StableCalibrationProfiles(const GpuCalibrationRequest& request) {
     if (request.left.lens_profile.has_value()) {
-      left_.emplace(*request.left.lens_profile);
+      left_.emplace(*request.left.lens_profile, request.left.lens_profile_expected_identity);
     }
     if (request.right.lens_profile.has_value()) {
-      right_.emplace(*request.right.lens_profile);
+      right_.emplace(*request.right.lens_profile, request.right.lens_profile_expected_identity);
     }
   }
 
@@ -793,8 +793,9 @@ CalibrationResult detail::run_gpu_calibration_in_process(const GpuCalibrationReq
   try {
     auto left_config = calibration_decode_config(request.left.path);
     auto right_config = calibration_decode_config(request.right.path);
-    StableMediaFile left_media(calibration_open_path(request.left));
-    StableMediaFile right_media(calibration_open_path(request.right));
+    StableMediaFile left_media(calibration_open_path(request.left), request.left.expected_identity);
+    StableMediaFile right_media(calibration_open_path(request.right),
+                                request.right.expected_identity);
     StableCalibrationProfiles profiles(request);
     left_config.path = left_media.decode_path().string();
     right_config.path = right_media.decode_path().string();

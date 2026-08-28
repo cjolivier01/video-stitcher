@@ -267,6 +267,39 @@ struct PinnedFileIdentity {
     return std::filesystem::path("/proc") / std::to_string(::getpid()) / "fd" /
            std::to_string(descriptor.get());
   }
+
+  [[nodiscard]] reco::calibrate::CalibrationFileIdentity portable_identity() const {
+    return {
+        .device = static_cast<std::uint64_t>(identity.st_dev),
+        .inode = static_cast<std::uint64_t>(identity.st_ino),
+        .size = static_cast<std::uint64_t>(identity.st_size),
+        .mode = static_cast<std::uint32_t>(identity.st_mode),
+        .modified_seconds = static_cast<std::int64_t>(identity.st_mtim.tv_sec),
+        .modified_nanoseconds = static_cast<std::int64_t>(identity.st_mtim.tv_nsec),
+        .changed_seconds = static_cast<std::int64_t>(identity.st_ctim.tv_sec),
+        .changed_nanoseconds = static_cast<std::int64_t>(identity.st_ctim.tv_nsec),
+    };
+  }
+
+  void verify_unchanged() const {
+    struct stat current{};
+    if (::fstat(descriptor.get(), &current) != 0) {
+      throw std::runtime_error("cannot re-inspect " + label + " before publication");
+    }
+    const auto observed = reco::calibrate::CalibrationFileIdentity{
+        .device = static_cast<std::uint64_t>(current.st_dev),
+        .inode = static_cast<std::uint64_t>(current.st_ino),
+        .size = static_cast<std::uint64_t>(current.st_size),
+        .mode = static_cast<std::uint32_t>(current.st_mode),
+        .modified_seconds = static_cast<std::int64_t>(current.st_mtim.tv_sec),
+        .modified_nanoseconds = static_cast<std::int64_t>(current.st_mtim.tv_nsec),
+        .changed_seconds = static_cast<std::int64_t>(current.st_ctim.tv_sec),
+        .changed_nanoseconds = static_cast<std::int64_t>(current.st_ctim.tv_nsec),
+    };
+    if (observed != portable_identity()) {
+      throw std::runtime_error(label + " changed before calibration output publication");
+    }
+  }
 };
 
 [[nodiscard]] PinnedFileIdentity pin_input_identity(const std::filesystem::path& path,
@@ -280,7 +313,7 @@ struct PinnedFileIdentity {
   if (::fstat(descriptor, &pinned.identity) != 0) {
     throw_file_error("cannot inspect " + std::string(label), path, errno);
   }
-  if (!S_ISREG(pinned.identity.st_mode)) {
+  if (!S_ISREG(pinned.identity.st_mode) || pinned.identity.st_size <= 0) {
     throw std::runtime_error(std::string(label) + " must be a regular file: " + path.string());
   }
   return pinned;
@@ -612,7 +645,8 @@ void write_calibration_json_atomically_impl(std::string_view json,
 }
 
 void write_calibration_result(const reco::calibrate::CalibrationResult& result,
-                              const reco::calibrate::GpuCalibrationRequest& request) {
+                              const reco::calibrate::GpuCalibrationRequest& request,
+                              const std::function<void()>& before_publish = {}) {
   const auto json = reco::core::calibration_to_json(result.calibration);
   const auto reparsed = reco::core::parse_match_calibration_json(json);
   if (!reparsed.has_value() || !reparsed->validate().empty()) {
@@ -630,8 +664,8 @@ void write_calibration_result(const reco::calibrate::CalibrationResult& result,
   if (request.right.lens_profile.has_value()) {
     profiles.emplace_back(*request.right.lens_profile);
   }
-  detail::write_calibration_json_atomically(json, request.output, left_path, right_path, {},
-                                            profiles);
+  detail::write_calibration_json_atomically(json, request.output, left_path, right_path,
+                                            before_publish, profiles);
 }
 
 void write_calibration_result_summary(const reco::calibrate::CalibrationResult& result,
@@ -1896,11 +1930,17 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err,
       auto pinned_request = request;
       pinned_request.left.retained_path = left_identity.retained_path().string();
       pinned_request.right.retained_path = right_identity.retained_path().string();
+      pinned_request.left.expected_identity = left_identity.portable_identity();
+      pinned_request.right.expected_identity = right_identity.portable_identity();
       if (left_profile_identity.has_value()) {
         pinned_request.left.lens_profile = left_profile_identity->retained_path().string();
+        pinned_request.left.lens_profile_expected_identity =
+            left_profile_identity->portable_identity();
       }
       if (right_profile_identity.has_value()) {
         pinned_request.right.lens_profile = right_profile_identity->retained_path().string();
+        pinned_request.right.lens_profile_expected_identity =
+            right_profile_identity->portable_identity();
       }
       auto result = reco::calibrate::run_gpu_calibration(pinned_request, backends);
       if (result.left_lens_profile.has_value()) {
@@ -1911,7 +1951,18 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err,
                                               ? request.right.lens_profile
                                               : request.left.lens_profile;
       }
-      write_calibration_result(result, pinned_request);
+      const auto verify_pinned_inputs = [&] {
+        left_identity.verify_unchanged();
+        right_identity.verify_unchanged();
+        if (left_profile_identity.has_value()) {
+          left_profile_identity->verify_unchanged();
+        }
+        if (right_profile_identity.has_value()) {
+          right_profile_identity->verify_unchanged();
+        }
+      };
+      verify_pinned_inputs();
+      write_calibration_result(result, pinned_request, verify_pinned_inputs);
 #else
       const auto result = reco::calibrate::run_gpu_calibration(request, backends);
       write_calibration_result(result, request);

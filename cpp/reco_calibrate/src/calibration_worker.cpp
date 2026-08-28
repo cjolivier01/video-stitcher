@@ -305,6 +305,16 @@ int receive_calibration_right_input_fd(int descriptor, std::uint64_t deadline_na
                                      "right input");
 }
 
+int receive_calibration_left_profile_fd(int descriptor, std::uint64_t deadline_nanoseconds) {
+  return receive_calibration_file_fd(descriptor, deadline_nanoseconds, 'K', false, false,
+                                     "left lens profile");
+}
+
+int receive_calibration_right_profile_fd(int descriptor, std::uint64_t deadline_nanoseconds) {
+  return receive_calibration_file_fd(descriptor, deadline_nanoseconds, 'M', false, false,
+                                     "right lens profile");
+}
+
 int receive_calibration_cgroup_fd(int descriptor, std::uint64_t deadline_nanoseconds) {
 #if defined(__linux__)
   const auto deadline = ipc_deadline(deadline_nanoseconds);
@@ -380,6 +390,8 @@ int run_calibration_worker_fd(int descriptor, std::uint64_t deadline_nanoseconds
   }
   int left_input = -1;
   int right_input = -1;
+  int left_profile = -1;
+  int right_profile = -1;
   try {
     const auto deadline = ipc_deadline(deadline_nanoseconds);
     if (!deadline.has_value()) {
@@ -406,12 +418,26 @@ int run_calibration_worker_fd(int descriptor, std::uint64_t deadline_nanoseconds
             right_input = receive_calibration_right_input_fd(descriptor, deadline_nanoseconds);
             request.right.retained_path = retained_path(right_input);
           }
+          if (request.left.lens_profile.has_value()) {
+            left_profile = receive_calibration_left_profile_fd(descriptor, deadline_nanoseconds);
+            request.left.lens_profile = retained_path(left_profile);
+          }
+          if (request.right.lens_profile.has_value()) {
+            right_profile = receive_calibration_right_profile_fd(descriptor, deadline_nanoseconds);
+            request.right.lens_profile = retained_path(right_profile);
+          }
         });
     if (left_input >= 0) {
       (void)::close(left_input);
     }
     if (right_input >= 0) {
       (void)::close(right_input);
+    }
+    if (left_profile >= 0) {
+      (void)::close(left_profile);
+    }
+    if (right_profile >= 0) {
+      (void)::close(right_profile);
     }
     return result;
   } catch (...) {
@@ -420,6 +446,12 @@ int run_calibration_worker_fd(int descriptor, std::uint64_t deadline_nanoseconds
     }
     if (right_input >= 0) {
       (void)::close(right_input);
+    }
+    if (left_profile >= 0) {
+      (void)::close(left_profile);
+    }
+    if (right_profile >= 0) {
+      (void)::close(right_profile);
     }
     return EXIT_FAILURE;
   }

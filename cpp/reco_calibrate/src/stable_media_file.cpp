@@ -29,11 +29,25 @@ bool same_timestamp(const timespec& left, const timespec& right) {
   return left.tv_sec == right.tv_sec && left.tv_nsec == right.tv_nsec;
 }
 
+CalibrationFileIdentity portable_identity(const struct stat& value) {
+  return {
+      .device = static_cast<std::uint64_t>(value.st_dev),
+      .inode = static_cast<std::uint64_t>(value.st_ino),
+      .size = static_cast<std::uint64_t>(value.st_size),
+      .mode = static_cast<std::uint32_t>(value.st_mode),
+      .modified_seconds = static_cast<std::int64_t>(value.st_mtim.tv_sec),
+      .modified_nanoseconds = static_cast<std::int64_t>(value.st_mtim.tv_nsec),
+      .changed_seconds = static_cast<std::int64_t>(value.st_ctim.tv_sec),
+      .changed_nanoseconds = static_cast<std::int64_t>(value.st_ctim.tv_nsec),
+  };
+}
+
 } // namespace
 
 struct StableFileState {
   StableFileState(const std::filesystem::path& path, const char* file_kind,
-                  bool require_original_path_identity)
+                  bool require_original_path_identity,
+                  const std::optional<CalibrationFileIdentity>& expected_identity)
       : original_path(path), kind(file_kind), verify_path_identity(require_original_path_identity) {
     descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (descriptor < 0) {
@@ -56,6 +70,12 @@ struct StableFileState {
       ::close(descriptor);
       descriptor = -1;
       throw CalibrationExecutionError(std::string(kind) + " must not be empty: " + path.string());
+    }
+    if (expected_identity.has_value() && portable_identity(identity) != *expected_identity) {
+      ::close(descriptor);
+      descriptor = -1;
+      throw CalibrationExecutionError(
+          std::string(kind) + " changed before isolated processing began: " + path.string());
     }
     if (::flock(descriptor, LOCK_SH | LOCK_NB) != 0) {
       const auto saved_error = errno;
@@ -106,19 +126,21 @@ struct StableFileState {
 };
 
 struct StableMediaFile::Impl : StableFileState {
-  explicit Impl(const std::filesystem::path& path)
-      : StableFileState(path, "calibration video", false) {}
+  Impl(const std::filesystem::path& path,
+       const std::optional<CalibrationFileIdentity>& expected_identity)
+      : StableFileState(path, "calibration video", false, expected_identity) {}
 };
 
 struct StableLensProfileFile::Impl : StableFileState {
-  explicit Impl(const std::filesystem::path& path)
-      : StableFileState(path, "calibration lens profile", true) {}
+  Impl(const std::filesystem::path& path,
+       const std::optional<CalibrationFileIdentity>& expected_identity)
+      : StableFileState(path, "calibration lens profile", true, expected_identity) {}
 };
 
 #else
 
 struct StableMediaFile::Impl {
-  explicit Impl(const std::filesystem::path&) {
+  Impl(const std::filesystem::path&, const std::optional<CalibrationFileIdentity>&) {
     throw CalibrationExecutionError(
         "stable file-backed GPU calibration is currently supported only on Linux");
   }
@@ -127,7 +149,7 @@ struct StableMediaFile::Impl {
 };
 
 struct StableLensProfileFile::Impl {
-  explicit Impl(const std::filesystem::path&) {
+  Impl(const std::filesystem::path&, const std::optional<CalibrationFileIdentity>&) {
     throw CalibrationExecutionError(
         "stable file-backed GPU calibration is currently supported only on Linux");
   }
@@ -137,8 +159,9 @@ struct StableLensProfileFile::Impl {
 
 #endif
 
-StableMediaFile::StableMediaFile(const std::filesystem::path& path)
-    : impl_(std::make_unique<Impl>(path)) {}
+StableMediaFile::StableMediaFile(const std::filesystem::path& path,
+                                 std::optional<CalibrationFileIdentity> expected_identity)
+    : impl_(std::make_unique<Impl>(path, expected_identity)) {}
 
 StableMediaFile::~StableMediaFile() = default;
 StableMediaFile::StableMediaFile(StableMediaFile&&) noexcept = default;
@@ -158,8 +181,9 @@ void StableMediaFile::verify_unchanged() const {
   impl_->verify_unchanged();
 }
 
-StableLensProfileFile::StableLensProfileFile(const std::filesystem::path& path)
-    : impl_(std::make_unique<Impl>(path)) {}
+StableLensProfileFile::StableLensProfileFile(
+    const std::filesystem::path& path, std::optional<CalibrationFileIdentity> expected_identity)
+    : impl_(std::make_unique<Impl>(path, expected_identity)) {}
 
 StableLensProfileFile::~StableLensProfileFile() = default;
 StableLensProfileFile::StableLensProfileFile(StableLensProfileFile&&) noexcept = default;

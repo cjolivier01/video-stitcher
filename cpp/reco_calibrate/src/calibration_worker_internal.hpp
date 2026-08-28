@@ -37,6 +37,12 @@ run_gpu_calibration_supervised(const GpuCalibrationRequest& request);
 /// Receives and validates a retained right calibration-media descriptor.
 [[nodiscard]] int receive_calibration_right_input_fd(int descriptor,
                                                      std::uint64_t deadline_nanoseconds);
+/// Receives and validates a retained left lens-profile descriptor.
+[[nodiscard]] int receive_calibration_left_profile_fd(int descriptor,
+                                                      std::uint64_t deadline_nanoseconds);
+/// Receives and validates a retained right lens-profile descriptor.
+[[nodiscard]] int receive_calibration_right_profile_fd(int descriptor,
+                                                       std::uint64_t deadline_nanoseconds);
 /// Receives and validates the delegated cgroup-v2 directory descriptor.
 [[nodiscard]] int receive_calibration_cgroup_fd(int descriptor, std::uint64_t deadline_nanoseconds);
 /// Runs the Linux guardian that owns worker launch and cleanup.

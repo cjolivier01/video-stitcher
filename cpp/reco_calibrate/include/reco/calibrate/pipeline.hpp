@@ -27,6 +27,10 @@ struct CalibrationVideoInput {
   /// Stable descriptor-backed path used for opening and identity checks.
   /// The original path remains the explicit codec/container format hint.
   std::optional<std::string> retained_path;
+  /// Metadata captured when the media descriptor was first pinned.
+  std::optional<CalibrationFileIdentity> expected_identity;
+  /// Metadata captured when the selected lens profile was first pinned.
+  std::optional<CalibrationFileIdentity> lens_profile_expected_identity;
 };
 
 struct GpuCalibrationRequest {

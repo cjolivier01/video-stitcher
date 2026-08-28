@@ -1,14 +1,18 @@
 #pragma once
 
+#include "reco/calibrate/types.hpp"
+
 #include <filesystem>
 #include <memory>
+#include <optional>
 
 namespace reco::calibrate::detail {
 
 /// Retains one immutable media identity across parser probing and GPU decode.
 class StableMediaFile {
 public:
-  explicit StableMediaFile(const std::filesystem::path& path);
+  explicit StableMediaFile(const std::filesystem::path& path,
+                           std::optional<CalibrationFileIdentity> expected_identity = std::nullopt);
   ~StableMediaFile();
 
   StableMediaFile(const StableMediaFile&) = delete;
@@ -29,7 +33,9 @@ private:
 /// Retains one immutable lens-profile identity across calibration.
 class StableLensProfileFile {
 public:
-  explicit StableLensProfileFile(const std::filesystem::path& path);
+  explicit StableLensProfileFile(
+      const std::filesystem::path& path,
+      std::optional<CalibrationFileIdentity> expected_identity = std::nullopt);
   ~StableLensProfileFile();
 
   StableLensProfileFile(const StableLensProfileFile&) = delete;

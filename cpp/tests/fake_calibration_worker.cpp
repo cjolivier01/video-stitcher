@@ -312,11 +312,20 @@ int main(int argc, char** argv) {
     const int right_input = receive_calibration_right_input_fd(descriptor, deadline);
     request.right.retained_path = retained_path(right_input);
   }
+  if (request.left.lens_profile.has_value()) {
+    const int left_profile = receive_calibration_left_profile_fd(descriptor, deadline);
+    request.left.lens_profile = retained_path(left_profile);
+  }
+  if (request.right.lens_profile.has_value()) {
+    const int right_profile = receive_calibration_right_profile_fd(descriptor, deadline);
+    request.right.lens_profile = retained_path(right_profile);
+  }
   write_environment_pid_marker("RECO_FAKE_CALIBRATION_WORKER_PID_PATH", host_process_id());
   const char* raw_scenario = std::getenv("RECO_FAKE_CALIBRATION_WORKER_SCENARIO");
   const std::string_view scenario = raw_scenario == nullptr ? "success" : raw_scenario;
   if (scenario == "retained-inputs") {
-    if (!request.left.retained_path.has_value() || !request.right.retained_path.has_value()) {
+    if (!request.left.retained_path.has_value() || !request.right.retained_path.has_value() ||
+        !request.left.lens_profile.has_value() || !request.right.lens_profile.has_value()) {
       return EXIT_FAILURE;
     }
     std::ifstream left(*request.left.retained_path, std::ios::binary);
@@ -325,7 +334,15 @@ int main(int argc, char** argv) {
                                     std::istreambuf_iterator<char>()};
     const std::string right_contents{std::istreambuf_iterator<char>(right),
                                      std::istreambuf_iterator<char>()};
-    if (left_contents != "retained left input\n" || right_contents != "retained right input\n") {
+    std::ifstream left_profile(*request.left.lens_profile, std::ios::binary);
+    std::ifstream right_profile(*request.right.lens_profile, std::ios::binary);
+    const std::string left_profile_contents{std::istreambuf_iterator<char>(left_profile),
+                                            std::istreambuf_iterator<char>()};
+    const std::string right_profile_contents{std::istreambuf_iterator<char>(right_profile),
+                                             std::istreambuf_iterator<char>()};
+    if (left_contents != "retained left input\n" || right_contents != "retained right input\n" ||
+        left_profile_contents != "retained left profile\n" ||
+        right_profile_contents != "retained right profile\n") {
       return EXIT_FAILURE;
     }
     write_bytes(descriptor, encode_calibration_worker_success(result()), deadline);

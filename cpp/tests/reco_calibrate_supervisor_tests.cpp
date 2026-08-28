@@ -122,9 +122,8 @@ std::filesystem::path executable_runfile(std::string path) {
 GpuCalibrationRequest request_fixture() {
   GpuCalibrationRequest request;
   request.left.path = "left.mp4";
-  request.left.lens_profile = "/profiles/left.json";
+  request.left.lens_profile = fake_worker.string();
   request.right.path = "right.mp4";
-  request.right.lens_profile = "/profiles/right.json";
   request.config.num_frames = 2;
   request.no_auto_imu = true;
   request.auto_sync = false;
@@ -280,6 +279,8 @@ void success_returns_only_the_compact_result() {
 void retained_input_descriptors_reach_the_sandboxed_worker() {
   const auto left = temporary_path("retained-left.mp4");
   const auto right = temporary_path("retained-right.mp4");
+  const auto left_profile = temporary_path("retained-left-profile.json");
+  const auto right_profile = temporary_path("retained-right-profile.json");
   {
     std::ofstream output(left, std::ios::binary | std::ios::trunc);
     output << "retained left input\n";
@@ -288,9 +289,19 @@ void retained_input_descriptors_reach_the_sandboxed_worker() {
     std::ofstream output(right, std::ios::binary | std::ios::trunc);
     output << "retained right input\n";
   }
+  {
+    std::ofstream output(left_profile, std::ios::binary | std::ios::trunc);
+    output << "retained left profile\n";
+  }
+  {
+    std::ofstream output(right_profile, std::ios::binary | std::ios::trunc);
+    output << "retained right profile\n";
+  }
   auto request = request_fixture();
   request.left.retained_path = left.string();
   request.right.retained_path = right.string();
+  request.left.lens_profile = left_profile.string();
+  request.right.lens_profile = right_profile.string();
   {
     Scenario scenario("retained-inputs");
     expect_eq(run_gpu_calibration(request, ready_backends()).total_matches, 12U,
@@ -298,6 +309,8 @@ void retained_input_descriptors_reach_the_sandboxed_worker() {
   }
   std::filesystem::remove(left);
   std::filesystem::remove(right);
+  std::filesystem::remove(left_profile);
+  std::filesystem::remove(right_profile);
 }
 
 void native_stdout_noise_does_not_corrupt_protocol() {
@@ -314,8 +327,6 @@ void delayed_worker_request_io_obeys_the_deadline() {
     auto request = request_fixture();
     request.left.path = std::string(12U * 1024U - 4U, 'l') + ".mp4";
     request.right.path = std::string(12U * 1024U - 4U, 'r') + ".mp4";
-    request.left.lens_profile = std::string(12U * 1024U - 5U, 'a') + ".json";
-    request.right.lens_profile = std::string(12U * 1024U - 5U, 'b') + ".json";
     request.calibration_timeout_ns = 2'000'000'000ULL;
     const auto result = run_gpu_calibration(request, ready_backends());
     expect_eq(result.total_matches, 256U * 12U,

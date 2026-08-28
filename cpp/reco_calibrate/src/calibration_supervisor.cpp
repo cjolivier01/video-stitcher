@@ -109,6 +109,19 @@ constexpr std::uint32_t kX32SyscallBit = 0x40000000U;
 constexpr std::uint32_t kSeccompArchitecture = AUDIT_ARCH_AARCH64;
 #endif
 
+[[nodiscard]] CalibrationFileIdentity portable_file_identity(const struct stat& value) {
+  return {
+      .device = static_cast<std::uint64_t>(value.st_dev),
+      .inode = static_cast<std::uint64_t>(value.st_ino),
+      .size = static_cast<std::uint64_t>(value.st_size),
+      .mode = static_cast<std::uint32_t>(value.st_mode),
+      .modified_seconds = static_cast<std::int64_t>(value.st_mtim.tv_sec),
+      .modified_nanoseconds = static_cast<std::int64_t>(value.st_mtim.tv_nsec),
+      .changed_seconds = static_cast<std::int64_t>(value.st_ctim.tv_sec),
+      .changed_nanoseconds = static_cast<std::int64_t>(value.st_ctim.tv_nsec),
+  };
+}
+
 class UniqueFd {
 public:
   UniqueFd() = default;
@@ -1979,12 +1992,15 @@ void close_child_descriptors_except(int preserved) noexcept {
 }
 
 [[nodiscard]] bool install_worker_filesystem_boundary(const char* scratch, int left_input,
-                                                      int right_input) noexcept {
+                                                      int right_input, int left_profile,
+                                                      int right_profile) noexcept {
 #if !defined(SYS_landlock_create_ruleset) || !defined(SYS_landlock_add_rule) ||                    \
     !defined(SYS_landlock_restrict_self)
   (void)scratch;
   (void)left_input;
   (void)right_input;
+  (void)left_profile;
+  (void)right_profile;
   return false;
 #else
   if (scratch == nullptr || scratch[0] != '/') {
@@ -2137,7 +2153,8 @@ void close_child_descriptors_except(int preserved) noexcept {
   if (!devices_allowed || !system_reads_allowed || worker_proc_size <= 0 ||
       static_cast<std::size_t>(worker_proc_size) >= sizeof(worker_proc) ||
       !allow_path(worker_proc, proc_access) || !allow_input(left_input) ||
-      !allow_input(right_input) || !allow_path(scratch, write_access | read_access) ||
+      !allow_input(right_input) || !allow_input(left_profile) || !allow_input(right_profile) ||
+      !allow_path(scratch, write_access | read_access) ||
       ::prctl(PR_SET_NO_NEW_PRIVS, 1L, 0L, 0L, 0L) != 0 ||
       ::syscall(SYS_landlock_restrict_self, ruleset.get(), 0U) != 0) {
     return false;
@@ -2751,7 +2768,7 @@ private:
 [[noreturn]] void worker_child(int executable, char* const* argv, char* const* environment,
                                std::uint64_t memory_limit, int child_gate, int parent_gate,
                                const std::filesystem::path& scratch, int left_input,
-                               int right_input) noexcept {
+                               int right_input, int left_profile, int right_profile) noexcept {
   (void)::close(parent_gate);
   char mapped = '\0';
   ssize_t map_received = -1;
@@ -2761,7 +2778,8 @@ private:
   if (map_received != 1 || mapped != 'S' || ::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0) {
     child_exit();
   }
-  if (!install_worker_filesystem_boundary(scratch.c_str(), left_input, right_input)) {
+  if (!install_worker_filesystem_boundary(scratch.c_str(), left_input, right_input, left_profile,
+                                          right_profile)) {
     child_exit();
   }
   apply_worker_limit(memory_limit);
@@ -3098,8 +3116,8 @@ private:
                                        int cgroup_fd, std::string_view address,
                                        Clock::time_point deadline,
                                        Clock::time_point cleanup_deadline,
-                                       std::uint64_t memory_limit, int left_input,
-                                       int right_input) {
+                                       std::uint64_t memory_limit, int left_input, int right_input,
+                                       int left_profile, int right_profile) {
   std::vector<std::string> arguments{std::string(kCalibrationWorkerIpcArgument),
                                      std::string(address),
                                      std::to_string(time_point_nanoseconds(deadline))};
@@ -3116,7 +3134,8 @@ private:
       0,
       [&] {
         worker_child(executable_fd, argv.data(), environment.data(), memory_limit, child_gate.get(),
-                     parent_gate.get(), scratch->scratch(), left_input, right_input);
+                     parent_gate.get(), scratch->scratch(), left_input, right_input, left_profile,
+                     right_profile);
       },
       cgroup_fd, cleanup_deadline);
   child_gate.reset();
@@ -3170,11 +3189,13 @@ void certify_channel_eof(int descriptor) {
 supervise_worker(int caller_socket, const std::string& executable, int executable_fd, int cgroup_fd,
                  const std::string& encoded_request, const GpuCalibrationRequest& request,
                  Clock::time_point worker_deadline, Clock::time_point cleanup_deadline,
-                 int left_input_fd, int right_input_fd, bool* authority_reported) {
+                 int left_input_fd, int right_input_fd, int left_profile_fd, int right_profile_fd,
+                 bool* authority_reported) {
   auto listener = create_listener();
-  auto worker = spawn_worker(
-      executable, executable_fd, cgroup_fd, listener.address, worker_deadline, cleanup_deadline,
-      request.calibration_host_memory_limit_bytes, left_input_fd, right_input_fd);
+  auto worker =
+      spawn_worker(executable, executable_fd, cgroup_fd, listener.address, worker_deadline,
+                   cleanup_deadline, request.calibration_host_memory_limit_bytes, left_input_fd,
+                   right_input_fd, left_profile_fd, right_profile_fd);
   try {
     send_file_fd(caller_socket, worker.process(), 'P', worker.process().pidfd(), worker_deadline,
                  -1, request.calibration_host_memory_limit_bytes);
@@ -3190,6 +3211,14 @@ supervise_worker(int caller_socket, const std::string& executable, int executabl
     }
     if (right_input_fd >= 0) {
       send_file_fd(channel.get(), worker.process(), 'J', right_input_fd, worker_deadline,
+                   caller_socket, request.calibration_host_memory_limit_bytes);
+    }
+    if (left_profile_fd >= 0) {
+      send_file_fd(channel.get(), worker.process(), 'K', left_profile_fd, worker_deadline,
+                   caller_socket, request.calibration_host_memory_limit_bytes);
+    }
+    if (right_profile_fd >= 0) {
+      send_file_fd(channel.get(), worker.process(), 'M', right_profile_fd, worker_deadline,
                    caller_socket, request.calibration_host_memory_limit_bytes);
     }
     if (::shutdown(channel.get(), SHUT_WR) != 0) {
@@ -3242,20 +3271,28 @@ int run_calibration_guardian_fd(int descriptor, const char* executable,
     auto request = decode_calibration_worker_request(encoded_request);
     UniqueFd left_input;
     UniqueFd right_input;
+    UniqueFd left_profile;
+    UniqueFd right_profile;
     if (request.left.retained_path.has_value()) {
       left_input.reset(receive_calibration_left_input_fd(descriptor, deadline_nanoseconds));
     }
     if (request.right.retained_path.has_value()) {
       right_input.reset(receive_calibration_right_input_fd(descriptor, deadline_nanoseconds));
     }
+    if (request.left.lens_profile.has_value()) {
+      left_profile.reset(receive_calibration_left_profile_fd(descriptor, deadline_nanoseconds));
+    }
+    if (request.right.lens_profile.has_value()) {
+      right_profile.reset(receive_calibration_right_profile_fd(descriptor, deadline_nanoseconds));
+    }
     const auto now = Clock::now();
     if (now >= deadline || deadline - now <= kCleanupReserve) {
       throw CalibrationExecutionError("calibration deadline leaves no cleanup reserve");
     }
-    const auto response =
-        supervise_worker(descriptor, executable, executable_image.get(), cgroup.get(),
-                         encoded_request, request, deadline - kCleanupReserve, deadline,
-                         left_input.get(), right_input.get(), &authority_reported);
+    const auto response = supervise_worker(
+        descriptor, executable, executable_image.get(), cgroup.get(), encoded_request, request,
+        deadline - kCleanupReserve, deadline, left_input.get(), right_input.get(),
+        left_profile.get(), right_profile.get(), &authority_reported);
     write_plain_all(descriptor, response, deadline);
     return EXIT_SUCCESS;
   } catch (const std::exception& error) {
@@ -3290,23 +3327,47 @@ CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest& re
   AdmissionLock admission;
   check_admission_headroom(request.calibration_host_memory_limit_bytes);
   PinnedExecutable executable(std::filesystem::path(request.calibration_worker_path), deadline);
-  const auto encoded_request = encode_calibration_worker_request(request);
+  auto worker_request = request;
   const auto open_retained_input = [](const std::optional<std::string>& path,
-                                      std::string_view label) {
+                                      std::string_view label,
+                                      std::optional<CalibrationFileIdentity>& expected_identity) {
     UniqueFd descriptor;
     if (!path.has_value()) {
+      if (expected_identity.has_value()) {
+        throw CalibrationExecutionError(std::string(label) +
+                                        " identity has no retained descriptor path");
+      }
       return descriptor;
     }
     descriptor.reset(::open(path->c_str(), O_RDONLY | O_CLOEXEC));
     struct stat identity{};
-    if (!descriptor || ::fstat(descriptor.get(), &identity) != 0 || !S_ISREG(identity.st_mode)) {
-      throw CalibrationExecutionError("cannot retain " + std::string(label) +
-                                      " calibration video identity");
+    if (!descriptor || ::fstat(descriptor.get(), &identity) != 0 || !S_ISREG(identity.st_mode) ||
+        identity.st_size <= 0) {
+      throw CalibrationExecutionError("cannot retain " + std::string(label) + " identity");
     }
+    const auto observed = portable_file_identity(identity);
+    if (expected_identity.has_value() && *expected_identity != observed) {
+      throw CalibrationExecutionError(std::string(label) +
+                                      " changed before isolated calibration began");
+    }
+    expected_identity = observed;
     return descriptor;
   };
-  auto left_input = open_retained_input(request.left.retained_path, "left");
-  auto right_input = open_retained_input(request.right.retained_path, "right");
+  auto left_input = open_retained_input(request.left.retained_path, "left calibration video",
+                                        worker_request.left.expected_identity);
+  auto right_input = open_retained_input(request.right.retained_path, "right calibration video",
+                                         worker_request.right.expected_identity);
+  UniqueFd left_profile;
+  UniqueFd right_profile;
+  if (request.left.lens_profile.has_value()) {
+    left_profile = open_retained_input(request.left.lens_profile, "left lens profile",
+                                       worker_request.left.lens_profile_expected_identity);
+  }
+  if (request.right.lens_profile.has_value()) {
+    right_profile = open_retained_input(request.right.lens_profile, "right lens profile",
+                                        worker_request.right.lens_profile_expected_identity);
+  }
+  const auto encoded_request = encode_calibration_worker_request(worker_request);
   CgroupMemoryBoundary memory_boundary(request.calibration_host_memory_limit_bytes, deadline);
   try {
     auto listener = create_listener();
@@ -3321,6 +3382,12 @@ CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest& re
     }
     if (right_input) {
       send_file_fd(channel.get(), guardian, 'J', right_input.get(), deadline);
+    }
+    if (left_profile) {
+      send_file_fd(channel.get(), guardian, 'K', left_profile.get(), deadline);
+    }
+    if (right_profile) {
+      send_file_fd(channel.get(), guardian, 'M', right_profile.get(), deadline);
     }
     if (::shutdown(channel.get(), SHUT_WR) != 0) {
       throw CalibrationExecutionError("cannot finish the calibration guardian request");
