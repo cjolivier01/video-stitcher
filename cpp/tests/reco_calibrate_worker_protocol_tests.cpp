@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -102,7 +103,14 @@ reco::core::CameraParams camera_fixture() {
 
 CalibrationResult result_fixture() {
   FrameMatches frame;
-  frame.points.push_back(MatchedPoint::from_planes({0.1, 0.2}, {0.3, 0.4}));
+  frame.points = {
+      {.left = {12.3456789, -0.0},
+       .right = {-98.7654321, 0.000'000'125},
+       .left_pixel_nx = 0.123456789,
+       .right_pixel_nx = 0.987654321},
+      {.left = {-1.25, 2.5}, .right = {3.75, -4.5}, .left_pixel_nx = 0.25, .right_pixel_nx = 0.75},
+      MatchedPoint::from_planes({0.1, 0.2}, {0.3, 0.4}),
+  };
   frame.keypoints_left = 100;
   frame.keypoints_right = 90;
   frame.min_descriptors = 90;
@@ -142,6 +150,29 @@ std::array<char, sizeof(std::uint64_t)> encoded_u64(std::uint64_t value) {
     bytes[index] = static_cast<char>(value >> ((bytes.size() - index - 1U) * 8U));
   }
   return bytes;
+}
+
+std::optional<std::size_t> find_u64(std::string_view bytes, std::uint64_t value,
+                                    std::size_t occurrence = 0) {
+  const auto encoded = encoded_u64(value);
+  std::size_t found = 0;
+  for (std::size_t offset = kCalibrationWorkerFrameHeaderBytes;
+       offset + encoded.size() <= bytes.size(); ++offset) {
+    if (!std::equal(encoded.begin(), encoded.end(), bytes.begin() + offset)) {
+      continue;
+    }
+    if (found++ == occurrence) {
+      return offset;
+    }
+  }
+  return std::nullopt;
+}
+
+void replace_u32_at(std::string& bytes, std::size_t offset, std::uint32_t value) {
+  bytes[offset] = static_cast<char>(value >> 24U);
+  bytes[offset + 1U] = static_cast<char>(value >> 16U);
+  bytes[offset + 2U] = static_cast<char>(value >> 8U);
+  bytes[offset + 3U] = static_cast<char>(value);
 }
 
 std::size_t replace_u64(std::string& bytes, std::uint64_t from, std::uint64_t to,
@@ -206,7 +237,11 @@ void request_round_trip_is_exact_and_bounded() {
               "NvBufSurface ABI round trip");
 }
 
-void result_round_trip_transfers_only_compact_summaries() {
+void expect_double_exact(double actual, double expected, std::string_view message) {
+  expect_eq(std::bit_cast<std::uint64_t>(actual), std::bit_cast<std::uint64_t>(expected), message);
+}
+
+void result_round_trip_preserves_correspondences_exactly() {
   const auto expected = result_fixture();
   const auto encoded = encode_calibration_worker_success(expected);
   expect_true(encoded.size() <= kMaximumCalibrationWorkerFrameBytes,
@@ -216,10 +251,110 @@ void result_round_trip_transfers_only_compact_summaries() {
   expect_eq(decoded.frames_used, expected.frames_used, "used frames round trip");
   expect_eq(decoded.per_frame.size(), 1U, "one frame summary transferred");
   expect_eq(decoded.per_frame[0].post_ransac, 20U, "frame count summary round trip");
-  expect_true(decoded.per_frame[0].points.empty(),
-              "raw correspondences do not cross the worker boundary");
+  expect_eq(decoded.per_frame[0].points.size(), expected.per_frame[0].points.size(),
+            "all frame correspondences transferred");
+  for (std::size_t index = 0; index < expected.per_frame[0].points.size(); ++index) {
+    const auto& actual = decoded.per_frame[0].points[index];
+    const auto& wanted = expected.per_frame[0].points[index];
+    expect_double_exact(actual.left[0], wanted.left[0], "left correspondence x exact");
+    expect_double_exact(actual.left[1], wanted.left[1], "left correspondence y exact");
+    expect_double_exact(actual.right[0], wanted.right[0], "right correspondence x exact");
+    expect_double_exact(actual.right[1], wanted.right[1], "right correspondence y exact");
+    expect_double_exact(actual.left_pixel_nx, wanted.left_pixel_nx,
+                        "left normalized pixel x exact");
+    expect_double_exact(actual.right_pixel_nx, wanted.right_pixel_nx,
+                        "right normalized pixel x exact");
+  }
   expect_eq(decoded.calibration.field_roi->left.size(), 2U, "bounded field ROI round trip");
   expect_eq(decoded.left_lens_profile->camera, std::string("GoPro"), "lens metadata round trip");
+}
+
+void correspondence_limits_and_numeric_validation_are_strict() {
+  auto too_many = compact_result_fixture();
+  const auto valid_point = too_many.per_frame.front().points.front();
+  too_many.per_frame.front().points.assign(kMaximumCalibrationWorkerCorrespondences + 1U,
+                                           valid_point);
+  too_many.per_frame.front().keypoints_left = too_many.per_frame.front().points.size();
+  too_many.per_frame.front().keypoints_right = too_many.per_frame.front().points.size();
+  too_many.per_frame.front().min_descriptors = too_many.per_frame.front().points.size();
+  too_many.per_frame.front().post_ratio_test = too_many.per_frame.front().points.size();
+  too_many.per_frame.front().post_spatial_filter = too_many.per_frame.front().points.size();
+  too_many.per_frame.front().post_ransac = too_many.per_frame.front().points.size();
+  too_many.total_matches = too_many.per_frame.front().points.size();
+  expect_error([&] { (void)encode_calibration_worker_success(too_many); },
+               "too many correspondences", "oversized correspondence vector rejected");
+
+  auto payload_overflow = too_many;
+  payload_overflow.per_frame.front().points.pop_back();
+  payload_overflow.per_frame.front().keypoints_left--;
+  payload_overflow.per_frame.front().keypoints_right--;
+  payload_overflow.per_frame.front().min_descriptors--;
+  payload_overflow.per_frame.front().post_ratio_test--;
+  payload_overflow.per_frame.front().post_spatial_filter--;
+  payload_overflow.per_frame.front().post_ransac--;
+  payload_overflow.total_matches--;
+  expect_error([&] { (void)encode_calibration_worker_success(payload_overflow); },
+               "payload exceeds", "correspondences cannot overflow the bounded payload writer");
+
+  auto inconsistent = compact_result_fixture();
+  inconsistent.per_frame.front().post_ransac = inconsistent.per_frame.front().points.size() - 1U;
+  inconsistent.total_matches = inconsistent.per_frame.front().post_ransac;
+  expect_error([&] { (void)encode_calibration_worker_success(inconsistent); }, "inconsistent",
+               "point count cannot exceed the RANSAC count on encode");
+
+  auto non_finite = compact_result_fixture();
+  non_finite.per_frame.front().points.front().right_pixel_nx =
+      std::numeric_limits<double>::infinity();
+  expect_error([&] { (void)encode_calibration_worker_success(non_finite); }, "non-finite",
+               "non-finite correspondence rejected on encode");
+
+  const auto valid = compact_result_fixture();
+  const auto post_ransac =
+      find_u64(encode_calibration_worker_success(valid), valid.per_frame.front().post_ransac, 1U);
+  expect_true(post_ransac.has_value(), "correspondence-count mutation anchor found");
+  if (post_ransac.has_value()) {
+    auto inconsistent_count = encode_calibration_worker_success(valid);
+    replace_u32_at(inconsistent_count, *post_ransac + sizeof(std::uint64_t),
+                   static_cast<std::uint32_t>(valid.per_frame.front().post_ransac + 1U));
+    expect_error([&] { (void)decode_calibration_worker_response(inconsistent_count); },
+                 "inconsistent", "point count cannot exceed the RANSAC count on decode");
+
+    auto truncated_points = encode_calibration_worker_success(valid);
+    replace_u32_at(truncated_points, *post_ransac + sizeof(std::uint64_t),
+                   static_cast<std::uint32_t>(valid.per_frame.front().points.size() + 1U));
+    expect_error([&] { (void)decode_calibration_worker_response(truncated_points); }, "truncated",
+                 "truncated correspondence payload rejected before allocation");
+  }
+
+  auto count_carrier = compact_result_fixture();
+  constexpr auto impossible_count = kMaximumCalibrationWorkerCorrespondences + 1U;
+  auto& carrier_summary = count_carrier.per_frame.front();
+  carrier_summary.keypoints_left = impossible_count;
+  carrier_summary.keypoints_right = impossible_count;
+  carrier_summary.min_descriptors = impossible_count;
+  carrier_summary.post_ratio_test = impossible_count;
+  carrier_summary.post_spatial_filter = impossible_count;
+  carrier_summary.post_ransac = impossible_count;
+  count_carrier.total_matches = impossible_count;
+  auto oversized_count = encode_calibration_worker_success(count_carrier);
+  const auto oversized_anchor = find_u64(oversized_count, impossible_count, 6U);
+  expect_true(oversized_anchor.has_value(), "oversized count mutation anchor found");
+  if (oversized_anchor.has_value()) {
+    replace_u32_at(oversized_count, *oversized_anchor + sizeof(std::uint64_t),
+                   static_cast<std::uint32_t>(impossible_count));
+    expect_error([&] { (void)decode_calibration_worker_response(oversized_count); },
+                 "too many correspondences",
+                 "oversized decoded point count rejected before allocation");
+  }
+
+  auto non_finite_wire = encode_calibration_worker_success(valid);
+  const auto finite_bits =
+      std::bit_cast<std::uint64_t>(valid.per_frame.front().points.front().left[0]);
+  const auto quiet_nan = std::bit_cast<std::uint64_t>(std::numeric_limits<double>::quiet_NaN());
+  expect_eq(replace_u64(non_finite_wire, finite_bits, quiet_nan, 0U), 1U,
+            "non-finite decoder fixture mutation");
+  expect_error([&] { (void)decode_calibration_worker_response(non_finite_wire); }, "non-finite",
+               "non-finite correspondence rejected on decode");
 }
 
 void malformed_frames_fail_before_unbounded_allocation() {
@@ -227,7 +362,7 @@ void malformed_frames_fail_before_unbounded_allocation() {
 
   auto bad_version = request;
   bad_version[4] = 0;
-  bad_version[5] = 3;
+  bad_version[5] = 4;
   expect_error([&] { (void)decode_calibration_worker_request(bad_version); }, "version",
                "unknown protocol version rejected");
 
@@ -455,7 +590,8 @@ void production_fd_transport_enforces_its_deadline() {
 
 int main() {
   request_round_trip_is_exact_and_bounded();
-  result_round_trip_transfers_only_compact_summaries();
+  result_round_trip_preserves_correspondences_exactly();
+  correspondence_limits_and_numeric_validation_are_strict();
   malformed_frames_fail_before_unbounded_allocation();
   inconsistent_result_counts_are_rejected_on_encode_and_decode();
   result_match_summation_overflow_is_rejected_on_encode_and_decode();

@@ -20,7 +20,10 @@ constexpr std::size_t kMaximumProfileTextBytes = 4U * 1024U;
 
 class Writer {
 public:
-  void u8(std::uint8_t value) { bytes_.push_back(static_cast<char>(value)); }
+  void u8(std::uint8_t value) {
+    require_capacity(1);
+    bytes_.push_back(static_cast<char>(value));
+  }
 
   void boolean(bool value) { u8(value ? 1U : 0U); }
 
@@ -50,6 +53,7 @@ public:
       throw CalibrationExecutionError(std::string(description) + " exceeds the protocol limit");
     }
     u32(static_cast<std::uint32_t>(value.size()));
+    require_capacity(value.size());
     bytes_.append(value);
   }
 
@@ -64,6 +68,14 @@ public:
   [[nodiscard]] std::string take() && { return std::move(bytes_); }
 
 private:
+  void require_capacity(std::size_t count) const {
+    constexpr auto maximum_payload_bytes =
+        kMaximumCalibrationWorkerFrameBytes - kCalibrationWorkerFrameHeaderBytes;
+    if (count > maximum_payload_bytes - bytes_.size()) {
+      throw CalibrationExecutionError("calibration worker payload exceeds the protocol limit");
+    }
+  }
+
   std::string bytes_;
 };
 
@@ -131,6 +143,13 @@ public:
       return std::nullopt;
     }
     return text(maximum, description);
+  }
+
+  void require_elements(std::size_t count, std::size_t element_size,
+                        std::string_view description) const {
+    if (element_size == 0 || count > (bytes_.size() - offset_) / element_size) {
+      throw CalibrationExecutionError(std::string(description) + " is truncated");
+    }
   }
 
   void finish(std::string_view description) const {
@@ -266,6 +285,35 @@ std::size_t read_size(Reader& reader, std::string_view description) {
   return static_cast<std::size_t>(value);
 }
 
+bool matched_point_is_finite(const MatchedPoint& point) {
+  return std::isfinite(point.left[0]) && std::isfinite(point.left[1]) &&
+         std::isfinite(point.right[0]) && std::isfinite(point.right[1]) &&
+         std::isfinite(point.left_pixel_nx) && std::isfinite(point.right_pixel_nx);
+}
+
+void write_matched_point(Writer& writer, const MatchedPoint& point) {
+  writer.floating(point.left[0]);
+  writer.floating(point.left[1]);
+  writer.floating(point.right[0]);
+  writer.floating(point.right[1]);
+  writer.floating(point.left_pixel_nx);
+  writer.floating(point.right_pixel_nx);
+}
+
+MatchedPoint read_matched_point(Reader& reader) {
+  MatchedPoint point;
+  point.left[0] = reader.floating64("left correspondence x");
+  point.left[1] = reader.floating64("left correspondence y");
+  point.right[0] = reader.floating64("right correspondence x");
+  point.right[1] = reader.floating64("right correspondence y");
+  point.left_pixel_nx = reader.floating64("left correspondence pixel x");
+  point.right_pixel_nx = reader.floating64("right correspondence pixel x");
+  if (!matched_point_is_finite(point)) {
+    throw CalibrationExecutionError("calibration worker returned a non-finite correspondence");
+  }
+  return point;
+}
+
 void validate_finite_result(const CalibrationResult& result) {
   if (!std::isfinite(result.residual_error) || !std::isfinite(result.confidence) ||
       (result.quality.has_value() && (!std::isfinite(result.quality->mean_reprojection_error) ||
@@ -280,15 +328,24 @@ void validate_finite_result(const CalibrationResult& result) {
 
 void validate_result_counts(const CalibrationResult& result) {
   std::size_t summarized_matches = 0;
+  std::size_t correspondence_count = 0;
   for (const auto& summary : result.per_frame) {
     if (summary.min_descriptors != std::min(summary.keypoints_left, summary.keypoints_right) ||
         summary.post_ratio_test > summary.min_descriptors ||
         summary.post_spatial_filter > summary.post_ratio_test ||
         summary.post_ransac > summary.post_spatial_filter ||
+        summary.points.size() > summary.post_ransac ||
         summary.post_ransac > std::numeric_limits<std::size_t>::max() - summarized_matches) {
       throw CalibrationExecutionError("calibration worker returned inconsistent result counts");
     }
+    if (summary.points.size() > kMaximumCalibrationWorkerCorrespondences - correspondence_count) {
+      throw CalibrationExecutionError("calibration result has too many correspondences");
+    }
+    if (!std::all_of(summary.points.begin(), summary.points.end(), matched_point_is_finite)) {
+      throw CalibrationExecutionError("calibration worker returned a non-finite correspondence");
+    }
     summarized_matches += summary.post_ransac;
+    correspondence_count += summary.points.size();
   }
   if (result.frames_used != result.per_frame.size() || result.total_matches == 0 ||
       result.total_matches != summarized_matches) {
@@ -494,6 +551,10 @@ std::string encode_calibration_worker_success(const CalibrationResult& result) {
     writer.u64(summary.post_ratio_test);
     writer.u64(summary.post_spatial_filter);
     writer.u64(summary.post_ransac);
+    writer.u32(static_cast<std::uint32_t>(summary.points.size()));
+    for (const auto& point : summary.points) {
+      write_matched_point(writer, point);
+    }
   }
   write_profile(writer, result.left_lens_profile);
   write_profile(writer, result.right_lens_profile);
@@ -554,6 +615,7 @@ CalibrationResult decode_calibration_worker_response(std::string_view value) {
     throw CalibrationExecutionError("calibration worker returned too many frame summaries");
   }
   result.per_frame.reserve(frame_count);
+  std::size_t correspondence_count = 0;
   for (std::uint32_t index = 0; index < frame_count; ++index) {
     FrameMatches summary;
     summary.keypoints_left = read_size(reader, "left keypoint count");
@@ -562,6 +624,20 @@ CalibrationResult decode_calibration_worker_response(std::string_view value) {
     summary.post_ratio_test = read_size(reader, "ratio match count");
     summary.post_spatial_filter = read_size(reader, "spatial match count");
     summary.post_ransac = read_size(reader, "RANSAC match count");
+    const auto point_count = reader.u32("correspondence count");
+    if (point_count > summary.post_ransac) {
+      throw CalibrationExecutionError("calibration worker returned inconsistent result counts");
+    }
+    if (point_count > kMaximumCalibrationWorkerCorrespondences - correspondence_count) {
+      throw CalibrationExecutionError("calibration worker returned too many correspondences");
+    }
+    reader.require_elements(point_count, kCalibrationWorkerMatchedPointBytes,
+                            "calibration worker correspondence payload");
+    summary.points.reserve(point_count);
+    for (std::uint32_t point_index = 0; point_index < point_count; ++point_index) {
+      summary.points.push_back(read_matched_point(reader));
+    }
+    correspondence_count += point_count;
     result.per_frame.push_back(std::move(summary));
   }
   result.left_lens_profile = read_profile(reader);

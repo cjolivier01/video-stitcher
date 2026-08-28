@@ -10,13 +10,17 @@
 
 namespace reco::calibrate::detail {
 
-inline constexpr std::uint16_t kCalibrationWorkerProtocolVersion = 2;
+inline constexpr std::uint16_t kCalibrationWorkerProtocolVersion = 3;
 inline constexpr std::size_t kCalibrationWorkerFrameHeaderBytes = 12;
 inline constexpr std::size_t kMaximumCalibrationWorkerFrameBytes = 64U * 1024U;
 inline constexpr std::size_t kMaximumCalibrationWorkerPathBytes = 16U * 1024U;
 inline constexpr std::size_t kMaximumCalibrationWorkerErrorBytes = 2U * 1024U;
 inline constexpr std::size_t kMaximumCalibrationWorkerResultFrames = 256;
 inline constexpr std::size_t kMaximumCalibrationWorkerRoiPoints = 256;
+inline constexpr std::size_t kCalibrationWorkerMatchedPointBytes = 6U * sizeof(std::uint64_t);
+inline constexpr std::size_t kMaximumCalibrationWorkerCorrespondences =
+    (kMaximumCalibrationWorkerFrameBytes - kCalibrationWorkerFrameHeaderBytes) /
+    kCalibrationWorkerMatchedPointBytes;
 
 enum class CalibrationWorkerMessage : std::uint16_t {
   Request = 1,
