@@ -3,6 +3,7 @@
 #include "reco/calibrate/pipeline.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
@@ -727,6 +728,35 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
               "retained calibrated identity survives a pre-publication input retarget");
   expect_true(std::filesystem::equivalent(calibrated_input, calibrated_alias),
               "pre-publication retarget cannot hide the calibrated input alias");
+
+  const auto selected_profile = root.path() / "selected-lens.json";
+  const auto moved_profile = root.path() / "selected-lens-original.json";
+  const auto profile_alias = root.path() / "profile-alias.json";
+  write_text_file(selected_profile, "selected lens profile\n");
+  const std::array<std::filesystem::path, 1> lens_profiles{selected_profile};
+  bool profile_swap_hook_ran = false;
+  bool profile_alias_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"profile-retarget"})json", profile_alias, left_input, right_input,
+        [&] {
+          std::filesystem::rename(selected_profile, moved_profile);
+          write_text_file(selected_profile, "replacement lens profile\n");
+          std::filesystem::create_hard_link(moved_profile, profile_alias);
+          profile_swap_hook_ran = true;
+        },
+        lens_profiles);
+  } catch (const std::exception& error) {
+    profile_alias_rejected =
+        std::string_view(error.what()).find("left lens profile") != std::string_view::npos;
+  }
+  expect_true(profile_swap_hook_ran, "lens-profile retarget happens at publication boundary");
+  expect_true(profile_alias_rejected,
+              "pinned lens-profile identity rejects a publication alias after path replacement");
+  expect_true(std::filesystem::equivalent(moved_profile, profile_alias),
+              "rejected publication preserves the selected lens-profile identity");
+  expect_eq(read_text_file(selected_profile), std::string("replacement lens profile\n"),
+            "profile replacement cannot hide the selected identity from publication checks");
 
   const auto temporary_race_destination = root.path() / "temporary-race.json";
   std::filesystem::path replacement_temporary;

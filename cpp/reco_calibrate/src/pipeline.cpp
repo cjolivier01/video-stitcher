@@ -362,21 +362,62 @@ bool matching_frame_rates(const reco::io::GpuVideoProbe& left,
 }
 
 std::pair<reco::core::CameraParams, reco::core::CameraParams>
-load_calibration_profiles(const GpuCalibrationRequest& request) {
-  if (!request.left.lens_profile.has_value()) {
-    throw CalibrationExecutionError(
-        "automatic lens profile detection is not ported; provide --left-profile");
-  }
+load_calibration_profiles(const detail::StableLensProfileFile& left_profile,
+                          const detail::StableLensProfileFile* right_profile) {
   try {
-    auto left = load_lens_from_file(*request.left.lens_profile);
-    auto right = request.right.lens_profile.has_value()
-                     ? load_lens_from_file(*request.right.lens_profile)
+    auto left = load_lens_from_file(left_profile.retained_path().string());
+    auto right = right_profile != nullptr
+                     ? load_lens_from_file(right_profile->retained_path().string())
                      : left;
     return {std::move(left), std::move(right)};
   } catch (const std::exception& error) {
     throw CalibrationExecutionError(std::string("failed to load calibration lens profile: ") +
                                     error.what());
   }
+}
+
+class StableCalibrationProfiles {
+public:
+  explicit StableCalibrationProfiles(const GpuCalibrationRequest& request) {
+    if (request.left.lens_profile.has_value()) {
+      left_.emplace(*request.left.lens_profile);
+    }
+    if (request.right.lens_profile.has_value()) {
+      right_.emplace(*request.right.lens_profile);
+    }
+  }
+
+  [[nodiscard]] std::pair<reco::core::CameraParams, reco::core::CameraParams> load() const {
+    if (!left_.has_value()) {
+      throw CalibrationExecutionError(
+          "automatic lens profile detection is not ported; provide --left-profile");
+    }
+    return load_calibration_profiles(*left_, right_ ? &*right_ : nullptr);
+  }
+
+  void verify_unchanged() const {
+    if (left_.has_value()) {
+      left_->verify_unchanged();
+    }
+    if (right_.has_value()) {
+      right_->verify_unchanged();
+    }
+  }
+
+private:
+  std::optional<detail::StableLensProfileFile> left_;
+  std::optional<detail::StableLensProfileFile> right_;
+};
+
+std::vector<std::filesystem::path> lens_profile_paths(const GpuCalibrationRequest& request) {
+  std::vector<std::filesystem::path> profiles;
+  if (request.left.lens_profile.has_value()) {
+    profiles.emplace_back(*request.left.lens_profile);
+  }
+  if (request.right.lens_profile.has_value()) {
+    profiles.emplace_back(*request.right.lens_profile);
+  }
+  return profiles;
 }
 
 } // namespace
@@ -416,10 +457,9 @@ validate_gpu_calibration_probe_metadata(const reco::io::GpuVideoProbe& probe) {
   return std::nullopt;
 }
 
-std::optional<std::string>
-validate_calibration_output_identity(const std::filesystem::path& left_input,
-                                     const std::filesystem::path& right_input,
-                                     const std::filesystem::path& output) {
+std::optional<std::string> validate_calibration_output_identity(
+    const std::filesystem::path& left_input, const std::filesystem::path& right_input,
+    const std::filesystem::path& output, std::span<const std::filesystem::path> lens_profiles) {
   const auto normalize = [](const std::filesystem::path& path, std::string_view label,
                             std::filesystem::path& normalized) -> std::optional<std::string> {
     std::error_code error;
@@ -434,6 +474,7 @@ validate_calibration_output_identity(const std::filesystem::path& left_input,
   std::filesystem::path normalized_left;
   std::filesystem::path normalized_right;
   std::filesystem::path normalized_output;
+  std::vector<std::filesystem::path> normalized_profiles;
   if (const auto error = normalize(left_input, "left video path", normalized_left);
       error.has_value()) {
     return error;
@@ -446,15 +487,30 @@ validate_calibration_output_identity(const std::filesystem::path& left_input,
       error.has_value()) {
     return error;
   }
+  normalized_profiles.reserve(lens_profiles.size());
+  for (std::size_t index = 0; index < lens_profiles.size(); ++index) {
+    std::filesystem::path normalized_profile;
+    const auto label = index == 0 ? "left lens profile path" : "right lens profile path";
+    if (const auto error = normalize(lens_profiles[index], label, normalized_profile);
+        error.has_value()) {
+      return error;
+    }
+    normalized_profiles.push_back(std::move(normalized_profile));
+  }
 
   const auto alias_error = [](std::string_view label) {
-    return "output calibration path identifies the " + std::string(label) + " video input";
+    return "output calibration path identifies the " + std::string(label);
   };
   if (normalized_output == normalized_left) {
-    return alias_error("left");
+    return alias_error("left video input");
   }
   if (normalized_output == normalized_right) {
-    return alias_error("right");
+    return alias_error("right video input");
+  }
+  for (std::size_t index = 0; index < normalized_profiles.size(); ++index) {
+    if (normalized_output == normalized_profiles[index]) {
+      return alias_error(index == 0 ? "left lens profile" : "right lens profile");
+    }
   }
 
   std::error_code error;
@@ -475,14 +531,26 @@ validate_calibration_output_identity(const std::filesystem::path& left_input,
     const bool equivalent = std::filesystem::equivalent(normalized_output, input, error);
     if (error) {
       return "cannot compare output calibration path with " + std::string(label) +
-             " video input identity: " + error.message();
+             " identity: " + error.message();
     }
     return equivalent ? std::optional<std::string>(alias_error(label)) : std::nullopt;
   };
-  if (const auto alias = equivalent_to_input(normalized_left, "left"); alias.has_value()) {
+  if (const auto alias = equivalent_to_input(normalized_left, "left video input");
+      alias.has_value()) {
     return alias;
   }
-  return equivalent_to_input(normalized_right, "right");
+  if (const auto alias = equivalent_to_input(normalized_right, "right video input");
+      alias.has_value()) {
+    return alias;
+  }
+  for (std::size_t index = 0; index < normalized_profiles.size(); ++index) {
+    if (const auto alias = equivalent_to_input(
+            normalized_profiles[index], index == 0 ? "left lens profile" : "right lens profile");
+        alias.has_value()) {
+      return alias;
+    }
+  }
+  return std::nullopt;
 }
 
 std::optional<std::string> validate_gpu_calibration_request(const GpuCalibrationRequest& request) {
@@ -522,9 +590,10 @@ std::optional<std::string> validate_gpu_calibration_request(const GpuCalibration
         !std::filesystem::path(*request.right.retained_path).is_absolute()))) {
     return "retained calibration video paths must be non-empty and absolute";
   }
+  const auto profiles = lens_profile_paths(request);
   if (const auto error = validate_calibration_output_identity(calibration_open_path(request.left),
                                                               calibration_open_path(request.right),
-                                                              request.output);
+                                                              request.output, profiles);
       error.has_value()) {
     return *error;
   }
@@ -726,6 +795,7 @@ CalibrationResult detail::run_gpu_calibration_in_process(const GpuCalibrationReq
     auto right_config = calibration_decode_config(request.right.path);
     StableMediaFile left_media(calibration_open_path(request.left));
     StableMediaFile right_media(calibration_open_path(request.right));
+    StableCalibrationProfiles profiles(request);
     left_config.path = left_media.decode_path().string();
     right_config.path = right_media.decode_path().string();
     const auto left_probe = reco::io::detail::probe_gpu_video_in_process(
@@ -760,7 +830,7 @@ CalibrationResult detail::run_gpu_calibration_in_process(const GpuCalibrationReq
     if (left_indices.empty() || left_indices.size() != right_indices.size()) {
       throw CalibrationExecutionError("calibration videos have no synchronized sample range");
     }
-    auto [left_params, right_params] = load_calibration_profiles(request);
+    auto [left_params, right_params] = profiles.load();
     auto backend = reco::core::CudaBackend::create();
     left_config.start_frame_index = left_indices.front();
     right_config.start_frame_index = right_indices.front();
@@ -773,6 +843,7 @@ CalibrationResult detail::run_gpu_calibration_in_process(const GpuCalibrationReq
                                               request.config, request.manual_sync_offset);
     left_media.verify_unchanged();
     right_media.verify_unchanged();
+    profiles.verify_unchanged();
     result.left_lens_profile = LensProfileInfo{
         .camera = "", .lens = "", .source = ProfileSource::File, .path = request.left.lens_profile};
     result.right_lens_profile =

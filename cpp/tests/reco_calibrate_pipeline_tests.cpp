@@ -272,6 +272,58 @@ void validation_rejects_calibration_output_input_aliases() {
   }
 }
 
+void validation_rejects_calibration_output_profile_aliases() {
+  TemporaryDirectory root;
+  const auto left = root.path() / "left.mp4";
+  const auto right = root.path() / "right.mp4";
+  const auto left_profile = root.path() / "left-lens.json";
+  const auto right_profile = root.path() / "right-lens.json";
+  write_file(left);
+  write_file(right);
+  write_file(left_profile);
+  write_file(right_profile);
+
+  auto request = valid_request();
+  request.left.path = left.string();
+  request.right.path = right.string();
+  request.left.lens_profile = left_profile.string();
+  request.right.lens_profile = right_profile.string();
+  request.output = left_profile.string();
+  auto error = validate_gpu_calibration_request(request);
+  expect_true(error.has_value() && error->find("left lens profile") != std::string::npos,
+              "direct lens-profile/output alias is rejected");
+
+  request.output =
+      std::filesystem::relative(right_profile, std::filesystem::current_path()).string();
+  error = validate_gpu_calibration_request(request);
+  expect_true(error.has_value() && error->find("right lens profile") != std::string::npos,
+              "relative output alias of an absolute lens profile is rejected");
+
+  const auto hardlink_output = root.path() / "hardlink-match.json";
+  std::error_code hardlink_error;
+  std::filesystem::create_hard_link(left_profile, hardlink_output, hardlink_error);
+  expect_true(!hardlink_error, "lens-profile hard-link fixture is available");
+  if (!hardlink_error) {
+    request.output = hardlink_output.string();
+    error = validate_gpu_calibration_request(request);
+    expect_true(error.has_value() && error->find("left lens profile") != std::string::npos,
+                "hard-link lens-profile/output alias is rejected");
+  }
+
+  const auto symlink_output = root.path() / "symlink-match.json";
+  std::error_code symlink_error;
+  std::filesystem::create_symlink(right_profile, symlink_output, symlink_error);
+#if !defined(_WIN32)
+  expect_true(!symlink_error, "lens-profile symlink fixture is available");
+#endif
+  if (!symlink_error) {
+    request.output = symlink_output.string();
+    error = validate_gpu_calibration_request(request);
+    expect_true(error.has_value() && error->find("right lens profile") != std::string::npos,
+                "symlink lens-profile/output alias is rejected");
+  }
+}
+
 void plan_keeps_calibration_gpu_resident() {
   const auto plan = build_gpu_calibration_plan(valid_request(), ready_backends());
   expect_true(plan.gpu_resident, "ready plan is marked GPU resident");
@@ -401,6 +453,7 @@ int main() {
   validation_rejects_invalid_requests();
   calibration_requires_exhaustive_indexed_cadence_proof();
   validation_rejects_calibration_output_input_aliases();
+  validation_rejects_calibration_output_profile_aliases();
   plan_keeps_calibration_gpu_resident();
   calibration_plan_selects_hevc_decode_for_hevc_paths();
   plan_reports_missing_required_backend_first();

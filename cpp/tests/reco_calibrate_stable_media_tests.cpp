@@ -1,5 +1,6 @@
 #include "stable_media_file.hpp"
 
+#include "reco/calibrate/lens_database.hpp"
 #include "reco/calibrate/pipeline.hpp"
 
 #include <chrono>
@@ -14,6 +15,7 @@
 #include <thread>
 
 using reco::calibrate::CalibrationExecutionError;
+using reco::calibrate::detail::StableLensProfileFile;
 using reco::calibrate::detail::StableMediaFile;
 
 namespace {
@@ -133,11 +135,52 @@ void invalid_inputs_fail_before_gstreamer() {
 #endif
 }
 
+void retained_lens_profile_survives_path_replacement() {
+#if defined(__linux__)
+  TemporaryDirectory directory;
+  const auto profile = directory.path() / "selected-profile.json";
+  const auto selected = directory.path() / "selected-profile-original.json";
+  write_file(profile, R"json({
+    "width": 1920,
+    "height": 1080,
+    "fx": 700.0,
+    "fy": 701.0,
+    "cx": 960.0,
+    "cy": 540.0,
+    "d": [0.01, -0.02, 0.003, -0.004]
+  })json");
+  StableLensProfileFile stable(profile);
+
+  std::filesystem::rename(profile, selected);
+  write_file(profile, R"json({
+    "width": 1920,
+    "height": 1080,
+    "fx": 1700.0,
+    "fy": 1701.0,
+    "cx": 960.0,
+    "cy": 540.0,
+    "d": [0.01, -0.02, 0.003, -0.004]
+  })json");
+
+  const auto retained = reco::calibrate::load_lens_from_file(stable.retained_path().string());
+  expect_true(retained.fx == 700.0,
+              "retained lens profile remains bound to the selected profile identity");
+  bool replacement_rejected = false;
+  try {
+    stable.verify_unchanged();
+  } catch (const CalibrationExecutionError& error) {
+    replacement_rejected = std::string_view(error.what()).find("changed") != std::string_view::npos;
+  }
+  expect_true(replacement_rejected, "lens profile path replacement fails closed");
+#endif
+}
+
 } // namespace
 
 int main() {
   retained_handle_survives_path_replacement();
   same_size_mtime_restored_mutation_is_rejected();
   invalid_inputs_fail_before_gstreamer();
+  retained_lens_profile_survives_path_replacement();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

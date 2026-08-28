@@ -5,6 +5,7 @@
 #include <functional>
 #include <iosfwd>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -176,12 +177,14 @@ resolve_video_probe_worker(const std::filesystem::path& executable_path);
 [[nodiscard]] std::optional<std::filesystem::path>
 resolve_calibration_worker(const std::filesystem::path& executable_path);
 
-/// Publishes serialized calibration JSON after rechecking that it cannot replace either input.
+/// Publishes serialized calibration JSON after rechecking that it cannot replace an input or
+/// selected lens profile.
 void write_calibration_json_atomically(std::string_view json,
                                        const std::filesystem::path& destination,
                                        const std::filesystem::path& left_input,
                                        const std::filesystem::path& right_input,
-                                       const std::function<void()>& before_publish = {});
+                                       const std::function<void()>& before_publish = {},
+                                       std::span<const std::filesystem::path> lens_profiles = {});
 
 } // namespace detail
 
