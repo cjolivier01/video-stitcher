@@ -15,7 +15,10 @@
 #include <thread>
 
 #if defined(__linux__)
+#include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 using reco::calibrate::CalibrationExecutionError;
@@ -64,6 +67,25 @@ public:
 private:
   std::filesystem::path path_;
 };
+
+#if defined(__linux__)
+reco::calibrate::CalibrationFileIdentity file_identity(const std::filesystem::path& path) {
+  struct stat metadata{};
+  if (::stat(path.c_str(), &metadata) != 0) {
+    throw std::runtime_error("failed to inspect stable-media identity fixture");
+  }
+  return {
+      .device = static_cast<std::uint64_t>(metadata.st_dev),
+      .inode = static_cast<std::uint64_t>(metadata.st_ino),
+      .size = static_cast<std::uint64_t>(metadata.st_size),
+      .mode = static_cast<std::uint32_t>(metadata.st_mode),
+      .modified_seconds = static_cast<std::int64_t>(metadata.st_mtim.tv_sec),
+      .modified_nanoseconds = static_cast<std::int64_t>(metadata.st_mtim.tv_nsec),
+      .changed_seconds = static_cast<std::int64_t>(metadata.st_ctim.tv_sec),
+      .changed_nanoseconds = static_cast<std::int64_t>(metadata.st_ctim.tv_nsec),
+  };
+}
+#endif
 
 void retained_handle_survives_path_replacement() {
 #if defined(__linux__)
@@ -144,18 +166,7 @@ void expected_identity_mismatch_fails_before_processing() {
   TemporaryDirectory directory;
   const auto input = directory.path() / "input.mp4";
   write_file(input, "pinned calibration media");
-  struct stat metadata{};
-  expect_true(::stat(input.c_str(), &metadata) == 0, "identity mismatch fixture can be inspected");
-  auto expected = reco::calibrate::CalibrationFileIdentity{
-      .device = static_cast<std::uint64_t>(metadata.st_dev),
-      .inode = static_cast<std::uint64_t>(metadata.st_ino),
-      .size = static_cast<std::uint64_t>(metadata.st_size),
-      .mode = static_cast<std::uint32_t>(metadata.st_mode),
-      .modified_seconds = static_cast<std::int64_t>(metadata.st_mtim.tv_sec),
-      .modified_nanoseconds = static_cast<std::int64_t>(metadata.st_mtim.tv_nsec),
-      .changed_seconds = static_cast<std::int64_t>(metadata.st_ctim.tv_sec),
-      .changed_nanoseconds = static_cast<std::int64_t>(metadata.st_ctim.tv_nsec),
-  };
+  auto expected = file_identity(input);
   ++expected.inode;
   bool mismatch_rejected = false;
   try {
@@ -165,6 +176,31 @@ void expected_identity_mismatch_fails_before_processing() {
                         std::string_view::npos;
   }
   expect_true(mismatch_rejected, "initial media identity mismatch fails before processing");
+#endif
+}
+
+void descriptor_pinned_identity_does_not_require_worker_flock() {
+#if defined(__linux__)
+  TemporaryDirectory directory;
+  const auto input = directory.path() / "input.mp4";
+  write_file(input, "descriptor-pinned calibration media");
+  const int lock_descriptor = ::open(input.c_str(), O_RDONLY | O_CLOEXEC);
+  expect_true(lock_descriptor >= 0, "exclusive lock fixture opens");
+  if (lock_descriptor < 0) {
+    return;
+  }
+  expect_true(::flock(lock_descriptor, LOCK_EX | LOCK_NB) == 0,
+              "exclusive lock fixture acquires its lock");
+  try {
+    StableMediaFile stable(input, file_identity(input));
+    expect_true(read_file(stable.decode_path()) == "descriptor-pinned calibration media",
+                "descriptor-pinned media opens without a worker flock syscall");
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: descriptor-pinned media rejected by advisory lock: " << error.what()
+              << '\n';
+    ++failures;
+  }
+  (void)::close(lock_descriptor);
 #endif
 }
 
@@ -215,6 +251,7 @@ int main() {
   same_size_mtime_restored_mutation_is_rejected();
   invalid_inputs_fail_before_gstreamer();
   expected_identity_mismatch_fails_before_processing();
+  descriptor_pinned_identity_does_not_require_worker_flock();
   retained_lens_profile_survives_path_replacement();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

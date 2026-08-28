@@ -77,7 +77,9 @@ struct StableFileState {
       throw CalibrationExecutionError(
           std::string(kind) + " changed before isolated processing began: " + path.string());
     }
-    if (::flock(descriptor, LOCK_SH | LOCK_NB) != 0) {
+    // Isolated workers receive descriptor-pinned identities and deny flock in seccomp. The
+    // supervisor and CLI revalidate those identities across processing and publication.
+    if (!expected_identity.has_value() && ::flock(descriptor, LOCK_SH | LOCK_NB) != 0) {
       const auto saved_error = errno;
       ::close(descriptor);
       descriptor = -1;
