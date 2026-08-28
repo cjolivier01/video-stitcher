@@ -259,6 +259,7 @@ private:
 };
 
 struct PinnedFileIdentity {
+  std::string label;
   UniqueFileDescriptor descriptor;
   struct stat identity{};
 
@@ -272,15 +273,15 @@ struct PinnedFileIdentity {
                                                     std::string_view label) {
   const int descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (descriptor < 0) {
-    throw_file_error("cannot open " + std::string(label) + " video input", path, errno);
+    throw_file_error("cannot open " + std::string(label), path, errno);
   }
-  PinnedFileIdentity pinned{.descriptor = UniqueFileDescriptor(descriptor)};
+  PinnedFileIdentity pinned{.label = std::string(label),
+                            .descriptor = UniqueFileDescriptor(descriptor)};
   if (::fstat(descriptor, &pinned.identity) != 0) {
-    throw_file_error("cannot inspect " + std::string(label) + " video input", path, errno);
+    throw_file_error("cannot inspect " + std::string(label), path, errno);
   }
   if (!S_ISREG(pinned.identity.st_mode)) {
-    throw std::runtime_error(std::string(label) +
-                             " video input must be a regular file: " + path.string());
+    throw std::runtime_error(std::string(label) + " must be a regular file: " + path.string());
   }
   return pinned;
 }
@@ -304,7 +305,8 @@ struct PinnedFileIdentity {
 [[nodiscard]] std::optional<std::string>
 validate_pinned_output_identity(int directory_descriptor, std::string_view destination_name,
                                 const PinnedFileIdentity& left_input,
-                                const PinnedFileIdentity& right_input) {
+                                const PinnedFileIdentity& right_input,
+                                const std::vector<PinnedFileIdentity>& lens_profiles) {
   struct stat destination_identity{};
   const std::string name(destination_name);
   if (::fstatat(directory_descriptor, name.c_str(), &destination_identity, AT_SYMLINK_NOFOLLOW) !=
@@ -317,13 +319,18 @@ validate_pinned_output_identity(int directory_descriptor, std::string_view desti
   }
 
   const auto alias_error = [](std::string_view label) {
-    return "output calibration path identifies the " + std::string(label) + " video input";
+    return "output calibration path identifies the " + std::string(label);
   };
   if (same_file_identity(destination_identity, left_input.identity)) {
-    return alias_error("left");
+    return alias_error(left_input.label);
   }
   if (same_file_identity(destination_identity, right_input.identity)) {
-    return alias_error("right");
+    return alias_error(right_input.label);
+  }
+  for (const auto& profile : lens_profiles) {
+    if (same_file_identity(destination_identity, profile.identity)) {
+      return alias_error(profile.label);
+    }
   }
 
   if (S_ISLNK(destination_identity.st_mode)) {
@@ -336,10 +343,15 @@ validate_pinned_output_identity(int directory_descriptor, std::string_view desti
                               "cannot inspect output calibration symlink target identity");
     }
     if (same_file_identity(followed_identity, left_input.identity)) {
-      return alias_error("left");
+      return alias_error(left_input.label);
     }
     if (same_file_identity(followed_identity, right_input.identity)) {
-      return alias_error("right");
+      return alias_error(right_input.label);
+    }
+    for (const auto& profile : lens_profiles) {
+      if (same_file_identity(followed_identity, profile.identity)) {
+        return alias_error(profile.label);
+      }
     }
   }
   return std::nullopt;
@@ -426,7 +438,8 @@ void write_calibration_json_atomically_impl(std::string_view json,
                                             const std::filesystem::path& destination,
                                             const std::filesystem::path& left_input,
                                             const std::filesystem::path& right_input,
-                                            const std::function<void()>& before_publish) {
+                                            const std::function<void()>& before_publish,
+                                            std::span<const std::filesystem::path> lens_profiles) {
   std::string contents(json);
   contents.push_back('\n');
 #if defined(_WIN32)
@@ -451,7 +464,7 @@ void write_calibration_json_atomically_impl(std::string_view json,
       before_publish();
     }
     if (const auto error = reco::calibrate::validate_calibration_output_identity(
-            left_input, right_input, destination);
+            left_input, right_input, destination, lens_profiles);
         error.has_value()) {
       throw std::runtime_error("refusing to publish calibration output: " + *error);
     }
@@ -488,8 +501,14 @@ void write_calibration_json_atomically_impl(std::string_view json,
     throw;
   }
 #elif defined(__linux__)
-  const auto left_identity = pin_input_identity(left_input, "left");
-  const auto right_identity = pin_input_identity(right_input, "right");
+  const auto left_identity = pin_input_identity(left_input, "left video input");
+  const auto right_identity = pin_input_identity(right_input, "right video input");
+  std::vector<PinnedFileIdentity> profile_identities;
+  profile_identities.reserve(lens_profiles.size());
+  for (std::size_t index = 0; index < lens_profiles.size(); ++index) {
+    profile_identities.push_back(pin_input_identity(
+        lens_profiles[index], index == 0 ? "left lens profile" : "right lens profile"));
+  }
   const auto parent =
       destination.has_parent_path() ? destination.parent_path() : std::filesystem::path(".");
   const auto destination_name = destination.filename().string();
@@ -528,8 +547,9 @@ void write_calibration_json_atomically_impl(std::string_view json,
       throw std::runtime_error(
           "refusing to publish calibration output: temporary output identity changed");
     }
-    if (const auto error = validate_pinned_output_identity(
-            directory_descriptor.get(), destination_name, left_identity, right_identity);
+    if (const auto error =
+            validate_pinned_output_identity(directory_descriptor.get(), destination_name,
+                                            left_identity, right_identity, profile_identities);
         error.has_value()) {
       throw std::runtime_error("refusing to publish calibration output: " + *error);
     }
@@ -570,7 +590,7 @@ void write_calibration_json_atomically_impl(std::string_view json,
       before_publish();
     }
     if (const auto error = reco::calibrate::validate_calibration_output_identity(
-            left_input, right_input, destination);
+            left_input, right_input, destination, lens_profiles);
         error.has_value()) {
       throw std::runtime_error("refusing to publish calibration output: " + *error);
     }
@@ -603,7 +623,15 @@ void write_calibration_result(const reco::calibrate::CalibrationResult& result,
       request.left.retained_path.has_value() ? *request.left.retained_path : request.left.path;
   const auto& right_path =
       request.right.retained_path.has_value() ? *request.right.retained_path : request.right.path;
-  detail::write_calibration_json_atomically(json, request.output, left_path, right_path);
+  std::vector<std::filesystem::path> profiles;
+  if (request.left.lens_profile.has_value()) {
+    profiles.emplace_back(*request.left.lens_profile);
+  }
+  if (request.right.lens_profile.has_value()) {
+    profiles.emplace_back(*request.right.lens_profile);
+  }
+  detail::write_calibration_json_atomically(json, request.output, left_path, right_path, {},
+                                            profiles);
 }
 
 void write_calibration_result_summary(const reco::calibrate::CalibrationResult& result,
@@ -1597,9 +1625,10 @@ void write_calibration_json_atomically(std::string_view json,
                                        const std::filesystem::path& destination,
                                        const std::filesystem::path& left_input,
                                        const std::filesystem::path& right_input,
-                                       const std::function<void()>& before_publish) {
-  write_calibration_json_atomically_impl(json, destination, left_input, right_input,
-                                         before_publish);
+                                       const std::function<void()>& before_publish,
+                                       std::span<const std::filesystem::path> lens_profiles) {
+  write_calibration_json_atomically_impl(json, destination, left_input, right_input, before_publish,
+                                         lens_profiles);
 }
 
 } // namespace detail
@@ -1852,12 +1881,36 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err,
 
     try {
 #if defined(__linux__)
-      const auto left_identity = pin_input_identity(request.left.path, "left");
-      const auto right_identity = pin_input_identity(request.right.path, "right");
+      const auto left_identity = pin_input_identity(request.left.path, "left video input");
+      const auto right_identity = pin_input_identity(request.right.path, "right video input");
+      std::optional<PinnedFileIdentity> left_profile_identity;
+      std::optional<PinnedFileIdentity> right_profile_identity;
+      if (request.left.lens_profile.has_value()) {
+        left_profile_identity.emplace(
+            pin_input_identity(*request.left.lens_profile, "left lens profile"));
+      }
+      if (request.right.lens_profile.has_value()) {
+        right_profile_identity.emplace(
+            pin_input_identity(*request.right.lens_profile, "right lens profile"));
+      }
       auto pinned_request = request;
       pinned_request.left.retained_path = left_identity.retained_path().string();
       pinned_request.right.retained_path = right_identity.retained_path().string();
-      const auto result = reco::calibrate::run_gpu_calibration(pinned_request, backends);
+      if (left_profile_identity.has_value()) {
+        pinned_request.left.lens_profile = left_profile_identity->retained_path().string();
+      }
+      if (right_profile_identity.has_value()) {
+        pinned_request.right.lens_profile = right_profile_identity->retained_path().string();
+      }
+      auto result = reco::calibrate::run_gpu_calibration(pinned_request, backends);
+      if (result.left_lens_profile.has_value()) {
+        result.left_lens_profile->path = request.left.lens_profile;
+      }
+      if (result.right_lens_profile.has_value()) {
+        result.right_lens_profile->path = request.right.lens_profile.has_value()
+                                              ? request.right.lens_profile
+                                              : request.left.lens_profile;
+      }
       write_calibration_result(result, pinned_request);
 #else
       const auto result = reco::calibrate::run_gpu_calibration(request, backends);

@@ -94,11 +94,11 @@ validate_gpu_calibration_request(const GpuCalibrationRequest& request);
 /// requires complete selected-video caps and indexed-cadence proof through end of stream.
 [[nodiscard]] std::optional<std::string>
 validate_gpu_calibration_probe_metadata(const reco::io::GpuVideoProbe& probe);
-/// Rejects an output path that lexically or physically identifies either video input.
-[[nodiscard]] std::optional<std::string>
-validate_calibration_output_identity(const std::filesystem::path& left_input,
-                                     const std::filesystem::path& right_input,
-                                     const std::filesystem::path& output);
+/// Rejects an output path that lexically or physically identifies a video input or selected lens
+/// profile.
+[[nodiscard]] std::optional<std::string> validate_calibration_output_identity(
+    const std::filesystem::path& left_input, const std::filesystem::path& right_input,
+    const std::filesystem::path& output, std::span<const std::filesystem::path> lens_profiles = {});
 [[nodiscard]] CalibrationBackendStatus probe_calibration_backends();
 [[nodiscard]] CalibrationExecutionPlan
 build_gpu_calibration_plan(const GpuCalibrationRequest& request,
