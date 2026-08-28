@@ -3012,8 +3012,16 @@ private:
   }
   close_child_descriptors_except(executable);
 #if defined(RECO_CALIBRATION_THREAD_SANITIZER)
-  // TSan may self-reexec and cannot reliably recover an AT_EMPTY_PATH image.
-  (void)::execve(argv[0], argv, environment);
+  // TSan may self-reexec and cannot reliably recover an AT_EMPTY_PATH image. Give it a stable
+  // procfs name for the sealed executable snapshot while preserving descriptor-pinned execution.
+  char snapshot_path[64]{};
+  const auto snapshot_path_size =
+      std::snprintf(snapshot_path, sizeof(snapshot_path), "/proc/%lld/fd/%d",
+                    static_cast<long long>(::getpid()), executable);
+  if (snapshot_path_size > 0 &&
+      static_cast<std::size_t>(snapshot_path_size) < sizeof(snapshot_path)) {
+    (void)::execve(snapshot_path, argv, environment);
+  }
 #elif defined(SYS_execveat)
   if (!install_initial_exec_filter(executable)) {
     child_exit();
@@ -3622,18 +3630,10 @@ CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest& re
   check_admission_headroom(request.calibration_host_memory_limit_bytes);
   PinnedExecutable executable(std::filesystem::path(request.calibration_worker_path), deadline);
   auto worker_request = request;
-  const auto open_retained_input = [](const std::optional<std::string>& path,
-                                      std::string_view label,
+  const auto open_retained_input = [](const std::string& path, std::string_view label,
                                       std::optional<CalibrationFileIdentity>& expected_identity) {
     UniqueFd descriptor;
-    if (!path.has_value()) {
-      if (expected_identity.has_value()) {
-        throw CalibrationExecutionError(std::string(label) +
-                                        " identity has no retained descriptor path");
-      }
-      return descriptor;
-    }
-    descriptor.reset(::open(path->c_str(), O_RDONLY | O_CLOEXEC));
+    descriptor.reset(::open(path.c_str(), O_RDONLY | O_CLOEXEC));
     struct stat identity{};
     if (!descriptor || ::fstat(descriptor.get(), &identity) != 0 || !S_ISREG(identity.st_mode) ||
         identity.st_size <= 0) {
@@ -3647,20 +3647,37 @@ CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest& re
     expected_identity = observed;
     return descriptor;
   };
-  auto left_input = open_retained_input(request.left.retained_path, "left calibration video",
-                                        worker_request.left.expected_identity);
-  auto right_input = open_retained_input(request.right.retained_path, "right calibration video",
-                                         worker_request.right.expected_identity);
+  const auto retained_descriptor_path = [](int descriptor) {
+    return (std::filesystem::path("/proc") / std::to_string(::getpid()) / "fd" /
+            std::to_string(descriptor))
+        .string();
+  };
+  auto left_input =
+      open_retained_input(request.left.retained_path.value_or(request.left.path),
+                          "left calibration video", worker_request.left.expected_identity);
+  auto right_input =
+      open_retained_input(request.right.retained_path.value_or(request.right.path),
+                          "right calibration video", worker_request.right.expected_identity);
+  worker_request.left.retained_path = retained_descriptor_path(left_input.get());
+  worker_request.right.retained_path = retained_descriptor_path(right_input.get());
   UniqueFd left_profile;
   UniqueFd right_profile;
   if (request.left.lens_profile.has_value()) {
-    left_profile = open_retained_input(request.left.lens_profile, "left lens profile",
+    left_profile = open_retained_input(*request.left.lens_profile, "left lens profile",
                                        worker_request.left.lens_profile_expected_identity);
   }
   if (request.right.lens_profile.has_value()) {
-    right_profile = open_retained_input(request.right.lens_profile, "right lens profile",
+    right_profile = open_retained_input(*request.right.lens_profile, "right lens profile",
                                         worker_request.right.lens_profile_expected_identity);
   }
+  const auto verify_retained_input = [](int descriptor, std::string_view label,
+                                        const std::optional<CalibrationFileIdentity>& identity) {
+    struct stat current{};
+    if (descriptor < 0 || !identity.has_value() || ::fstat(descriptor, &current) != 0 ||
+        portable_file_identity(current) != *identity) {
+      throw CalibrationExecutionError(std::string(label) + " changed during isolated calibration");
+    }
+  };
   const auto encoded_request = encode_calibration_worker_request(worker_request);
   CgroupMemoryBoundary memory_boundary(request.calibration_host_memory_limit_bytes, deadline);
   try {
@@ -3696,6 +3713,18 @@ CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest& re
       throw CalibrationExecutionError("calibration worker exceeded its cgroup host memory limit");
     }
     auto result = decode_calibration_worker_response(response);
+    verify_retained_input(left_input.get(), "left calibration video",
+                          worker_request.left.expected_identity);
+    verify_retained_input(right_input.get(), "right calibration video",
+                          worker_request.right.expected_identity);
+    if (left_profile) {
+      verify_retained_input(left_profile.get(), "left lens profile",
+                            worker_request.left.lens_profile_expected_identity);
+    }
+    if (right_profile) {
+      verify_retained_input(right_profile.get(), "right lens profile",
+                            worker_request.right.lens_profile_expected_identity);
+    }
     memory_boundary.finish();
     return result;
   } catch (...) {

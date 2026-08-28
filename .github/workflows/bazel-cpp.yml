@@ -169,6 +169,7 @@ jobs:
           //cpp/tests:reco_calibrate_gpu_features_tests
           //cpp/tests:reco_calibrate_gpu_features_full_resolution_tests
           //cpp/tests:reco_calibrate_gpu_pipeline_tests
+          //cpp/tests:reco_calibrate_gpu_video_parity_tests
       - name: Run probe-to-NVDEC calibration smoke
         shell: bash
         run: |
