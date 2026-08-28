@@ -13,6 +13,9 @@
 namespace reco::io {
 
 inline constexpr std::uint32_t kMaximumIndexedTimestampMultiplicity = 1024;
+inline constexpr std::int64_t kMaximumGpuStereoSyncOffset = 100'000;
+inline constexpr std::uint32_t kMinimumGpuStereoQueueCapacity = 1;
+inline constexpr std::uint32_t kMaximumGpuStereoQueueCapacity = 16;
 
 enum class GpuDecodeCodec {
   H264,
@@ -84,6 +87,8 @@ public:
   [[nodiscard]] virtual std::string_view pipeline() const = 0;
   [[nodiscard]] virtual bool gpu_resident() const = 0;
   [[nodiscard]] virtual GpuDecodeReadResult read() = 0;
+  /// Idempotently interrupts a blocked read and prevents further decoding.
+  virtual void request_stop() noexcept;
   /// Accurately seeks an indexed source without rebuilding its decode pipeline.
   virtual void seek_to_frame(std::uint64_t frame_index);
 };
@@ -94,6 +99,73 @@ public:
   explicit GpuDecodeError(std::string message) : std::runtime_error(std::move(message)) {}
 };
 
+/// Side of a persistent stereo decode failure.
+enum class GpuDecodeSide {
+  Left,
+  Right,
+};
+
+/// Failure from one side of a persistent stereo decode session.
+class GpuStereoDecodeError : public GpuDecodeError {
+public:
+  GpuStereoDecodeError(GpuDecodeSide side, std::string message);
+
+  /// Returns the source that failed.
+  [[nodiscard]] GpuDecodeSide side() const noexcept { return side_; }
+
+private:
+  GpuDecodeSide side_;
+};
+
+/// Bounds and temporal alignment for a persistent stereo decode session.
+struct GpuStereoDecodeConfig {
+  // Positive offsets pair left N with right N + offset; negative offsets pair
+  // left N + abs(offset) with right N.
+  std::int64_t sync_offset = 0;
+  // Maximum number of retained decoder-buffer owners in each side's queue.
+  std::uint32_t queue_capacity = 4;
+};
+
+/// Terminal or frame-producing state returned by a stereo session read.
+enum class GpuStereoDecodeStatus {
+  FramePair,
+  EndOfStream,
+  Stopped,
+};
+
+/// GPU-resident frames aligned for one stereo render operation.
+struct GpuDecodedFramePair {
+  GpuDecodedFrame left;
+  GpuDecodedFrame right;
+};
+
+/// Result of one persistent stereo session read.
+struct GpuStereoDecodeReadResult {
+  GpuStereoDecodeStatus status = GpuStereoDecodeStatus::EndOfStream;
+  std::optional<GpuDecodedFramePair> frames;
+};
+
+/// Concurrently decodes and aligns two persistent GPU-resident file sources.
+class GpuStereoDecodeSession {
+public:
+  GpuStereoDecodeSession(std::unique_ptr<GpuFileDecodeSource> left,
+                         std::unique_ptr<GpuFileDecodeSource> right,
+                         GpuStereoDecodeConfig config = {});
+  ~GpuStereoDecodeSession();
+
+  GpuStereoDecodeSession(const GpuStereoDecodeSession&) = delete;
+  GpuStereoDecodeSession& operator=(const GpuStereoDecodeSession&) = delete;
+
+  /// Returns the next aligned pair, EOS, or the explicit-stop state.
+  [[nodiscard]] GpuStereoDecodeReadResult read();
+  /// Idempotently stops both sources and wakes blocked reads.
+  void request_stop() noexcept;
+
+private:
+  class Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
 [[nodiscard]] std::string_view gpu_decode_codec_name(GpuDecodeCodec codec);
 [[nodiscard]] std::string_view gpu_decode_container_demuxer(GpuDecodeContainer container);
 [[nodiscard]] GpuDecodeCodec gpu_decode_codec_for_path(std::string_view path);
@@ -102,6 +174,8 @@ public:
 gpu_decode_container_for_path(std::string_view path);
 [[nodiscard]] std::optional<std::string>
 validate_gpu_file_decode_config(const GpuFileDecodeConfig& config);
+[[nodiscard]] std::optional<std::string>
+validate_gpu_stereo_decode_config(const GpuStereoDecodeConfig& config);
 [[nodiscard]] std::optional<std::string> validate_gpu_decoded_frame(const GpuDecodedFrame& frame);
 [[nodiscard]] NvmmCudaFrame map_gpu_decoded_frame_to_cuda(const GpuDecodedFrame& frame);
 [[nodiscard]] std::string

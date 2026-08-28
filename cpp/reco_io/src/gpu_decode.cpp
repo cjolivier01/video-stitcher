@@ -150,6 +150,20 @@ void GpuFileDecodeSource::seek_to_frame(std::uint64_t) {
   throw GpuDecodeError("GPU file decode source does not support indexed seeking");
 }
 
+void GpuFileDecodeSource::request_stop() noexcept {}
+
+std::optional<std::string> validate_gpu_stereo_decode_config(const GpuStereoDecodeConfig& config) {
+  if (config.sync_offset < -kMaximumGpuStereoSyncOffset ||
+      config.sync_offset > kMaximumGpuStereoSyncOffset) {
+    return "GPU stereo decode sync offset must be between -100000 and 100000 frames";
+  }
+  if (config.queue_capacity < kMinimumGpuStereoQueueCapacity ||
+      config.queue_capacity > kMaximumGpuStereoQueueCapacity) {
+    return "GPU stereo decode queue capacity must be between 1 and 16";
+  }
+  return std::nullopt;
+}
+
 std::optional<std::string> validate_gpu_decoded_frame(const GpuDecodedFrame& frame) {
   if (!frame.owner) {
     return "GPU decoded frame must retain its decoder buffer owner";
