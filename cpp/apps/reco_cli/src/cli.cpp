@@ -9,20 +9,26 @@
 #include "reco/detect/probe.hpp"
 #include "reco/io/gpu_decode.hpp"
 #include "reco/io/gstreamer.hpp"
+#include "rules_cc/cc/runfiles/runfiles.h"
 
 #include <algorithm>
-#include <atomic>
+#include <array>
+#include <cerrno>
 #include <charconv>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
-#include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <optional>
+#include <random>
 #include <sstream>
+#include <system_error>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
@@ -30,105 +36,558 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#elif defined(__linux__)
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#else
+#include <unistd.h>
 #endif
 
 namespace reco::cli {
 namespace {
 
-std::optional<std::string> existing_absolute_path(const std::filesystem::path& path) {
+using rules_cc::cc::runfiles::Runfiles;
+
+#if defined(_WIN32)
+constexpr std::string_view probe_worker_name = "reco_video_probe_worker.exe";
+constexpr std::string_view calibration_worker_name = "reco_calibration_worker.exe";
+constexpr char path_separator = ';';
+#else
+constexpr std::string_view probe_worker_name = "reco_video_probe_worker";
+constexpr std::string_view calibration_worker_name = "reco_calibration_worker";
+constexpr char path_separator = ':';
+#endif
+
+std::optional<std::filesystem::path>
+existing_absolute_executable(const std::filesystem::path& path) {
   std::error_code error;
   if (path.empty() || !std::filesystem::is_regular_file(path, error) || error) {
     return std::nullopt;
   }
+#if !defined(_WIN32)
+  if (::access(path.c_str(), X_OK) != 0) {
+    return std::nullopt;
+  }
+#endif
   auto absolute = std::filesystem::absolute(path, error);
   if (error) {
     return std::nullopt;
   }
-  return absolute.lexically_normal().string();
+  return absolute.lexically_normal();
 }
 
-std::optional<std::string> resolve_video_probe_worker(std::string_view executable_path) {
-  if (const char* configured = std::getenv("RECO_VIDEO_PROBE_WORKER");
-      configured != nullptr && configured[0] != '\0') {
-    return existing_absolute_path(configured);
+std::optional<std::filesystem::path>
+resolve_path_invocation(const std::filesystem::path& executable_path) {
+  if (executable_path.empty()) {
+    return std::nullopt;
+  }
+  if (executable_path.is_absolute() || executable_path.has_parent_path()) {
+    return existing_absolute_executable(executable_path);
   }
 
+  const char* path_value = std::getenv("PATH");
+  if (path_value == nullptr) {
+    return std::nullopt;
+  }
+  const std::string path(path_value);
+  std::size_t begin = 0;
+  while (begin <= path.size()) {
+    const auto end = path.find(path_separator, begin);
+    const auto component = path.substr(begin, end - begin);
+    const auto directory =
+        component.empty() ? std::filesystem::path(".") : std::filesystem::path(component);
+    if (auto resolved = existing_absolute_executable(directory / executable_path);
+        resolved.has_value()) {
+      return resolved;
+    }
 #if defined(_WIN32)
-  constexpr std::string_view worker_name = "reco_video_probe_worker.exe";
-#else
-  constexpr std::string_view worker_name = "reco_video_probe_worker";
+    if (!executable_path.has_extension()) {
+      auto with_extension = executable_path;
+      with_extension += ".exe";
+      if (auto resolved = existing_absolute_executable(directory / with_extension);
+          resolved.has_value()) {
+        return resolved;
+      }
+    }
 #endif
-  std::vector<std::filesystem::path> candidates;
-  if (!executable_path.empty()) {
-    std::error_code error;
-    const auto executable = std::filesystem::absolute(executable_path, error);
-    if (!error) {
-      const auto directory = executable.parent_path();
-      candidates.push_back(directory / worker_name);
-      candidates.push_back(directory / ".." / ".." / "reco_io" / worker_name);
-      candidates.push_back(std::filesystem::path(executable.string() + ".runfiles") /
-                           "reco_video_stitcher" / "cpp" / "reco_io" / worker_name);
+    if (end == std::string::npos) {
+      break;
+    }
+    begin = end + 1;
+  }
+  return std::nullopt;
+}
+
+std::optional<std::filesystem::path>
+resolve_worker_impl(const std::filesystem::path& executable_path, const char* environment_name,
+                    std::string_view name, std::string_view runfiles_directory,
+                    std::string_view output_directory) {
+  if (const char* configured = std::getenv(environment_name);
+      configured != nullptr && configured[0] != '\0') {
+    return existing_absolute_executable(configured);
+  }
+
+  const auto resolved_executable = resolve_path_invocation(executable_path);
+  if (resolved_executable.has_value()) {
+    if (auto sibling = existing_absolute_executable(resolved_executable->parent_path() / name);
+        sibling.has_value()) {
+      return sibling;
     }
   }
-  if (const char* runfiles = std::getenv("RUNFILES_DIR"); runfiles != nullptr) {
-    candidates.emplace_back(std::filesystem::path(runfiles) / "reco_video_stitcher" / "cpp" /
-                            "reco_io" / worker_name);
-  }
-  if (const char* test_srcdir = std::getenv("TEST_SRCDIR"); test_srcdir != nullptr) {
-    candidates.emplace_back(std::filesystem::path(test_srcdir) / "reco_video_stitcher" / "cpp" /
-                            "reco_io" / worker_name);
-  }
-  for (const auto& candidate : candidates) {
-    if (auto resolved = existing_absolute_path(candidate); resolved.has_value()) {
+
+  std::string runfiles_error;
+  const auto runfiles_argv0 = resolved_executable.value_or(executable_path).string();
+  std::unique_ptr<Runfiles> runfiles(
+      Runfiles::Create(runfiles_argv0, BAZEL_CURRENT_REPOSITORY, &runfiles_error));
+  if (runfiles != nullptr) {
+    const auto logical_path = std::string("reco_video_stitcher/") +
+                              std::string(runfiles_directory) + "/" + std::string(name);
+    if (auto resolved = existing_absolute_executable(runfiles->Rlocation(logical_path));
+        resolved.has_value()) {
       return resolved;
+    }
+  }
+
+  if (resolved_executable.has_value()) {
+    if (auto output_tree_worker = existing_absolute_executable(
+            resolved_executable->parent_path() / ".." / ".." / output_directory / name);
+        output_tree_worker.has_value()) {
+      return output_tree_worker;
     }
   }
   return std::nullopt;
 }
 
+std::optional<std::filesystem::path>
+resolve_video_probe_worker_impl(const std::filesystem::path& executable_path) {
+  return resolve_worker_impl(executable_path, "RECO_VIDEO_PROBE_WORKER", probe_worker_name,
+                             "cpp/reco_io", "reco_io");
+}
+
+std::optional<std::filesystem::path>
+resolve_calibration_worker_impl(const std::filesystem::path& executable_path) {
+  return resolve_worker_impl(executable_path, "RECO_CALIBRATION_WORKER", calibration_worker_name,
+                             "cpp/reco_calibrate", "reco_calibrate");
+}
+
+[[noreturn]] void throw_file_error(std::string_view operation, const std::filesystem::path& path,
+                                   int error) {
+  throw std::system_error(error, std::system_category(),
+                          std::string(operation) + " " + path.string());
+}
+
+#if defined(_WIN32)
+std::filesystem::path create_exclusive_temporary(const std::filesystem::path& destination,
+                                                 HANDLE& handle) {
+  std::random_device random;
+  constexpr char hex[] = "0123456789abcdef";
+  for (int attempt = 0; attempt < 128; ++attempt) {
+    std::array<char, 32> token{};
+    for (auto& digit : token) {
+      digit = hex[random() & 0x0fU];
+    }
+    auto filename = destination.filename();
+    filename += ".tmp." + std::string(token.begin(), token.end());
+    auto temporary = destination.parent_path() / filename;
+    handle = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                         FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle != INVALID_HANDLE_VALUE) {
+      return temporary;
+    }
+    const auto error = GetLastError();
+    if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS) {
+      throw_file_error("cannot create temporary calibration output", temporary,
+                       static_cast<int>(error));
+    }
+  }
+  throw std::runtime_error("cannot create unique temporary calibration output for " +
+                           destination.string());
+}
+
+void write_all(HANDLE handle, std::string_view contents, const std::filesystem::path& temporary) {
+  std::size_t offset = 0;
+  while (offset < contents.size()) {
+    const auto remaining = contents.size() - offset;
+    const auto chunk =
+        static_cast<DWORD>(std::min<std::size_t>(remaining, std::numeric_limits<DWORD>::max()));
+    DWORD written = 0;
+    if (WriteFile(handle, contents.data() + offset, chunk, &written, nullptr) == 0 ||
+        written == 0) {
+      throw_file_error("failed to write temporary calibration output", temporary,
+                       static_cast<int>(GetLastError()));
+    }
+    offset += written;
+  }
+}
+#elif defined(__linux__)
+class UniqueFileDescriptor {
+public:
+  UniqueFileDescriptor() = default;
+  explicit UniqueFileDescriptor(int descriptor) : descriptor_(descriptor) {}
+  ~UniqueFileDescriptor() {
+    if (descriptor_ >= 0) {
+      (void)::close(descriptor_);
+    }
+  }
+
+  UniqueFileDescriptor(const UniqueFileDescriptor&) = delete;
+  UniqueFileDescriptor& operator=(const UniqueFileDescriptor&) = delete;
+  UniqueFileDescriptor(UniqueFileDescriptor&& other) noexcept
+      : descriptor_(std::exchange(other.descriptor_, -1)) {}
+  UniqueFileDescriptor& operator=(UniqueFileDescriptor&& other) noexcept {
+    if (this != &other) {
+      if (descriptor_ >= 0) {
+        (void)::close(descriptor_);
+      }
+      descriptor_ = std::exchange(other.descriptor_, -1);
+    }
+    return *this;
+  }
+
+  [[nodiscard]] int get() const { return descriptor_; }
+
+  void close_checked(const std::filesystem::path& path) {
+    const int descriptor = std::exchange(descriptor_, -1);
+    if (descriptor >= 0 && ::close(descriptor) != 0) {
+      throw_file_error("failed to close temporary calibration output", path, errno);
+    }
+  }
+
+private:
+  int descriptor_ = -1;
+};
+
+struct PinnedFileIdentity {
+  UniqueFileDescriptor descriptor;
+  struct stat identity{};
+
+  [[nodiscard]] std::filesystem::path retained_path() const {
+    return std::filesystem::path("/proc") / std::to_string(::getpid()) / "fd" /
+           std::to_string(descriptor.get());
+  }
+};
+
+[[nodiscard]] PinnedFileIdentity pin_input_identity(const std::filesystem::path& path,
+                                                    std::string_view label) {
+  const int descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (descriptor < 0) {
+    throw_file_error("cannot open " + std::string(label) + " video input", path, errno);
+  }
+  PinnedFileIdentity pinned{.descriptor = UniqueFileDescriptor(descriptor)};
+  if (::fstat(descriptor, &pinned.identity) != 0) {
+    throw_file_error("cannot inspect " + std::string(label) + " video input", path, errno);
+  }
+  if (!S_ISREG(pinned.identity.st_mode)) {
+    throw std::runtime_error(std::string(label) +
+                             " video input must be a regular file: " + path.string());
+  }
+  return pinned;
+}
+
+[[nodiscard]] bool same_file_identity(const struct stat& left, const struct stat& right) {
+  return left.st_dev == right.st_dev && left.st_ino == right.st_ino;
+}
+
+[[nodiscard]] bool temporary_name_identifies_descriptor(int directory_descriptor,
+                                                        std::string_view name,
+                                                        int temporary_descriptor) {
+  struct stat descriptor_identity{};
+  struct stat name_identity{};
+  const std::string filename(name);
+  return ::fstat(temporary_descriptor, &descriptor_identity) == 0 &&
+         ::fstatat(directory_descriptor, filename.c_str(), &name_identity, AT_SYMLINK_NOFOLLOW) ==
+             0 &&
+         S_ISREG(name_identity.st_mode) && same_file_identity(descriptor_identity, name_identity);
+}
+
+[[nodiscard]] std::optional<std::string>
+validate_pinned_output_identity(int directory_descriptor, std::string_view destination_name,
+                                const PinnedFileIdentity& left_input,
+                                const PinnedFileIdentity& right_input) {
+  struct stat destination_identity{};
+  const std::string name(destination_name);
+  if (::fstatat(directory_descriptor, name.c_str(), &destination_identity, AT_SYMLINK_NOFOLLOW) !=
+      0) {
+    if (errno == ENOENT) {
+      return std::nullopt;
+    }
+    throw std::system_error(errno, std::system_category(),
+                            "cannot inspect output calibration path identity");
+  }
+
+  const auto alias_error = [](std::string_view label) {
+    return "output calibration path identifies the " + std::string(label) + " video input";
+  };
+  if (same_file_identity(destination_identity, left_input.identity)) {
+    return alias_error("left");
+  }
+  if (same_file_identity(destination_identity, right_input.identity)) {
+    return alias_error("right");
+  }
+
+  if (S_ISLNK(destination_identity.st_mode)) {
+    struct stat followed_identity{};
+    if (::fstatat(directory_descriptor, name.c_str(), &followed_identity, 0) != 0) {
+      if (errno == ENOENT || errno == ELOOP) {
+        return std::nullopt;
+      }
+      throw std::system_error(errno, std::system_category(),
+                              "cannot inspect output calibration symlink target identity");
+    }
+    if (same_file_identity(followed_identity, left_input.identity)) {
+      return alias_error("left");
+    }
+    if (same_file_identity(followed_identity, right_input.identity)) {
+      return alias_error("right");
+    }
+  }
+  return std::nullopt;
+}
+
+struct TemporaryOutput {
+  std::string name;
+  UniqueFileDescriptor descriptor;
+};
+
+[[nodiscard]] TemporaryOutput
+create_exclusive_temporary_at(int directory_descriptor, const std::filesystem::path& destination) {
+  std::random_device random;
+  constexpr char hex[] = "0123456789abcdef";
+  for (int attempt = 0; attempt < 128; ++attempt) {
+    std::array<char, 32> token{};
+    for (auto& digit : token) {
+      digit = hex[random() & 0x0fU];
+    }
+    const auto name =
+        destination.filename().string() + ".tmp." + std::string(token.begin(), token.end());
+    const int descriptor = ::openat(directory_descriptor, name.c_str(),
+                                    O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (descriptor >= 0) {
+      return TemporaryOutput{.name = name, .descriptor = UniqueFileDescriptor(descriptor)};
+    }
+    if (errno != EEXIST) {
+      throw_file_error("cannot create temporary calibration output", destination, errno);
+    }
+  }
+  throw std::runtime_error("cannot create unique temporary calibration output for " +
+                           destination.string());
+}
+
+void write_all(int descriptor, std::string_view contents, const std::filesystem::path& temporary) {
+  std::size_t offset = 0;
+  while (offset < contents.size()) {
+    const auto written = ::write(descriptor, contents.data() + offset, contents.size() - offset);
+    if (written < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      throw_file_error("failed to write temporary calibration output", temporary, errno);
+    }
+    if (written == 0) {
+      throw_file_error("failed to write temporary calibration output", temporary, EIO);
+    }
+    offset += static_cast<std::size_t>(written);
+  }
+}
+#else
+std::filesystem::path create_exclusive_temporary(const std::filesystem::path& destination,
+                                                 int& descriptor) {
+  auto temporary = destination.parent_path() / (destination.filename().string() + ".tmp.XXXXXX");
+  auto mutable_path = temporary.string();
+  std::vector<char> buffer(mutable_path.begin(), mutable_path.end());
+  buffer.push_back('\0');
+  descriptor = ::mkstemp(buffer.data());
+  if (descriptor < 0) {
+    throw_file_error("cannot create temporary calibration output", temporary, errno);
+  }
+  return std::filesystem::path(buffer.data());
+}
+
+void write_all(int descriptor, std::string_view contents, const std::filesystem::path& temporary) {
+  std::size_t offset = 0;
+  while (offset < contents.size()) {
+    const auto written = ::write(descriptor, contents.data() + offset, contents.size() - offset);
+    if (written < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      throw_file_error("failed to write temporary calibration output", temporary, errno);
+    }
+    if (written == 0) {
+      throw_file_error("failed to write temporary calibration output", temporary, EIO);
+    }
+    offset += static_cast<std::size_t>(written);
+  }
+}
+#endif
+
+void write_calibration_json_atomically_impl(std::string_view json,
+                                            const std::filesystem::path& destination,
+                                            const std::filesystem::path& left_input,
+                                            const std::filesystem::path& right_input,
+                                            const std::function<void()>& before_publish) {
+  std::string contents(json);
+  contents.push_back('\n');
+#if defined(_WIN32)
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  std::filesystem::path temporary;
+  bool temporary_exists = false;
+  try {
+    temporary = create_exclusive_temporary(destination, handle);
+    temporary_exists = true;
+    write_all(handle, contents, temporary);
+    if (FlushFileBuffers(handle) == 0) {
+      throw_file_error("failed to flush temporary calibration output", temporary,
+                       static_cast<int>(GetLastError()));
+    }
+    if (CloseHandle(handle) == 0) {
+      handle = INVALID_HANDLE_VALUE;
+      throw_file_error("failed to close temporary calibration output", temporary,
+                       static_cast<int>(GetLastError()));
+    }
+    handle = INVALID_HANDLE_VALUE;
+    if (before_publish) {
+      before_publish();
+    }
+    if (const auto error = reco::calibrate::validate_calibration_output_identity(
+            left_input, right_input, destination);
+        error.has_value()) {
+      throw std::runtime_error("refusing to publish calibration output: " + *error);
+    }
+    if (MoveFileExW(temporary.c_str(), destination.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0) {
+      throw_file_error("failed to replace calibration output", destination,
+                       static_cast<int>(GetLastError()));
+    }
+    temporary_exists = false;
+  } catch (...) {
+    if (handle != INVALID_HANDLE_VALUE) {
+      CloseHandle(handle);
+    }
+    if (temporary_exists) {
+      std::error_code ignored;
+      std::filesystem::remove(temporary, ignored);
+    }
+    throw;
+  }
+#elif defined(__linux__)
+  const auto left_identity = pin_input_identity(left_input, "left");
+  const auto right_identity = pin_input_identity(right_input, "right");
+  const auto parent =
+      destination.has_parent_path() ? destination.parent_path() : std::filesystem::path(".");
+  const auto destination_name = destination.filename().string();
+  if (destination_name.empty() || destination_name == "." || destination_name == "..") {
+    throw std::runtime_error("calibration output path must name a file: " + destination.string());
+  }
+  const int raw_directory_descriptor = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (raw_directory_descriptor < 0) {
+    throw_file_error("cannot open calibration output directory", parent, errno);
+  }
+  UniqueFileDescriptor directory_descriptor(raw_directory_descriptor);
+  struct stat directory_identity{};
+  if (::fstat(directory_descriptor.get(), &directory_identity) != 0) {
+    throw_file_error("cannot inspect calibration output directory", parent, errno);
+  }
+  if (!S_ISDIR(directory_identity.st_mode)) {
+    throw std::runtime_error("calibration output parent is not a directory: " + parent.string());
+  }
+
+  TemporaryOutput temporary;
+  bool temporary_exists = false;
+  try {
+    temporary = create_exclusive_temporary_at(directory_descriptor.get(), destination);
+    temporary_exists = true;
+    const auto temporary_path = parent / temporary.name;
+    write_all(temporary.descriptor.get(), contents, temporary_path);
+    if (::fsync(temporary.descriptor.get()) != 0) {
+      throw_file_error("failed to flush temporary calibration output", temporary_path, errno);
+    }
+    if (before_publish) {
+      before_publish();
+    }
+    if (!temporary_name_identifies_descriptor(directory_descriptor.get(), temporary.name,
+                                              temporary.descriptor.get())) {
+      temporary_exists = false;
+      throw std::runtime_error(
+          "refusing to publish calibration output: temporary output identity changed");
+    }
+    if (const auto error = validate_pinned_output_identity(
+            directory_descriptor.get(), destination_name, left_identity, right_identity);
+        error.has_value()) {
+      throw std::runtime_error("refusing to publish calibration output: " + *error);
+    }
+    if (::renameat(directory_descriptor.get(), temporary.name.c_str(), directory_descriptor.get(),
+                   destination_name.c_str()) != 0) {
+      throw_file_error("failed to replace calibration output", destination, errno);
+    }
+    temporary_exists = false;
+    temporary.descriptor.close_checked(destination);
+    if (::fsync(directory_descriptor.get()) != 0) {
+      throw_file_error("failed to flush calibration output directory", parent, errno);
+    }
+  } catch (...) {
+    if (temporary_exists &&
+        temporary_name_identifies_descriptor(directory_descriptor.get(), temporary.name,
+                                             temporary.descriptor.get())) {
+      (void)::unlinkat(directory_descriptor.get(), temporary.name.c_str(), 0);
+    }
+    throw;
+  }
+#else
+  int descriptor = -1;
+  std::filesystem::path temporary;
+  bool temporary_exists = false;
+  try {
+    temporary = create_exclusive_temporary(destination, descriptor);
+    temporary_exists = true;
+    write_all(descriptor, contents, temporary);
+    if (::fsync(descriptor) != 0) {
+      throw_file_error("failed to flush temporary calibration output", temporary, errno);
+    }
+    const auto close_result = ::close(descriptor);
+    descriptor = -1;
+    if (close_result != 0) {
+      throw_file_error("failed to close temporary calibration output", temporary, errno);
+    }
+    if (before_publish) {
+      before_publish();
+    }
+    if (const auto error = reco::calibrate::validate_calibration_output_identity(
+            left_input, right_input, destination);
+        error.has_value()) {
+      throw std::runtime_error("refusing to publish calibration output: " + *error);
+    }
+    if (::rename(temporary.c_str(), destination.c_str()) != 0) {
+      throw_file_error("failed to replace calibration output", destination, errno);
+    }
+    temporary_exists = false;
+  } catch (...) {
+    if (descriptor >= 0) {
+      ::close(descriptor);
+    }
+    if (temporary_exists) {
+      std::error_code ignored;
+      std::filesystem::remove(temporary, ignored);
+    }
+    throw;
+  }
+#endif
+}
+
 void write_calibration_result(const reco::calibrate::CalibrationResult& result,
-                              const std::string& path) {
+                              const reco::calibrate::GpuCalibrationRequest& request) {
   const auto json = reco::core::calibration_to_json(result.calibration);
   const auto reparsed = reco::core::parse_match_calibration_json(json);
   if (!reparsed.has_value() || !reparsed->validate().empty()) {
     throw std::runtime_error("calibration result failed serialization validation");
   }
 
-  static std::atomic<std::uint64_t> temporary_sequence{0};
-  auto temporary = std::filesystem::path(path);
-  temporary += ".tmp." + std::to_string(temporary_sequence.fetch_add(1, std::memory_order_relaxed));
-  try {
-    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
-    if (!output) {
-      throw std::runtime_error("cannot open temporary calibration output " + temporary.string());
-    }
-    output << json << '\n';
-    output.flush();
-    if (!output) {
-      throw std::runtime_error("failed to write temporary calibration output " +
-                               temporary.string());
-    }
-    output.close();
-    if (!output) {
-      throw std::runtime_error("failed to close temporary calibration output " +
-                               temporary.string());
-    }
-
-#if defined(_WIN32)
-    if (MoveFileExW(temporary.c_str(), std::filesystem::path(path).c_str(),
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0) {
-      throw std::runtime_error("failed to replace calibration output " + path);
-    }
-#else
-    if (std::rename(temporary.c_str(), path.c_str()) != 0) {
-      throw std::runtime_error("failed to replace calibration output " + path);
-    }
-#endif
-  } catch (...) {
-    std::error_code ignored;
-    std::filesystem::remove(temporary, ignored);
-    throw;
-  }
+  const auto& left_path =
+      request.left.retained_path.has_value() ? *request.left.retained_path : request.left.path;
+  const auto& right_path =
+      request.right.retained_path.has_value() ? *request.right.retained_path : request.right.path;
+  detail::write_calibration_json_atomically(json, request.output, left_path, right_path);
 }
 
 void write_calibration_result_summary(const reco::calibrate::CalibrationResult& result,
@@ -1106,6 +1565,29 @@ std::variant<CalibrateCommand, ParseError> parse_calibrate(Cursor& cursor) {
 
 } // namespace
 
+namespace detail {
+
+std::optional<std::filesystem::path>
+resolve_video_probe_worker(const std::filesystem::path& executable_path) {
+  return resolve_video_probe_worker_impl(executable_path);
+}
+
+std::optional<std::filesystem::path>
+resolve_calibration_worker(const std::filesystem::path& executable_path) {
+  return resolve_calibration_worker_impl(executable_path);
+}
+
+void write_calibration_json_atomically(std::string_view json,
+                                       const std::filesystem::path& destination,
+                                       const std::filesystem::path& left_input,
+                                       const std::filesystem::path& right_input,
+                                       const std::function<void()>& before_publish) {
+  write_calibration_json_atomically_impl(json, destination, left_input, right_input,
+                                         before_publish);
+}
+
+} // namespace detail
+
 std::variant<float, ParseError> parse_blend(std::string_view value) {
   auto parsed = parse_float(value, "blend");
   if (const auto* error = std::get_if<ParseError>(&parsed)) {
@@ -1240,14 +1722,15 @@ std::string help_text() {
          "  reco preview LEFT RIGHT -c CALIBRATION [options]\n"
          "  reco camera --left-device DEV --right-device DEV -c CALIBRATION -o OUTPUT [options]\n"
          "  reco libcamera -c CALIBRATION -o OUTPUT [options]\n"
-         "  reco calibrate LEFT RIGHT [options]\n"
+         "  reco calibrate LEFT RIGHT --left-profile PROFILE --no-auto-sync --no-auto-imu "
+         "[options]\n"
          "  reco gopro [options]\n"
          "  reco info\n\n"
          "Runtime command execution is staged behind the remaining GPU/backend ports.";
 }
 
 int run_command(const Command& command, std::ostream& out, std::ostream& err,
-                std::string_view executable_path) {
+                const std::filesystem::path& executable_path) {
   if (std::holds_alternative<HelpCommand>(command)) {
     out << help_text() << '\n';
     return 0;
@@ -1326,7 +1809,21 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err,
     request.manual_sync_offset = calibrate->sync_offset;
     request.debug_dir = calibrate->debug_dir;
     request.output = calibrate->output;
-    request.probe_worker = resolve_video_probe_worker(executable_path).value_or("");
+    if (const auto probe_worker = detail::resolve_video_probe_worker(executable_path);
+        probe_worker.has_value()) {
+      request.probe_worker = probe_worker->string();
+    }
+    if (const auto calibration_worker = detail::resolve_calibration_worker(executable_path);
+        calibration_worker.has_value()) {
+      request.calibration_worker_path = calibration_worker->string();
+    }
+
+    try {
+      request.nvbufsurface_abi = reco::io::discover_nvbufsurface_abi();
+    } catch (const std::exception& error) {
+      err << "error: cannot discover the installed NvBufSurface ABI: " << error.what() << '\n';
+      return 2;
+    }
 
     const auto backends = reco::calibrate::probe_calibration_backends();
     const auto plan = reco::calibrate::build_gpu_calibration_plan(request, backends);
@@ -1338,8 +1835,18 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err,
     }
 
     try {
+#if defined(__linux__)
+      const auto left_identity = pin_input_identity(request.left.path, "left");
+      const auto right_identity = pin_input_identity(request.right.path, "right");
+      auto pinned_request = request;
+      pinned_request.left.retained_path = left_identity.retained_path().string();
+      pinned_request.right.retained_path = right_identity.retained_path().string();
+      const auto result = reco::calibrate::run_gpu_calibration(pinned_request, backends);
+      write_calibration_result(result, pinned_request);
+#else
       const auto result = reco::calibrate::run_gpu_calibration(request, backends);
-      write_calibration_result(result, request.output);
+      write_calibration_result(result, request);
+#endif
       write_calibration_result_summary(result, request.output, out);
     } catch (const std::exception& error) {
       err << "error: " << error.what() << '\n';

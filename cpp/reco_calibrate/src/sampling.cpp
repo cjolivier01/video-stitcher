@@ -1,6 +1,9 @@
 #include "reco/calibrate/sampling.hpp"
 
+#include "nvrtc_compiler.hpp"
+
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -8,6 +11,24 @@
 
 namespace reco::calibrate {
 namespace {
+
+constexpr char kRotate180KernelSource[] = R"cuda(
+extern "C" __global__ void rotate_luma_180(
+    const unsigned char* src,
+    unsigned long long src_pitch,
+    unsigned char* dst,
+    unsigned long long dst_pitch,
+    unsigned int width,
+    unsigned int height) {
+  const unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= width || y >= height) {
+    return;
+  }
+  dst[(unsigned long long)y * dst_pitch + x] =
+      src[(unsigned long long)(height - 1U - y) * src_pitch + (width - 1U - x)];
+}
+)cuda";
 
 std::uint64_t rust_float_to_u64_saturating(double value) {
   if (std::isnan(value) || value <= 0.0) {
@@ -24,7 +45,37 @@ std::uint64_t saturating_sub(std::uint64_t lhs, std::uint64_t rhs) {
   return rhs > lhs ? 0 : lhs - rhs;
 }
 
+void validate_frame_indices(std::span<const std::uint64_t> frame_indices) {
+  for (std::size_t index = 1; index < frame_indices.size(); ++index) {
+    if (frame_indices[index] <= frame_indices[index - 1U]) {
+      throw std::invalid_argument("calibration frame indices must be sorted and unique");
+    }
+  }
+}
+
 } // namespace
+
+struct GpuCalibrationFrameReader::Rotate180 {
+  explicit Rotate180(reco::core::CudaBackend& backend_in) : backend(backend_in) {
+    detail::NvrtcCompiler compiler;
+    kernel = backend.load_kernel_from_ptx(
+        compiler.compile(kRotate180KernelSource, "reco_calibrate_rotate_luma_180.cu"),
+        "rotate_luma_180");
+  }
+
+  void run(reco::core::CudaDevicePtr src, std::size_t src_pitch, reco::core::CudaDevicePtr dst,
+           std::size_t dst_pitch, std::uint32_t width, std::uint32_t height) {
+    auto src_pitch_u64 = static_cast<std::uint64_t>(src_pitch);
+    auto dst_pitch_u64 = static_cast<std::uint64_t>(dst_pitch);
+    std::array<void*, 6> args{&src, &src_pitch_u64, &dst, &dst_pitch_u64, &width, &height};
+    kernel.launch({.grid = {.x = (width + 15U) / 16U, .y = (height + 15U) / 16U},
+                   .block = {.x = 16U, .y = 16U}},
+                  std::span<void*>{args});
+  }
+
+  reco::core::CudaBackend backend;
+  reco::core::CudaKernel kernel;
+};
 
 std::vector<std::uint64_t> select_frame_indices(std::uint64_t total_frames, double fps,
                                                 std::size_t num_samples, double skip_start_secs,
@@ -137,12 +188,29 @@ GrayFrame downscale_if_needed(const GrayFrame& frame, std::uint32_t target_width
   return {.data = std::move(data), .width = new_w, .height = new_h};
 }
 
+reco::core::CameraParams
+camera_params_after_applied_rotation(const reco::core::CameraParams& camera,
+                                     std::uint16_t rotation_degrees) {
+  if (rotation_degrees == 0U) {
+    return camera;
+  }
+  if (rotation_degrees != 180U) {
+    throw std::invalid_argument("calibration camera parameters support only 0- or 180-degree "
+                                "applied rotation");
+  }
+  auto rotated = camera;
+  rotated.cx = static_cast<double>(camera.width) - camera.cx;
+  rotated.cy = static_cast<double>(camera.height) - camera.cy;
+  return rotated;
+}
+
 GpuGrayFrame GpuCalibrationFrame::view() const {
   return {.ptr = y_plane.ptr(),
           .pitch = pitch,
           .width = width,
           .height = height,
-          .color_range = color_range};
+          .color_range = color_range,
+          .applied_rotation_degrees = applied_rotation_degrees};
 }
 
 GpuCalibrationFrameReader::GpuCalibrationFrameReader(reco::core::CudaBackend& backend,
@@ -157,11 +225,32 @@ GpuCalibrationFrameReader::GpuCalibrationFrameReader(reco::core::CudaBackend& ba
   }
 }
 
+GpuCalibrationFrameReader::~GpuCalibrationFrameReader() = default;
+
 GpuCalibrationFrame GpuCalibrationFrameReader::read(std::uint64_t frame_index) {
   if (previous_requested_index_.has_value() && frame_index <= *previous_requested_index_) {
     throw std::invalid_argument("calibration frame indices must be sorted and unique");
   }
   previous_requested_index_ = frame_index;
+
+  const auto& source_config = source_->config();
+  const bool indexed_seek_available = source_config.indexed_fps_numerator.has_value() &&
+                                      source_config.indexed_stream_time_origin_ns.has_value();
+  const bool source_starts_at_request =
+      !previous_source_index_.has_value() && source_config.start_frame_index == frame_index;
+  const bool next_frame_is_request =
+      previous_source_index_.has_value() &&
+      *previous_source_index_ != std::numeric_limits<std::uint64_t>::max() &&
+      *previous_source_index_ + 1U == frame_index;
+  if (indexed_seek_available && !source_starts_at_request && !next_frame_is_request) {
+    try {
+      source_->seek_to_frame(frame_index);
+    } catch (const reco::io::GpuDecodeError& error) {
+      throw GpuFrameExtractionError("GPU calibration indexed seek failed: " +
+                                    std::string(error.what()));
+    }
+    previous_source_index_.reset();
+  }
 
   while (true) {
     auto result = source_->read();
@@ -197,13 +286,25 @@ GpuCalibrationFrame GpuCalibrationFrameReader::read(std::uint64_t frame_index) {
       throw GpuFrameExtractionError("GPU calibration frame allocation size overflows");
     }
 
+    if (decoded.rotation_degrees != 0U && decoded.rotation_degrees != 180U) {
+      throw GpuFrameExtractionError(
+          "GPU calibration supports only 0- or 180-degree stream rotation");
+    }
     auto allocation = backend_->allocate_pitched(mapped.width, mapped.height, 16);
-    backend_->copy_device_to_device_2d({.src = mapped.y_ptr,
-                                        .src_pitch = mapped.y_pitch,
-                                        .dst = allocation.buffer.ptr(),
-                                        .dst_pitch = allocation.pitch,
-                                        .width_bytes = mapped.width,
-                                        .height = mapped.height});
+    if (decoded.rotation_degrees == 180U) {
+      if (!rotate_180_) {
+        rotate_180_ = std::make_unique<Rotate180>(*backend_);
+      }
+      rotate_180_->run(mapped.y_ptr, mapped.y_pitch, allocation.buffer.ptr(), allocation.pitch,
+                       mapped.width, mapped.height);
+    } else {
+      backend_->copy_device_to_device_2d({.src = mapped.y_ptr,
+                                          .src_pitch = mapped.y_pitch,
+                                          .dst = allocation.buffer.ptr(),
+                                          .dst_pitch = allocation.pitch,
+                                          .width_bytes = mapped.width,
+                                          .height = mapped.height});
+    }
     // The decoder may recycle its surface when `decoded` is released.
     backend_->synchronize();
     return {.y_plane = std::move(allocation.buffer),
@@ -213,18 +314,15 @@ GpuCalibrationFrame GpuCalibrationFrameReader::read(std::uint64_t frame_index) {
             .color_range = mapped.color_range,
             .frame_index = decoded.frame_index,
             .pts_ns = decoded.pts_ns,
-            .duration_ns = decoded.duration_ns};
+            .duration_ns = decoded.duration_ns,
+            .applied_rotation_degrees = decoded.rotation_degrees};
   }
 }
 
 std::vector<GpuCalibrationFrame>
 extract_gpu_gray_frames(reco::core::CudaBackend& backend, reco::io::GpuFileDecodeSource& source,
                         std::span<const std::uint64_t> frame_indices) {
-  for (std::size_t index = 1; index < frame_indices.size(); ++index) {
-    if (frame_indices[index] <= frame_indices[index - 1U]) {
-      throw std::invalid_argument("calibration frame indices must be sorted and unique");
-    }
-  }
+  validate_frame_indices(frame_indices);
   if (frame_indices.empty()) {
     return {};
   }
@@ -241,11 +339,34 @@ extract_gpu_gray_frames(reco::core::CudaBackend& backend, reco::io::GpuFileDecod
 std::vector<GpuCalibrationFrame> extract_gpu_gray_frames_from_file(
     reco::core::CudaBackend& backend, reco::io::GpuFileDecodeConfig config,
     reco::io::NvbufSurfaceAbi abi, std::span<const std::uint64_t> frame_indices) {
+  const GpuFileDecodeSourceOpener opener = [](reco::io::GpuFileDecodeConfig sample_config,
+                                              reco::io::NvbufSurfaceAbi sample_abi) {
+    return reco::io::open_gstreamer_gpu_file_decode_source(std::move(sample_config), sample_abi);
+  };
+  return extract_gpu_gray_frames_from_file(backend, std::move(config), abi, frame_indices, opener);
+}
+
+std::vector<GpuCalibrationFrame> extract_gpu_gray_frames_from_file(
+    reco::core::CudaBackend& backend, reco::io::GpuFileDecodeConfig config,
+    reco::io::NvbufSurfaceAbi abi, std::span<const std::uint64_t> frame_indices,
+    const GpuFileDecodeSourceOpener& opener) {
   if (config.drop) {
     throw std::invalid_argument(
         "calibration frame extraction requires decoder frame dropping to be disabled");
   }
-  auto source = reco::io::open_gstreamer_gpu_file_decode_source(std::move(config), abi);
+  validate_frame_indices(frame_indices);
+  if (!opener) {
+    throw std::invalid_argument("calibration frame extraction requires a GPU source opener");
+  }
+  if (frame_indices.empty()) {
+    return {};
+  }
+
+  config.start_frame_index = frame_indices.front();
+  auto source = opener(std::move(config), abi);
+  if (!source) {
+    throw GpuFrameExtractionError("GPU calibration source opener returned no source");
+  }
   return extract_gpu_gray_frames(backend, *source, frame_indices);
 }
 

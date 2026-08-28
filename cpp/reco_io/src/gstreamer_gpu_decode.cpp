@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -29,9 +31,13 @@ namespace {
 
 constexpr std::uint32_t kGstMapRead = 1;
 constexpr int kGstStateNull = 1;
+constexpr int kGstStatePaused = 3;
 constexpr int kGstStatePlaying = 4;
 constexpr int kGstStateChangeFailure = 0;
+constexpr int kGstFormatTime = 3;
+constexpr int kGstSeekFlagFlushAccurate = (1 << 0) | (1 << 1);
 constexpr std::uint32_t kGstMessageError = 1U << 1U;
+constexpr std::uint32_t kGstMessageTag = 1U << 4U;
 constexpr int kGstPadProbeTypeBuffer = 1 << 4;
 constexpr int kGstPadProbeOk = 1;
 constexpr std::uint64_t kGstClockTimeNone = std::numeric_limits<std::uint64_t>::max();
@@ -84,6 +90,11 @@ struct GstPadProbeInfoAbi {
   void* data = nullptr;
 };
 
+struct GstMessageAbi {
+  GstMiniObjectAbi mini_object;
+  std::uint32_t type = 0;
+};
+
 // GstBuffer and GstMapInfo are public GStreamer 1.x ABI structs. The runtime
 // major-version check below prevents these layouts from being used with a
 // future incompatible ABI.
@@ -94,6 +105,7 @@ static_assert(offsetof(GstMapInfoAbi, size) == (sizeof(void*) == 8 ? 24 : 12));
 static_assert(sizeof(GstMapInfoAbi) == (sizeof(void*) == 8 ? 104 : 52));
 static_assert(offsetof(GstPadProbeInfoAbi, data) ==
               (sizeof(void*) == 8 && sizeof(unsigned long) == 8 ? 16 : 8));
+static_assert(offsetof(GstMessageAbi, type) == (sizeof(void*) == 8 ? 64 : 36));
 
 class DynamicLibrary {
 public:
@@ -181,6 +193,8 @@ public:
   using BinGetByName = void* (*)(void*, const char*);
   using ElementGetStaticPad = void* (*)(void*, const char*);
   using ElementSetState = int (*)(void*, int);
+  using ElementGetState = int (*)(void*, int*, int*, std::uint64_t);
+  using ElementSeekSimple = int (*)(void*, int, int, std::int64_t);
   using ElementGetBus = void* (*)(void*);
   using ObjectUnref = void (*)(void*);
   using PadGetCurrentCaps = void* (*)(void*);
@@ -194,6 +208,8 @@ public:
   using AppSinkTryPullSample = void* (*)(void*, std::uint64_t);
   using AppSinkIsEos = int (*)(void*);
   using SampleGetBuffer = void* (*)(void*);
+  using SampleGetSegment = const void* (*)(void*);
+  using SegmentToStreamTime = std::uint64_t (*)(const void*, int, std::uint64_t);
   using SampleUnref = void (*)(void*);
   using CapsGetStructure = void* (*)(const void*, std::uint32_t);
   using StructureGetInt = int (*)(const void*, const char*, int*);
@@ -201,7 +217,10 @@ public:
   using BufferUnmap = void (*)(void*, GstMapInfoAbi*);
   using BusTimedPopFiltered = void* (*)(void*, std::uint64_t, std::uint32_t);
   using MessageParseError = void (*)(void*, GErrorAbi**, char**);
+  using MessageParseTag = void (*)(void*, void**);
   using MessageUnref = void (*)(void*);
+  using TagListGetString = int (*)(const void*, const char*, char**);
+  using TagListUnref = void (*)(void*);
   using ErrorFree = void (*)(GErrorAbi*);
   using Free = void (*)(void*);
   using QuarkFromStaticString = std::uint32_t (*)(const char*);
@@ -237,6 +256,8 @@ public:
     element_get_static_pad =
         core_library->symbol<ElementGetStaticPad>("gst_element_get_static_pad");
     element_set_state = core_library->symbol<ElementSetState>("gst_element_set_state");
+    element_get_state = core_library->symbol<ElementGetState>("gst_element_get_state");
+    element_seek_simple = core_library->symbol<ElementSeekSimple>("gst_element_seek_simple");
     element_get_bus = core_library->symbol<ElementGetBus>("gst_element_get_bus");
     object_unref = core_library->symbol<ObjectUnref>("gst_object_unref");
     pad_get_current_caps = core_library->symbol<PadGetCurrentCaps>("gst_pad_get_current_caps");
@@ -246,6 +267,9 @@ public:
     mini_object_get_qdata = core_library->symbol<MiniObjectGetQdata>("gst_mini_object_get_qdata");
     caps_unref = core_library->symbol<CapsUnref>("gst_caps_unref");
     sample_get_buffer = core_library->symbol<SampleGetBuffer>("gst_sample_get_buffer");
+    sample_get_segment = core_library->symbol<SampleGetSegment>("gst_sample_get_segment");
+    segment_to_stream_time =
+        core_library->symbol<SegmentToStreamTime>("gst_segment_to_stream_time");
     sample_unref = core_library->symbol<SampleUnref>("gst_sample_unref");
     caps_get_structure = core_library->symbol<CapsGetStructure>("gst_caps_get_structure");
     structure_get_int = core_library->symbol<StructureGetInt>("gst_structure_get_int");
@@ -254,7 +278,10 @@ public:
     bus_timed_pop_filtered =
         core_library->symbol<BusTimedPopFiltered>("gst_bus_timed_pop_filtered");
     message_parse_error = core_library->symbol<MessageParseError>("gst_message_parse_error");
+    message_parse_tag = core_library->symbol<MessageParseTag>("gst_message_parse_tag");
     message_unref = core_library->symbol<MessageUnref>("gst_message_unref");
+    tag_list_get_string = core_library->symbol<TagListGetString>("gst_tag_list_get_string");
+    tag_list_unref = core_library->symbol<TagListUnref>("gst_tag_list_unref");
     app_sink_try_pull_sample =
         app_library->symbol<AppSinkTryPullSample>("gst_app_sink_try_pull_sample");
     app_sink_is_eos = app_library->symbol<AppSinkIsEos>("gst_app_sink_is_eos");
@@ -277,6 +304,8 @@ public:
   BinGetByName bin_get_by_name = nullptr;
   ElementGetStaticPad element_get_static_pad = nullptr;
   ElementSetState element_set_state = nullptr;
+  ElementGetState element_get_state = nullptr;
+  ElementSeekSimple element_seek_simple = nullptr;
   ElementGetBus element_get_bus = nullptr;
   ObjectUnref object_unref = nullptr;
   PadGetCurrentCaps pad_get_current_caps = nullptr;
@@ -288,6 +317,8 @@ public:
   AppSinkTryPullSample app_sink_try_pull_sample = nullptr;
   AppSinkIsEos app_sink_is_eos = nullptr;
   SampleGetBuffer sample_get_buffer = nullptr;
+  SampleGetSegment sample_get_segment = nullptr;
+  SegmentToStreamTime segment_to_stream_time = nullptr;
   SampleUnref sample_unref = nullptr;
   CapsGetStructure caps_get_structure = nullptr;
   StructureGetInt structure_get_int = nullptr;
@@ -295,7 +326,10 @@ public:
   BufferUnmap buffer_unmap = nullptr;
   BusTimedPopFiltered bus_timed_pop_filtered = nullptr;
   MessageParseError message_parse_error = nullptr;
+  MessageParseTag message_parse_tag = nullptr;
   MessageUnref message_unref = nullptr;
+  TagListGetString tag_list_get_string = nullptr;
+  TagListUnref tag_list_unref = nullptr;
   ErrorFree error_free = nullptr;
   Free free = nullptr;
   QuarkFromStaticString quark_from_static_string = nullptr;
@@ -447,6 +481,14 @@ public:
 
   [[nodiscard]] bool failed() const noexcept {
     return failure_.load(std::memory_order_acquire) != GeometryProbeFailure::None;
+  }
+
+  void reset_before_seek() {
+    throw_if_failed();
+    std::lock_guard lock(mutex_);
+    observations_.clear();
+    ambiguity_groups_.clear();
+    unknown_ambiguity_active_ = false;
   }
 
   [[nodiscard]] GeometryDimensions
@@ -667,7 +709,7 @@ public:
                                std::shared_ptr<GstreamerApi> api)
       : config_(std::move(config)),
         pipeline_description_(build_gstreamer_gpu_file_decode_pipeline(config_)), abi_(abi),
-        api_(std::move(api)) {}
+        api_(std::move(api)), next_frame_index_(config_.start_frame_index.value_or(0U)) {}
 
   GstreamerGpuFileDecodeSource(const GstreamerGpuFileDecodeSource&) = delete;
   GstreamerGpuFileDecodeSource& operator=(const GstreamerGpuFileDecodeSource&) = delete;
@@ -745,6 +787,10 @@ public:
     if (bus_ == nullptr) {
       throw GpuDecodeError("GStreamer pipeline does not provide a message bus");
     }
+    if (config_.start_frame_index.has_value()) {
+      seek_pipeline_to_frame(*config_.start_frame_index, true);
+      return;
+    }
     if (api_->element_set_state(pipeline_, kGstStatePlaying) == kGstStateChangeFailure) {
       throw GpuDecodeError("GStreamer pipeline rejected the PLAYING state");
     }
@@ -753,6 +799,21 @@ public:
   [[nodiscard]] const GpuFileDecodeConfig& config() const override { return config_; }
   [[nodiscard]] std::string_view pipeline() const override { return pipeline_description_; }
   [[nodiscard]] bool gpu_resident() const override { return true; }
+
+  void seek_to_frame(std::uint64_t frame_index) override {
+    std::lock_guard lock(read_mutex_);
+    if (terminal_error_.has_value()) {
+      throw GpuDecodeError(*terminal_error_);
+    }
+    throw_if_geometry_probe_failed();
+    drain_pipeline_messages();
+    try {
+      seek_pipeline_to_frame(frame_index, false);
+    } catch (const GpuDecodeError& error) {
+      terminal_error_ = error.what();
+      throw GpuDecodeError(*terminal_error_);
+    }
+  }
 
   [[nodiscard]] GpuDecodeReadResult read() override {
     std::lock_guard lock(read_mutex_);
@@ -764,24 +825,39 @@ public:
       return make_gpu_decode_eos();
     }
 
+    drain_pipeline_messages();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::nanoseconds(config_.read_timeout_ns);
     void* sample = nullptr;
     while (sample == nullptr) {
-      sample = api_->app_sink_try_pull_sample(sink_, kSamplePollTimeoutNs);
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) {
+        terminal_error_ = "GStreamer GPU decode read timed out";
+        throw GpuDecodeError(*terminal_error_);
+      }
+      const auto remaining =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now).count();
+      const auto poll_timeout =
+          std::min<std::uint64_t>(kSamplePollTimeoutNs, static_cast<std::uint64_t>(remaining));
+      sample = api_->app_sink_try_pull_sample(sink_, poll_timeout);
       if (sample != nullptr) {
         break;
       }
       throw_if_geometry_probe_failed();
-      if (const auto error = pop_pipeline_error(); !error.empty()) {
-        terminal_error_ = error;
-        throw GpuDecodeError(*terminal_error_);
-      }
+      drain_pipeline_messages();
       if (api_->app_sink_is_eos(sink_) != 0) {
+        if (last_indexed_stream_time_ns_.has_value() &&
+            timestamp_group_ordinal_ + 1U != config_.indexed_timestamp_multiplicity) {
+          terminal_error_ = "indexed GStreamer GPU decode ended within a duplicate timestamp group";
+          throw GpuDecodeError(*terminal_error_);
+        }
         ended_ = true;
         return make_gpu_decode_eos();
       }
     }
 
     auto owner = std::make_shared<GstSampleOwner>(api_, sample);
+    drain_pipeline_messages();
     throw_if_geometry_probe_failed();
     void* buffer = api_->sample_get_buffer(sample);
     if (buffer == nullptr) {
@@ -800,6 +876,7 @@ public:
     const auto pts_ns = gst_buffer.pts == kGstClockTimeNone
                             ? std::nullopt
                             : std::optional<std::uint64_t>(gst_buffer.pts);
+    const auto frame_index = index_for_sample(sample, pts_ns);
     const auto allocation_dimensions = std::pair(nvmm.width, nvmm.height);
     GeometryDimensions visible_dimensions;
     try {
@@ -818,11 +895,12 @@ public:
         .visible_width = visible_width,
         .visible_height = visible_height,
         .owner = owner,
-        .frame_index = next_frame_index_,
+        .frame_index = frame_index,
         .pts_ns = pts_ns,
         .duration_ns = gst_buffer.duration == kGstClockTimeNone
                            ? std::nullopt
                            : std::optional<std::uint64_t>(gst_buffer.duration),
+        .rotation_degrees = rotation_degrees_,
     };
     if (const auto validation_error = validate_gpu_decoded_frame(frame);
         validation_error.has_value()) {
@@ -844,11 +922,75 @@ public:
     }
     previous_allocation_dimensions_ = allocation_dimensions;
     previous_visible_dimensions_ = current_visible_dimensions;
-    ++next_frame_index_;
+    if (frame_index == std::numeric_limits<std::uint64_t>::max()) {
+      throw GpuDecodeError("GStreamer GPU decode frame index overflow");
+    }
+    next_frame_index_ = frame_index + 1U;
+    ++frames_emitted_;
     return make_gpu_decode_frame(std::move(frame));
   }
 
 private:
+  void seek_pipeline_to_frame(std::uint64_t frame_index, bool initial) {
+    if (!config_.indexed_fps_numerator.has_value() ||
+        !config_.indexed_stream_time_origin_ns.has_value()) {
+      throw GpuDecodeError("GStreamer GPU decode indexed seek requires probed cadence and origin");
+    }
+    const auto multiplicity = static_cast<std::uint64_t>(config_.indexed_timestamp_multiplicity);
+    const auto group_base_index = frame_index - frame_index % multiplicity;
+    // An exact seek to a shared PTS may land on any member of that group. Seek
+    // to the preceding empty cadence slot so every equal-PTS member is emitted.
+    const auto seek_index =
+        multiplicity > 1U && group_base_index > 0U ? group_base_index - 1U : group_base_index;
+    const auto operation = initial ? "initial seek" : "indexed seek";
+    if (api_->element_set_state(pipeline_, kGstStatePaused) == kGstStateChangeFailure) {
+      throw GpuDecodeError("GStreamer pipeline rejected the PAUSED state for " +
+                           std::string(operation));
+    }
+    wait_for_state(kGstStatePaused, "before " + std::string(operation));
+    geometry_probe_state_->reset_before_seek();
+
+    const long double target_ns = static_cast<long double>(*config_.indexed_stream_time_origin_ns) +
+                                  static_cast<long double>(seek_index) * 1'000'000'000.0L *
+                                      static_cast<long double>(*config_.indexed_fps_denominator) /
+                                      static_cast<long double>(*config_.indexed_fps_numerator);
+    if (!std::isfinite(target_ns) || target_ns < 0.0L ||
+        target_ns > static_cast<long double>(std::numeric_limits<std::int64_t>::max())) {
+      throw GpuDecodeError("GPU decode " + std::string(operation) +
+                           " target exceeds GStreamer time range");
+    }
+    const auto rounded_target_ns = static_cast<std::int64_t>(std::round(target_ns));
+    if (api_->element_seek_simple(pipeline_, kGstFormatTime, kGstSeekFlagFlushAccurate,
+                                  rounded_target_ns) == 0) {
+      if (initial) {
+        throw GpuDecodeError("GStreamer pipeline rejected the requested initial frame seek");
+      }
+      throw GpuDecodeError("GStreamer pipeline rejected the requested " + std::string(operation));
+    }
+    wait_for_state(kGstStatePaused, "after " + std::string(operation));
+
+    next_frame_index_ = group_base_index;
+    post_seek_expected_base_index_ = group_base_index;
+    last_indexed_stream_time_ns_.reset();
+    timestamp_group_ordinal_ = 0;
+    ended_ = false;
+    if (api_->element_set_state(pipeline_, kGstStatePlaying) == kGstStateChangeFailure) {
+      throw GpuDecodeError("GStreamer pipeline rejected the PLAYING state after " +
+                           std::string(operation));
+    }
+  }
+
+  void wait_for_state(int expected, std::string_view operation) {
+    int state = kGstStateNull;
+    int pending = kGstStateNull;
+    const auto result =
+        api_->element_get_state(pipeline_, &state, &pending, config_.read_timeout_ns);
+    if (result == kGstStateChangeFailure || state != expected) {
+      throw GpuDecodeError("GStreamer pipeline did not reach the PAUSED state " +
+                           std::string(operation));
+    }
+  }
+
   void throw_if_geometry_probe_failed() {
     try {
       geometry_probe_state_->check_failure();
@@ -858,25 +1000,146 @@ private:
     }
   }
 
-  [[nodiscard]] std::string pop_pipeline_error() {
-    void* message = api_->bus_timed_pop_filtered(bus_, 0, kGstMessageError);
-    if (message == nullptr) {
-      return {};
+  void drain_pipeline_messages() {
+    while (void* message =
+               api_->bus_timed_pop_filtered(bus_, 0, kGstMessageError | kGstMessageTag)) {
+      const auto message_type = static_cast<const GstMessageAbi*>(message)->type;
+      if (message_type == kGstMessageError) {
+        GErrorAbi* error = nullptr;
+        char* debug = nullptr;
+        api_->message_parse_error(message, &error, &debug);
+        std::string result =
+            "GStreamer pipeline error: " + take_error(api_, error, "unknown streaming error");
+        if (debug != nullptr && debug[0] != '\0') {
+          result += " (" + std::string(debug) + ")";
+        }
+        if (debug != nullptr) {
+          api_->free(debug);
+        }
+        api_->message_unref(message);
+        terminal_error_ = std::move(result);
+        throw GpuDecodeError(*terminal_error_);
+      }
+      if (message_type != kGstMessageTag) {
+        api_->message_unref(message);
+        terminal_error_ = "GStreamer bus returned an unexpected filtered message type";
+        throw GpuDecodeError(*terminal_error_);
+      }
+
+      void* tags = nullptr;
+      api_->message_parse_tag(message, &tags);
+      api_->message_unref(message);
+      if (tags == nullptr) {
+        terminal_error_ = "GStreamer orientation tag message has no tag list";
+        throw GpuDecodeError(*terminal_error_);
+      }
+      const std::unique_ptr<void, GstreamerApi::TagListUnref> tags_owner(tags,
+                                                                         api_->tag_list_unref);
+      char* orientation = nullptr;
+      if (api_->tag_list_get_string(tags, "image-orientation", &orientation) == 0) {
+        continue;
+      }
+      const std::unique_ptr<char, GstreamerApi::Free> orientation_owner(orientation, api_->free);
+      if (orientation == nullptr) {
+        terminal_error_ = "GStreamer image-orientation tag has no value";
+        throw GpuDecodeError(*terminal_error_);
+      }
+      const std::string_view value(orientation);
+      std::uint16_t parsed_rotation = 0;
+      if (value == "rotate-0" || value == "normal") {
+        parsed_rotation = 0;
+      } else if (value == "rotate-90") {
+        parsed_rotation = 90;
+      } else if (value == "rotate-180") {
+        parsed_rotation = 180;
+      } else if (value == "rotate-270") {
+        parsed_rotation = 270;
+      } else {
+        terminal_error_ = "unsupported GStreamer image orientation `" + std::string(value) + "`";
+        throw GpuDecodeError(*terminal_error_);
+      }
+      if (frames_emitted_ != 0U && parsed_rotation != rotation_degrees_) {
+        terminal_error_ = "GStreamer video orientation changed after decoding began";
+        throw GpuDecodeError(*terminal_error_);
+      }
+      rotation_degrees_ = parsed_rotation;
+    }
+  }
+
+  [[nodiscard]] std::uint64_t index_for_sample(void* sample,
+                                               const std::optional<std::uint64_t>& pts_ns) {
+    if (!config_.indexed_fps_numerator.has_value()) {
+      return next_frame_index_;
+    }
+    if (!pts_ns.has_value()) {
+      throw GpuDecodeError("indexed GStreamer GPU decode frame has no presentation timestamp");
+    }
+    const void* segment = api_->sample_get_segment(sample);
+    if (segment == nullptr) {
+      throw GpuDecodeError("indexed GStreamer GPU decode sample has no time segment");
+    }
+    const auto stream_time_ns = api_->segment_to_stream_time(segment, kGstFormatTime, *pts_ns);
+    if (stream_time_ns == kGstClockTimeNone) {
+      throw GpuDecodeError(
+          "indexed GStreamer GPU decode PTS cannot be converted to presentation stream time");
+    }
+    if (!indexed_stream_time_origin_ns_.has_value()) {
+      indexed_stream_time_origin_ns_ = stream_time_ns;
+    }
+    if (stream_time_ns < *indexed_stream_time_origin_ns_) {
+      throw GpuDecodeError("indexed GStreamer GPU decode stream time moved before the origin");
+    }
+    const long double elapsed =
+        static_cast<long double>(stream_time_ns - *indexed_stream_time_origin_ns_);
+    const long double frames =
+        elapsed * static_cast<long double>(*config_.indexed_fps_numerator) /
+        (1'000'000'000.0L * static_cast<long double>(*config_.indexed_fps_denominator));
+    const long double rounded = std::round(frames);
+    const auto maximum_offset = static_cast<long double>(std::numeric_limits<std::uint64_t>::max());
+    if (!std::isfinite(frames) || std::abs(frames - rounded) > 0.125L || rounded < 0.0L ||
+        rounded > maximum_offset) {
+      throw GpuDecodeError("indexed GStreamer GPU decode stream time violates the probed cadence");
+    }
+    const auto group_base_index = static_cast<std::uint64_t>(rounded);
+    const auto multiplicity = static_cast<std::uint64_t>(config_.indexed_timestamp_multiplicity);
+    if (group_base_index % multiplicity != 0U) {
+      throw GpuDecodeError(
+          "indexed GStreamer GPU decode timestamp group violates the probed cadence");
     }
 
-    GErrorAbi* error = nullptr;
-    char* debug = nullptr;
-    api_->message_parse_error(message, &error, &debug);
-    std::string result =
-        "GStreamer pipeline error: " + take_error(api_, error, "unknown streaming error");
-    if (debug != nullptr && debug[0] != '\0') {
-      result += " (" + std::string(debug) + ")";
+    if (last_indexed_stream_time_ns_.has_value()) {
+      if (stream_time_ns < *last_indexed_stream_time_ns_) {
+        throw GpuDecodeError("indexed GStreamer GPU decode stream time is not increasing");
+      }
+      if (stream_time_ns == *last_indexed_stream_time_ns_) {
+        ++timestamp_group_ordinal_;
+        if (timestamp_group_ordinal_ >= config_.indexed_timestamp_multiplicity) {
+          throw GpuDecodeError(
+              "indexed GStreamer GPU decode exceeds the probed timestamp multiplicity");
+        }
+      } else {
+        if (timestamp_group_ordinal_ + 1U != config_.indexed_timestamp_multiplicity) {
+          throw GpuDecodeError("indexed GStreamer GPU decode has an incomplete timestamp group");
+        }
+        timestamp_group_ordinal_ = 0;
+      }
+    } else {
+      timestamp_group_ordinal_ = 0;
     }
-    if (debug != nullptr) {
-      api_->free(debug);
+    last_indexed_stream_time_ns_ = stream_time_ns;
+    if (group_base_index > std::numeric_limits<std::uint64_t>::max() - timestamp_group_ordinal_) {
+      throw GpuDecodeError("indexed GStreamer GPU decode frame index overflow");
     }
-    api_->message_unref(message);
-    return result;
+    const auto index = group_base_index + timestamp_group_ordinal_;
+    if (post_seek_expected_base_index_.has_value() && index != *post_seek_expected_base_index_) {
+      throw GpuDecodeError(
+          "first post-seek GStreamer sample does not match the requested absolute frame index");
+    }
+    post_seek_expected_base_index_.reset();
+    if (index < next_frame_index_) {
+      throw GpuDecodeError("indexed GStreamer GPU decode frame indices are not increasing");
+    }
+    return index;
   }
 
   void close() noexcept {
@@ -940,6 +1203,13 @@ private:
   std::optional<std::pair<std::uint32_t, std::uint32_t>> previous_allocation_dimensions_;
   std::optional<std::pair<std::uint32_t, std::uint32_t>> previous_visible_dimensions_;
   std::uint64_t next_frame_index_ = 0;
+  std::optional<std::uint64_t> indexed_stream_time_origin_ns_ =
+      config_.indexed_stream_time_origin_ns;
+  std::optional<std::uint64_t> last_indexed_stream_time_ns_;
+  std::optional<std::uint64_t> post_seek_expected_base_index_;
+  std::uint32_t timestamp_group_ordinal_ = 0;
+  std::uint64_t frames_emitted_ = 0;
+  std::uint16_t rotation_degrees_ = 0;
   std::optional<std::string> terminal_error_;
   bool ended_ = false;
 };

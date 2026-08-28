@@ -472,7 +472,7 @@ void npp_resize_c1(core::CudaDevicePtr src, std::size_t src_pitch, std::uint32_t
                 reinterpret_cast<std::uint8_t*>(dst), checked_pitch(dst_pitch, "C1 destination"),
                 NppiSize{static_cast<int>(dst_w), static_cast<int>(dst_h)},
                 NppiRect{0, 0, static_cast<int>(dst_w), static_cast<int>(dst_h)},
-                dst_w < src_w || dst_h < src_h ? kNppiInterSuper : kNppiInterLinear,
+                dst_w < src_w && dst_h < src_h ? kNppiInterSuper : kNppiInterLinear,
                 functions.stream_ctx));
 }
 

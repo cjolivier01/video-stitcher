@@ -11,12 +11,16 @@ cc_library(
         "//cpp/reco_core",
         "//cpp/reco_detect",
         "//cpp/reco_io",
+        "@rules_cc//cc/runfiles",
     ],
 )
 
 cc_binary(
     name = "reco",
     srcs = ["src/main.cpp"],
-    data = ["//cpp/reco_io:reco_video_probe_worker"],
+    data = [
+        "//cpp/reco_calibrate:reco_calibration_worker",
+        "//cpp/reco_io:reco_video_probe_worker",
+    ],
     deps = [":reco_cli_lib"],
 )

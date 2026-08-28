@@ -282,6 +282,39 @@ GpuVideoProbe probe_video(const GpuFileDecodeConfig& config, std::uint64_t timeo
   }
 }
 
+#if !defined(RECO_PROBE_TEST_FORCE_GUARDIAN_FALLBACKS)
+void exhaustive_calibration_probe_scans_to_eos(const std::filesystem::path& video_path) {
+  set_scenario("probe-exhaustive-50001");
+  const auto exact = reco::io::detail::probe_gpu_video_exhaustive_for_test(
+      container_config(video_path), 5'000'000'000ULL);
+  expect_eq(exact.total_frames, 50'001ULL,
+            "exhaustive calibration probe scans beyond the bounded AU ceiling");
+  expect_true(!exact.total_frames_is_estimated && exact.selected_stream_caps_verified &&
+                  exact.indexed_sampling_cadence_verified,
+              "exhaustive calibration probe returns exact indexed metadata");
+
+  set_scenario("probe-exhaustive-hidden-vfr");
+  expect_probe_error(
+      [&] {
+        (void)reco::io::detail::probe_gpu_video_exhaustive_for_test(container_config(video_path),
+                                                                    5'000'000'000ULL);
+      },
+      "missing or duplicated", "exhaustive calibration probe catches an unsampled cadence gap");
+
+  set_scenario("probe-exhaustive-endless");
+  const auto started = std::chrono::steady_clock::now();
+  expect_probe_error(
+      [&] {
+        (void)reco::io::detail::probe_gpu_video_exhaustive_for_test(container_config(video_path),
+                                                                    1'000'000'000ULL);
+      },
+      "timed out", "exhaustive calibration probe retains its end-to-end deadline");
+  expect_true(std::chrono::steady_clock::now() - started < std::chrono::seconds(2),
+              "exhaustive calibration deadline remains bounded");
+  set_scenario("probe-ok");
+}
+#endif
+
 #if !defined(_WIN32)
 bool parse_probe_caller_duration(const char* value, std::uint64_t* duration_ns) {
   if (value == nullptr || value[0] == '\0') {
@@ -411,6 +444,8 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_true(std::abs(result.fps - 30'000.0 / 1'001.0) < 1e-12, "rational FPS");
   expect_eq(result.duration_ns, 10'000'000'000ULL, "queried duration");
   expect_eq(result.total_frames, 300ULL, "EOS scan preserves the exact access-unit count");
+  expect_true(result.first_stream_time_ns == 0,
+              "zero-origin stream preserves its first presentation stream time");
   expect_true(!result.duration_is_estimated, "known duration is not estimated");
   expect_true(!result.total_frames_is_estimated, "EOS-proven frame count is exact");
   expect_true(result.indexed_sampling_cadence_verified,
@@ -509,6 +544,8 @@ void probe_contracts(const std::filesystem::path& video_path,
 
   set_scenario("probe-nonzero-origin");
   const auto nonzero_origin = probe_video(container_config(video_path), timeout_ns);
+  expect_true(nonzero_origin.first_stream_time_ns == 766'666'666ULL,
+              "nonzero presentation stream origin is preserved through worker IPC");
   expect_eq(nonzero_origin.duration_ns, 2'000'000'000ULL,
             "nonzero timeline origin does not shorten a duration span");
   expect_eq(nonzero_origin.total_frames, 60ULL,
@@ -516,6 +553,8 @@ void probe_contracts(const std::filesystem::path& video_path,
 
   set_scenario("probe-decode-order-origin");
   const auto decode_order_origin = probe_video(container_config(video_path), timeout_ns);
+  expect_true(decode_order_origin.first_stream_time_ns == 0,
+              "presentation-order minimum defines the indexed stream origin");
   expect_eq(decode_order_origin.duration_ns, 1'000'000'000ULL,
             "first decode-order access unit does not define the timeline origin");
   expect_eq(decode_order_origin.total_frames, 30ULL,
@@ -608,6 +647,8 @@ void probe_contracts(const std::filesystem::path& video_path,
             "long untimed prefix is included in correlated duration");
   expect_eq(long_mixed_prefix.total_frames, 600ULL,
             "long untimed prefix is included in correlated frame count");
+  expect_true(long_mixed_prefix.first_stream_time_ns == 0,
+              "long untimed prefix exports the inferred frame-zero origin");
   expect_true(long_mixed_prefix.duration_is_estimated,
               "long untimed-prefix duration remains explicitly estimated");
   expect_true(long_mixed_prefix.total_frames_is_estimated,
@@ -623,6 +664,8 @@ void probe_contracts(const std::filesystem::path& video_path,
             "reordered untimed prefix is counted once in correlated duration");
   expect_eq(reordered_untimed_prefix.total_frames, 600ULL,
             "reordered untimed prefix is counted once in correlated frame count");
+  expect_true(reordered_untimed_prefix.first_stream_time_ns == 4'000'000'000ULL,
+              "reordered untimed prefix exports its inferred frame-zero origin");
 
   set_scenario("probe-unset-fps-inferred");
   const auto unset_fps = probe_video(container_config(video_path), timeout_ns);
@@ -692,6 +735,38 @@ void probe_contracts(const std::filesystem::path& video_path,
             "duplicate PTS pairs retain their EOS-proven AU count");
   expect_eq(duplicate_pts.duration_ns, 4'000'000'000ULL,
             "duplicate PTS pairs retain their observed terminal span");
+  expect_eq(duplicate_pts.timestamp_multiplicity, 2U,
+            "duplicate PTS pair multiplicity remains explicit");
+
+  auto duplicate_decode_config = container_config(video_path);
+  duplicate_decode_config.indexed_fps_numerator = duplicate_pts.fps_numerator;
+  duplicate_decode_config.indexed_fps_denominator = duplicate_pts.fps_denominator;
+  duplicate_decode_config.indexed_timestamp_multiplicity = duplicate_pts.timestamp_multiplicity;
+  duplicate_decode_config.indexed_stream_time_origin_ns = duplicate_pts.first_stream_time_ns;
+  duplicate_decode_config.start_frame_index = 101U;
+  auto duplicate_source = open_gstreamer_gpu_file_decode_source(duplicate_decode_config,
+                                                                NvbufSurfaceAbi::DeepStream9_1);
+  const auto group_start = duplicate_source->read();
+  const auto odd_member = duplicate_source->read();
+  expect_true(group_start.frame.has_value() && odd_member.frame.has_value(),
+              "probe-configured duplicate PTS seek returns the target group");
+  if (group_start.frame.has_value() && odd_member.frame.has_value()) {
+    expect_eq(group_start.frame->frame_index, 100U,
+              "odd indexed seek begins at its duplicate group base");
+    expect_eq(odd_member.frame->frame_index, 101U,
+              "duplicate group ordinal identifies the odd target frame");
+  }
+  duplicate_source->seek_to_frame(151U);
+  const auto reused_group_start = duplicate_source->read();
+  const auto reused_odd_member = duplicate_source->read();
+  expect_true(reused_group_start.frame.has_value() && reused_odd_member.frame.has_value(),
+              "one decoder supports a second duplicate PTS seek");
+  if (reused_group_start.frame.has_value() && reused_odd_member.frame.has_value()) {
+    expect_eq(reused_group_start.frame->frame_index, 150U,
+              "reused seek resets duplicate group indexing");
+    expect_eq(reused_odd_member.frame->frame_index, 151U,
+              "reused seek preserves duplicate group ordinal");
+  }
 
   set_scenario("probe-triplicate-pts");
   const auto triplicate_pts = probe_video(container_config(video_path), timeout_ns);
@@ -703,6 +778,8 @@ void probe_contracts(const std::filesystem::path& video_path,
             "verified cadence closes the full triplicate terminal group");
   expect_true(!triplicate_pts.duration_is_estimated,
               "verified cadence and exact count provide an exact triplicate duration");
+  expect_eq(triplicate_pts.timestamp_multiplicity, 3U,
+            "triplicate PTS multiplicity remains explicit");
 
   set_scenario("probe-long-duplicate-pts-pairs");
   const auto long_duplicate_pts = probe_video(container_config(video_path), timeout_ns);
@@ -1275,6 +1352,8 @@ void worker_ipc_failures_are_bounded(const std::filesystem::path& video_path) {
   expect_true(std::chrono::steady_clock::now() - blocked_input_started <
                   std::chrono::milliseconds(1'800),
               "blocked worker request IPC is reclaimed before its native sleep completes");
+  expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
+            "blocked worker cleanup is certified before returning");
 
   set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "close-input");
   expect_probe_error(
@@ -1282,6 +1361,8 @@ void worker_ipc_failures_are_bounded(const std::filesystem::path& video_path) {
         (void)reco::io::probe_gpu_video(large_config, fake_probe_worker_path, 5'000'000'000ULL);
       },
       "video probe worker", "closed worker input is an exception rather than process SIGPIPE");
+  expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
+            "closed-input worker cleanup is certified before returning");
 
   const std::array<std::pair<std::string_view, std::string_view>, 11> invalid_workers{{
       {"crash", "exited abnormally"},
@@ -1304,6 +1385,8 @@ void worker_ipc_failures_are_bounded(const std::filesystem::path& video_path) {
                                           5'000'000'000ULL);
         },
         fragment, std::string("fake worker response: ") + std::string(scenario));
+    expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
+              std::string("invalid worker cleanup is certified: ") + std::string(scenario));
   }
 }
 
@@ -1378,8 +1461,94 @@ void aggregate_worker_memory_budget_is_enforced() {
             "probe worker memory reservations are released after completion");
 }
 
+void inherited_probe_state_is_rejected_after_fork(const std::filesystem::path& video_path) {
+#if !defined(_WIN32)
+  std::atomic<bool> reservation_failed = false;
+  std::thread reservation([&] {
+    try {
+      reco::io::detail::hold_probe_worker_memory_reservation_for_test(2'000'000'000ULL);
+    } catch (...) {
+      reservation_failed.store(true, std::memory_order_release);
+    }
+  });
+  const auto reservation_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  while (reco::io::detail::reserved_probe_worker_address_space_bytes_for_test() == 0 &&
+         std::chrono::steady_clock::now() < reservation_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+
+  int readiness[2] = {-1, -1};
+  expect_true(::pipe(readiness) == 0, "post-fork admission-lock readiness pipe opens");
+  std::atomic<bool> lock_failed = false;
+  std::thread admission_lock;
+  bool admission_lock_held = false;
+  if (readiness[0] >= 0) {
+    admission_lock = std::thread([&] {
+      try {
+        reco::io::detail::hold_probe_worker_admission_lock_for_test(2'000'000'000ULL, readiness[1]);
+      } catch (...) {
+        lock_failed.store(true, std::memory_order_release);
+      }
+    });
+    pollfd readiness_poll{.fd = readiness[0], .events = POLLIN, .revents = 0};
+    int poll_result = -1;
+    do {
+      poll_result = ::poll(&readiness_poll, 1, 1'000);
+    } while (poll_result < 0 && errno == EINTR);
+    char ready = '\0';
+    const auto ready_size = poll_result > 0 ? ::read(readiness[0], &ready, 1) : -1;
+    admission_lock_held = ready_size == 1 && ready == 'R';
+    expect_true(admission_lock_held, "post-fork test observes the inherited admission lock");
+  }
+
+  const auto child = ::fork();
+  if (child == 0) {
+    (void)::alarm(3);
+    try {
+      (void)reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
+                                      5'000'000'000ULL);
+    } catch (const GpuVideoProbeError& error) {
+      const auto message = std::string_view(error.what());
+      ::_exit(message.find("after fork without exec") != std::string_view::npos ? 0 : 2);
+    } catch (...) {
+      ::_exit(3);
+    }
+    ::_exit(4);
+  }
+  expect_true(child > 0, "post-fork rejection child starts");
+  int child_status = 0;
+  if (child > 0) {
+    while (::waitpid(child, &child_status, 0) < 0 && errno == EINTR) {
+    }
+    expect_true(WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0,
+                "post-fork probe use rejects before inherited admission or reaper state");
+  }
+
+  if (admission_lock.joinable()) {
+    admission_lock.join();
+  }
+  if (readiness[0] >= 0) {
+    (void)::close(readiness[0]);
+    (void)::close(readiness[1]);
+  }
+  reservation.join();
+  expect_true(!reservation_failed.load(std::memory_order_acquire),
+              "post-fork reservation setup succeeds");
+  expect_true(!lock_failed.load(std::memory_order_acquire),
+              "post-fork admission-lock setup succeeds");
+  expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
+            "fork rejection does not alter the parent's aggregate admission");
+#else
+  (void)video_path;
+#endif
+}
+
 void deferred_cleanup_retains_worker_memory_reservation(const std::filesystem::path& video_path) {
 #if defined(__linux__)
+  const auto worker_marker =
+      video_path.parent_path() / (video_path.filename().string() + ".deferred-worker");
+  std::filesystem::remove(worker_marker);
+  set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", worker_marker.string());
   set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "block-input");
   bool probe_failed = false;
   std::thread probe([&] {
@@ -1394,20 +1563,41 @@ void deferred_cleanup_retains_worker_memory_reservation(const std::filesystem::p
   const auto supervisor =
       wait_for_direct_child(::getpid(), std::chrono::steady_clock::now() + std::chrono::seconds(2),
                             "--reco-video-probe-supervisor");
+  const auto guardian = supervisor.has_value()
+                            ? wait_for_direct_child(*supervisor, std::chrono::steady_clock::now() +
+                                                                     std::chrono::seconds(2))
+                            : std::nullopt;
+  const auto worker = wait_for_process_marker(worker_marker, std::chrono::steady_clock::now() +
+                                                                 std::chrono::seconds(2));
   expect_true(supervisor.has_value(), "deferred-cleanup probe supervisor starts");
-  bool supervisor_stopped = false;
-  if (supervisor.has_value()) {
-    supervisor_stopped = ::kill(*supervisor, SIGSTOP) == 0;
-    expect_true(supervisor_stopped, "deferred-cleanup probe supervisor stops before timeout");
-  }
+  expect_true(guardian.has_value(), "deferred-cleanup probe guardian starts");
+  expect_true(worker.has_value(), "deferred-cleanup probe worker starts");
+  const bool worker_group_stopped =
+      worker.has_value() && ::kill(-static_cast<pid_t>(*worker), SIGSTOP) == 0;
+  const bool guardian_stopped = guardian.has_value() && ::kill(*guardian, SIGSTOP) == 0;
+  const bool supervisor_stopped = supervisor.has_value() && ::kill(*supervisor, SIGSTOP) == 0;
+  expect_true(worker_group_stopped, "deferred-cleanup worker group is frozen adversarially");
+  expect_true(guardian_stopped, "deferred-cleanup guardian is frozen adversarially");
+  expect_true(supervisor_stopped, "deferred-cleanup supervisor stops before timeout");
 
   probe.join();
   expect_true(probe_failed, "stopped supervisor causes a bounded probe failure");
-  if (supervisor_stopped) {
+  const bool process_tree_frozen = worker_group_stopped && guardian_stopped && supervisor_stopped;
+  if (process_tree_frozen) {
     expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(),
               reco::io::detail::maximum_probe_worker_address_space_bytes_for_test(),
               "deferred supervisor cleanup retains its worker memory reservation");
     (void)::kill(*supervisor, SIGCONT);
+  } else {
+    if (supervisor.has_value()) {
+      (void)::kill(*supervisor, SIGCONT);
+    }
+    if (guardian.has_value()) {
+      (void)::kill(*guardian, SIGCONT);
+    }
+    if (worker.has_value()) {
+      (void)::kill(-static_cast<pid_t>(*worker), SIGCONT);
+    }
   }
 
   const auto release_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -1417,12 +1607,78 @@ void deferred_cleanup_retains_worker_memory_reservation(const std::filesystem::p
   }
   expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
             "deferred supervisor cleanup releases its reservation after process-tree exit");
+  if (process_tree_frozen && worker.has_value()) {
+    errno = 0;
+    expect_true(::kill(static_cast<pid_t>(*worker), 0) != 0 && errno == ESRCH,
+                "admission is released only after the frozen worker group is empty");
+  }
   if (supervisor_stopped &&
       reco::io::detail::reserved_probe_worker_address_space_bytes_for_test() != 0) {
     (void)::kill(*supervisor, SIGKILL);
     (void)::kill(*supervisor, SIGCONT);
   }
+  if (guardian.has_value()) {
+    (void)::kill(*guardian, SIGCONT);
+  }
+  if (worker.has_value()) {
+    (void)::kill(-static_cast<pid_t>(*worker), SIGCONT);
+    (void)::kill(-static_cast<pid_t>(*worker), SIGKILL);
+  }
+  set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", "");
   set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+  std::filesystem::remove(worker_marker);
+#else
+  (void)video_path;
+#endif
+}
+
+void killed_cleanup_authority_fails_closed(const std::filesystem::path& video_path) {
+#if defined(__linux__)
+  const auto worker_marker =
+      video_path.parent_path() / (video_path.filename().string() + ".killed-authority-worker");
+  std::filesystem::remove(worker_marker);
+  set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", worker_marker.string());
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "block-input");
+  bool probe_failed = false;
+  std::thread probe([&] {
+    try {
+      (void)reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
+                                      5'000'000'000ULL);
+    } catch (...) {
+      probe_failed = true;
+    }
+  });
+
+  const auto supervisor =
+      wait_for_direct_child(::getpid(), std::chrono::steady_clock::now() + std::chrono::seconds(2),
+                            "--reco-video-probe-supervisor");
+  const auto worker = wait_for_process_marker(worker_marker, std::chrono::steady_clock::now() +
+                                                                 std::chrono::seconds(2));
+  expect_true(supervisor.has_value(), "killed-authority probe supervisor starts");
+  expect_true(worker.has_value(), "killed-authority probe worker starts");
+  const bool authority_killed = supervisor.has_value() && ::kill(*supervisor, SIGKILL) == 0;
+  expect_true(authority_killed, "cleanup authority is killed before certification");
+
+  probe.join();
+  expect_true(probe_failed, "killed cleanup authority fails the active probe");
+  expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(),
+            reco::io::detail::maximum_probe_worker_address_space_bytes_for_test(),
+            "uncertified supervisor death retains aggregate admission for process life");
+
+  if (worker.has_value()) {
+    const auto cleanup_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < cleanup_deadline) {
+      errno = 0;
+      if (::kill(static_cast<pid_t>(*worker), 0) != 0 && errno == ESRCH) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    (void)::kill(-static_cast<pid_t>(*worker), SIGKILL);
+  }
+  set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", "");
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+  std::filesystem::remove(worker_marker);
 #else
   (void)video_path;
 #endif
@@ -2268,6 +2524,13 @@ void worker_process_creation_is_confined(const std::filesystem::path& video_path
 #endif
 }
 
+void worker_rejects_x32_syscall_namespace() {
+#if defined(__linux__) && defined(__x86_64__)
+  expect_true(reco::io::detail::probe_worker_rejects_x32_syscalls_for_test(),
+              "x86-64 worker kills x32-tagged syscalls before syscall dispatch");
+#endif
+}
+
 void watchdog_exit_after_memory_termination_is_expected() {
 #if !defined(_WIN32)
   constexpr std::int64_t watchdog_pid = 73;
@@ -2423,8 +2686,13 @@ int main(int argc, char** argv) {
 #endif
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
   const auto runtime = resolve_runfile("cpp/tests/libfake_gstreamer_runtime.so");
+#if defined(RECO_PROBE_TEST_FORCE_GUARDIAN_FALLBACKS)
+  probe_worker_path = executable_runfile("cpp/reco_io/reco_video_probe_worker_fallback");
+  fake_probe_worker_path = executable_runfile("cpp/tests/fake_video_probe_worker_fallback");
+#else
   probe_worker_path = executable_runfile("cpp/reco_io/reco_video_probe_worker");
   fake_probe_worker_path = executable_runfile("cpp/tests/fake_video_probe_worker");
+#endif
   set_environment("RECO_GSTREAMER_DYLIB_PATH", runtime.string());
   set_environment("RECO_GSTAPP_DYLIB_PATH", runtime.string());
   set_environment("RECO_GLIB_DYLIB_PATH", runtime.string());
@@ -2442,12 +2710,22 @@ int main(int argc, char** argv) {
   set_environment("RECO_FAKE_GST_EVENT_PATH", event_path.string());
 
   probe_contracts(video_path, event_path);
+#if !defined(RECO_PROBE_TEST_FORCE_GUARDIAN_FALLBACKS)
+  exhaustive_calibration_probe_scans_to_eos(video_path);
+#endif
+  expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
+            "probe contracts leave no aggregate admission behind");
   invalid_inputs_fail(video_path, event_path);
+  expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
+            "invalid inputs leave no aggregate admission behind");
   non_utf8_path_round_trips();
   windows_unicode_path_round_trips();
   windows_path_runtime_discovery(video_path, runtime);
+  expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
+            "path tests leave no aggregate admission behind");
   worker_ipc_failures_are_bounded(video_path);
   aggregate_worker_memory_budget_is_enforced();
+  inherited_probe_state_is_rejected_after_fork(video_path);
   deferred_cleanup_retains_worker_memory_reservation(video_path);
   delayed_supervision_cannot_launch_worker(video_path);
   launch_gate_prevents_post_timeout_process_start(video_path);
@@ -2460,6 +2738,7 @@ int main(int argc, char** argv) {
   lowered_file_limit_does_not_leak_high_descriptors(video_path);
   worker_address_space_is_limited(video_path);
   worker_process_creation_is_confined(video_path);
+  worker_rejects_x32_syscall_namespace();
   watchdog_exit_after_memory_termination_is_expected();
   unrelated_descriptor_writer_does_not_delay_pipe_eof(video_path);
   parent_death_reclaims_worker(video_path);
@@ -2468,6 +2747,7 @@ int main(int argc, char** argv) {
   caller_death_before_guardian_main(video_path);
   caller_death_before_worker_main(video_path);
   pre_main_loader_stall_respects_timeout(video_path);
+  killed_cleanup_authority_fails_closed(video_path);
   expect_no_unreaped_children();
 
   std::filesystem::remove(video_path);

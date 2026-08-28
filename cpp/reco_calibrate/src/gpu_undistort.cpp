@@ -48,8 +48,10 @@ extern "C" __global__ void undistort_y_plane(
     return;
   }
 
-  const float nx = ((float)x - out_cx) / out_fx;
-  const float ny = ((float)y - out_cy) / out_fy;
+  // Match WebGPU fragment-center interpolation: the shader evaluates the
+  // remapped UV at the center of each destination pixel.
+  const float nx = ((float)x + 0.5f - out_cx) / out_fx;
+  const float ny = ((float)y + 0.5f - out_cy) / out_fy;
   const float r = sqrtf(nx * nx + ny * ny);
 
   float scale = 1.0f;
@@ -63,18 +65,23 @@ extern "C" __global__ void undistort_y_plane(
         theta * (1.0f + k0 * theta2 + k1 * theta4 + k2 * theta6 + k3 * theta8);
     scale = theta_d / r;
   }
-  const float sx = src_fx * nx * scale + src_cx;
-  const float sy = src_fy * ny * scale + src_cy;
+  // A normalized texture coordinate maps to texel space as uv * size - 0.5.
+  const float sx = src_fx * nx * scale + src_cx - 0.5f;
+  const float sy = src_fy * ny * scale + src_cy - 0.5f;
 
   unsigned char value = (unsigned char)black_level;
-  if (sx >= 0.0f && sy >= 0.0f && sx < (float)(src_width - 1) &&
-      sy < (float)(src_height - 1)) {
-    const unsigned int x0 = (unsigned int)floorf(sx);
-    const unsigned int y0 = (unsigned int)floorf(sy);
+  // The shader bounds-checks normalized coordinates in [0, 1], then its
+  // clamp-to-edge sampler extends the edge texels by half a pixel.
+  if (sx >= -0.5f && sy >= -0.5f && sx <= (float)src_width - 0.5f &&
+      sy <= (float)src_height - 0.5f) {
+    const float clamped_x = fminf(fmaxf(sx, 0.0f), (float)(src_width - 1U));
+    const float clamped_y = fminf(fmaxf(sy, 0.0f), (float)(src_height - 1U));
+    const unsigned int x0 = (unsigned int)floorf(clamped_x);
+    const unsigned int y0 = (unsigned int)floorf(clamped_y);
     const unsigned int x1 = x0 + 1U < src_width ? x0 + 1U : x0;
     const unsigned int y1 = y0 + 1U < src_height ? y0 + 1U : y0;
-    const float tx = sx - (float)x0;
-    const float ty = sy - (float)y0;
+    const float tx = clamped_x - (float)x0;
+    const float ty = clamped_y - (float)y0;
     const unsigned char* row0 = src + (unsigned long long)y0 * src_pitch;
     const unsigned char* row1 = src + (unsigned long long)y1 * src_pitch;
     const float a = (1.0f - tx) * (float)row0[x0] + tx * (float)row0[x1];

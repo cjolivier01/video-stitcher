@@ -155,6 +155,23 @@ int main() {
     backend.synchronize();
     expect_bytes(backend, gray_small_dst, {10, 20, 30, 40}, "resize c1 area downscale");
 
+    const auto expect_mixed_axis_resize = [&](std::uint32_t src_width, std::uint32_t src_height,
+                                              std::uint32_t dst_width, std::uint32_t dst_height,
+                                              std::uint8_t value, std::string_view label) {
+      const std::vector<std::uint8_t> src(src_width * src_height, value);
+      auto src_buffer = backend.allocate(src.size());
+      auto dst_buffer = backend.allocate(dst_width * dst_height);
+      upload_bytes(backend, src, src_buffer);
+      npp_resize_c1(src_buffer.ptr(), src_width, src_width, src_height, dst_buffer.ptr(), dst_width,
+                    dst_width, dst_height);
+      backend.synchronize();
+      expect_bytes(backend, dst_buffer, std::vector<std::uint8_t>(dst_width * dst_height, value),
+                   label);
+    };
+    expect_mixed_axis_resize(4, 2, 2, 4, 17, "resize c1 width shrink height grow");
+    expect_mixed_axis_resize(2, 4, 4, 2, 31, "resize c1 width grow height shrink");
+    expect_mixed_axis_resize(4, 2, 2, 2, 47, "resize c1 width shrink height unchanged");
+
     auto mirror_dst = backend.allocate(rgb.size());
     npp_mirror_c3(rgb_src.ptr(), mirror_dst.ptr(), width, height);
     backend.synchronize();

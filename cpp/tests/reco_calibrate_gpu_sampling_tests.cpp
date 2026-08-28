@@ -56,7 +56,13 @@ void expect_error(Function&& function, std::string_view fragment, std::string_vi
 }
 
 GpuFileDecodeConfig fixture_config(bool drop = false) {
-  return {.path = "fixture.mp4", .container = GpuDecodeContainer::QuickTime, .drop = drop};
+  return {.path = "fixture.mp4",
+          .container = GpuDecodeContainer::QuickTime,
+          .drop = drop,
+          .indexed_fps_numerator = std::nullopt,
+          .indexed_fps_denominator = std::nullopt,
+          .indexed_stream_time_origin_ns = std::nullopt,
+          .start_frame_index = std::nullopt};
 }
 
 GpuDecodedFrame metadata_frame(std::uint64_t frame_index) {
@@ -74,7 +80,10 @@ GpuDecodedFrame metadata_frame(std::uint64_t frame_index) {
           .visible_width = 64,
           .visible_height = 32,
           .owner = std::make_shared<int>(1),
-          .frame_index = frame_index};
+          .frame_index = frame_index,
+          .pts_ns = std::nullopt,
+          .duration_ns = std::nullopt,
+          .rotation_degrees = 0};
 }
 
 class VectorSource final : public GpuFileDecodeSource {
@@ -83,6 +92,13 @@ public:
                         bool drop = false)
       : config_(fixture_config(drop)), pipeline_(build_gstreamer_gpu_file_decode_pipeline(config_)),
         frames_(std::move(frames)), gpu_resident_(gpu_resident) {}
+
+  VectorSource(GpuFileDecodeConfig config, std::vector<GpuDecodedFrame> frames,
+               bool gpu_resident = true,
+               std::shared_ptr<std::vector<std::uint64_t>> seek_trace = nullptr)
+      : config_(std::move(config)), pipeline_(build_gstreamer_gpu_file_decode_pipeline(config_)),
+        frames_(std::move(frames)), gpu_resident_(gpu_resident),
+        seek_trace_(std::move(seek_trace)) {}
 
   [[nodiscard]] const GpuFileDecodeConfig& config() const override { return config_; }
   [[nodiscard]] std::string_view pipeline() const override { return pipeline_; }
@@ -94,6 +110,18 @@ public:
     }
     return make_gpu_decode_frame(std::move(frames_[next_++]));
   }
+  void seek_to_frame(std::uint64_t frame_index) override {
+    if (seek_trace_) {
+      seek_trace_->push_back(frame_index);
+    }
+    const auto match = std::find_if(
+        frames_.begin() + static_cast<std::ptrdiff_t>(next_), frames_.end(),
+        [frame_index](const GpuDecodedFrame& frame) { return frame.frame_index == frame_index; });
+    if (match == frames_.end()) {
+      throw GpuDecodeError("fixture seek target is unavailable");
+    }
+    next_ = static_cast<std::size_t>(std::distance(frames_.begin(), match));
+  }
   [[nodiscard]] std::size_t read_count() const { return read_count_; }
 
 private:
@@ -103,6 +131,7 @@ private:
   std::size_t next_ = 0;
   std::size_t read_count_ = 0;
   bool gpu_resident_ = true;
+  std::shared_ptr<std::vector<std::uint64_t>> seek_trace_;
 };
 
 class MissingPayloadSource final : public GpuFileDecodeSource {
@@ -245,7 +274,8 @@ struct CudaNvmmOwner {
 std::pair<GpuDecodedFrame, std::weak_ptr<CudaNvmmOwner>>
 make_cuda_frame(CudaBackend& backend, std::uint64_t frame_index, std::uint8_t y_value,
                 std::uint32_t width = 854, std::uint32_t height = 32,
-                std::uint32_t allocation_width = 864, std::shared_ptr<CopyOrderTrace> trace = {}) {
+                std::uint32_t allocation_width = 864, std::shared_ptr<CopyOrderTrace> trace = {},
+                std::uint16_t rotation_degrees = 0, bool patterned = false) {
   auto source_allocation = backend.allocate_pitched(allocation_width, height + height / 2U, 16);
   const std::size_t pitch = source_allocation.pitch;
   const std::size_t total_size = pitch * (height + height / 2U);
@@ -253,6 +283,14 @@ make_cuda_frame(CudaBackend& backend, std::uint64_t frame_index, std::uint8_t y_
       std::make_shared<CudaNvmmOwner>(std::move(source_allocation.buffer), std::move(trace));
   std::vector<std::uint8_t> pixels(total_size, 128);
   std::fill_n(pixels.begin(), pitch * height, y_value);
+  if (patterned) {
+    for (std::uint32_t y = 0; y < height; ++y) {
+      for (std::uint32_t x = 0; x < width; ++x) {
+        pixels[static_cast<std::size_t>(y) * pitch + x] =
+            static_cast<std::uint8_t>((static_cast<std::uint64_t>(y) * width + x) % 251U);
+      }
+    }
+  }
   backend.copy_host_to_device_2d({.src = pixels.data(),
                                   .src_pitch = pitch,
                                   .dst = owner->allocation.ptr(),
@@ -294,8 +332,50 @@ make_cuda_frame(CudaBackend& backend, std::uint64_t frame_index, std::uint8_t y_
                           .owner = std::move(owner),
                           .frame_index = frame_index,
                           .pts_ns = frame_index * 33'333'333U,
-                          .duration_ns = 33'333'333U},
+                          .duration_ns = 33'333'333U,
+                          .rotation_degrees = rotation_degrees},
           lifetime};
+}
+
+void stream_rotation_is_applied_on_device(CudaBackend& backend) {
+  constexpr std::uint32_t width = 64;
+  constexpr std::uint32_t height = 32;
+  auto rotated_frame = make_cuda_frame(backend, 0, 0, width, height, width, {}, 180U, true).first;
+  VectorSource rotated_source({std::move(rotated_frame)});
+  const auto extracted =
+      extract_gpu_gray_frames(backend, rotated_source, std::vector<std::uint64_t>{0});
+  expect_eq(extracted.size(), 1U, "180-degree frame is extracted");
+  if (!extracted.empty()) {
+    expect_eq(extracted[0].applied_rotation_degrees, 180U,
+              "extracted frame preserves the applied source rotation");
+    expect_eq(extracted[0].view().applied_rotation_degrees, 180U,
+              "calibration frame view exposes the applied source rotation");
+    std::vector<std::uint8_t> pixels(static_cast<std::size_t>(width) * height);
+    backend.copy_device_to_host_2d({.dst = pixels.data(),
+                                    .dst_pitch = width,
+                                    .src = extracted[0].y_plane.ptr(),
+                                    .src_pitch = extracted[0].pitch,
+                                    .width_bytes = width,
+                                    .height = height});
+    for (std::uint32_t y = 0; y < height; ++y) {
+      for (std::uint32_t x = 0; x < width; ++x) {
+        const auto source_x = width - 1U - x;
+        const auto source_y = height - 1U - y;
+        const auto expected = static_cast<std::uint8_t>(
+            (static_cast<std::uint64_t>(source_y) * width + source_x) % 251U);
+        expect_eq(pixels[static_cast<std::size_t>(y) * width + x], expected,
+                  "CUDA luma rotation pixel");
+      }
+    }
+  }
+
+  auto quarter_turn = make_cuda_frame(backend, 0, 0, width, height, width, {}, 90U).first;
+  VectorSource quarter_turn_source({std::move(quarter_turn)});
+  expect_error<GpuFrameExtractionError>(
+      [&] {
+        (void)extract_gpu_gray_frames(backend, quarter_turn_source, std::vector<std::uint64_t>{0});
+      },
+      "only 0- or 180-degree", "dimension-swapping rotation fails closed");
 }
 
 void selected_y_planes_are_copied_device_to_device(CudaBackend& backend) {
@@ -374,11 +454,72 @@ void selected_y_planes_are_copied_device_to_device(CudaBackend& backend) {
       "dimensions changed", "mid-stream dimension changes are rejected");
 }
 
-void sequential_source_calibration_releases_each_pair(CudaBackend& backend) {
+void sparse_file_sampling_reuses_one_seekable_source(CudaBackend& backend) {
+  auto trace = std::make_shared<CopyOrderTrace>();
+  auto extraction_backend = backend.with_trace_sink(trace);
+  auto config = fixture_config();
+  config.indexed_fps_numerator = 30;
+  config.indexed_fps_denominator = 1;
+  config.indexed_stream_time_origin_ns = 0;
+  constexpr std::array<std::uint64_t, 3> indices{3, 300, 9'000};
+  std::vector<std::uint64_t> opened_indices;
+  auto seek_trace = std::make_shared<std::vector<std::uint64_t>>();
+
+  const GpuFileDecodeSourceOpener opener = [&](GpuFileDecodeConfig sample_config,
+                                               NvbufSurfaceAbi abi_value) {
+    expect_true(abi_value == NvbufSurfaceAbi::DeepStream9_1,
+                "sample opener receives the selected NvBufSurface ABI");
+    expect_true(sample_config.start_frame_index.has_value(),
+                "sample opener receives an indexed seek target");
+    opened_indices.push_back(sample_config.start_frame_index.value_or(0));
+    std::vector<GpuDecodedFrame> frames;
+    for (const auto frame_index : indices) {
+      frames.push_back(make_cuda_frame(backend, frame_index,
+                                       static_cast<std::uint8_t>(frame_index % 251U), 64, 32, 64,
+                                       trace)
+                           .first);
+    }
+    return std::make_unique<VectorSource>(std::move(sample_config), std::move(frames), true,
+                                          seek_trace);
+  };
+
+  const auto extracted = extract_gpu_gray_frames_from_file(
+      extraction_backend, config, NvbufSurfaceAbi::DeepStream9_1, indices, opener);
+  expect_true(opened_indices == std::vector<std::uint64_t>{indices.front()},
+              "sparse sampling opens one source at the first absolute index");
+  expect_true(*seek_trace == std::vector<std::uint64_t>({indices[1], indices[2]}),
+              "one source seeks in place for later sparse samples");
+  expect_eq(extracted.size(), indices.size(), "one reused GPU source yields every frame");
+  for (std::size_t index = 0; index < extracted.size(); ++index) {
+    expect_eq(extracted[index].frame_index, indices[index], "reused source preserves frame index");
+  }
+  expect_eq(static_cast<std::size_t>(std::count(trace->events.begin(),
+                                                trace->events.begin() + trace->event_count,
+                                                CopyTraceEvent::CopySubmitted)),
+            indices.size(), "reused samples use one device-to-device copy each");
+
+  const GpuFileDecodeSourceOpener ambiguous = [&](GpuFileDecodeConfig sample_config,
+                                                  NvbufSurfaceAbi) {
+    const auto requested = sample_config.start_frame_index.value_or(0);
+    std::vector<GpuDecodedFrame> frames;
+    frames.push_back(make_cuda_frame(backend, requested + 1U, 0, 64, 32, 64).first);
+    return std::make_unique<VectorSource>(std::move(sample_config), std::move(frames));
+  };
+  constexpr std::array<std::uint64_t, 1> ambiguous_index{12'000};
+  expect_error<GpuFrameExtractionError>(
+      [&] {
+        (void)extract_gpu_gray_frames_from_file(backend, config, NvbufSurfaceAbi::DeepStream9_1,
+                                                ambiguous_index, ambiguous);
+      },
+      "skipped requested", "seek result that cannot prove the requested index fails closed");
+}
+
+void seekable_source_calibration_releases_each_pair(CudaBackend& backend) {
   std::vector<GpuDecodedFrame> left_frames;
   std::vector<GpuDecodedFrame> right_frames;
   std::vector<std::weak_ptr<CudaNvmmOwner>> lifetimes;
-  for (std::uint64_t index = 0; index < 3; ++index) {
+  constexpr std::array<std::uint64_t, 3> indices{3, 300, 9'000};
+  for (const auto index : indices) {
     auto [left, left_lifetime] = make_cuda_frame(backend, index, 32, 854, 64, 864);
     auto [right, right_lifetime] = make_cuda_frame(backend, index, 224, 854, 64, 864);
     left_frames.push_back(std::move(left));
@@ -386,9 +527,15 @@ void sequential_source_calibration_releases_each_pair(CudaBackend& backend) {
     lifetimes.push_back(std::move(left_lifetime));
     lifetimes.push_back(std::move(right_lifetime));
   }
-  VectorSource left_source(std::move(left_frames));
-  VectorSource right_source(std::move(right_frames));
-  constexpr std::array<std::uint64_t, 3> indices{0, 1, 2};
+  auto source_config = fixture_config();
+  source_config.indexed_fps_numerator = 30;
+  source_config.indexed_fps_denominator = 1;
+  source_config.indexed_stream_time_origin_ns = 0;
+  source_config.start_frame_index = indices.front();
+  auto left_seeks = std::make_shared<std::vector<std::uint64_t>>();
+  auto right_seeks = std::make_shared<std::vector<std::uint64_t>>();
+  VectorSource left_source(source_config, std::move(left_frames), true, left_seeks);
+  VectorSource right_source(source_config, std::move(right_frames), true, right_seeks);
   const CameraParams params{.width = 854,
                             .height = 64,
                             .fx = 1.0e10,
@@ -406,12 +553,16 @@ void sequential_source_calibration_releases_each_pair(CudaBackend& backend) {
         (void)run_gpu_calibration_sources(backend, left_source, right_source, indices, indices,
                                           params, params, config);
       },
-      "no usable frame pairs", "uniform sequential frames produce no calibration features");
-  expect_eq(left_source.read_count(), indices.size(), "left source is consumed sequentially");
-  expect_eq(right_source.read_count(), indices.size(), "right source is consumed sequentially");
+      "no usable frame pairs", "uniform seeked frames produce no calibration features");
+  expect_eq(left_source.read_count(), indices.size(), "left source returns every selected frame");
+  expect_eq(right_source.read_count(), indices.size(), "right source returns every selected frame");
+  expect_true(*left_seeks == std::vector<std::uint64_t>({indices[1], indices[2]}),
+              "left calibration source is reused across sparse samples");
+  expect_true(*right_seeks == std::vector<std::uint64_t>({indices[1], indices[2]}),
+              "right calibration source is reused across sparse samples");
   expect_true(std::all_of(lifetimes.begin(), lifetimes.end(),
                           [](const auto& lifetime) { return lifetime.expired(); }),
-              "sequential calibration releases every decoder-owned surface");
+              "seeked calibration releases every decoder-owned surface");
 }
 
 #endif
@@ -435,7 +586,9 @@ int main() {
   extraction_contract_rejects_invalid_streams(backend);
 #if defined(__linux__)
   selected_y_planes_are_copied_device_to_device(backend);
-  sequential_source_calibration_releases_each_pair(backend);
+  sparse_file_sampling_reuses_one_seekable_source(backend);
+  stream_rotation_is_applied_on_device(backend);
+  seekable_source_calibration_releases_each_pair(backend);
 #else
   std::cerr << "SKIP: NvBufSurface CUDA mapping tests require Linux\n";
 #endif

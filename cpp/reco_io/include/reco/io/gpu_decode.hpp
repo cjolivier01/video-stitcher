@@ -12,6 +12,8 @@
 
 namespace reco::io {
 
+inline constexpr std::uint32_t kMaximumIndexedTimestampMultiplicity = 1024;
+
 enum class GpuDecodeCodec {
   H264,
   Hevc,
@@ -32,6 +34,24 @@ struct GpuFileDecodeConfig {
   std::optional<GpuDecodeContainer> container;
   std::uint32_t max_buffers = 4;
   bool drop = false;
+  // Bounds one appsink read, including repeated poll wakeups.
+  std::uint64_t read_timeout_ns = 30'000'000'000ULL;
+  // When set, decoded frame indices are derived from presentation stream time
+  // instead of a synthetic pull counter. Calibration uses this to detect
+  // dropped AUs.
+  std::optional<std::uint32_t> indexed_fps_numerator;
+  std::optional<std::uint32_t> indexed_fps_denominator;
+  // Number of consecutive access units that share each presentation timestamp.
+  // The probe proves this value is constant before indexed calibration uses it.
+  std::uint32_t indexed_timestamp_multiplicity = 1;
+  // Presentation stream time of absolute frame zero, as returned by the GPU
+  // video probe. Required for an indexed seek so nonzero media timelines are
+  // not relabeled as though they began at zero.
+  std::optional<std::uint64_t> indexed_stream_time_origin_ns;
+  // Optional first frame for an accurate, bounded GStreamer seek before
+  // decoding starts. Requires indexed cadence so emitted indices retain their
+  // absolute stream positions after the seek.
+  std::optional<std::uint64_t> start_frame_index;
 };
 
 enum class GpuDecodeFrameStatus {
@@ -47,6 +67,8 @@ struct GpuDecodedFrame {
   std::uint64_t frame_index = 0;
   std::optional<std::uint64_t> pts_ns;
   std::optional<std::uint64_t> duration_ns;
+  // Clockwise display rotation carried by the selected video stream.
+  std::uint16_t rotation_degrees = 0;
 };
 
 struct GpuDecodeReadResult {
@@ -62,6 +84,8 @@ public:
   [[nodiscard]] virtual std::string_view pipeline() const = 0;
   [[nodiscard]] virtual bool gpu_resident() const = 0;
   [[nodiscard]] virtual GpuDecodeReadResult read() = 0;
+  /// Accurately seeks an indexed source without rebuilding its decode pipeline.
+  virtual void seek_to_frame(std::uint64_t frame_index);
 };
 
 /// Failure while loading or consuming a GPU-resident GStreamer decode stream.

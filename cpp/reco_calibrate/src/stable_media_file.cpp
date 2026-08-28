@@ -1,0 +1,127 @@
+#include "stable_media_file.hpp"
+
+#include "reco/calibrate/pipeline.hpp"
+
+#include <cerrno>
+#include <cstring>
+#include <string>
+#include <utility>
+
+#if defined(__linux__)
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
+namespace reco::calibrate::detail {
+
+#if defined(__linux__)
+namespace {
+
+[[noreturn]] void throw_file_error(const std::filesystem::path& path, const char* operation) {
+  throw CalibrationExecutionError(std::string(operation) + " calibration video " + path.string() +
+                                  ": " + std::strerror(errno));
+}
+
+bool same_timestamp(const timespec& left, const timespec& right) {
+  return left.tv_sec == right.tv_sec && left.tv_nsec == right.tv_nsec;
+}
+
+} // namespace
+
+struct StableMediaFile::Impl {
+  explicit Impl(const std::filesystem::path& path) : original_path(path) {
+    descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (descriptor < 0) {
+      throw_file_error(path, "cannot open");
+    }
+    if (::fstat(descriptor, &identity) != 0) {
+      const auto saved_error = errno;
+      ::close(descriptor);
+      descriptor = -1;
+      errno = saved_error;
+      throw_file_error(path, "cannot inspect");
+    }
+    if (!S_ISREG(identity.st_mode)) {
+      ::close(descriptor);
+      descriptor = -1;
+      throw CalibrationExecutionError("calibration video must be a regular file: " + path.string());
+    }
+    if (identity.st_size <= 0) {
+      ::close(descriptor);
+      descriptor = -1;
+      throw CalibrationExecutionError("calibration video must not be empty: " + path.string());
+    }
+    if (::flock(descriptor, LOCK_SH | LOCK_NB) != 0) {
+      const auto saved_error = errno;
+      ::close(descriptor);
+      descriptor = -1;
+      errno = saved_error;
+      throw_file_error(path, "cannot acquire a shared lock for");
+    }
+    retained_path = std::filesystem::path("/proc") / std::to_string(::getpid()) / "fd" /
+                    std::to_string(descriptor);
+  }
+
+  ~Impl() {
+    if (descriptor >= 0) {
+      (void)::close(descriptor);
+    }
+  }
+
+  void verify_unchanged() const {
+    struct stat current{};
+    if (::fstat(descriptor, &current) != 0) {
+      throw_file_error(original_path, "cannot re-inspect");
+    }
+    if (current.st_dev != identity.st_dev || current.st_ino != identity.st_ino ||
+        current.st_mode != identity.st_mode || current.st_size != identity.st_size ||
+        !same_timestamp(current.st_mtim, identity.st_mtim) ||
+        !same_timestamp(current.st_ctim, identity.st_ctim)) {
+      throw CalibrationExecutionError("calibration video changed while it was being processed: " +
+                                      original_path.string());
+    }
+  }
+
+  std::filesystem::path original_path;
+  std::filesystem::path retained_path;
+  int descriptor = -1;
+  struct stat identity{};
+};
+
+#else
+
+struct StableMediaFile::Impl {
+  explicit Impl(const std::filesystem::path&) {
+    throw CalibrationExecutionError(
+        "stable file-backed GPU calibration is currently supported only on Linux");
+  }
+  void verify_unchanged() const {}
+  std::filesystem::path retained_path;
+};
+
+#endif
+
+StableMediaFile::StableMediaFile(const std::filesystem::path& path)
+    : impl_(std::make_unique<Impl>(path)) {}
+
+StableMediaFile::~StableMediaFile() = default;
+StableMediaFile::StableMediaFile(StableMediaFile&&) noexcept = default;
+StableMediaFile& StableMediaFile::operator=(StableMediaFile&&) noexcept = default;
+
+const std::filesystem::path& StableMediaFile::decode_path() const {
+  if (impl_ == nullptr) {
+    throw CalibrationExecutionError("cannot use a moved-from stable calibration video");
+  }
+  return impl_->retained_path;
+}
+
+void StableMediaFile::verify_unchanged() const {
+  if (impl_ == nullptr) {
+    throw CalibrationExecutionError("cannot use a moved-from stable calibration video");
+  }
+  impl_->verify_unchanged();
+}
+
+} // namespace reco::calibrate::detail

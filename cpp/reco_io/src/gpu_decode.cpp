@@ -112,10 +112,41 @@ std::optional<std::string> validate_gpu_file_decode_config(const GpuFileDecodeCo
   if (config.max_buffers == 0) {
     return "GPU file decode max_buffers must be non-zero";
   }
+  if (config.read_timeout_ns < 100'000'000ULL || config.read_timeout_ns > 3'600'000'000'000ULL) {
+    return "GPU file decode read timeout must be between 100 ms and one hour";
+  }
+  if (config.indexed_fps_numerator.has_value() != config.indexed_fps_denominator.has_value()) {
+    return "GPU file decode indexed cadence requires both numerator and denominator";
+  }
+  if (config.indexed_fps_numerator.value_or(1U) == 0U ||
+      config.indexed_fps_denominator.value_or(1U) == 0U) {
+    return "GPU file decode indexed cadence must be non-zero";
+  }
+  if (config.indexed_timestamp_multiplicity == 0U ||
+      config.indexed_timestamp_multiplicity > kMaximumIndexedTimestampMultiplicity) {
+    return "GPU file decode indexed timestamp multiplicity is out of range";
+  }
+  if (config.indexed_timestamp_multiplicity != 1U && !config.indexed_fps_numerator.has_value()) {
+    return "GPU file decode timestamp multiplicity requires indexed cadence";
+  }
+  if (config.start_frame_index.has_value() && !config.indexed_fps_numerator.has_value()) {
+    return "GPU file decode start frame requires indexed cadence";
+  }
+  if (config.start_frame_index.has_value() && !config.indexed_stream_time_origin_ns.has_value()) {
+    return "GPU file decode start frame requires the probed stream-time origin";
+  }
+  if (config.indexed_stream_time_origin_ns.has_value() &&
+      !config.indexed_fps_numerator.has_value()) {
+    return "GPU file decode stream-time origin requires indexed cadence";
+  }
   if (!config.elementary_stream && !config.container.has_value()) {
     return "GPU file decode container is unsupported";
   }
   return std::nullopt;
+}
+
+void GpuFileDecodeSource::seek_to_frame(std::uint64_t) {
+  throw GpuDecodeError("GPU file decode source does not support indexed seeking");
 }
 
 std::optional<std::string> validate_gpu_decoded_frame(const GpuDecodedFrame& frame) {
@@ -133,6 +164,10 @@ std::optional<std::string> validate_gpu_decoded_frame(const GpuDecodedFrame& fra
   }
   if (frame.visible_width > frame.nvmm.width || frame.visible_height > frame.nvmm.height) {
     return "GPU decoded frame visible dimensions exceed the NVMM allocation";
+  }
+  if (frame.rotation_degrees != 0U && frame.rotation_degrees != 90U &&
+      frame.rotation_degrees != 180U && frame.rotation_degrees != 270U) {
+    return "GPU decoded frame rotation must be 0, 90, 180, or 270 degrees";
   }
   return std::nullopt;
 }

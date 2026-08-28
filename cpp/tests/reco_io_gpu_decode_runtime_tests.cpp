@@ -183,6 +183,148 @@ void production_source_retains_mapped_sample() {
             "idempotent EOS does not perform a third pull on either source");
 }
 
+void orientation_tags_are_preserved() {
+  set_scenario("orientation-180");
+  auto source =
+      open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+  const auto frame = source->read();
+  expect_true(frame.frame.has_value(), "orientation fixture returns frame");
+  if (frame.frame.has_value()) {
+    expect_eq(frame.frame->rotation_degrees, 180U, "180-degree stream tag is preserved");
+  }
+
+  set_scenario("orientation-90");
+  source = open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+  const auto rotated = source->read();
+  expect_true(rotated.frame.has_value(), "90-degree orientation fixture returns frame");
+  if (rotated.frame.has_value()) {
+    expect_eq(rotated.frame->rotation_degrees, 90U, "90-degree stream tag is preserved");
+  }
+
+  set_scenario("orientation-flip");
+  source = open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+  expect_gpu_decode_error([&] { (void)source->read(); }, "unsupported GStreamer image orientation",
+                          "mirrored stream orientation fails closed");
+}
+
+void indexed_cadence_drives_frame_indices() {
+  auto config = valid_config();
+  config.indexed_fps_numerator = 30U;
+  config.indexed_fps_denominator = 1U;
+
+  set_scenario("indexed-cfr");
+  auto source = open_gstreamer_gpu_file_decode_source(config, NvbufSurfaceAbi::DeepStream9_1);
+  const auto first = source->read();
+  const auto second = source->read();
+  expect_true(first.frame.has_value() && second.frame.has_value(),
+              "indexed CFR fixture returns frames");
+  if (first.frame.has_value() && second.frame.has_value()) {
+    expect_eq(first.frame->frame_index, 0U, "indexed cadence origin is frame zero");
+    expect_eq(second.frame->frame_index, 1U, "indexed cadence advances from PTS");
+  }
+
+  set_scenario("indexed-gap");
+  source = open_gstreamer_gpu_file_decode_source(config, NvbufSurfaceAbi::DeepStream9_1);
+  (void)source->read();
+  const auto after_gap = source->read();
+  expect_true(after_gap.frame.has_value(), "indexed gap fixture returns second frame");
+  if (after_gap.frame.has_value()) {
+    expect_eq(after_gap.frame->frame_index, 2U, "PTS gap is not hidden by a pull counter");
+  }
+
+  set_scenario("indexed-off-cadence");
+  source = open_gstreamer_gpu_file_decode_source(config, NvbufSurfaceAbi::DeepStream9_1);
+  (void)source->read();
+  expect_gpu_decode_error([&] { (void)source->read(); }, "violates the probed cadence",
+                          "off-cadence decoded PTS fails closed");
+}
+
+void indexed_decode_seeks_to_absolute_start_frame() {
+  set_scenario("indexed-seek");
+  const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
+  std::filesystem::remove(event_path);
+  auto config = valid_config();
+  config.indexed_fps_numerator = 30U;
+  config.indexed_fps_denominator = 1U;
+  config.indexed_stream_time_origin_ns = 0U;
+  config.start_frame_index = 300U;
+
+  auto source = open_gstreamer_gpu_file_decode_source(config, NvbufSurfaceAbi::DeepStream9_1);
+  const auto first = source->read();
+  const auto second = source->read();
+  expect_true(first.frame.has_value() && second.frame.has_value(),
+              "indexed seek fixture returns frames");
+  if (first.frame.has_value() && second.frame.has_value()) {
+    expect_eq(first.frame->frame_index, 300U, "seeked frame keeps absolute stream index");
+    expect_eq(second.frame->frame_index, 301U, "seeked cadence advances absolute index");
+    expect_true(first.frame->pts_ns == 10'000'000'000ULL,
+                "initial seek uses exact rational frame timestamp");
+  }
+  const auto events = read_events(event_path);
+  const auto paused = std::find(events.begin(), events.end(), "state-paused");
+  const auto seek = std::find(events.begin(), events.end(), "seek-compressed");
+  const auto playing = std::find(events.begin(), events.end(), "state-playing");
+  expect_true(paused < seek && seek < playing,
+              "decode pauses and seeks before entering PLAYING state");
+
+  set_scenario("probe-seek-unsupported");
+  expect_gpu_decode_error(
+      [&] { (void)open_gstreamer_gpu_file_decode_source(config, NvbufSurfaceAbi::DeepStream9_1); },
+      "rejected the requested initial frame seek", "unsupported initial decode seek");
+
+  set_scenario("indexed-seek-nonzero-origin");
+  config.indexed_fps_numerator = 30'000U;
+  config.indexed_fps_denominator = 1'001U;
+  config.indexed_stream_time_origin_ns = 766'666'666ULL;
+  source = open_gstreamer_gpu_file_decode_source(config, NvbufSurfaceAbi::DeepStream9_1);
+  const auto nonzero_first = source->read();
+  const auto nonzero_second = source->read();
+  expect_true(nonzero_first.frame.has_value() && nonzero_second.frame.has_value(),
+              "nonzero-origin indexed seek returns frames");
+  if (nonzero_first.frame.has_value() && nonzero_second.frame.has_value()) {
+    expect_eq(nonzero_first.frame->frame_index, 300U,
+              "nonzero-origin rational seek retains the requested absolute index");
+    expect_eq(nonzero_second.frame->frame_index, 301U,
+              "nonzero-origin rational cadence advances the absolute index");
+    expect_true(nonzero_first.frame->pts_ns == 15'776'666'666ULL,
+                "raw PTS remains distinct from converted presentation stream time");
+  }
+
+  set_scenario("indexed-seek-wrong-first");
+  expect_gpu_decode_error(
+      [&] {
+        auto mismatched =
+            open_gstreamer_gpu_file_decode_source(config, NvbufSurfaceAbi::DeepStream9_1);
+        (void)mismatched->read();
+      },
+      "does not match the requested absolute frame index",
+      "post-seek sample from the wrong absolute frame is rejected");
+
+  set_scenario("indexed-seek-invalid-segment");
+  expect_gpu_decode_error(
+      [&] {
+        auto invalid_segment =
+            open_gstreamer_gpu_file_decode_source(config, NvbufSurfaceAbi::DeepStream9_1);
+        (void)invalid_segment->read();
+      },
+      "cannot be converted to presentation stream time",
+      "post-seek sample without a presentation stream-time mapping is rejected");
+}
+
+void stalled_appsink_reads_are_bounded() {
+  set_scenario("read-timeout");
+  auto config = valid_config();
+  config.read_timeout_ns = 100'000'000ULL;
+  auto source = open_gstreamer_gpu_file_decode_source(config, NvbufSurfaceAbi::DeepStream9_1);
+  const auto start = std::chrono::steady_clock::now();
+  expect_gpu_decode_error([&] { (void)source->read(); }, "read timed out",
+                          "stalled appsink read reaches its deadline");
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  expect_true(elapsed < std::chrono::seconds(2), "appsink read deadline is bounded in wall time");
+  expect_gpu_decode_error([&] { (void)source->read(); }, "read timed out",
+                          "read timeout is latched");
+}
+
 void padded_sink_caps_preserve_predecoder_dimensions() {
   set_scenario("visible-crop");
   const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
@@ -511,7 +653,8 @@ void fatal_pipeline_errors_are_latched() {
   expect_eq(expected_errors.load(), 16U, "all concurrent readers receive the fatal bus error");
   expect_eq(unexpected_results.load(), 0U, "fatal bus errors return deterministic results");
   const auto events = read_events(event_path);
-  expect_eq(count_event(events, "pull"), 1U, "latched bus error prevents later appsink pulls");
+  expect_eq(count_event(events, "pull"), 0U,
+            "queued fatal bus error prevents the first appsink pull");
 }
 
 void geometry_probe_errors_are_latched_before_further_pulls() {
@@ -587,6 +730,10 @@ int main() {
   set_environment("RECO_FAKE_GST_EVENT_PATH", event_path.string());
 
   production_source_retains_mapped_sample();
+  orientation_tags_are_preserved();
+  indexed_cadence_drives_frame_indices();
+  indexed_decode_seeks_to_absolute_start_frame();
+  stalled_appsink_reads_are_bounded();
   padded_sink_caps_preserve_predecoder_dimensions();
   runahead_caps_are_correlated_by_timestamp();
   duplicate_pts_at_geometry_transition_is_ambiguous();

@@ -5,6 +5,7 @@
 #include <iostream>
 #include <limits>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -18,7 +19,7 @@ std::string encode(const nlohmann::json& value) {
 }
 
 nlohmann::json valid_request() {
-  return {{"protocol_version", 3U},
+  return {{"protocol_version", 5U},
           {"path", nlohmann::json::binary({0x76, 0x69, 0x64, 0x65, 0x6f})},
           {"codec", 0},
           {"elementary_stream", false},
@@ -55,7 +56,7 @@ template <typename Function> void expect_success(Function&& function, std::strin
 }
 
 nlohmann::json valid_response() {
-  return {{"protocol_version", 3U},
+  return {{"protocol_version", 5U},
           {"ok", true},
           {"width", 1920U},
           {"height", 1080U},
@@ -63,6 +64,8 @@ nlohmann::json valid_response() {
           {"fps_denominator", 1U},
           {"duration_ns", 1'000'000'000ULL},
           {"total_frames", 30ULL},
+          {"first_stream_time_ns", 766'666'666ULL},
+          {"timestamp_multiplicity", 1U},
           {"duration_is_estimated", false},
           {"total_frames_is_estimated", false},
           {"selected_stream_caps_verified", true},
@@ -71,7 +74,7 @@ nlohmann::json valid_response() {
 
 void request_numeric_domains_are_enforced() {
   auto previous_protocol = valid_request();
-  previous_protocol["protocol_version"] = 2U;
+  previous_protocol["protocol_version"] = 3U;
   expect_probe_error(
       [&] { (void)reco::io::detail::decode_probe_request(encode(previous_protocol)); },
       "unsupported protocol version", "previous request schema is rejected explicitly");
@@ -97,7 +100,7 @@ void request_numeric_domains_are_enforced() {
 void response_numeric_domains_are_enforced() {
   const auto base = valid_response();
   auto previous_protocol = base;
-  previous_protocol["protocol_version"] = 2U;
+  previous_protocol["protocol_version"] = 3U;
   expect_probe_error(
       [&] { (void)reco::io::detail::decode_probe_response(encode(previous_protocol)); },
       "unsupported protocol version", "previous response schema is rejected explicitly");
@@ -106,19 +109,32 @@ void response_numeric_domains_are_enforced() {
   missing_cadence_proof.erase("indexed_sampling_cadence_verified");
   expect_probe_error(
       [&] { (void)reco::io::detail::decode_probe_response(encode(missing_cadence_proof)); },
-      "indexed_sampling_cadence_verified", "cadence proof is mandatory in protocol version 3");
+      "indexed_sampling_cadence_verified", "cadence proof is mandatory in protocol version 5");
 
   auto missing_caps_proof = base;
   missing_caps_proof.erase("selected_stream_caps_verified");
   expect_probe_error(
       [&] { (void)reco::io::detail::decode_probe_response(encode(missing_caps_proof)); },
-      "selected_stream_caps_verified", "caps proof is mandatory in protocol version 3");
+      "selected_stream_caps_verified", "caps proof is mandatory in protocol version 5");
+
+  auto missing_stream_origin = base;
+  missing_stream_origin.erase("first_stream_time_ns");
+  expect_probe_error(
+      [&] { (void)reco::io::detail::decode_probe_response(encode(missing_stream_origin)); },
+      "first_stream_time_ns", "stream-time origin is mandatory in protocol version 5");
+
+  auto missing_multiplicity = base;
+  missing_multiplicity.erase("timestamp_multiplicity");
+  expect_probe_error(
+      [&] { (void)reco::io::detail::decode_probe_response(encode(missing_multiplicity)); },
+      "timestamp_multiplicity", "timestamp multiplicity is mandatory in protocol version 5");
 
   for (const auto& [key, value] : std::initializer_list<std::pair<std::string, nlohmann::json>>{
            {"protocol_version", std::numeric_limits<std::uint64_t>::max()},
            {"width", -2},
            {"duration_ns", -1},
-           {"total_frames", -1}}) {
+           {"total_frames", -1},
+           {"timestamp_multiplicity", -1}}) {
     auto response = base;
     response[key] = value;
     expect_probe_error([&] { (void)reco::io::detail::decode_probe_response(encode(response)); },
@@ -142,6 +158,64 @@ void response_numeric_domains_are_enforced() {
   expect_probe_error(
       [&] { (void)reco::io::detail::decode_probe_response(encode(impossible_frame_count)); },
       "invalid metadata", "impossible average frame counts are rejected");
+}
+
+void stream_time_origin_round_trips() {
+  const auto decoded = reco::io::detail::decode_probe_response(encode(valid_response()));
+  if (decoded.first_stream_time_ns != std::optional<std::uint64_t>(766'666'666ULL)) {
+    std::cerr << "FAIL: nonzero stream-time origin decodes from protocol\n";
+    ++failures;
+  }
+
+  const auto round_tripped =
+      reco::io::detail::decode_probe_response(reco::io::detail::encode_probe_success(decoded));
+  if (round_tripped.first_stream_time_ns != decoded.first_stream_time_ns) {
+    std::cerr << "FAIL: nonzero stream-time origin survives protocol round trip\n";
+    ++failures;
+  }
+
+  auto untimed = valid_response();
+  untimed["first_stream_time_ns"] = nullptr;
+  untimed["selected_stream_caps_verified"] = false;
+  untimed["indexed_sampling_cadence_verified"] = false;
+  const auto decoded_untimed = reco::io::detail::decode_probe_response(encode(untimed));
+  if (decoded_untimed.first_stream_time_ns.has_value()) {
+    std::cerr << "FAIL: missing stream-time origin remains explicit\n";
+    ++failures;
+  }
+
+  untimed["indexed_sampling_cadence_verified"] = true;
+  untimed["selected_stream_caps_verified"] = true;
+  expect_probe_error([&] { (void)reco::io::detail::decode_probe_response(encode(untimed)); },
+                     "cadence proof metadata",
+                     "cadence proof without a stream-time origin is rejected");
+}
+
+void timestamp_multiplicity_round_trips() {
+  auto duplicate = valid_response();
+  duplicate["fps_numerator"] = 50U;
+  duplicate["duration_ns"] = 4'000'000'000ULL;
+  duplicate["total_frames"] = 200ULL;
+  duplicate["timestamp_multiplicity"] = 2U;
+  const auto decoded = reco::io::detail::decode_probe_response(encode(duplicate));
+  if (decoded.timestamp_multiplicity != 2U) {
+    std::cerr << "FAIL: duplicate timestamp multiplicity decodes from protocol\n";
+    ++failures;
+  }
+  const auto round_tripped =
+      reco::io::detail::decode_probe_response(reco::io::detail::encode_probe_success(decoded));
+  if (round_tripped.timestamp_multiplicity != 2U) {
+    std::cerr << "FAIL: duplicate timestamp multiplicity survives protocol round trip\n";
+    ++failures;
+  }
+
+  duplicate["timestamp_multiplicity"] = 0U;
+  expect_probe_error([&] { (void)reco::io::detail::decode_probe_response(encode(duplicate)); },
+                     "invalid metadata", "zero timestamp multiplicity is rejected");
+  duplicate["timestamp_multiplicity"] = 3U;
+  expect_probe_error([&] { (void)reco::io::detail::decode_probe_response(encode(duplicate)); },
+                     "cadence proof metadata",
+                     "exact frame count must contain complete timestamp groups");
 }
 
 void exact_response_metadata_must_be_consistent() {
@@ -271,6 +345,8 @@ void cbor_nesting_is_bounded_before_parsing() {
 int main() {
   request_numeric_domains_are_enforced();
   response_numeric_domains_are_enforced();
+  stream_time_origin_round_trips();
+  timestamp_multiplicity_round_trips();
   exact_response_metadata_must_be_consistent();
   ipc_frame_lengths_are_enforced();
   cbor_nesting_is_bounded_before_parsing();

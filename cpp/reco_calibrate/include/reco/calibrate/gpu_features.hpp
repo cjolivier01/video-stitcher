@@ -14,6 +14,12 @@ namespace reco::calibrate {
 /// Hard upper bound for detector output and matcher input capacities.
 inline constexpr std::uint32_t kMaxGpuAkazeFeatures = 8'192;
 
+/// Hard ceiling for one AKAZE detection workspace, including allocation accounting margin.
+inline constexpr std::size_t kMaxGpuAkazeWorkspaceBytes = std::size_t{2} * 1'024U * 1'024U * 1'024U;
+
+/// Device memory left unused when admitting an AKAZE detection workspace.
+inline constexpr std::size_t kGpuAkazeMemoryHeadroomBytes = std::size_t{256} * 1'024U * 1'024U;
+
 /// Device ABI for an AKAZE keypoint. Descriptors are stored separately.
 struct GpuFeaturePoint {
   /// Source-image x coordinate.
@@ -73,6 +79,25 @@ struct GpuAkazeConfig {
   /// Maximum number of scale-space octaves.
   std::uint32_t max_octaves = 4;
 };
+
+/// Returns a conservative peak CUDA workspace bound without allocating device memory.
+///
+/// The bound includes worst-case candidate selection, retained scale-space images, detector
+/// output, scan scratch, and allocation accounting margin. Invalid dimensions or configuration
+/// values throw `std::invalid_argument`; arithmetic overflow throws `std::overflow_error`.
+[[nodiscard]] std::size_t gpu_akaze_peak_workspace_bytes(std::uint32_t frame_width,
+                                                         std::uint32_t frame_height,
+                                                         const GpuAkazeConfig& config);
+
+/// Reduces only `max_detection_width` to the largest GPU geometry that fits `workspace_limit`.
+///
+/// Full-resolution input and undistortion remain unchanged; the existing CUDA resize feeds the
+/// fitted detector geometry. Invalid input/configuration or a limit too small for a usable AKAZE
+/// scale space throws `std::invalid_argument`.
+[[nodiscard]] GpuAkazeConfig
+fit_gpu_akaze_workspace(std::uint32_t frame_width, std::uint32_t frame_height,
+                        const GpuAkazeConfig& config,
+                        std::size_t workspace_limit = kMaxGpuAkazeWorkspaceBytes);
 
 /// Owning device-resident AKAZE feature set.
 class GpuFeatureSet {

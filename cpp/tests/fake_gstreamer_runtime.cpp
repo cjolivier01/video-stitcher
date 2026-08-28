@@ -107,6 +107,7 @@ struct FakeSink : FakeObject {
 struct FakeBus : FakeObject {
   FakeBus() : FakeObject(ObjectKind::Bus) {}
   bool emitted_error = false;
+  bool emitted_tag = false;
   std::uint32_t poll_count = 0;
 };
 
@@ -185,6 +186,12 @@ constexpr std::uint64_t kFakeMessageMagic = 0x5245434f4d534747ULL;
 
 struct FakeMessage {
   std::uint64_t magic = kFakeMessageMagic;
+  std::array<std::byte, 56> padding{};
+  std::uint32_t type = 0;
+};
+
+struct FakeTagList {
+  std::string orientation;
 };
 
 struct FakePadProbeInfo {
@@ -203,6 +210,7 @@ struct FakeSample {
   bool segment_outside = false;
   bool non_time_segment = false;
   std::uint64_t segment_stream_origin_ns = 0;
+  std::uint64_t segment_pts_offset_ns = 0;
 };
 
 std::mutex event_mutex;
@@ -226,10 +234,12 @@ FakeCaps parser_sample_caps() {
   } else if (scenario() == "probe-duration-mismatch" ||
              scenario() == "probe-container-duration-underestimate" ||
              scenario() == "probe-short-vfr" || scenario() == "probe-vfr-between-windows" ||
-             scenario() == "probe-dynamic-resolution" || scenario() == "probe-delayed-stream" ||
-             scenario() == "probe-nonzero-origin" || scenario() == "probe-decode-order-origin" ||
-             scenario() == "probe-unknown-pts" || scenario() == "probe-long-unknown-pts" ||
-             scenario() == "probe-mixed-prefix-pts" ||
+             scenario() == "probe-exhaustive-50001" ||
+             scenario() == "probe-exhaustive-hidden-vfr" ||
+             scenario() == "probe-exhaustive-endless" || scenario() == "probe-dynamic-resolution" ||
+             scenario() == "probe-delayed-stream" || scenario() == "probe-nonzero-origin" ||
+             scenario() == "probe-decode-order-origin" || scenario() == "probe-unknown-pts" ||
+             scenario() == "probe-long-unknown-pts" || scenario() == "probe-mixed-prefix-pts" ||
              scenario() == "probe-long-mixed-prefix-pts" ||
              scenario() == "probe-reordered-untimed-prefix" ||
              scenario() == "probe-one-frame-rounding" ||
@@ -373,6 +383,9 @@ std::uint64_t parser_timing_offset(std::uint64_t frame_index, const FakeCaps& ca
     }
     return 80'000'000'000ULL + (frame_index - kSlowEndFrame) * 1'000'000'000ULL / 30U;
   }
+  if (scenario() == "probe-exhaustive-hidden-vfr" && frame_index >= 11'111U) {
+    return (frame_index + 1U) * 1'000'000'000ULL / 30U;
+  }
   if (scenario() == "probe-low-amplitude-vfr") {
     constexpr std::uint64_t kTransitionFrame = 75;
     constexpr std::uint64_t kTransitionNs = kTransitionFrame * 1'000'000'000ULL / 30U;
@@ -506,6 +519,9 @@ std::uint64_t snapped_parser_seek_target(std::uint64_t requested_target, std::ui
 }
 
 void record(std::string_view event) {
+  if (scenario().starts_with("probe-exhaustive-")) {
+    return;
+  }
   const char* path = std::getenv("RECO_FAKE_GST_EVENT_PATH");
   if (path == nullptr || path[0] == '\0') {
     return;
@@ -895,8 +911,20 @@ RECO_FAKE_EXPORT int gst_element_query_duration(void*, int format, std::int64_t*
     *duration = 20'000'000'000;
     return 1;
   }
-  if (format != 3 || duration == nullptr || scenario() == "probe-duration-unknown" ||
-      scenario() == "probe-long-unknown-pts" || scenario() == "probe-durationless-unseekable-15" ||
+  if (format != 3 || duration == nullptr) {
+    return 0;
+  }
+  if (current_scenario == "probe-exhaustive-50001" ||
+      current_scenario == "probe-exhaustive-hidden-vfr") {
+    *duration = 1'666'700'000'000LL;
+    return 1;
+  }
+  if (current_scenario == "probe-exhaustive-endless") {
+    *duration = std::numeric_limits<std::int64_t>::max();
+    return 1;
+  }
+  if (scenario() == "probe-duration-unknown" || scenario() == "probe-long-unknown-pts" ||
+      scenario() == "probe-durationless-unseekable-15" ||
       scenario() == "probe-million-au-no-duration") {
     return 0;
   }
@@ -1349,6 +1377,11 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
       std::this_thread::sleep_for(std::chrono::nanoseconds(timeout_ns));
       return nullptr;
     }
+    if (current_scenario == "probe-exhaustive-endless" &&
+        sink->probe_sequential_pull_count >= 12'000U) {
+      std::this_thread::sleep_for(std::chrono::nanoseconds(timeout_ns));
+      return nullptr;
+    }
     auto sample_caps = parser_sample_caps();
     auto timing_caps = sample_caps;
     if (current_scenario == "probe-inexact-caps-fps") {
@@ -1404,32 +1437,36 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
                 current_scenario == "probe-seek-preroll" ||
                 current_scenario == "probe-seek-unknown-pts-preroll"
             ? 200'000'000'000ULL
-        : current_scenario == "probe-delayed-stream"                        ? 5'000'000'000ULL
-        : current_scenario == "probe-nonzero-origin"                        ? 2'766'666'666ULL
-        : current_scenario == "probe-duration-mismatch"                     ? 1'000'000'000ULL
-        : current_scenario == "probe-container-duration-underestimate"      ? 200'000'000'000ULL
-        : current_scenario == "probe-short-vfr"                             ? 333'333'333ULL
-        : current_scenario == "probe-vfr-between-windows"                   ? 200'000'000'000ULL
-        : current_scenario == "probe-dynamic-resolution"                    ? 10'000'000'000ULL
-        : current_scenario == "probe-decode-order-origin"                   ? 1'000'000'000ULL
-        : current_scenario == "probe-unknown-pts"                           ? 1'000'000'000ULL
-        : current_scenario == "probe-long-unknown-pts"                      ? 3'000'000'000ULL
-        : current_scenario == "probe-mixed-prefix-pts"                      ? 4'000'000'000ULL
-        : current_scenario == "probe-long-mixed-prefix-pts"                 ? 20'000'000'000ULL
-        : current_scenario == "probe-reordered-untimed-prefix"              ? 24'000'000'000ULL
-        : current_scenario == "probe-one-frame-rounding"                    ? 33'333'333ULL
-        : current_scenario == "probe-inexact-caps-fps"                      ? 2'000'000'000ULL
-        : current_scenario == "probe-cadence-proof-rate-mismatch"           ? 200'000'000'000ULL
-        : current_scenario == "probe-container-rate-over-vui"               ? 40'000'000'000ULL
-        : current_scenario == "probe-bounded-stale-caps"                    ? 40'000'000'000ULL
-        : current_scenario == "probe-eos-vui-duration-mismatch"             ? 5'100'000'000ULL
-        : current_scenario == "probe-sparse-exact-30-gaps"                  ? 20'100'000'000ULL
-        : current_scenario == "probe-container-exact-5997-parser-ntsc"      ? 10'005'002'501ULL
-        : current_scenario == "probe-matroska-duration-transition"          ? 20'010'004'800ULL
-        : current_scenario == "probe-long-unset-fps-15"                     ? 40'000'000'000ULL
-        : current_scenario == "probe-short-unset-fps-15"                    ? 1'000'000'000ULL
-        : current_scenario == "probe-durationless-unseekable-15"            ? 600'000'000'000ULL
-        : current_scenario == "probe-million-au-no-duration"                ? 33'333'333'333'334ULL
+        : current_scenario == "probe-delayed-stream"                   ? 5'000'000'000ULL
+        : current_scenario == "probe-nonzero-origin"                   ? 2'766'666'666ULL
+        : current_scenario == "probe-duration-mismatch"                ? 1'000'000'000ULL
+        : current_scenario == "probe-container-duration-underestimate" ? 200'000'000'000ULL
+        : current_scenario == "probe-short-vfr"                        ? 333'333'333ULL
+        : current_scenario == "probe-vfr-between-windows"              ? 200'000'000'000ULL
+        : current_scenario == "probe-dynamic-resolution"               ? 10'000'000'000ULL
+        : current_scenario == "probe-decode-order-origin"              ? 1'000'000'000ULL
+        : current_scenario == "probe-unknown-pts"                      ? 1'000'000'000ULL
+        : current_scenario == "probe-long-unknown-pts"                 ? 3'000'000'000ULL
+        : current_scenario == "probe-mixed-prefix-pts"                 ? 4'000'000'000ULL
+        : current_scenario == "probe-long-mixed-prefix-pts"            ? 20'000'000'000ULL
+        : current_scenario == "probe-reordered-untimed-prefix"         ? 24'000'000'000ULL
+        : current_scenario == "probe-one-frame-rounding"               ? 33'333'333ULL
+        : current_scenario == "probe-inexact-caps-fps"                 ? 2'000'000'000ULL
+        : current_scenario == "probe-cadence-proof-rate-mismatch"      ? 200'000'000'000ULL
+        : current_scenario == "probe-container-rate-over-vui"          ? 40'000'000'000ULL
+        : current_scenario == "probe-bounded-stale-caps"               ? 40'000'000'000ULL
+        : current_scenario == "probe-eos-vui-duration-mismatch"        ? 5'100'000'000ULL
+        : current_scenario == "probe-sparse-exact-30-gaps"             ? 20'100'000'000ULL
+        : current_scenario == "probe-container-exact-5997-parser-ntsc" ? 10'005'002'501ULL
+        : current_scenario == "probe-matroska-duration-transition"     ? 20'010'004'800ULL
+        : current_scenario == "probe-long-unset-fps-15"                ? 40'000'000'000ULL
+        : current_scenario == "probe-short-unset-fps-15"               ? 1'000'000'000ULL
+        : current_scenario == "probe-durationless-unseekable-15"       ? 600'000'000'000ULL
+        : current_scenario == "probe-million-au-no-duration"           ? 33'333'333'333'334ULL
+        : current_scenario == "probe-exhaustive-50001" ||
+                current_scenario == "probe-exhaustive-hidden-vfr"
+            ? 1'666'700'000'000ULL
+        : current_scenario == "probe-exhaustive-endless" ? std::numeric_limits<std::uint64_t>::max()
         : current_scenario == "probe-long-gop-seek-budget"                  ? 21'600'000'000'000ULL
         : current_scenario == "probe-late-vfr-after-bounded-prefix"         ? 200'000'000'000ULL
         : current_scenario == "probe-interior-seek-gap"                     ? 200'000'000'000ULL
@@ -1693,6 +1730,10 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     return sample;
   }
   record("pull");
+  if (sink->observed_seek_generation != sink->pipeline->seek_generation) {
+    sink->observed_seek_generation = sink->pipeline->seek_generation;
+    sink->pull_count = 0;
+  }
   const auto current = sink->pull_count++;
   const auto current_scenario = scenario();
   if (current_scenario == "duplicate-transition-pts" && current < 2) {
@@ -1793,6 +1834,48 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     release_buffer_qdata(dropped_buffer);
     return deliver_output(sink, sample);
   }
+  if (current_scenario == "probe-duplicate-pts-pairs" && current < 4) {
+    auto* sample = make_sample(current);
+    const auto requested_time = static_cast<std::uint64_t>(sink->pipeline->seek_target_ns);
+    const auto group_time = ((requested_time + 39'999'999ULL) / 40'000'000ULL) * 40'000'000ULL;
+    sample->buffer.pts = group_time + static_cast<std::uint64_t>(current / 2U) * 40'000'000ULL;
+    sample->buffer.duration = 20'000'000ULL;
+    push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, 1280, 720);
+    return deliver_output(sink, sample);
+  }
+  if ((current_scenario == "indexed-cfr" || current_scenario == "indexed-gap" ||
+       current_scenario == "indexed-off-cadence" || current_scenario == "indexed-seek" ||
+       current_scenario == "indexed-seek-nonzero-origin" ||
+       current_scenario == "indexed-seek-wrong-first" ||
+       current_scenario == "indexed-seek-invalid-segment") &&
+      current < 2) {
+    auto* sample = make_sample(current);
+    if (current_scenario == "indexed-seek-nonzero-origin" ||
+        current_scenario == "indexed-seek-wrong-first") {
+      constexpr std::uint64_t kPtsOffsetNs = 5'000'000'000ULL;
+      constexpr std::uint64_t kNtscFrameDurationNs = 33'366'667ULL;
+      sample->segment_pts_offset_ns = kPtsOffsetNs;
+      sample->buffer.pts = static_cast<std::uint64_t>(sink->pipeline->seek_target_ns) +
+                           kPtsOffsetNs +
+                           static_cast<std::uint64_t>(current) * kNtscFrameDurationNs;
+      if (current_scenario == "indexed-seek-wrong-first") {
+        sample->buffer.pts += kNtscFrameDurationNs;
+      }
+    } else if (current_scenario == "indexed-seek") {
+      sample->buffer.pts = static_cast<std::uint64_t>(sink->pipeline->seek_target_ns) +
+                           static_cast<std::uint64_t>(current) * 33'333'333ULL;
+    } else if (current_scenario == "indexed-seek-invalid-segment") {
+      sample->buffer.pts = static_cast<std::uint64_t>(sink->pipeline->seek_target_ns);
+      sample->non_time_segment = true;
+    } else if (current == 1) {
+      sample->buffer.pts =
+          1'000'000'000ULL + (current_scenario == "indexed-gap"           ? 66'666'667ULL
+                              : current_scenario == "indexed-off-cadence" ? 50'000'000ULL
+                                                                          : 33'333'333ULL);
+    }
+    push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, 1280, 720);
+    return deliver_output(sink, sample);
+  }
   const bool caps_runahead = current_scenario == "caps-runahead" ||
                              current_scenario == "caps-runahead-unknown-time" ||
                              current_scenario == "caps-runahead-stale-caps" ||
@@ -1816,7 +1899,9 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
        current_scenario == "invalid-surface" || current_scenario == "visible-crop" ||
        current_scenario == "missing-caps" || current_scenario == "missing-caps-structure" ||
        current_scenario == "invalid-caps" || current_scenario == "oversized-caps" ||
-       current_scenario == "drop-stale-caps-first" || current_scenario == "post-pull-runahead") &&
+       current_scenario == "drop-stale-caps-first" || current_scenario == "post-pull-runahead" ||
+       current_scenario == "orientation-180" || current_scenario == "orientation-90" ||
+       current_scenario == "orientation-flip") &&
       current == 0) {
     auto* sample = make_sample(current);
     push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, predecoder_width(current),
@@ -1837,11 +1922,20 @@ RECO_FAKE_EXPORT int gst_app_sink_is_eos(void* sink_pointer) {
           current_scenario == "caps-runahead-unknown-time" ||
           current_scenario == "caps-runahead-stale-caps" ||
           current_scenario == "same-allocation-runahead" ||
-          current_scenario == "drop-transition-first") &&
+          current_scenario == "drop-transition-first" || current_scenario == "orientation-180" ||
+          current_scenario == "orientation-90" || current_scenario == "orientation-flip" ||
+          current_scenario == "indexed-cfr" || current_scenario == "indexed-gap" ||
+          current_scenario == "indexed-off-cadence" || current_scenario == "indexed-seek" ||
+          current_scenario == "probe-duplicate-pts-pairs") &&
          sink->pull_count >= (current_scenario == "caps-runahead" ||
                                       current_scenario == "caps-runahead-unknown-time" ||
                                       current_scenario == "caps-runahead-stale-caps" ||
-                                      current_scenario == "same-allocation-runahead"
+                                      current_scenario == "same-allocation-runahead" ||
+                                      current_scenario == "indexed-cfr" ||
+                                      current_scenario == "indexed-gap" ||
+                                      current_scenario == "indexed-off-cadence" ||
+                                      current_scenario == "indexed-seek" ||
+                                      current_scenario == "probe-duplicate-pts-pairs"
                                   ? 3U
                                   : 2U);
 }
@@ -1868,9 +1962,10 @@ RECO_FAKE_EXPORT const void* gst_sample_get_segment(void* sample) { return sampl
 
 RECO_FAKE_EXPORT std::uint64_t gst_segment_to_stream_time(const void* segment, int format,
                                                           std::uint64_t position) {
-  return format == 3 && !static_cast<const FakeSample*>(segment)->segment_outside &&
-                 !static_cast<const FakeSample*>(segment)->non_time_segment
-             ? position
+  const auto* sample = static_cast<const FakeSample*>(segment);
+  return format == 3 && !sample->segment_outside && !sample->non_time_segment &&
+                 position >= sample->segment_pts_offset_ns
+             ? position - sample->segment_pts_offset_ns
              : std::numeric_limits<std::uint64_t>::max();
 }
 
@@ -2012,6 +2107,14 @@ RECO_FAKE_EXPORT void* gst_bus_timed_pop_filtered(void* bus_pointer, std::uint64
                                                   std::uint32_t types) {
   auto* bus = static_cast<FakeBus*>(bus_pointer);
   ++bus->poll_count;
+  if (!bus->emitted_tag && (types & (1U << 4U)) != 0 &&
+      (scenario() == "orientation-180" || scenario() == "orientation-90" ||
+       scenario() == "orientation-flip")) {
+    bus->emitted_tag = true;
+    auto* message = new FakeMessage;
+    message->type = 1U << 4U;
+    return message;
+  }
   const bool ready = scenario() == "stream-error" || scenario() == "probe-async-error" ||
                      (scenario() == "probe-buffered-async-error" && bus->poll_count >= 513) ||
                      (scenario() == "delayed-stream-error" && bus->poll_count >= 2);
@@ -2019,7 +2122,9 @@ RECO_FAKE_EXPORT void* gst_bus_timed_pop_filtered(void* bus_pointer, std::uint64
     return nullptr;
   }
   bus->emitted_error = true;
-  return new FakeMessage;
+  auto* message = new FakeMessage;
+  message->type = 1U << 1U;
+  return message;
 }
 
 RECO_FAKE_EXPORT void gst_message_parse_error(void*, GErrorAbi** error, char** debug) {
@@ -2029,6 +2134,28 @@ RECO_FAKE_EXPORT void gst_message_parse_error(void*, GErrorAbi** error, char** d
                      : "fake decoder failure");
   *debug = duplicate("fake debug detail");
 }
+
+RECO_FAKE_EXPORT void gst_message_parse_tag(void*, void** tags) {
+  auto* result = new FakeTagList;
+  if (scenario() == "orientation-180") {
+    result->orientation = "rotate-180";
+  } else if (scenario() == "orientation-90") {
+    result->orientation = "rotate-90";
+  } else {
+    result->orientation = "flip-rotate-0";
+  }
+  *tags = result;
+}
+
+RECO_FAKE_EXPORT int gst_tag_list_get_string(const void* tags, const char* name, char** value) {
+  if (std::strcmp(name, "image-orientation") != 0) {
+    return 0;
+  }
+  *value = duplicate(static_cast<const FakeTagList*>(tags)->orientation.c_str());
+  return 1;
+}
+
+RECO_FAKE_EXPORT void gst_tag_list_unref(void* tags) { delete static_cast<FakeTagList*>(tags); }
 
 RECO_FAKE_EXPORT void gst_message_unref(void* message) { gst_mini_object_unref(message); }
 

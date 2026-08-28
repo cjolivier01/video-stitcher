@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
+#include <functional>
 #include <iosfwd>
 #include <optional>
 #include <string>
@@ -162,6 +164,25 @@ using Command = std::variant<StitchCommand, PreviewCommand, CalibrateCommand, Ca
 [[nodiscard]] std::string_view command_name(const Command& command);
 [[nodiscard]] std::string help_text();
 int run_command(const Command& command, std::ostream& out, std::ostream& err,
-                std::string_view executable_path = {});
+                const std::filesystem::path& executable_path = {});
+
+namespace detail {
+
+/// Resolves the deployed video probe worker for CLI startup and hardening tests.
+[[nodiscard]] std::optional<std::filesystem::path>
+resolve_video_probe_worker(const std::filesystem::path& executable_path);
+
+/// Resolves the deployed calibration worker for CLI startup and hardening tests.
+[[nodiscard]] std::optional<std::filesystem::path>
+resolve_calibration_worker(const std::filesystem::path& executable_path);
+
+/// Publishes serialized calibration JSON after rechecking that it cannot replace either input.
+void write_calibration_json_atomically(std::string_view json,
+                                       const std::filesystem::path& destination,
+                                       const std::filesystem::path& left_input,
+                                       const std::filesystem::path& right_input,
+                                       const std::function<void()>& before_publish = {});
+
+} // namespace detail
 
 } // namespace reco::cli

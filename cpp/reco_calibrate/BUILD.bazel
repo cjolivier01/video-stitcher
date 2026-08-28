@@ -1,8 +1,13 @@
-load("@rules_cc//cc:defs.bzl", "cc_library")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 
 cc_library(
     name = "reco_calibrate",
     srcs = [
+        "src/calibration_supervisor.cpp",
+        "src/calibration_worker.cpp",
+        "src/calibration_worker_internal.hpp",
+        "src/calibration_worker_protocol.cpp",
+        "src/calibration_worker_protocol.hpp",
         "src/defaults.cpp",
         "src/features.cpp",
         "src/filter.cpp",
@@ -18,6 +23,8 @@ cc_library(
         "src/pipeline.cpp",
         "src/ransac.cpp",
         "src/sampling.cpp",
+        "src/stable_media_file.cpp",
+        "src/stable_media_file.hpp",
         "src/telemetry.cpp",
         "src/types.cpp",
     ],
@@ -43,6 +50,33 @@ cc_library(
         "//cpp/reco_core",
         "//cpp/reco_detect",
         "//cpp/reco_io",
+        "//cpp/reco_io:gpu_video_probe_in_process_support",
         "@nlohmann_json//:json",
     ],
+)
+
+cc_library(
+    name = "calibration_worker_test_support",
+    testonly = True,
+    hdrs = [
+        "src/calibration_worker_internal.hpp",
+        "src/calibration_worker_protocol.hpp",
+        "src/stable_media_file.hpp",
+    ],
+    strip_include_prefix = "src",
+    visibility = ["//cpp/tests:__pkg__"],
+    deps = [":reco_calibrate"],
+)
+
+cc_binary(
+    name = "reco_calibration_worker",
+    srcs = ["src/calibration_worker_main.cpp"],
+    visibility = ["//visibility:public"],
+    deps = [":reco_calibrate"],
+)
+
+filegroup(
+    name = "reco_calibration_worker_runtime",
+    srcs = [":reco_calibration_worker"],
+    visibility = ["//visibility:public"],
 )

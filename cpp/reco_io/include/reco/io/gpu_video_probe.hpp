@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -28,6 +29,14 @@ struct GpuVideoProbe {
   /// EOS-proven compressed access-unit count when available, otherwise a
   /// bounded duration/timestamp estimate.
   std::uint64_t total_frames = 0;
+  /// Presentation stream-time origin corresponding to absolute frame index zero.
+  /// This may precede the earliest timed access unit when a bounded untimed
+  /// presentation prefix is inferred. Missing timing remains explicit when the
+  /// probe could not establish an indexed origin.
+  std::optional<std::uint64_t> first_stream_time_ns;
+  /// Constant number of consecutive access units sharing each presentation
+  /// timestamp. Indexed decode uses the ordinal within each group.
+  std::uint32_t timestamp_multiplicity = 1;
   /// Whether `duration_ns` uses fallback, inferred terminal timing, or bounded
   /// correlation rather than an EOS-proven final AU duration.
   bool duration_is_estimated = false;

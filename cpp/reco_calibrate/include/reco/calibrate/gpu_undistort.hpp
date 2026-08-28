@@ -16,6 +16,8 @@ struct GpuGrayFrame {
   std::uint32_t width = 0;
   std::uint32_t height = 0;
   reco::core::YuvColorRange color_range = reco::core::YuvColorRange::Full;
+  // Clockwise source rotation already applied to this frame's pixels.
+  std::uint16_t applied_rotation_degrees = 0;
 };
 
 struct GpuUndistortConfig {

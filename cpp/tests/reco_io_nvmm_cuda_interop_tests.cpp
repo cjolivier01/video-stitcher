@@ -79,6 +79,80 @@ void set_runtime_path(const char* name, const std::filesystem::path& path) {
 #endif
 }
 
+void set_environment(const char* name, std::string_view value) {
+#if defined(_WIN32)
+  _putenv_s(name, std::string(value).c_str());
+#else
+  setenv(name, std::string(value).c_str(), 1);
+#endif
+}
+
+template <typename Fn>
+void expect_nvmm_error_contains(Fn&& fn, std::string_view fragment, std::string_view message) {
+  try {
+    fn();
+    std::cerr << "FAIL: " << message << " did not throw\n";
+    ++failures;
+  } catch (const NvmmError& error) {
+    if (std::string_view(error.what()).find(fragment) == std::string_view::npos) {
+      std::cerr << "FAIL: " << message << " missing error fragment: " << error.what() << '\n';
+      ++failures;
+    }
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: " << message << " threw unexpected exception: " << error.what() << '\n';
+    ++failures;
+  }
+}
+
+void runtime_abi_discovery_is_fail_closed() {
+#if defined(__linux__)
+  const auto nvbufsurface = find_fake_runtime_runfile("fake_nvbufsurface.so");
+  const auto nvbufsurface_7_1 = find_fake_runtime_runfile("fake_nvbufsurface_7_1");
+  const auto no_version_api = find_fake_runtime_runfile("fake_cuda_driver");
+  set_environment("RECO_FAKE_DEEPSTREAM_VERSION", "9.1");
+
+  set_runtime_path("RECO_NVBUFSURFACE_DYLIB_PATH", nvbufsurface_7_1);
+  set_runtime_path("RECO_NVDS_UTILS_DYLIB_PATH", nvbufsurface_7_1);
+  expect_true(discover_nvbufsurface_abi() == NvbufSurfaceAbi::DeepStream7_1,
+              "DeepStream 7.1 runtime selects the 7.1 NvBufSurface ABI");
+
+  set_runtime_path("RECO_NVBUFSURFACE_DYLIB_PATH", nvbufsurface);
+  set_runtime_path("RECO_NVDS_UTILS_DYLIB_PATH", nvbufsurface);
+  expect_true(discover_nvbufsurface_abi() == NvbufSurfaceAbi::DeepStream9_1,
+              "DeepStream 9.1 runtime selects the 9.1 NvBufSurface ABI");
+
+  set_runtime_path("RECO_NVDS_UTILS_DYLIB_PATH", nvbufsurface_7_1);
+  expect_nvmm_error_contains([] { (void)discover_nvbufsurface_abi(); }, "forbidden for the 7.1 ABI",
+                             "7.1 metadata with a 9.1 NvBufSurface runtime fails closed");
+
+  set_runtime_path("RECO_NVBUFSURFACE_DYLIB_PATH", nvbufsurface_7_1);
+  set_runtime_path("RECO_NVDS_UTILS_DYLIB_PATH", nvbufsurface);
+  expect_nvmm_error_contains([] { (void)discover_nvbufsurface_abi(); }, "required for the 9.1 ABI",
+                             "9.1 metadata with a 7.1 NvBufSurface runtime fails closed");
+
+  set_runtime_path("RECO_NVBUFSURFACE_DYLIB_PATH", nvbufsurface);
+  set_runtime_path("RECO_NVDS_UTILS_DYLIB_PATH", nvbufsurface);
+  set_environment("RECO_FAKE_DEEPSTREAM_VERSION", "8.0");
+  expect_nvmm_error_contains([] { (void)discover_nvbufsurface_abi(); }, "supported versions",
+                             "unadapted DeepStream runtime version fails closed");
+
+  set_runtime_path("RECO_NVDS_UTILS_DYLIB_PATH", no_version_api);
+  expect_nvmm_error_contains([] { (void)discover_nvbufsurface_abi(); }, "nvds_version",
+                             "runtime without version capability fails closed");
+
+  set_runtime_path("RECO_NVDS_UTILS_DYLIB_PATH", nvbufsurface);
+  set_runtime_path("RECO_NVBUFSURFACE_DYLIB_PATH", no_version_api);
+  expect_nvmm_error_contains([] { (void)discover_nvbufsurface_abi(); }, "NvBufSurfaceMapEglImage",
+                             "versioned runtime without NvBufSurface capability fails closed");
+
+  set_runtime_path("RECO_NVBUFSURFACE_DYLIB_PATH", nvbufsurface);
+  set_environment("RECO_FAKE_DEEPSTREAM_VERSION", "9.1");
+#else
+  expect_nvmm_error_contains([] { (void)discover_nvbufsurface_abi(); }, "only supported on Linux",
+                             "non-Linux ABI discovery fails closed");
+#endif
+}
+
 template <typename Params> Params make_params_as() {
   Params params;
   params.width = 1280;
@@ -477,6 +551,7 @@ void failed_cleanup_poisoning_retains_surface_owners() {
 } // namespace
 
 int main() {
+  runtime_abi_discovery_is_fail_closed();
   surface_array_mapping_retains_and_unmaps_owner();
   deepstream_7_1_egl_mapping_is_gpu_resident();
   cuda_device_mapping_retains_context_and_owner();

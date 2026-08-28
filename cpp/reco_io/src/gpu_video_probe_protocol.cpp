@@ -16,7 +16,7 @@ namespace {
 
 constexpr std::size_t kMaximumErrorMessageBytes = 1024;
 constexpr std::size_t kMaximumCborNestingDepth = 32;
-constexpr std::uint32_t kProbeProtocolVersion = 3;
+constexpr std::uint32_t kProbeProtocolVersion = 5;
 constexpr double kMaximumSaneFps = 1000.0;
 constexpr std::uint32_t kMaximumGpuVideoDimension = 8'192;
 constexpr std::uint64_t kMaximumNv12FrameBytes = 8'192ULL * 8'192ULL * 3ULL / 2ULL;
@@ -332,6 +332,23 @@ Value required_value(const nlohmann::json& json, std::string_view key,
   }
 }
 
+std::optional<std::uint64_t> required_optional_u64(const nlohmann::json& json, std::string_view key,
+                                                   std::string_view description) {
+  try {
+    if (json.at(std::string(key)).is_null()) {
+      return std::nullopt;
+    }
+  } catch (const nlohmann::json::exception& error) {
+    throw GpuVideoProbeError(std::string(description) + " has an invalid " + std::string(key) +
+                             ": " + error.what());
+  }
+  return required_value<std::uint64_t>(json, key, description);
+}
+
+nlohmann::json optional_u64(const std::optional<std::uint64_t>& value) {
+  return value.has_value() ? nlohmann::json(*value) : nlohmann::json(nullptr);
+}
+
 } // namespace
 
 ProbeIpcFrameHeader encode_probe_ipc_frame_header(std::size_t payload_size) {
@@ -406,6 +423,8 @@ std::string encode_probe_success(const GpuVideoProbe& probe) {
       {"fps_denominator", probe.fps_denominator},
       {"duration_ns", probe.duration_ns},
       {"total_frames", probe.total_frames},
+      {"first_stream_time_ns", optional_u64(probe.first_stream_time_ns)},
+      {"timestamp_multiplicity", probe.timestamp_multiplicity},
       {"duration_is_estimated", probe.duration_is_estimated},
       {"total_frames_is_estimated", probe.total_frames_is_estimated},
       {"selected_stream_caps_verified", probe.selected_stream_caps_verified},
@@ -451,6 +470,10 @@ GpuVideoProbe decode_probe_response(std::string_view payload) {
       required_value<std::uint64_t>(response, "duration_ns", "video probe worker response");
   probe.total_frames =
       required_value<std::uint64_t>(response, "total_frames", "video probe worker response");
+  probe.first_stream_time_ns =
+      required_optional_u64(response, "first_stream_time_ns", "video probe worker response");
+  probe.timestamp_multiplicity = required_value<std::uint32_t>(response, "timestamp_multiplicity",
+                                                               "video probe worker response");
   probe.duration_is_estimated =
       required_value<bool>(response, "duration_is_estimated", "video probe worker response");
   probe.total_frames_is_estimated =
@@ -460,7 +483,9 @@ GpuVideoProbe decode_probe_response(std::string_view payload) {
   probe.indexed_sampling_cadence_verified = required_value<bool>(
       response, "indexed_sampling_cadence_verified", "video probe worker response");
   if (!gpu_geometry_is_valid(probe.width, probe.height) || probe.fps_numerator == 0 ||
-      probe.fps_denominator == 0 || probe.duration_ns == 0 || probe.total_frames == 0) {
+      probe.fps_denominator == 0 || probe.duration_ns == 0 || probe.total_frames == 0 ||
+      probe.timestamp_multiplicity == 0 ||
+      probe.timestamp_multiplicity > kMaximumIndexedTimestampMultiplicity) {
     throw GpuVideoProbeError("video probe worker returned invalid metadata");
   }
   probe.fps = static_cast<double>(probe.fps_numerator) / probe.fps_denominator;
@@ -482,7 +507,9 @@ GpuVideoProbe decode_probe_response(std::string_view payload) {
   }
   if (probe.indexed_sampling_cadence_verified &&
       (probe.total_frames < 3 || probe.total_frames_is_estimated ||
-       !probe.selected_stream_caps_verified || !exact_frame_count_is_consistent(probe))) {
+       !probe.selected_stream_caps_verified || !probe.first_stream_time_ns.has_value() ||
+       !exact_frame_count_is_consistent(probe) ||
+       probe.total_frames % probe.timestamp_multiplicity != 0U)) {
     throw GpuVideoProbeError("video probe worker returned inconsistent cadence proof metadata");
   }
   if (probe.selected_stream_caps_verified && probe.total_frames_is_estimated) {

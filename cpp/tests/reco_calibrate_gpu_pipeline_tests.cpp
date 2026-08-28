@@ -59,12 +59,13 @@ struct DeviceFrame {
   std::uint32_t width = 0;
   std::uint32_t height = 0;
 
-  [[nodiscard]] GpuGrayFrame view() const {
+  [[nodiscard]] GpuGrayFrame view(std::uint16_t applied_rotation_degrees = 0) const {
     return {.ptr = pixels.ptr(),
             .pitch = width,
             .width = width,
             .height = height,
-            .color_range = YuvColorRange::Full};
+            .color_range = YuvColorRange::Full,
+            .applied_rotation_degrees = applied_rotation_degrees};
   }
 };
 
@@ -184,6 +185,29 @@ void calibration_stays_gpu_resident(CudaBackend& backend, std::uint32_t width,
   expect_eq(compact_copies, 1U, "one accepted-match buffer is read back");
 }
 
+void calibration_returns_intrinsics_in_rotated_frame_coordinates(CudaBackend& backend) {
+  constexpr std::uint32_t width = 640;
+  constexpr std::uint32_t height = 360;
+  const auto left = make_frame(backend, width, height, 0);
+  const auto right = make_frame(backend, width, height, width / 2U);
+  const std::array pairs{
+      GpuCalibrationFramePairView{.left = left.view(180), .right = right.view(180)}};
+  auto params = camera(width, height);
+  params.cx = 311.25;
+  params.cy = 172.75;
+
+  const auto result = run_gpu_calibration_frames(
+      backend, std::span<const GpuCalibrationFramePairView>{pairs}, params, params, test_config());
+  expect_eq(result.calibration.left.cx, 328.75,
+            "left calibration cx follows the applied 180-degree rotation");
+  expect_eq(result.calibration.left.cy, 187.25,
+            "left calibration cy follows the applied 180-degree rotation");
+  expect_eq(result.calibration.right.cx, 328.75,
+            "right calibration cx follows the applied 180-degree rotation");
+  expect_eq(result.calibration.right.cy, 187.25,
+            "right calibration cy follows the applied 180-degree rotation");
+}
+
 } // namespace
 
 int main() {
@@ -206,6 +230,7 @@ int main() {
     auto backend = CudaBackend::create();
     calibration_stays_gpu_resident(backend, 640, 360);
     calibration_stays_gpu_resident(backend, 2560, 1440);
+    calibration_returns_intrinsics_in_rotated_frame_coordinates(backend);
   } catch (const std::exception& error) {
     std::cerr << "FAIL: unexpected exception: " << error.what() << '\n';
     return EXIT_FAILURE;

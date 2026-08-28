@@ -239,6 +239,67 @@ void gpu_file_decode_pipeline_preserves_nvmm() {
       "zero max buffers rejected");
   expect_invalid_argument(
       [] {
+        (void)build_gstreamer_gpu_file_decode_pipeline({.path = "left.mp4",
+                                                        .container = GpuDecodeContainer::QuickTime,
+                                                        .read_timeout_ns = 99'999'999ULL});
+      },
+      "sub-100ms read timeout rejected");
+  expect_invalid_argument(
+      [] {
+        (void)build_gstreamer_gpu_file_decode_pipeline({.path = "left.mp4",
+                                                        .container = GpuDecodeContainer::QuickTime,
+                                                        .indexed_fps_numerator = 30U});
+      },
+      "partial indexed cadence rejected");
+  expect_invalid_argument(
+      [] {
+        (void)build_gstreamer_gpu_file_decode_pipeline({.path = "left.mp4",
+                                                        .container = GpuDecodeContainer::QuickTime,
+                                                        .indexed_fps_numerator = 30U,
+                                                        .indexed_fps_denominator = 0U});
+      },
+      "zero indexed cadence denominator rejected");
+  expect_invalid_argument(
+      [] {
+        (void)build_gstreamer_gpu_file_decode_pipeline({.path = "left.mp4",
+                                                        .container = GpuDecodeContainer::QuickTime,
+                                                        .indexed_timestamp_multiplicity = 0U});
+      },
+      "zero indexed timestamp multiplicity rejected");
+  expect_invalid_argument(
+      [] {
+        (void)build_gstreamer_gpu_file_decode_pipeline({.path = "left.mp4",
+                                                        .container = GpuDecodeContainer::QuickTime,
+                                                        .indexed_timestamp_multiplicity = 2U});
+      },
+      "timestamp multiplicity without indexed cadence rejected");
+  expect_invalid_argument(
+      [] {
+        (void)build_gstreamer_gpu_file_decode_pipeline({.path = "left.mp4",
+                                                        .container = GpuDecodeContainer::QuickTime,
+                                                        .start_frame_index = 300U});
+      },
+      "start frame without indexed cadence rejected");
+  expect_invalid_argument(
+      [] {
+        (void)build_gstreamer_gpu_file_decode_pipeline({.path = "left.mp4",
+                                                        .container = GpuDecodeContainer::QuickTime,
+                                                        .indexed_fps_numerator = 30U,
+                                                        .indexed_fps_denominator = 1U,
+                                                        .start_frame_index = 300U});
+      },
+      "start frame without probed stream origin rejected");
+  expect_invalid_argument(
+      [] {
+        (void)build_gstreamer_gpu_file_decode_pipeline({
+            .path = "left.mp4",
+            .container = GpuDecodeContainer::QuickTime,
+            .indexed_stream_time_origin_ns = 766'666'666ULL,
+        });
+      },
+      "stream origin without indexed cadence rejected");
+  expect_invalid_argument(
+      [] {
         (void)build_gstreamer_gpu_file_decode_pipeline({.path = "left.avi",
                                                         .codec = GpuDecodeCodec::H264,
                                                         .elementary_stream = false,
@@ -325,6 +386,10 @@ void gpu_decode_frame_source_preserves_gpu_residency() {
   frame.visible_width = frame.nvmm.width + 2;
   expect_true(validate_gpu_decoded_frame(frame).has_value(),
               "visible width beyond NVMM allocation rejected");
+
+  frame = valid_gpu_frame();
+  frame.rotation_degrees = 45;
+  expect_true(validate_gpu_decoded_frame(frame).has_value(), "unsupported rotation rejected");
 
   frame = valid_gpu_frame();
   frame.nvmm.uv_pitch += 128;

@@ -74,6 +74,14 @@ enum class NvbufSurfaceAbi : std::uint32_t {
   DeepStream9_1 = 901,
 };
 
+/// Discovers the installed DeepStream NvBufSurface ABI from the runtime
+/// `nvds_version` API and verifies the symbols required by that ABI.
+///
+/// Only the explicitly adapted DeepStream 7.1 and 9.1 layouts are accepted.
+/// Missing, mixed, or unsupported runtimes throw `NvmmError` rather than
+/// selecting a compatibility layout implicitly.
+[[nodiscard]] NvbufSurfaceAbi discover_nvbufsurface_abi();
+
 enum class NvmmMemoryType : std::uint32_t {
   CudaDevice = 2,
   SurfaceArray = 4,

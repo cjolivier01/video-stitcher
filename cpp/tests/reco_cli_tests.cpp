@@ -1,21 +1,189 @@
 #include "reco/cli/cli.hpp"
 
+#include "reco/calibrate/pipeline.hpp"
+
+#include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
+#include <optional>
+#include <random>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <thread>
 #include <variant>
 #include <vector>
 
+#if defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
+#ifndef __has_feature
+#define __has_feature(value) 0
+#endif
+
 using namespace reco::cli;
+
+#if defined(__SANITIZE_ADDRESS__) || __has_feature(address_sanitizer)
+extern "C" const char* __lsan_default_suppressions() { return "leak:libcuda.so.1\n"; }
+#endif
 
 namespace {
 
 int failures = 0;
+
+void set_environment(std::string_view name, const std::optional<std::string>& value) {
+#if defined(_WIN32)
+  _putenv_s(std::string(name).c_str(), value.value_or("").c_str());
+#else
+  if (value.has_value()) {
+    setenv(std::string(name).c_str(), value->c_str(), 1);
+  } else {
+    unsetenv(std::string(name).c_str());
+  }
+#endif
+}
+
+class ScopedEnvironment {
+public:
+  ScopedEnvironment(std::string name, std::optional<std::string> value) : name_(std::move(name)) {
+    if (const char* existing = std::getenv(name_.c_str()); existing != nullptr) {
+      previous_ = std::string(existing);
+    }
+    set_environment(name_, value);
+  }
+
+  ~ScopedEnvironment() { set_environment(name_, previous_); }
+
+  ScopedEnvironment(const ScopedEnvironment&) = delete;
+  ScopedEnvironment& operator=(const ScopedEnvironment&) = delete;
+
+private:
+  std::string name_;
+  std::optional<std::string> previous_;
+};
+
+class ScopedCurrentPath {
+public:
+  explicit ScopedCurrentPath(const std::filesystem::path& path)
+      : previous_(std::filesystem::current_path()) {
+    std::filesystem::current_path(path);
+  }
+
+  ~ScopedCurrentPath() {
+    std::error_code ignored;
+    std::filesystem::current_path(previous_, ignored);
+  }
+
+  ScopedCurrentPath(const ScopedCurrentPath&) = delete;
+  ScopedCurrentPath& operator=(const ScopedCurrentPath&) = delete;
+
+private:
+  std::filesystem::path previous_;
+};
+
+class TemporaryDirectory {
+public:
+  TemporaryDirectory() {
+    std::random_device random;
+    const auto base = std::filesystem::temp_directory_path();
+    for (int attempt = 0; attempt < 128; ++attempt) {
+      path_ =
+          base / ("reco_cli_stage27_" + std::to_string(random()) + "_" + std::to_string(random()));
+      std::error_code error;
+      if (std::filesystem::create_directory(path_, error)) {
+        return;
+      }
+      if (error && error != std::errc::file_exists) {
+        throw std::filesystem::filesystem_error("cannot create test directory", path_, error);
+      }
+    }
+    throw std::runtime_error("cannot create unique CLI test directory");
+  }
+
+  ~TemporaryDirectory() {
+    std::error_code ignored;
+    std::filesystem::remove_all(path_, ignored);
+  }
+
+  [[nodiscard]] const std::filesystem::path& path() const { return path_; }
+
+  TemporaryDirectory(const TemporaryDirectory&) = delete;
+  TemporaryDirectory& operator=(const TemporaryDirectory&) = delete;
+
+private:
+  std::filesystem::path path_;
+};
+
+void write_text_file(const std::filesystem::path& path, std::string_view contents) {
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  if (!output) {
+    throw std::runtime_error("cannot create test file " + path.string());
+  }
+  output << contents;
+  output.close();
+  if (!output) {
+    throw std::runtime_error("cannot write test file " + path.string());
+  }
+}
+
+std::string read_text_file(const std::filesystem::path& path) {
+  std::ifstream input(path, std::ios::binary);
+  return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+}
+
+void make_executable(const std::filesystem::path& path) {
+#if !defined(_WIN32)
+  std::error_code error;
+  std::filesystem::permissions(
+      path,
+      std::filesystem::perms::owner_read | std::filesystem::perms::owner_write |
+          std::filesystem::perms::owner_exec | std::filesystem::perms::group_read |
+          std::filesystem::perms::group_exec | std::filesystem::perms::others_read |
+          std::filesystem::perms::others_exec,
+      std::filesystem::perm_options::replace, error);
+  if (error) {
+    throw std::filesystem::filesystem_error("cannot make test file executable", path, error);
+  }
+#else
+  (void)path;
+#endif
+}
+
+std::filesystem::path canonical_path(const std::filesystem::path& path) {
+  std::error_code error;
+  auto canonical = std::filesystem::weakly_canonical(path, error);
+  return error ? std::filesystem::absolute(path) : canonical;
+}
+
+#if defined(__linux__)
+std::filesystem::path find_shared_library_runfile(std::string_view needle) {
+  const char* test_srcdir = std::getenv("TEST_SRCDIR");
+  if (test_srcdir == nullptr || test_srcdir[0] == '\0') {
+    throw std::runtime_error("TEST_SRCDIR is not set");
+  }
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(test_srcdir)) {
+    if (!entry.is_regular_file()) {
+      continue;
+    }
+    const auto filename = entry.path().filename().string();
+    if (filename.find(needle) != std::string::npos &&
+        (entry.path().extension() == ".so" || entry.path().extension() == ".dylib" ||
+         entry.path().extension() == ".dll")) {
+      return entry.path();
+    }
+  }
+  throw std::runtime_error("shared-library test runfile not found: " + std::string(needle));
+}
+#endif
 
 void expect_true(bool condition, std::string_view message) {
   if (!condition) {
@@ -275,6 +443,354 @@ void parse_errors_are_reported() {
   const auto camera_help =
       expect_command(parse_args({"camera", "--left-device", "0", "--help"}), "camera help parse");
   expect_true(std::holds_alternative<HelpCommand>(camera_help), "camera help variant");
+  expect_true(
+      help_text().find("calibrate LEFT RIGHT --left-profile PROFILE --no-auto-sync --no-auto-imu "
+                       "[options]") != std::string::npos,
+      "help advertises the currently executable calibration contract");
+}
+
+void probe_worker_discovery_handles_path_and_bzlmod_runfiles() {
+#if defined(_WIN32)
+  constexpr std::string_view cli_name = "reco.exe";
+  constexpr std::string_view worker_name = "reco_video_probe_worker.exe";
+  constexpr std::string_view calibration_name = "reco_calibration_worker.exe";
+#else
+  constexpr std::string_view cli_name = "reco";
+  constexpr std::string_view worker_name = "reco_video_probe_worker";
+  constexpr std::string_view calibration_name = "reco_calibration_worker";
+#endif
+
+  ScopedEnvironment no_override("RECO_VIDEO_PROBE_WORKER", std::nullopt);
+  ScopedEnvironment no_calibration_override("RECO_CALIBRATION_WORKER", std::nullopt);
+
+  const auto bazel_worker = detail::resolve_video_probe_worker("stage27-missing-reco");
+  expect_true(bazel_worker.has_value(), "bzlmod runfiles resolve probe worker");
+  if (bazel_worker.has_value()) {
+    expect_eq(bazel_worker->filename().string(), std::string(worker_name),
+              "bzlmod runfiles select probe worker target");
+    expect_true(std::filesystem::is_regular_file(*bazel_worker), "bzlmod runfile worker exists");
+  }
+  const auto bazel_calibration = detail::resolve_calibration_worker("stage27-missing-reco");
+  expect_true(bazel_calibration.has_value(), "bzlmod runfiles resolve calibration worker");
+  if (bazel_calibration.has_value()) {
+    expect_eq(bazel_calibration->filename().string(), std::string(calibration_name),
+              "bzlmod runfiles select calibration worker target");
+    expect_true(std::filesystem::is_regular_file(*bazel_calibration),
+                "bzlmod calibration worker exists");
+  }
+
+  TemporaryDirectory runfiles_root;
+  const auto mapped_worker = runfiles_root.path() / worker_name;
+  const auto repo_mapping = runfiles_root.path() / "repo_mapping";
+  const auto manifest = runfiles_root.path() / "MANIFEST";
+  write_text_file(mapped_worker, "synthetic worker");
+  make_executable(mapped_worker);
+  write_text_file(repo_mapping, ",reco_video_stitcher,stage27_canonical\n");
+  write_text_file(manifest, "stage27_canonical/cpp/reco_io/" + std::string(worker_name) + " " +
+                                mapped_worker.string() + "\n_repo_mapping " +
+                                repo_mapping.string() + "\n");
+  {
+    ScopedEnvironment use_manifest("RUNFILES_MANIFEST_FILE", manifest.string());
+    ScopedEnvironment no_runfiles_directory("RUNFILES_DIR", std::nullopt);
+    ScopedEnvironment empty_path("PATH", std::string{});
+    const auto remapped = detail::resolve_video_probe_worker("stage27-missing-reco");
+    expect_true(remapped.has_value(), "synthetic bzlmod repository mapping resolves worker");
+    if (remapped.has_value()) {
+      expect_eq(canonical_path(*remapped).string(), canonical_path(mapped_worker).string(),
+                "runfiles lookup honors canonical repository mapping");
+    }
+  }
+
+  TemporaryDirectory path_root;
+  const auto bin = path_root.path() / "bin";
+  const auto hostile_working_directory = path_root.path() / "working";
+  std::filesystem::create_directories(bin);
+  std::filesystem::create_directories(hostile_working_directory);
+  const auto path_cli = bin / cli_name;
+  const auto path_worker = bin / worker_name;
+  const auto hostile_worker = hostile_working_directory / worker_name;
+  write_text_file(path_cli, "PATH CLI");
+  write_text_file(path_worker, "PATH worker");
+  write_text_file(hostile_worker, "wrong working-directory worker");
+  make_executable(path_cli);
+  make_executable(path_worker);
+  make_executable(hostile_worker);
+  {
+    ScopedEnvironment no_manifest("RUNFILES_MANIFEST_FILE", std::nullopt);
+    ScopedEnvironment no_runfiles_directory("RUNFILES_DIR", std::nullopt);
+    ScopedEnvironment no_test_srcdir("TEST_SRCDIR", std::nullopt);
+    ScopedEnvironment path("PATH", bin.string());
+    ScopedCurrentPath working_directory(hostile_working_directory);
+    const auto resolved = detail::resolve_video_probe_worker(std::filesystem::path(cli_name));
+    expect_true(resolved.has_value(), "ordinary PATH invocation resolves worker");
+    if (resolved.has_value()) {
+      expect_eq(canonical_path(*resolved).string(), canonical_path(path_worker).string(),
+                "PATH executable directory wins over working directory");
+    }
+  }
+}
+
+void calibration_output_replacement_is_exclusive_and_atomic() {
+  TemporaryDirectory root;
+  const auto destination = root.path() / "match.json";
+  const auto left_input = root.path() / "left.mp4";
+  const auto right_input = root.path() / "right.mp4";
+  const auto victim = root.path() / "victim.json";
+  auto predictable_temporary = destination;
+  predictable_temporary += ".tmp.0";
+  write_text_file(left_input, "left video must not change\n");
+  write_text_file(right_input, "right video must not change\n");
+  write_text_file(victim, "victim must not change\n");
+
+  std::error_code output_symlink_error;
+  std::filesystem::create_symlink(victim, destination, output_symlink_error);
+  if (output_symlink_error) {
+    write_text_file(destination, "old output\n");
+  }
+  std::error_code temporary_symlink_error;
+  std::filesystem::create_symlink(victim, predictable_temporary, temporary_symlink_error);
+  if (temporary_symlink_error) {
+    write_text_file(predictable_temporary, "predictable temporary guard\n");
+  }
+#if !defined(_WIN32)
+  expect_true(!output_symlink_error, "destination symlink fixture is available");
+  expect_true(!temporary_symlink_error, "temporary symlink fixture is available");
+#endif
+
+  detail::write_calibration_json_atomically(R"json({"writer":"symlink-test"})json", destination,
+                                            left_input, right_input);
+  expect_eq(read_text_file(destination), std::string("{\"writer\":\"symlink-test\"}\n"),
+            "calibration output replaces destination atomically");
+  expect_eq(read_text_file(victim), std::string("victim must not change\n"),
+            "calibration output does not follow destination or temporary symlink");
+  if (!output_symlink_error) {
+    expect_true(!std::filesystem::is_symlink(destination),
+                "calibration replacement replaces destination symlink itself");
+  }
+  if (!temporary_symlink_error) {
+    expect_true(std::filesystem::is_symlink(predictable_temporary),
+                "predictable temporary symlink remains untouched");
+  } else {
+    expect_eq(read_text_file(predictable_temporary), std::string("predictable temporary guard\n"),
+              "predictable temporary filename remains untouched");
+  }
+
+  std::filesystem::remove(predictable_temporary);
+  std::vector<std::string> payloads;
+  for (int writer = 0; writer < 8; ++writer) {
+    payloads.push_back("{\"writer\":" + std::to_string(writer) + "}");
+  }
+  detail::write_calibration_json_atomically(payloads.front(), destination, left_input, right_input);
+
+  std::atomic<bool> running{true};
+  std::atomic<bool> observed_partial_output{false};
+  std::atomic<bool> writer_failed{false};
+  std::thread reader([&] {
+    while (running.load(std::memory_order_acquire)) {
+      const auto contents = read_text_file(destination);
+      const auto complete = std::any_of(payloads.begin(), payloads.end(), [&](const auto& payload) {
+        return contents == payload + '\n';
+      });
+      if (!complete) {
+        observed_partial_output.store(true, std::memory_order_release);
+        return;
+      }
+      std::this_thread::yield();
+    }
+  });
+
+  std::vector<std::thread> writers;
+  for (std::size_t writer = 0; writer < payloads.size(); ++writer) {
+    writers.emplace_back([&, writer] {
+      try {
+        for (int iteration = 0; iteration < 12; ++iteration) {
+          detail::write_calibration_json_atomically(payloads[writer], destination, left_input,
+                                                    right_input);
+        }
+      } catch (...) {
+        writer_failed.store(true, std::memory_order_release);
+      }
+    });
+  }
+  for (auto& writer : writers) {
+    writer.join();
+  }
+  running.store(false, std::memory_order_release);
+  reader.join();
+
+  expect_true(!writer_failed.load(std::memory_order_acquire),
+              "concurrent calibration writers all succeed");
+  expect_true(!observed_partial_output.load(std::memory_order_acquire),
+              "concurrent reader never observes partial calibration output");
+  const auto final_contents = read_text_file(destination);
+  expect_true(std::any_of(payloads.begin(), payloads.end(),
+                          [&](const auto& payload) { return final_contents == payload + '\n'; }),
+              "concurrent calibration output is one complete writer payload");
+
+  const auto blocked_destination = root.path() / "blocked.json";
+  std::filesystem::create_directory(blocked_destination);
+  write_text_file(blocked_destination / "keep", "keep");
+  bool replacement_failed = false;
+  try {
+    detail::write_calibration_json_atomically(R"json({"writer":"failure"})json",
+                                              blocked_destination, left_input, right_input);
+  } catch (const std::exception&) {
+    replacement_failed = true;
+  }
+  expect_true(replacement_failed, "failed calibration replacement reports an error");
+
+  const auto raced_destination = root.path() / "raced-match.json";
+  const auto initial_identity_error = reco::calibrate::validate_calibration_output_identity(
+      left_input, right_input, raced_destination);
+  expect_true(!initial_identity_error.has_value(), "absent output passes initial identity check");
+  std::filesystem::create_hard_link(left_input, raced_destination);
+  bool raced_alias_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(R"json({"writer":"raced"})json", raced_destination,
+                                              left_input, right_input);
+  } catch (const std::exception& error) {
+    raced_alias_rejected =
+        std::string_view(error.what()).find("left video input") != std::string_view::npos;
+  }
+  expect_true(raced_alias_rejected, "publication recheck rejects a newly introduced input alias");
+  expect_eq(read_text_file(left_input), std::string("left video must not change\n"),
+            "publication recheck preserves aliased input contents");
+
+#if defined(__linux__)
+  const auto symlink_alias = root.path() / "symlink-alias.json";
+  std::filesystem::create_symlink(left_input, symlink_alias);
+  bool symlink_alias_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(R"json({"writer":"symlink-alias"})json",
+                                              symlink_alias, left_input, right_input);
+  } catch (const std::exception& error) {
+    symlink_alias_rejected =
+        std::string_view(error.what()).find("left video input") != std::string_view::npos;
+  }
+  expect_true(symlink_alias_rejected, "publication rejects an existing symlink to a video input");
+  expect_true(std::filesystem::is_symlink(symlink_alias),
+              "rejected input symlink remains in place");
+
+  const auto original_input = root.path() / "original-left.mp4";
+  const auto replacement_input = root.path() / "replacement-left.mp4";
+  const auto input_symlink = root.path() / "retargeted-left.mp4";
+  const auto pinned_alias = root.path() / "pinned-alias.json";
+  write_text_file(original_input, "original pinned input\n");
+  write_text_file(replacement_input, "replacement input\n");
+  std::filesystem::create_symlink(original_input, input_symlink);
+  std::filesystem::create_hard_link(original_input, pinned_alias);
+  bool retarget_hook_ran = false;
+  bool retargeted_input_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"retarget-input"})json", pinned_alias, input_symlink, right_input, [&] {
+          std::filesystem::remove(input_symlink);
+          std::filesystem::create_symlink(replacement_input, input_symlink);
+          retarget_hook_ran = true;
+        });
+  } catch (const std::exception& error) {
+    retargeted_input_rejected =
+        std::string_view(error.what()).find("left video input") != std::string_view::npos;
+  }
+  expect_true(retarget_hook_ran, "input retarget happens at the publication boundary");
+  expect_true(retargeted_input_rejected,
+              "pinned input identity rejects a symlink retarget publication race");
+  expect_true(std::filesystem::equivalent(original_input, pinned_alias),
+              "rejected publication preserves the pinned input hardlink");
+
+  const auto calibrated_input = root.path() / "calibrated-left.mp4";
+  const auto post_calibration_input = root.path() / "post-calibration-left.mp4";
+  const auto user_input_path = root.path() / "user-left.mp4";
+  const auto calibrated_alias = root.path() / "calibrated-alias.json";
+  write_text_file(calibrated_input, "calibrated input identity\n");
+  write_text_file(post_calibration_input, "post-calibration input identity\n");
+  std::filesystem::create_symlink(calibrated_input, user_input_path);
+  const int calibrated_descriptor = ::open(user_input_path.c_str(), O_RDONLY | O_CLOEXEC);
+  expect_true(calibrated_descriptor >= 0, "calibrated input descriptor is retained");
+  std::filesystem::remove(user_input_path);
+  std::filesystem::create_symlink(post_calibration_input, user_input_path);
+  std::filesystem::create_hard_link(calibrated_input, calibrated_alias);
+  bool calibrated_alias_rejected = false;
+  if (calibrated_descriptor >= 0) {
+    const auto retained_input = std::filesystem::path("/proc") / std::to_string(::getpid()) / "fd" /
+                                std::to_string(calibrated_descriptor);
+    try {
+      detail::write_calibration_json_atomically(R"json({"writer":"post-calibration-retarget"})json",
+                                                calibrated_alias, retained_input, right_input);
+    } catch (const std::exception& error) {
+      calibrated_alias_rejected =
+          std::string_view(error.what()).find("left video input") != std::string_view::npos;
+    }
+    (void)::close(calibrated_descriptor);
+  }
+  expect_true(calibrated_alias_rejected,
+              "retained calibrated identity survives a pre-publication input retarget");
+  expect_true(std::filesystem::equivalent(calibrated_input, calibrated_alias),
+              "pre-publication retarget cannot hide the calibrated input alias");
+
+  const auto temporary_race_destination = root.path() / "temporary-race.json";
+  std::filesystem::path replacement_temporary;
+  bool temporary_identity_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"temporary-race"})json", temporary_race_destination, left_input,
+        right_input, [&] {
+          for (const auto& entry : std::filesystem::directory_iterator(root.path())) {
+            if (entry.path().filename().string().starts_with("temporary-race.json.tmp.")) {
+              replacement_temporary = entry.path();
+              std::filesystem::remove(replacement_temporary);
+              write_text_file(replacement_temporary, "attacker replacement\n");
+              return;
+            }
+          }
+          throw std::runtime_error("temporary publication fixture was not found");
+        });
+  } catch (const std::exception& error) {
+    temporary_identity_rejected =
+        std::string_view(error.what()).find("temporary output identity changed") !=
+        std::string_view::npos;
+  }
+  expect_true(temporary_identity_rejected,
+              "publication rejects a replaced temporary output directory entry");
+  expect_true(!std::filesystem::exists(temporary_race_destination),
+              "replaced temporary output is not published");
+  expect_eq(read_text_file(replacement_temporary), std::string("attacker replacement\n"),
+            "cleanup does not unlink a replacement temporary entry");
+  std::filesystem::remove(replacement_temporary);
+
+  const auto original_parent = root.path() / "original-parent";
+  const auto redirected_parent = root.path() / "redirected-parent";
+  const auto parent_symlink = root.path() / "output-parent";
+  std::filesystem::create_directory(original_parent);
+  std::filesystem::create_directory(redirected_parent);
+  std::filesystem::create_symlink(original_parent, parent_symlink);
+  const auto redirected_destination = parent_symlink / "match.json";
+  bool parent_retarget_hook_ran = false;
+  detail::write_calibration_json_atomically(R"json({"writer":"pinned-parent"})json",
+                                            redirected_destination, left_input, right_input, [&] {
+                                              std::filesystem::remove(parent_symlink);
+                                              std::filesystem::create_symlink(redirected_parent,
+                                                                              parent_symlink);
+                                              parent_retarget_hook_ran = true;
+                                            });
+  expect_true(parent_retarget_hook_ran,
+              "output parent retarget happens at the publication boundary");
+  expect_eq(read_text_file(original_parent / "match.json"),
+            std::string("{\"writer\":\"pinned-parent\"}\n"),
+            "publication stays in the pinned output directory");
+  expect_true(!std::filesystem::exists(redirected_parent / "match.json"),
+              "retargeted output parent cannot redirect publication");
+#endif
+
+  bool orphaned_temporary = false;
+  for (const auto& entry : std::filesystem::directory_iterator(root.path())) {
+    const auto filename = entry.path().filename().string();
+    if (filename.starts_with("match.json.tmp.") || filename.starts_with("blocked.json.tmp.") ||
+        filename.starts_with("raced-match.json.tmp.")) {
+      orphaned_temporary = true;
+    }
+  }
+  expect_true(!orphaned_temporary, "calibration replacement leaves no temporary files");
 }
 
 void command_execution_dispatches_available_stages() {
@@ -334,12 +850,37 @@ void command_execution_dispatches_available_stages() {
   err.str("");
   err.clear();
   CalibrateCommand calibrate{.left = "left.mp4", .right = "right.mp4"};
+#if defined(__linux__)
+  const auto fake_nvbufsurface = find_shared_library_runfile("fake_nvbufsurface");
+  ScopedEnvironment nvbufsurface_runtime("RECO_NVBUFSURFACE_DYLIB_PATH",
+                                         fake_nvbufsurface.string());
+  ScopedEnvironment nvds_utils_runtime("RECO_NVDS_UTILS_DYLIB_PATH", fake_nvbufsurface.string());
+  ScopedEnvironment deepstream_version("RECO_FAKE_DEEPSTREAM_VERSION", "9.1");
+  {
+    ScopedEnvironment unsupported_version("RECO_FAKE_DEEPSTREAM_VERSION", "8.0");
+    const auto unsupported_abi_status = run_command(Command{calibrate}, out, err);
+    expect_eq(unsupported_abi_status, 2, "calibrate rejects an unsupported NvBufSurface ABI");
+    expect_true(err.str().find("cannot discover the installed NvBufSurface ABI") !=
+                    std::string::npos,
+                "calibrate reports NvBufSurface ABI discovery failure");
+  }
+  out.str("");
+  out.clear();
+  err.str("");
+  err.clear();
+#endif
   const auto calibrate_status = run_command(Command{calibrate}, out, err);
-  expect_eq(calibrate_status, 2, "calibrate exits blocked until GPU pipeline is complete");
+#if defined(__linux__)
+  expect_eq(calibrate_status, 2, "calibrate exits blocked when required GPU backends are absent");
   expect_true(out.str().find("GPU calibration plan") != std::string::npos,
               "calibrate writes GPU plan");
   expect_true(out.str().find("FeatureMatching") != std::string::npos,
               "calibrate writes AKAZE stage");
+#else
+  expect_eq(calibrate_status, 2, "calibrate exits blocked without Linux NvBufSurface discovery");
+  expect_true(err.str().find("cannot discover the installed NvBufSurface ABI") != std::string::npos,
+              "calibrate reports unsupported platform ABI discovery");
+#endif
   expect_true(err.str().find("error:") != std::string::npos, "calibrate writes stderr error");
 
   out.str("");
@@ -478,6 +1019,8 @@ int main() {
   preview_and_calibrate_parse_matches_rust_defaults();
   live_command_parse_matches_rust_defaults();
   parse_errors_are_reported();
+  probe_worker_discovery_handles_path_and_bzlmod_runfiles();
+  calibration_output_replacement_is_exclusive_and_atomic();
   command_execution_dispatches_available_stages();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

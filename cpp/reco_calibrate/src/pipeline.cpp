@@ -1,5 +1,7 @@
 #include "reco/calibrate/pipeline.hpp"
 
+#include "calibration_worker_internal.hpp"
+#include "gpu_video_probe_internal.hpp"
 #include "reco/calibrate/geometry.hpp"
 #include "reco/calibrate/gpu_features.hpp"
 #include "reco/calibrate/lens_database.hpp"
@@ -11,8 +13,10 @@
 #include "reco/io/gpu_decode.hpp"
 #include "reco/io/gpu_video_probe.hpp"
 #include "reco/io/gstreamer.hpp"
+#include "stable_media_file.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <filesystem>
 #include <functional>
@@ -23,6 +27,20 @@
 
 namespace reco::calibrate {
 namespace {
+
+constexpr std::size_t kMaximumCalibrationRequestPathBytes = 16U * 1024U;
+constexpr std::size_t kMaximumCalibrationRequestFrames = 256;
+constexpr std::uint64_t kMinimumCalibrationWorkerMemoryBytes = 16ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaximumCalibrationWorkerMemoryBytes = 64ULL * 1024ULL * 1024ULL * 1024ULL;
+
+bool invalid_protocol_path(std::string_view value) {
+  return value.size() > kMaximumCalibrationRequestPathBytes ||
+         value.find('\0') != std::string_view::npos;
+}
+
+const std::string& calibration_open_path(const CalibrationVideoInput& input) {
+  return input.retained_path.has_value() ? *input.retained_path : input.path;
+}
 
 bool finite_in_range(double value, double min, double max, bool min_exclusive = false) {
   return std::isfinite(value) && (min_exclusive ? value > min : value >= min) && value <= max;
@@ -141,13 +159,6 @@ GpuAkazeConfig akaze_config_for_side(const CalibrationConfig& config, bool left)
   return result;
 }
 
-std::pair<std::uint32_t, std::uint32_t> calibration_working_dimensions(std::uint32_t width,
-                                                                       std::uint32_t height) {
-  constexpr std::uint32_t kTargetWidth = 1280;
-  const auto factor = std::max<std::uint32_t>(width / kTargetWidth, 1U);
-  return {width / factor, height / factor};
-}
-
 std::optional<FrameMatches>
 process_gpu_frame_pair(GpuAkazePipeline& akaze, const GpuGrayFrame& left, const GpuGrayFrame& right,
                        const GpuAkazeConfig& left_config, const GpuAkazeConfig& right_config,
@@ -242,58 +253,34 @@ CalibrationResult run_gpu_calibration_frame_provider(
   const auto left_height = first.left.height;
   const auto right_width = first.right.width;
   const auto right_height = first.right.height;
-  const auto [left_work_width, left_work_height] =
-      calibration_working_dimensions(left_width, left_height);
-  const auto [right_work_width, right_work_height] =
-      calibration_working_dimensions(right_width, right_height);
-
+  const auto calibrated_left_params =
+      camera_params_after_applied_rotation(left_params, first.left.applied_rotation_degrees);
+  const auto calibrated_right_params =
+      camera_params_after_applied_rotation(right_params, first.right.applied_rotation_degrees);
   GpuCalibrationUndistorter left_undistorter(
       backend,
-      {.camera = left_params, .output_width = left_work_width, .output_height = left_work_height});
-  GpuCalibrationUndistorter right_undistorter(backend, {.camera = right_params,
-                                                        .output_width = right_work_width,
-                                                        .output_height = right_work_height});
-  std::optional<reco::core::CudaPitchedAllocation> left_resized_storage;
-  std::optional<reco::core::CudaPitchedAllocation> right_resized_storage;
-  if (left_work_width != left_width || left_work_height != left_height) {
-    left_resized_storage = backend.allocate_pitched(left_work_width, left_work_height, 16);
-  }
-  if (right_work_width != right_width || right_work_height != right_height) {
-    right_resized_storage = backend.allocate_pitched(right_work_width, right_work_height, 16);
-  }
-  auto left_storage = backend.allocate_pitched(left_work_width, left_work_height, 16);
-  auto right_storage = backend.allocate_pitched(right_work_width, right_work_height, 16);
+      {.camera = calibrated_left_params, .output_width = left_width, .output_height = left_height});
+  GpuCalibrationUndistorter right_undistorter(backend, {.camera = calibrated_right_params,
+                                                        .output_width = right_width,
+                                                        .output_height = right_height});
+  auto left_storage = backend.allocate_pitched(left_width, left_height, 16);
+  auto right_storage = backend.allocate_pitched(right_width, right_height, 16);
   GpuGrayFrame left_undistorted{.ptr = left_storage.buffer.ptr(),
                                 .pitch = left_storage.pitch,
-                                .width = left_work_width,
-                                .height = left_work_height};
+                                .width = left_width,
+                                .height = left_height};
   GpuGrayFrame right_undistorted{.ptr = right_storage.buffer.ptr(),
                                  .pitch = right_storage.pitch,
-                                 .width = right_work_width,
-                                 .height = right_work_height};
+                                 .width = right_width,
+                                 .height = right_height};
   GpuAkazePipeline akaze(backend);
-  const auto left_config = akaze_config_for_side(config, true);
-  const auto right_config = akaze_config_for_side(config, false);
+  const auto left_config =
+      fit_gpu_akaze_workspace(left_width, left_height, akaze_config_for_side(config, true));
+  const auto right_config =
+      fit_gpu_akaze_workspace(right_width, right_height, akaze_config_for_side(config, false));
 
   std::vector<FrameMatches> successful_frames;
   successful_frames.reserve(frame_count);
-  const auto resize_for_features =
-      [&backend](const GpuGrayFrame& frame,
-                 const std::optional<reco::core::CudaPitchedAllocation>& resized_storage,
-                 std::uint32_t work_width, std::uint32_t work_height) {
-        if (!resized_storage.has_value()) {
-          return frame;
-        }
-        reco::detect::npp_resize_c1(frame.ptr, frame.pitch, frame.width, frame.height,
-                                    resized_storage->buffer.ptr(), resized_storage->pitch,
-                                    work_width, work_height);
-        backend.synchronize();
-        return GpuGrayFrame{.ptr = resized_storage->buffer.ptr(),
-                            .pitch = resized_storage->pitch,
-                            .width = work_width,
-                            .height = work_height,
-                            .color_range = frame.color_range};
-      };
   const auto process_pair = [&](const GpuCalibrationFramePairView& frame) {
     validate_calibration_frame(frame.left, "left");
     validate_calibration_frame(frame.right, "right");
@@ -301,14 +288,14 @@ CalibrationResult run_gpu_calibration_frame_provider(
         frame.right.width != right_width || frame.right.height != right_height) {
       throw std::invalid_argument("GPU calibration frame dimensions changed between pairs");
     }
+    if (frame.left.applied_rotation_degrees != first.left.applied_rotation_degrees ||
+        frame.right.applied_rotation_degrees != first.right.applied_rotation_degrees) {
+      throw std::invalid_argument("GPU calibration frame rotation changed between pairs");
+    }
     left_undistorted.color_range = frame.left.color_range;
     right_undistorted.color_range = frame.right.color_range;
-    const auto left_feature_frame =
-        resize_for_features(frame.left, left_resized_storage, left_work_width, left_work_height);
-    const auto right_feature_frame = resize_for_features(frame.right, right_resized_storage,
-                                                         right_work_width, right_work_height);
-    left_undistorter.undistort_y(left_feature_frame, left_undistorted);
-    right_undistorter.undistort_y(right_feature_frame, right_undistorted);
+    left_undistorter.undistort_y(frame.left, left_undistorted);
+    right_undistorter.undistort_y(frame.right, right_undistorted);
     if (auto result = process_gpu_frame_pair(akaze, left_undistorted, right_undistorted,
                                              left_config, right_config, config);
         result.has_value()) {
@@ -342,8 +329,8 @@ CalibrationResult run_gpu_calibration_frame_provider(
                               .z_rx = optimized.layout.z_rx};
   const auto confidence = std::min(static_cast<double>(all_points.size()) / 50.0, 1.0);
   return {
-      .calibration = {.left = left_params,
-                      .right = right_params,
+      .calibration = {.left = calibrated_left_params,
+                      .right = calibrated_right_params,
                       .layout = optimized.layout,
                       .rig_tilt = 0.0,
                       .rig_roll = 0.0,
@@ -363,21 +350,8 @@ CalibrationResult run_gpu_calibration_frame_provider(
 }
 
 void validate_probe(const reco::io::GpuVideoProbe& probe, std::string_view label) {
-  if (probe.width == 0 || probe.height == 0 || probe.width > reco::core::kMaxCalibrationDimension ||
-      probe.height > reco::core::kMaxCalibrationDimension) {
-    throw CalibrationExecutionError(std::string(label) + " video has unsupported probe dimensions");
-  }
-  if (!std::isfinite(probe.fps) || probe.fps <= 0.0 || probe.fps_numerator == 0 ||
-      probe.fps_denominator == 0) {
-    throw CalibrationExecutionError(std::string(label) +
-                                    " video has no usable constant frame rate");
-  }
-  if (probe.total_frames == 0) {
-    throw CalibrationExecutionError(std::string(label) + " video contains no indexed frames");
-  }
-  if (!probe.indexed_sampling_cadence_verified) {
-    throw CalibrationExecutionError(std::string(label) +
-                                    " video cadence is not verified for indexed sampling");
+  if (const auto error = validate_gpu_calibration_probe_metadata(probe); error.has_value()) {
+    throw CalibrationExecutionError(std::string(label) + " video " + *error);
   }
 }
 
@@ -407,6 +381,110 @@ load_calibration_profiles(const GpuCalibrationRequest& request) {
 
 } // namespace
 
+std::optional<std::string>
+validate_gpu_calibration_probe_metadata(const reco::io::GpuVideoProbe& probe) {
+  if (probe.width == 0 || probe.height == 0 || probe.width > reco::core::kMaxCalibrationDimension ||
+      probe.height > reco::core::kMaxCalibrationDimension) {
+    return "has unsupported probe dimensions";
+  }
+  if (!std::isfinite(probe.fps) || probe.fps <= 0.0 || probe.fps_numerator == 0 ||
+      probe.fps_denominator == 0) {
+    return "has no usable constant frame rate";
+  }
+  if (probe.total_frames == 0) {
+    return "contains no indexed frames";
+  }
+  if (probe.timestamp_multiplicity == 0U ||
+      probe.timestamp_multiplicity > reco::io::kMaximumIndexedTimestampMultiplicity) {
+    return "has an unsupported timestamp multiplicity";
+  }
+  if (!probe.first_stream_time_ns.has_value()) {
+    return "has no presentation stream-time origin";
+  }
+  if (probe.total_frames_is_estimated) {
+    return "has no exact compressed-frame count";
+  }
+  if (!probe.selected_stream_caps_verified) {
+    return "has no full-stream selected-video caps proof";
+  }
+  if (!probe.indexed_sampling_cadence_verified) {
+    return "cadence is ambiguous for indexed sampling";
+  }
+  if (probe.total_frames % probe.timestamp_multiplicity != 0U) {
+    return "ends within an indexed timestamp group";
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string>
+validate_calibration_output_identity(const std::filesystem::path& left_input,
+                                     const std::filesystem::path& right_input,
+                                     const std::filesystem::path& output) {
+  const auto normalize = [](const std::filesystem::path& path, std::string_view label,
+                            std::filesystem::path& normalized) -> std::optional<std::string> {
+    std::error_code error;
+    normalized = std::filesystem::absolute(path, error);
+    if (error) {
+      return "cannot resolve " + std::string(label) + " for identity checking: " + error.message();
+    }
+    normalized = normalized.lexically_normal();
+    return std::nullopt;
+  };
+
+  std::filesystem::path normalized_left;
+  std::filesystem::path normalized_right;
+  std::filesystem::path normalized_output;
+  if (const auto error = normalize(left_input, "left video path", normalized_left);
+      error.has_value()) {
+    return error;
+  }
+  if (const auto error = normalize(right_input, "right video path", normalized_right);
+      error.has_value()) {
+    return error;
+  }
+  if (const auto error = normalize(output, "output calibration path", normalized_output);
+      error.has_value()) {
+    return error;
+  }
+
+  const auto alias_error = [](std::string_view label) {
+    return "output calibration path identifies the " + std::string(label) + " video input";
+  };
+  if (normalized_output == normalized_left) {
+    return alias_error("left");
+  }
+  if (normalized_output == normalized_right) {
+    return alias_error("right");
+  }
+
+  std::error_code error;
+  const auto output_status = std::filesystem::status(normalized_output, error);
+  if (error == std::errc::no_such_file_or_directory) {
+    return std::nullopt;
+  }
+  if (error) {
+    return "cannot inspect output calibration path identity: " + error.message();
+  }
+  if (!std::filesystem::exists(output_status)) {
+    return std::nullopt;
+  }
+
+  const auto equivalent_to_input = [&](const std::filesystem::path& input,
+                                       std::string_view label) -> std::optional<std::string> {
+    error.clear();
+    const bool equivalent = std::filesystem::equivalent(normalized_output, input, error);
+    if (error) {
+      return "cannot compare output calibration path with " + std::string(label) +
+             " video input identity: " + error.message();
+    }
+    return equivalent ? std::optional<std::string>(alias_error(label)) : std::nullopt;
+  };
+  if (const auto alias = equivalent_to_input(normalized_left, "left"); alias.has_value()) {
+    return alias;
+  }
+  return equivalent_to_input(normalized_right, "right");
+}
+
 std::optional<std::string> validate_gpu_calibration_request(const GpuCalibrationRequest& request) {
   if (request.left.path.empty()) {
     return "left video path is required";
@@ -417,10 +495,37 @@ std::optional<std::string> validate_gpu_calibration_request(const GpuCalibration
   if (request.output.empty()) {
     return "output calibration path is required";
   }
+  if (invalid_protocol_path(request.left.path) || invalid_protocol_path(request.right.path) ||
+      invalid_protocol_path(request.output) ||
+      (request.left.lens_profile.has_value() &&
+       invalid_protocol_path(*request.left.lens_profile)) ||
+      (request.right.lens_profile.has_value() &&
+       invalid_protocol_path(*request.right.lens_profile)) ||
+      (request.left.retained_path.has_value() &&
+       invalid_protocol_path(*request.left.retained_path)) ||
+      (request.right.retained_path.has_value() &&
+       invalid_protocol_path(*request.right.retained_path)) ||
+      (request.debug_dir.has_value() && invalid_protocol_path(*request.debug_dir))) {
+    return "calibration paths must not contain NUL bytes or exceed 16384 bytes";
+  }
   if (const auto error = validate_decode_path(request.left.path, "left"); error.has_value()) {
     return *error;
   }
   if (const auto error = validate_decode_path(request.right.path, "right"); error.has_value()) {
+    return *error;
+  }
+  if ((request.left.retained_path.has_value() &&
+       (request.left.retained_path->empty() ||
+        !std::filesystem::path(*request.left.retained_path).is_absolute())) ||
+      (request.right.retained_path.has_value() &&
+       (request.right.retained_path->empty() ||
+        !std::filesystem::path(*request.right.retained_path).is_absolute()))) {
+    return "retained calibration video paths must be non-empty and absolute";
+  }
+  if (const auto error = validate_calibration_output_identity(calibration_open_path(request.left),
+                                                              calibration_open_path(request.right),
+                                                              request.output);
+      error.has_value()) {
     return *error;
   }
   if (const auto error = request.config.validate(); error.has_value()) {
@@ -428,6 +533,9 @@ std::optional<std::string> validate_gpu_calibration_request(const GpuCalibration
   }
   if (request.config.num_frames == 0) {
     return "calibration requires at least one frame";
+  }
+  if (request.config.num_frames > kMaximumCalibrationRequestFrames) {
+    return "calibration frame count exceeds the isolated worker limit of 256";
   }
   if (!std::isfinite(request.config.skip_start_secs) ||
       !std::isfinite(request.config.skip_end_secs) || request.config.skip_start_secs < 0.0 ||
@@ -455,9 +563,27 @@ std::optional<std::string> validate_gpu_calibration_request(const GpuCalibration
   if (!request.probe_worker.empty() && !std::filesystem::path(request.probe_worker).is_absolute()) {
     return "GPU video probe worker path must be absolute";
   }
+  if (invalid_protocol_path(request.probe_worker)) {
+    return "GPU video probe worker path must not contain NUL bytes or exceed 16384 bytes";
+  }
+  if (!request.calibration_worker_path.empty() &&
+      !std::filesystem::path(request.calibration_worker_path).is_absolute()) {
+    return "GPU calibration worker path must be absolute";
+  }
+  if (invalid_protocol_path(request.calibration_worker_path)) {
+    return "GPU calibration worker path must not contain NUL bytes or exceed 16384 bytes";
+  }
   constexpr std::uint64_t kSecondNs = 1'000'000'000ULL;
   if (request.probe_timeout_ns < kSecondNs || request.probe_timeout_ns > 3600ULL * kSecondNs) {
     return "GPU video probe timeout must be between one second and one hour";
+  }
+  if (request.calibration_timeout_ns < kSecondNs ||
+      request.calibration_timeout_ns > 24ULL * 3600ULL * kSecondNs) {
+    return "GPU calibration timeout must be between one second and 24 hours";
+  }
+  if (request.calibration_host_memory_limit_bytes < kMinimumCalibrationWorkerMemoryBytes ||
+      request.calibration_host_memory_limit_bytes > kMaximumCalibrationWorkerMemoryBytes) {
+    return "GPU calibration host memory limit must be between 16 MiB and 64 GiB";
   }
   return std::nullopt;
 }
@@ -505,19 +631,18 @@ CalibrationExecutionPlan build_gpu_calibration_plan(const GpuCalibrationRequest&
   } else if (!backends.gstreamer.available) {
     plan.blocked_reason =
         "GStreamer is required for C++ GPU calibration video ingest: " + backends.gstreamer.detail;
-  } else if (!backends.npp.available) {
-    plan.blocked_reason =
-        "NPP is required for C++ GPU calibration resize/color interop: " + backends.npp.detail;
   } else if (!backends.nvbufsurface.available) {
     plan.blocked_reason = "NvBufSurface is required for zero-copy C++ GPU calibration ingest: " +
                           backends.nvbufsurface.detail;
-  } else if (request.probe_worker.empty()) {
-    plan.blocked_reason = "GPU video probe worker path is required for calibration";
+  } else if (request.calibration_worker_path.empty()) {
+    plan.blocked_reason = "GPU calibration worker path is required for calibration";
   } else if (!request.left.lens_profile.has_value()) {
     plan.blocked_reason = "automatic lens profile detection is not ported; provide --left-profile";
+  } else if (!request.no_auto_imu) {
+    plan.blocked_reason = "automatic IMU extraction is not ported; explicitly use --no-auto-imu";
   } else if (request.auto_sync) {
     plan.blocked_reason =
-        "automatic IMU/audio sync extraction is not ported; use --no-auto-sync and --sync-offset";
+        "automatic audio sync extraction is not ported; use --no-auto-sync and --sync-offset";
   } else if (request.debug_dir.has_value()) {
     plan.blocked_reason = "GPU calibration debug image export is not ported; omit --debug-dir";
   } else {
@@ -584,27 +709,49 @@ CalibrationResult run_gpu_calibration_sources(
       left_params, right_params, config, sync_offset);
 }
 
-CalibrationResult run_gpu_calibration(const GpuCalibrationRequest& request,
-                                      const CalibrationBackendStatus& backends) {
+CalibrationResult detail::run_gpu_calibration_in_process(const GpuCalibrationRequest& request,
+                                                         const CalibrationBackendStatus& backends) {
+  const auto runtime_abi = reco::io::discover_nvbufsurface_abi();
+  if (runtime_abi != request.nvbufsurface_abi) {
+    throw CalibrationExecutionError(
+        "calibration worker NvBufSurface ABI does not match the supervisor runtime");
+  }
   const auto plan = build_gpu_calibration_plan(request, backends);
   if (!plan.ready) {
     throw CalibrationExecutionError(plan.blocked_reason.value_or("GPU calibration is unavailable"));
   }
 
   try {
-    const auto left_config = calibration_decode_config(request.left.path);
-    const auto right_config = calibration_decode_config(request.right.path);
-    const auto worker = std::filesystem::path(request.probe_worker);
-    const auto left_probe =
-        reco::io::probe_gpu_video(left_config, worker, request.probe_timeout_ns);
-    const auto right_probe =
-        reco::io::probe_gpu_video(right_config, worker, request.probe_timeout_ns);
+    auto left_config = calibration_decode_config(request.left.path);
+    auto right_config = calibration_decode_config(request.right.path);
+    StableMediaFile left_media(calibration_open_path(request.left));
+    StableMediaFile right_media(calibration_open_path(request.right));
+    left_config.path = left_media.decode_path().string();
+    right_config.path = right_media.decode_path().string();
+    const auto left_probe = reco::io::detail::probe_gpu_video_in_process(
+        left_config, request.probe_timeout_ns,
+        reco::io::detail::GpuVideoProbePolicy::ExhaustiveIndexedCadence);
+    const auto right_probe = reco::io::detail::probe_gpu_video_in_process(
+        right_config, request.probe_timeout_ns,
+        reco::io::detail::GpuVideoProbePolicy::ExhaustiveIndexedCadence);
+    left_media.verify_unchanged();
+    right_media.verify_unchanged();
     validate_probe(left_probe, "left");
     validate_probe(right_probe, "right");
     if (!matching_frame_rates(left_probe, right_probe)) {
       throw CalibrationExecutionError(
           "left and right calibration videos must have the same constant frame rate");
     }
+    left_config.read_timeout_ns = request.probe_timeout_ns;
+    right_config.read_timeout_ns = request.probe_timeout_ns;
+    left_config.indexed_fps_numerator = left_probe.fps_numerator;
+    left_config.indexed_fps_denominator = left_probe.fps_denominator;
+    left_config.indexed_timestamp_multiplicity = left_probe.timestamp_multiplicity;
+    left_config.indexed_stream_time_origin_ns = left_probe.first_stream_time_ns;
+    right_config.indexed_fps_numerator = right_probe.fps_numerator;
+    right_config.indexed_fps_denominator = right_probe.fps_denominator;
+    right_config.indexed_timestamp_multiplicity = right_probe.timestamp_multiplicity;
+    right_config.indexed_stream_time_origin_ns = right_probe.first_stream_time_ns;
 
     const auto [left_indices, right_indices] = select_synchronized_frame_indices(
         left_probe.total_frames, right_probe.total_frames, left_probe.fps,
@@ -613,16 +760,19 @@ CalibrationResult run_gpu_calibration(const GpuCalibrationRequest& request,
     if (left_indices.empty() || left_indices.size() != right_indices.size()) {
       throw CalibrationExecutionError("calibration videos have no synchronized sample range");
     }
-
     auto [left_params, right_params] = load_calibration_profiles(request);
     auto backend = reco::core::CudaBackend::create();
-    auto left_source =
-        reco::io::open_gstreamer_gpu_file_decode_source(left_config, request.nvbufsurface_abi);
-    auto right_source =
-        reco::io::open_gstreamer_gpu_file_decode_source(right_config, request.nvbufsurface_abi);
+    left_config.start_frame_index = left_indices.front();
+    right_config.start_frame_index = right_indices.front();
+    auto left_source = reco::io::open_gstreamer_gpu_file_decode_source(std::move(left_config),
+                                                                       request.nvbufsurface_abi);
+    auto right_source = reco::io::open_gstreamer_gpu_file_decode_source(std::move(right_config),
+                                                                        request.nvbufsurface_abi);
     auto result = run_gpu_calibration_sources(backend, *left_source, *right_source, left_indices,
                                               right_indices, left_params, right_params,
                                               request.config, request.manual_sync_offset);
+    left_media.verify_unchanged();
+    right_media.verify_unchanged();
     result.left_lens_profile = LensProfileInfo{
         .camera = "", .lens = "", .source = ProfileSource::File, .path = request.left.lens_profile};
     result.right_lens_profile =
@@ -640,8 +790,23 @@ CalibrationResult run_gpu_calibration(const GpuCalibrationRequest& request,
   }
 }
 
+CalibrationResult run_gpu_calibration(const GpuCalibrationRequest& request,
+                                      const CalibrationBackendStatus& backends) {
+  const auto plan = build_gpu_calibration_plan(request, backends);
+  if (!plan.ready) {
+    throw CalibrationExecutionError(plan.blocked_reason.value_or("GPU calibration is unavailable"));
+  }
+  return detail::run_gpu_calibration_supervised(request);
+}
+
 CalibrationResult run_gpu_calibration(const GpuCalibrationRequest& request) {
-  return run_gpu_calibration(request, probe_calibration_backends());
+  if (const auto error = validate_gpu_calibration_request(request); error.has_value()) {
+    throw CalibrationExecutionError(*error);
+  }
+  if (request.calibration_worker_path.empty()) {
+    throw CalibrationExecutionError("GPU calibration worker path is required for file execution");
+  }
+  return detail::run_gpu_calibration_supervised(request);
 }
 
 } // namespace reco::calibrate

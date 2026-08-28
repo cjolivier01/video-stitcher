@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -32,6 +33,9 @@ constexpr float kMinimumContrast = 1.0e-6F;
 constexpr double kFedMaximumStep = 0.25;
 constexpr std::size_t kCandidateBytes = 76;
 constexpr std::uint32_t kSelectionBatchCandidates = 256;
+constexpr std::size_t kImageRowAlignment = 256;
+constexpr std::size_t kWorkspaceAccountingMarginBytes = std::size_t{64} * 1'024U * 1'024U;
+constexpr std::size_t kHistogramBytes = 300U * sizeof(std::uint32_t);
 
 static_assert(sizeof(GpuFeaturePoint) == 24);
 
@@ -113,6 +117,25 @@ struct DetectionGeometry {
   return left * right;
 }
 
+[[nodiscard]] std::size_t checked_add(std::size_t left, std::size_t right, const char* label) {
+  if (right > std::numeric_limits<std::size_t>::max() - left) {
+    throw std::overflow_error(std::string(label) + " size overflow");
+  }
+  return left + right;
+}
+
+[[nodiscard]] std::size_t checked_scale(std::size_t value, std::size_t multiplier,
+                                        const char* label) {
+  return checked_multiply(value, multiplier, label);
+}
+
+[[nodiscard]] std::size_t aligned_float_image_bytes(std::uint32_t width, std::uint32_t height) {
+  const auto row_bytes = checked_multiply(width, sizeof(float), "GPU AKAZE image row");
+  const auto padded = checked_add(row_bytes, kImageRowAlignment - 1U, "GPU AKAZE image row");
+  const auto aligned_row_bytes = padded - padded % kImageRowAlignment;
+  return checked_multiply(aligned_row_bytes, height, "GPU AKAZE image");
+}
+
 [[nodiscard]] std::uint32_t checked_u32(std::size_t value, const char* label) {
   if (value > std::numeric_limits<std::uint32_t>::max()) {
     throw std::overflow_error(std::string(label) + " exceeds uint32 range");
@@ -151,10 +174,10 @@ void launch(const reco::core::CudaKernel& kernel, const reco::core::CudaLaunchCo
   if (width == 0 || height == 0) {
     throw std::invalid_argument("GPU AKAZE image dimensions must be non-zero");
   }
-  const auto width_bytes = checked_multiply(width, sizeof(float), "GPU AKAZE image row");
-  auto allocation = backend.allocate_pitched(width_bytes, height, sizeof(float));
-  return {.buffer = std::move(allocation.buffer),
-          .pitch = allocation.pitch,
+  const auto allocation_bytes = aligned_float_image_bytes(width, height);
+  const auto pitch = allocation_bytes / height;
+  return {.buffer = backend.allocate(allocation_bytes),
+          .pitch = pitch,
           .width = width,
           .height = height};
 }
@@ -198,17 +221,21 @@ void upload_bytes(reco::core::CudaBackend& backend, const void* source, std::siz
   return value;
 }
 
+void validate_frame_dimensions(std::uint32_t width, std::uint32_t height) {
+  if (width == 0 || height == 0) {
+    throw std::invalid_argument("GPU AKAZE frame dimensions must be non-zero");
+  }
+  if (width > reco::core::kMaxCalibrationDimension ||
+      height > reco::core::kMaxCalibrationDimension) {
+    throw std::invalid_argument("GPU AKAZE frame dimensions exceed the supported limit");
+  }
+}
+
 void validate_frame(const GpuGrayFrame& frame) {
   if (frame.ptr == 0) {
     throw std::invalid_argument("GPU AKAZE frame pointer must be non-zero");
   }
-  if (frame.width == 0 || frame.height == 0) {
-    throw std::invalid_argument("GPU AKAZE frame dimensions must be non-zero");
-  }
-  if (frame.width > reco::core::kMaxCalibrationDimension ||
-      frame.height > reco::core::kMaxCalibrationDimension) {
-    throw std::invalid_argument("GPU AKAZE frame dimensions exceed the supported limit");
-  }
+  validate_frame_dimensions(frame.width, frame.height);
   if (frame.pitch < frame.width) {
     throw std::invalid_argument("GPU AKAZE frame pitch is smaller than its visible width");
   }
@@ -271,9 +298,10 @@ void validate_config(const GpuAkazeConfig& config) {
   }
 }
 
-[[nodiscard]] DetectionGeometry detection_geometry(const GpuGrayFrame& frame,
+[[nodiscard]] DetectionGeometry detection_geometry(std::uint32_t frame_width,
+                                                   std::uint32_t frame_height,
                                                    const GpuAkazeConfig& config) {
-  DetectionGeometry result{.crop_width = frame.width, .crop_height = frame.height};
+  DetectionGeometry result{.crop_width = frame_width, .crop_height = frame_height};
   if (config.use_region) {
     const auto endpoint = [](float normalized, std::uint32_t dimension, bool upper) {
       const double scaled = static_cast<double>(normalized) * static_cast<double>(dimension);
@@ -283,22 +311,22 @@ void validate_config(const GpuAkazeConfig& config) {
       }
       return static_cast<std::uint32_t>(rounded);
     };
-    const auto x_low = endpoint(config.region.x_min, frame.width, false);
-    const auto y_low = endpoint(config.region.y_min, frame.height, false);
-    const auto x_high = endpoint(config.region.x_max, frame.width, true);
-    const auto y_high = endpoint(config.region.y_max, frame.height, true);
+    const auto x_low = endpoint(config.region.x_min, frame_width, false);
+    const auto y_low = endpoint(config.region.y_min, frame_height, false);
+    const auto x_high = endpoint(config.region.x_max, frame_width, true);
+    const auto y_high = endpoint(config.region.y_max, frame_height, true);
     const auto crop_x = x_low > kCropMargin ? x_low - kCropMargin : 0U;
     const auto crop_y = y_low > kCropMargin ? y_low - kCropMargin : 0U;
-    const auto crop_right = x_high > frame.width - std::min(frame.width, kCropMargin)
-                                ? frame.width
+    const auto crop_right = x_high > frame_width - std::min(frame_width, kCropMargin)
+                                ? frame_width
                                 : x_high + kCropMargin;
-    const auto crop_bottom = y_high > frame.height - std::min(frame.height, kCropMargin)
-                                 ? frame.height
+    const auto crop_bottom = y_high > frame_height - std::min(frame_height, kCropMargin)
+                                 ? frame_height
                                  : y_high + kCropMargin;
     const auto crop_width = crop_right - crop_x;
     const auto crop_height = crop_bottom - crop_y;
     const std::uint64_t crop_area = static_cast<std::uint64_t>(crop_width) * crop_height;
-    const std::uint64_t full_area = static_cast<std::uint64_t>(frame.width) * frame.height;
+    const std::uint64_t full_area = static_cast<std::uint64_t>(frame_width) * frame_height;
     const std::uint64_t three_quarters = (full_area / 4U) * 3U + ((full_area % 4U) * 3U) / 4U;
     if (crop_area < three_quarters) {
       result.crop_x = crop_x;
@@ -356,6 +384,97 @@ void validate_config(const GpuAkazeConfig& config) {
     throw std::invalid_argument("GPU AKAZE image is too small; both dimensions must reach 40px");
   }
   return specs;
+}
+
+[[nodiscard]] std::uint32_t total_scale_space_pixels(const std::vector<EvolutionSpec>& specs) {
+  const auto& final_spec = specs.back();
+  return checked_u32(
+      checked_add(final_spec.pixel_base,
+                  checked_multiply(final_spec.width, final_spec.height, "GPU AKAZE final level"),
+                  "GPU AKAZE total pixels"),
+      "GPU AKAZE total pixels");
+}
+
+[[nodiscard]] std::size_t scan_scratch_bytes(std::uint32_t count) {
+  std::size_t bytes = 0;
+  while (count != 0U) {
+    const auto blocks = divide_round_up(count, kLinearBlockSize);
+    const auto block_bytes =
+        checked_multiply(blocks, sizeof(std::uint32_t), "GPU AKAZE scan scratch");
+    bytes = checked_add(bytes, block_bytes, "GPU AKAZE scan scratch");
+    if (blocks == 1U) {
+      break;
+    }
+    bytes = checked_add(bytes, block_bytes, "GPU AKAZE scan scratch");
+    count = blocks;
+  }
+  return bytes;
+}
+
+void add_workspace_bytes(std::size_t& total, std::size_t bytes) {
+  total = checked_add(total, bytes, "GPU AKAZE workspace");
+}
+
+[[nodiscard]] std::size_t peak_workspace_bytes(const DetectionGeometry& geometry,
+                                               const std::vector<EvolutionSpec>& specs,
+                                               const GpuAkazeConfig& config) {
+  const auto base_bytes = aligned_float_image_bytes(geometry.detect_width, geometry.detect_height);
+  std::size_t peak_bytes = base_bytes;
+  if (geometry.crop_width != geometry.detect_width ||
+      geometry.crop_height != geometry.detect_height) {
+    peak_bytes = checked_add(base_bytes,
+                             aligned_float_image_bytes(geometry.crop_width, geometry.detect_height),
+                             "GPU AKAZE resize workspace");
+  }
+
+  const auto fixed_bytes =
+      checked_add(kHistogramBytes, 3U * sizeof(std::uint32_t), "GPU AKAZE fixed workspace");
+  std::size_t retained_level_bytes = 0;
+  for (std::size_t index = 0; index < specs.size(); ++index) {
+    const auto level_bytes = aligned_float_image_bytes(specs[index].width, specs[index].height);
+    std::size_t level_peak = fixed_bytes;
+    add_workspace_bytes(level_peak, base_bytes);
+    add_workspace_bytes(level_peak, retained_level_bytes);
+    add_workspace_bytes(level_peak, checked_scale(level_bytes, index == 0U ? 8U : 12U,
+                                                  "GPU AKAZE scale-space transient"));
+    peak_bytes = std::max(peak_bytes, level_peak);
+    add_workspace_bytes(retained_level_bytes,
+                        checked_scale(level_bytes, 4U, "GPU AKAZE retained scale space"));
+  }
+
+  const auto total_pixels = total_scale_space_pixels(specs);
+  const auto pixel_count = static_cast<std::size_t>(total_pixels);
+  const auto scan_bytes = scan_scratch_bytes(total_pixels);
+  std::size_t selection_peak = fixed_bytes;
+  add_workspace_bytes(selection_peak, base_bytes);
+  add_workspace_bytes(selection_peak, retained_level_bytes);
+  add_workspace_bytes(selection_peak, checked_scale(pixel_count, 2U * sizeof(std::uint32_t),
+                                                    "GPU AKAZE NMS flags and offsets"));
+  add_workspace_bytes(selection_peak, scan_bytes);
+  add_workspace_bytes(selection_peak, checked_scale(config.max_keypoints,
+                                                    sizeof(GpuFeaturePoint) + kDescriptorBytes,
+                                                    "GPU AKAZE detector output"));
+  add_workspace_bytes(selection_peak, sizeof(std::uint32_t));
+  add_workspace_bytes(selection_peak,
+                      checked_scale(pixel_count, kCandidateBytes, "GPU AKAZE candidates"));
+  add_workspace_bytes(selection_peak, checked_scale(specs.size(), sizeof(GpuSelectionLevel),
+                                                    "GPU AKAZE selection levels"));
+  add_workspace_bytes(selection_peak, checked_scale(pixel_count, 2U * sizeof(std::uint32_t),
+                                                    "GPU AKAZE selection flags and indices"));
+  add_workspace_bytes(selection_peak, checked_scale(pixel_count, sizeof(std::uint32_t),
+                                                    "GPU AKAZE selection cells"));
+  add_workspace_bytes(selection_peak, 2U * sizeof(std::uint32_t));
+  add_workspace_bytes(selection_peak, checked_scale(pixel_count, 6U * sizeof(std::uint32_t),
+                                                    "GPU AKAZE radix workspace"));
+  add_workspace_bytes(selection_peak,
+                      checked_scale(scan_bytes, 32U, "GPU AKAZE radix scan scratch"));
+  add_workspace_bytes(selection_peak, checked_scale(config.max_keypoints, 2U * sizeof(float),
+                                                    "GPU AKAZE descriptor positions"));
+  add_workspace_bytes(selection_peak, checked_scale(specs.size(), sizeof(GpuLevelView),
+                                                    "GPU AKAZE descriptor level views"));
+  peak_bytes = std::max(peak_bytes, selection_peak);
+  return checked_add(peak_bytes, kWorkspaceAccountingMarginBytes,
+                     "GPU AKAZE workspace accounting margin");
 }
 
 [[nodiscard]] bool is_prime(std::size_t value) {
@@ -443,6 +562,70 @@ void validate_feature_view(const GpuFeatureView& view, const char* label) {
 }
 
 } // namespace
+
+std::size_t gpu_akaze_peak_workspace_bytes(std::uint32_t frame_width, std::uint32_t frame_height,
+                                           const GpuAkazeConfig& config) {
+  validate_frame_dimensions(frame_width, frame_height);
+  validate_config(config);
+  const auto geometry = detection_geometry(frame_width, frame_height, config);
+  const auto specs = make_evolution_specs(geometry, config);
+  return peak_workspace_bytes(geometry, specs, config);
+}
+
+GpuAkazeConfig fit_gpu_akaze_workspace(std::uint32_t frame_width, std::uint32_t frame_height,
+                                       const GpuAkazeConfig& config, std::size_t workspace_limit) {
+  validate_frame_dimensions(frame_width, frame_height);
+  validate_config(config);
+  if (workspace_limit == 0) {
+    throw std::invalid_argument("GPU AKAZE workspace limit must be non-zero");
+  }
+  const auto workspace = [&](std::uint32_t detection_width) -> std::optional<std::size_t> {
+    auto candidate = config;
+    candidate.max_detection_width = detection_width;
+    try {
+      const auto geometry = detection_geometry(frame_width, frame_height, candidate);
+      const auto specs = make_evolution_specs(geometry, candidate);
+      return peak_workspace_bytes(geometry, specs, candidate);
+    } catch (const std::invalid_argument&) {
+      return std::nullopt;
+    }
+  };
+
+  if (!workspace(config.max_detection_width).has_value()) {
+    throw std::invalid_argument(
+        "GPU AKAZE maximum detection width cannot form a usable scale space");
+  }
+  std::uint32_t low = 1;
+  std::uint32_t high = config.max_detection_width;
+  while (low < high) {
+    const auto middle = low + (high - low) / 2U;
+    if (workspace(middle).has_value()) {
+      high = middle;
+    } else {
+      low = middle + 1U;
+    }
+  }
+  const auto minimum_width = low;
+  const auto minimum_workspace = workspace(minimum_width);
+  if (!minimum_workspace.has_value() || *minimum_workspace > workspace_limit) {
+    throw std::invalid_argument("GPU AKAZE workspace limit cannot fit a usable scale space");
+  }
+
+  low = minimum_width;
+  high = config.max_detection_width;
+  while (low < high) {
+    const auto middle = low + (high - low) / 2U + 1U;
+    const auto required = workspace(middle);
+    if (required.has_value() && *required <= workspace_limit) {
+      low = middle;
+    } else {
+      high = middle - 1U;
+    }
+  }
+  auto fitted = config;
+  fitted.max_detection_width = low;
+  return fitted;
+}
 
 struct GpuFeatureSet::Impl {
   reco::core::CudaDeviceBuffer points;
@@ -685,15 +868,28 @@ GpuFeatureSet GpuAkazePipeline::detect(const GpuGrayFrame& frame,
   validate_frame(frame);
   validate_config(config);
   auto& backend = impl_->backend;
-  backend.ensure_primary_context();
 
-  const auto geometry = detection_geometry(frame, config);
+  const auto geometry = detection_geometry(frame.width, frame.height, config);
   const auto specs = make_evolution_specs(geometry, config);
-  const auto& final_spec = specs.back();
-  const std::uint32_t total_pixels = checked_u32(
-      static_cast<std::size_t>(final_spec.pixel_base) +
-          checked_multiply(final_spec.width, final_spec.height, "GPU AKAZE final level"),
-      "GPU AKAZE total pixels");
+  const auto total_pixels = total_scale_space_pixels(specs);
+  const auto workspace_bytes = peak_workspace_bytes(geometry, specs, config);
+  if (workspace_bytes > kMaxGpuAkazeWorkspaceBytes) {
+    throw std::invalid_argument("GPU AKAZE peak workspace bound of " +
+                                std::to_string(workspace_bytes) + " bytes exceeds the " +
+                                std::to_string(kMaxGpuAkazeWorkspaceBytes) +
+                                "-byte detector limit; reduce the detection dimensions, ROI, "
+                                "sublevels, or octaves");
+  }
+  const auto memory = backend.memory_info();
+  if (memory.free_bytes < kGpuAkazeMemoryHeadroomBytes ||
+      workspace_bytes > memory.free_bytes - kGpuAkazeMemoryHeadroomBytes) {
+    throw std::runtime_error(
+        "GPU AKAZE peak workspace bound of " + std::to_string(workspace_bytes) +
+        " bytes exceeds available CUDA "
+        "memory after reserving " +
+        std::to_string(kGpuAkazeMemoryHeadroomBytes) +
+        " bytes of headroom (free: " + std::to_string(memory.free_bytes) + " bytes)");
+  }
 
   auto base = allocate_float_image(backend, geometry.detect_width, geometry.detect_height);
   auto src = frame.ptr;

@@ -1,6 +1,7 @@
 #include "reco/calibrate/gpu_undistort.hpp"
 #include "reco/core/cuda_backend.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdlib>
@@ -116,18 +117,22 @@ double kb4_forward_scale(double r, const std::array<double, 4>& d) {
 
 std::uint8_t bilinear_sample(const std::vector<std::uint8_t>& data, std::size_t pitch,
                              std::uint32_t width, std::uint32_t height, double x, double y) {
-  if (x < 0.0 || y < 0.0 || x >= static_cast<double>(width - 1) ||
-      y >= static_cast<double>(height - 1)) {
+  if (x < -0.5 || y < -0.5 || x > static_cast<double>(width) - 0.5 ||
+      y > static_cast<double>(height) - 0.5) {
     return 0;
   }
-  const auto x0 = static_cast<std::uint32_t>(x);
-  const auto y0 = static_cast<std::uint32_t>(y);
-  const double tx = x - static_cast<double>(x0);
-  const double ty = y - static_cast<double>(y0);
+  const double clamped_x = std::clamp(x, 0.0, static_cast<double>(width - 1));
+  const double clamped_y = std::clamp(y, 0.0, static_cast<double>(height - 1));
+  const auto x0 = static_cast<std::uint32_t>(clamped_x);
+  const auto y0 = static_cast<std::uint32_t>(clamped_y);
+  const auto x1 = std::min(x0 + 1U, width - 1U);
+  const auto y1 = std::min(y0 + 1U, height - 1U);
+  const double tx = clamped_x - static_cast<double>(x0);
+  const double ty = clamped_y - static_cast<double>(y0);
   const double p00 = data[y0 * pitch + x0];
-  const double p10 = data[y0 * pitch + x0 + 1];
-  const double p01 = data[(y0 + 1) * pitch + x0];
-  const double p11 = data[(y0 + 1) * pitch + x0 + 1];
+  const double p10 = data[y0 * pitch + x1];
+  const double p01 = data[y1 * pitch + x0];
+  const double p11 = data[y1 * pitch + x1];
   const double value =
       p00 * (1.0 - tx) * (1.0 - ty) + p10 * tx * (1.0 - ty) + p01 * (1.0 - tx) * ty + p11 * tx * ty;
   return static_cast<std::uint8_t>(std::round(value));
@@ -149,12 +154,12 @@ std::vector<std::uint8_t> reference_undistort(const std::vector<std::uint8_t>& i
   std::vector<std::uint8_t> out(width * height);
   for (std::uint32_t y = 0; y < height; ++y) {
     for (std::uint32_t x = 0; x < width; ++x) {
-      const double nx = (static_cast<double>(x) - out_cx) / out_fx;
-      const double ny = (static_cast<double>(y) - out_cy) / out_fy;
+      const double nx = (static_cast<double>(x) + 0.5 - out_cx) / out_fx;
+      const double ny = (static_cast<double>(y) + 0.5 - out_cy) / out_fy;
       const double scale = kb4_forward_scale(std::sqrt(nx * nx + ny * ny), camera.d);
       out[y * width + x] =
-          bilinear_sample(input, input_pitch, width, height, src_fx * nx * scale + src_cx,
-                          src_fy * ny * scale + src_cy);
+          bilinear_sample(input, input_pitch, width, height, src_fx * nx * scale + src_cx - 0.5,
+                          src_fy * ny * scale + src_cy - 0.5);
     }
   }
   return out;

@@ -134,11 +134,42 @@ void downscale_matches_rust() {
   expect_true(identity_short_buffer_threw, "identity path short buffer throws");
 }
 
+void applied_rotation_transforms_off_center_intrinsics() {
+  const reco::core::CameraParams camera{.width = 1920,
+                                        .height = 1080,
+                                        .fx = 970.0,
+                                        .fy = 965.0,
+                                        .cx = 931.25,
+                                        .cy = 517.75,
+                                        .d = {0.1, -0.02, 0.003, -0.0004}};
+  const auto unchanged = camera_params_after_applied_rotation(camera, 0);
+  expect_eq(unchanged.cx, camera.cx, "zero rotation preserves cx");
+  expect_eq(unchanged.cy, camera.cy, "zero rotation preserves cy");
+
+  const auto rotated = camera_params_after_applied_rotation(camera, 180);
+  expect_eq(rotated.width, camera.width, "180-degree rotation preserves width");
+  expect_eq(rotated.height, camera.height, "180-degree rotation preserves height");
+  expect_eq(rotated.fx, camera.fx, "180-degree rotation preserves fx");
+  expect_eq(rotated.fy, camera.fy, "180-degree rotation preserves fy");
+  expect_eq(rotated.cx, 988.75, "180-degree rotation mirrors cx about the image center");
+  expect_eq(rotated.cy, 562.25, "180-degree rotation mirrors cy about the image center");
+  expect_true(rotated.d == camera.d, "180-degree rotation preserves radial distortion");
+
+  bool unsupported_threw = false;
+  try {
+    (void)camera_params_after_applied_rotation(camera, 90);
+  } catch (const std::invalid_argument&) {
+    unsupported_threw = true;
+  }
+  expect_true(unsupported_threw, "dimension-swapping camera rotation fails closed");
+}
+
 } // namespace
 
 int main() {
   select_frame_indices_match_rust();
   synchronized_indices_stay_in_stream_bounds();
   downscale_matches_rust();
+  applied_rotation_transforms_off_center_intrinsics();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -230,6 +230,75 @@ GpuAkazeConfig detector_config(std::uint32_t max_keypoints = 32) {
   return config;
 }
 
+void workspace_boundaries_do_not_allocate() {
+  const GpuAkazeConfig config;
+  const auto full_hd = gpu_akaze_peak_workspace_bytes(1920, 1080, config);
+  expect_true(full_hd <= kMaxGpuAkazeWorkspaceBytes,
+              "default 1920x1080 detector fits the static workspace ceiling");
+
+  auto full_roi = config;
+  full_roi.use_region = true;
+  full_roi.region = {.x_min = 0.0F, .x_max = 1.0F, .y_min = 0.0F, .y_max = 1.0F};
+  expect_eq(gpu_akaze_peak_workspace_bytes(1920, 1080, full_roi), full_hd,
+            "full ROI retains normal 1920x1080 workspace behavior");
+  expect_true(gpu_akaze_peak_workspace_bytes(1920, kMaxCalibrationDimension, full_roi) >
+                  kMaxGpuAkazeWorkspaceBytes,
+              "pathological full-height 1920-wide ROI exceeds the workspace ceiling");
+
+  auto cropped_roi = config;
+  cropped_roi.use_region = true;
+  cropped_roi.region = {.x_min = 0.0F, .x_max = 1.0F, .y_min = 0.45F, .y_max = 0.55F};
+  expect_true(gpu_akaze_peak_workspace_bytes(1920, kMaxCalibrationDimension, cropped_roi) <=
+                  kMaxGpuAkazeWorkspaceBytes,
+              "bounded ROI keeps a tall source within the detector workspace ceiling");
+
+  std::uint32_t accepted_height = 1080;
+  std::uint32_t rejected_height = kMaxCalibrationDimension;
+  while (accepted_height + 1U < rejected_height) {
+    const auto candidate = accepted_height + (rejected_height - accepted_height) / 2U;
+    if (gpu_akaze_peak_workspace_bytes(1920, candidate, config) <= kMaxGpuAkazeWorkspaceBytes) {
+      accepted_height = candidate;
+    } else {
+      rejected_height = candidate;
+    }
+  }
+  expect_true(gpu_akaze_peak_workspace_bytes(1920, accepted_height, config) <=
+                  kMaxGpuAkazeWorkspaceBytes,
+              "last admitted 1920-wide height stays within the workspace ceiling");
+  expect_true(gpu_akaze_peak_workspace_bytes(1920, rejected_height, config) >
+                  kMaxGpuAkazeWorkspaceBytes,
+              "first rejected 1920-wide height crosses the workspace ceiling");
+  expect_eq(rejected_height, accepted_height + 1U,
+            "workspace boundary is contiguous and deterministic");
+
+  auto maximum_scale_space = config;
+  maximum_scale_space.num_sublevels = 8;
+  maximum_scale_space.max_octaves = 8;
+  expect_true(gpu_akaze_peak_workspace_bytes(1920, 1080, maximum_scale_space) >
+                  kMaxGpuAkazeWorkspaceBytes,
+              "adversarial scale-space settings are bounded without CUDA allocation");
+
+  auto left_seam = config;
+  left_seam.use_region = true;
+  left_seam.region = {.x_min = 0.5F, .x_max = 1.0F, .y_min = 0.05F, .y_max = 0.95F};
+  expect_true(gpu_akaze_peak_workspace_bytes(3840, 2160, left_seam) > kMaxGpuAkazeWorkspaceBytes,
+              "default 4K seam geometry crosses the unfitted workspace ceiling");
+  const auto fitted = fit_gpu_akaze_workspace(3840, 2160, left_seam);
+  expect_true(fitted.max_detection_width < left_seam.max_detection_width,
+              "default 4K seam geometry is adaptively reduced");
+  expect_true(gpu_akaze_peak_workspace_bytes(3840, 2160, fitted) <= kMaxGpuAkazeWorkspaceBytes,
+              "fitted 4K seam geometry respects the workspace ceiling");
+  auto next_width = fitted;
+  ++next_width.max_detection_width;
+  expect_true(gpu_akaze_peak_workspace_bytes(3840, 2160, next_width) > kMaxGpuAkazeWorkspaceBytes,
+              "fitted 4K seam geometry is the largest admissible width");
+
+  auto unusably_narrow = config;
+  unusably_narrow.max_detection_width = 100;
+  expect_invalid_argument([&] { (void)fit_gpu_akaze_workspace(16'384, 40, unusably_narrow); },
+                          "workspace fitting rejects an unusably narrow geometry");
+}
+
 void expect_equivalent_features(CudaBackend& backend, const GpuAkazePipeline& pipeline,
                                 const GpuFeatureSet& left, const GpuFeatureSet& right,
                                 std::string_view message) {
@@ -420,6 +489,18 @@ void api_validation(CudaBackend& backend, const GpuAkazePipeline& pipeline,
                               invalid_config);
       },
       "unit ROI endpoint at maximum uint32 dimension remains defined");
+  invalid_config = config;
+  invalid_config.use_region = true;
+  invalid_config.region = {.x_min = 0.0F, .x_max = 1.0F, .y_min = 0.0F, .y_max = 1.0F};
+  expect_invalid_argument(
+      [&] {
+        auto frame = valid_frame.view();
+        frame.pitch = 1920;
+        frame.width = 1920;
+        frame.height = kMaxCalibrationDimension;
+        (void)pipeline.detect(frame, invalid_config);
+      },
+      "detector rejects pathological tall full ROI before workspace allocation");
   invalid_config = config;
   invalid_config.lowe_ratio = 0.0F;
   expect_invalid_argument(
@@ -946,9 +1027,11 @@ int main() {
   static_assert(sizeof(GpuFeaturePoint) == 24);
   static_assert(sizeof(Descriptor) == kDescriptorBytes);
 
+  workspace_boundaries_do_not_allocate();
+
   if (address_sanitizer_build() && !require_cuda()) {
     std::cerr << "SKIP: CUDA AKAZE tests are skipped under ASan unless explicitly required\n";
-    return EXIT_SUCCESS;
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
   if (!CudaBackend::is_available()) {
     const auto error = CudaBackend::availability_error();
@@ -957,7 +1040,7 @@ int main() {
       return EXIT_FAILURE;
     }
     std::cerr << "SKIP: CUDA unavailable: " << error << '\n';
-    return EXIT_SUCCESS;
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
 
   const auto shard = test_shard();

@@ -324,13 +324,11 @@ void validate_cuda_plane_pointer(const std::shared_ptr<CudaFunctions>& cuda,
   }
   const auto required = static_cast<std::uint64_t>(pitch) * rows;
   if (pointer < mapping_base) {
-    throw NvmmError(std::string("NvBufSurface ") + plane_name +
-                    " plane precedes its CUDA mapping");
+    throw NvmmError(std::string("NvBufSurface ") + plane_name + " plane precedes its CUDA mapping");
   }
   const auto offset = pointer - mapping_base;
   if (offset > mapping_size || required > static_cast<std::uint64_t>(mapping_size - offset)) {
-    throw NvmmError(std::string("NvBufSurface ") + plane_name +
-                    " plane exceeds its CUDA mapping");
+    throw NvmmError(std::string("NvBufSurface ") + plane_name + " plane exceeds its CUDA mapping");
   }
 }
 
@@ -622,6 +620,53 @@ void* mapped_egl_image(const NvmmFrameInfo& info) {
 #endif
 
 } // namespace
+
+NvbufSurfaceAbi discover_nvbufsurface_abi() {
+#if defined(__linux__)
+  const char* nvbufsurface_path = std::getenv("RECO_NVBUFSURFACE_DYLIB_PATH");
+  if (nvbufsurface_path == nullptr || nvbufsurface_path[0] == '\0') {
+    nvbufsurface_path = "libnvbufsurface.so";
+  }
+  DynamicLibrary nvbufsurface(nvbufsurface_path);
+  using SurfaceMap = int (*)(void*, int);
+  (void)nvbufsurface.symbol<SurfaceMap>("NvBufSurfaceMapEglImage");
+  (void)nvbufsurface.symbol<SurfaceMap>("NvBufSurfaceUnMapEglImage");
+  const auto map_cuda = nvbufsurface.optional_symbol<SurfaceMap>("NvBufSurfaceMapCudaBuffer");
+  const auto unmap_cuda = nvbufsurface.optional_symbol<SurfaceMap>("NvBufSurfaceUnMapCudaBuffer");
+
+  const char* deepstream_utils_path = std::getenv("RECO_NVDS_UTILS_DYLIB_PATH");
+  if (deepstream_utils_path == nullptr || deepstream_utils_path[0] == '\0') {
+    deepstream_utils_path = "libnvds_utils.so";
+  }
+  DynamicLibrary deepstream_utils(deepstream_utils_path);
+  using DeepStreamVersion = void (*)(unsigned int*, unsigned int*);
+  const auto version = deepstream_utils.symbol<DeepStreamVersion>("nvds_version");
+  unsigned int major = 0;
+  unsigned int minor = 0;
+  version(&major, &minor);
+
+  if (major == 7U && minor == 1U) {
+    if (map_cuda != nullptr || unmap_cuda != nullptr) {
+      throw NvmmError(
+          "DeepStream 7.1 version metadata does not match the loaded NvBufSurface runtime: "
+          "CUDA-buffer mapping symbols are forbidden for the 7.1 ABI");
+    }
+    return NvbufSurfaceAbi::DeepStream7_1;
+  }
+  if (major == 9U && minor == 1U) {
+    if (map_cuda == nullptr || unmap_cuda == nullptr) {
+      throw NvmmError(
+          "DeepStream 9.1 version metadata does not match the loaded NvBufSurface runtime: "
+          "both CUDA-buffer mapping symbols are required for the 9.1 ABI");
+    }
+    return NvbufSurfaceAbi::DeepStream9_1;
+  }
+  throw NvmmError("unsupported DeepStream NvBufSurface ABI version " + std::to_string(major) + "." +
+                  std::to_string(minor) + "; supported versions are 7.1 and 9.1");
+#else
+  throw NvmmError("DeepStream NvBufSurface ABI discovery is only supported on Linux");
+#endif
+}
 
 std::optional<std::string> validate_nvmm_frame_info(const NvmmFrameInfo& info) {
   if (info.abi != NvbufSurfaceAbi::DeepStream7_1 && info.abi != NvbufSurfaceAbi::DeepStream9_1) {

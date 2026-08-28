@@ -6,6 +6,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -29,6 +31,12 @@ select_synchronized_frame_indices(std::uint64_t left_total_frames, std::uint64_t
 
 [[nodiscard]] GrayFrame downscale_if_needed(const GrayFrame& frame, std::uint32_t target_width);
 
+/// Transforms lens intrinsics into the coordinate system of an applied display rotation.
+/// Calibration currently supports only rotations that preserve frame dimensions.
+[[nodiscard]] reco::core::CameraParams
+camera_params_after_applied_rotation(const reco::core::CameraParams& camera,
+                                     std::uint16_t rotation_degrees);
+
 /// Calibration-owned grayscale frame stored entirely in CUDA device memory.
 struct GpuCalibrationFrame {
   reco::core::CudaDeviceBuffer y_plane;
@@ -39,28 +47,34 @@ struct GpuCalibrationFrame {
   std::uint64_t frame_index = 0;
   std::optional<std::uint64_t> pts_ns;
   std::optional<std::uint64_t> duration_ns;
+  std::uint16_t applied_rotation_degrees = 0;
 
   [[nodiscard]] GpuGrayFrame view() const;
 };
 
-/// Sequentially extracts requested frames into calibration-owned CUDA memory.
-/// Requests must be strictly increasing so the decoder is never rewound.
+/// Extracts requested frames into calibration-owned CUDA memory. Indexed file
+/// sources seek in place across sparse requests; other sources decode forward.
+/// Requests must be strictly increasing.
 class GpuCalibrationFrameReader {
 public:
   GpuCalibrationFrameReader(reco::core::CudaBackend& backend,
                             reco::io::GpuFileDecodeSource& source);
+  ~GpuCalibrationFrameReader();
   GpuCalibrationFrameReader(const GpuCalibrationFrameReader&) = delete;
   GpuCalibrationFrameReader& operator=(const GpuCalibrationFrameReader&) = delete;
 
-  /// Decodes through `frame_index` and returns a device-resident luma copy.
+  /// Seeks or decodes through `frame_index` and returns a device-resident luma copy.
   [[nodiscard]] GpuCalibrationFrame read(std::uint64_t frame_index);
 
 private:
+  struct Rotate180;
+
   reco::core::CudaBackend* backend_ = nullptr;
   reco::io::GpuFileDecodeSource* source_ = nullptr;
   std::optional<std::uint64_t> previous_requested_index_;
   std::optional<std::uint64_t> previous_source_index_;
   std::optional<std::pair<std::uint32_t, std::uint32_t>> dimensions_;
+  std::unique_ptr<Rotate180> rotate_180_;
 };
 
 /// Failure while extracting indexed calibration frames on the GPU.
@@ -78,5 +92,15 @@ extract_gpu_gray_frames(reco::core::CudaBackend& backend, reco::io::GpuFileDecod
 [[nodiscard]] std::vector<GpuCalibrationFrame> extract_gpu_gray_frames_from_file(
     reco::core::CudaBackend& backend, reco::io::GpuFileDecodeConfig config,
     reco::io::NvbufSurfaceAbi abi, std::span<const std::uint64_t> frame_indices);
+
+using GpuFileDecodeSourceOpener = std::function<std::unique_ptr<reco::io::GpuFileDecodeSource>(
+    reco::io::GpuFileDecodeConfig, reco::io::NvbufSurfaceAbi)>;
+
+/// Opens one accurately seekable GPU source and reuses it for every selected frame.
+/// The opener exists for pluggable backends and focused source-lifecycle tests.
+[[nodiscard]] std::vector<GpuCalibrationFrame> extract_gpu_gray_frames_from_file(
+    reco::core::CudaBackend& backend, reco::io::GpuFileDecodeConfig config,
+    reco::io::NvbufSurfaceAbi abi, std::span<const std::uint64_t> frame_indices,
+    const GpuFileDecodeSourceOpener& opener);
 
 } // namespace reco::calibrate

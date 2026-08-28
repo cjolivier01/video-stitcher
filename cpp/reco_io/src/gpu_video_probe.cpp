@@ -647,6 +647,8 @@ std::string pop_pipeline_error(const std::shared_ptr<ProbeApi>& api, void* bus) 
 
 class CompressedSampleBudget {
 public:
+  explicit CompressedSampleBudget(bool exhaustive) : exhaustive_(exhaustive) {}
+
   [[nodiscard]] bool admit_input(std::uint64_t bytes) noexcept {
     if (input_limit_exceeded_.load(std::memory_order_acquire)) {
       return false;
@@ -687,9 +689,12 @@ public:
 
   void consume() {
     require_input_within_limit();
-    if (consumed_ == kMaximumCompressedSamplePulls) {
+    if (!exhaustive_ && consumed_ == kMaximumCompressedSamplePulls) {
       throw GpuVideoProbeError(
           "video parser exceeded the compressed access-unit metadata work limit");
+    }
+    if (consumed_ == std::numeric_limits<std::uint64_t>::max()) {
+      throw GpuVideoProbeError("video parser compressed access-unit count overflowed");
     }
     if (consumed_ >= checkpointed_.load(std::memory_order_acquire)) {
       throw GpuVideoProbeError(
@@ -703,6 +708,7 @@ private:
   std::atomic<bool> input_limit_exceeded_{false};
   std::atomic<std::uint64_t> checkpointed_{0};
   std::uint64_t consumed_ = 0;
+  bool exhaustive_ = false;
 };
 
 struct InputBudgetCallbackData {
@@ -1436,6 +1442,7 @@ bool frame_rates_are_identical(std::uint32_t first_numerator, std::uint32_t firs
 struct UntimedPresentationPrefix {
   std::uint64_t frame_count = 0;
   std::uint64_t duration_ns = 0;
+  std::optional<std::uint64_t> stream_time_origin;
 };
 
 UntimedPresentationPrefix infer_untimed_presentation_prefix(const TimingScan& scan,
@@ -1471,11 +1478,15 @@ UntimedPresentationPrefix infer_untimed_presentation_prefix(const TimingScan& sc
       frame_count_for_duration(add_saturating(available_prefix_duration, half_frame_duration),
                                fps_numerator, fps_denominator);
   const auto frame_count = std::min(scan.timed_sample_indices[0], available_prefix_frames);
+  if (frame_count == 0) {
+    return {};
+  }
   return {.frame_count = frame_count,
           .duration_ns =
               frame_count == available_prefix_frames
                   ? available_prefix_duration
-                  : minimum_duration_for_frame_count(frame_count, fps_numerator, fps_denominator)};
+                  : minimum_duration_for_frame_count(frame_count, fps_numerator, fps_denominator),
+          .stream_time_origin = estimated_origin};
 }
 
 bool frame_rates_are_close(std::uint32_t first_numerator, std::uint32_t first_denominator,
@@ -1806,7 +1817,8 @@ std::optional<SelectedStreamProbe> selected_stream_duration(
 } // namespace
 
 GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& config,
-                                                 std::uint64_t timeout_ns) {
+                                                 std::uint64_t timeout_ns,
+                                                 GpuVideoProbePolicy policy) {
   if (const auto error = validate_gpu_file_decode_config(config); error.has_value()) {
     throw std::invalid_argument(*error);
   }
@@ -1814,7 +1826,8 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
     throw std::invalid_argument("video probe timeout must be between one second and one hour");
   }
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeout_ns);
-  CompressedSampleBudget sample_budget;
+  const bool exhaustive = policy == GpuVideoProbePolicy::ExhaustiveIndexedCadence;
+  CompressedSampleBudget sample_budget(exhaustive);
 
   std::error_code path_error;
   const auto absolute_path = std::filesystem::absolute(path_from_utf8(config.path), path_error);
@@ -2146,7 +2159,7 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
   std::vector<std::pair<std::uint32_t, std::uint32_t>> cadence_verified_rates;
   std::optional<std::uint64_t> full_cadence_sample_count;
   const bool eager_cadence_validation_is_bounded =
-      timing_scan.reached_eos || !queried_container_duration.has_value() ||
+      exhaustive || timing_scan.reached_eos || !queried_container_duration.has_value() ||
       std::any_of(cadence_candidates.begin(), cadence_candidates.end(), [&](const auto& candidate) {
         return frame_count_ceiling_for_duration(*queried_container_duration, candidate.rate.first,
                                                 candidate.rate.second) <=
@@ -2179,7 +2192,7 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
     }
     auto validation_sample_count = timing_scan.sample_count;
     if (!timing_scan.reached_eos) {
-      while (validation_sample_count < kMaximumEagerCadenceValidationSamples) {
+      while (exhaustive || validation_sample_count < kMaximumEagerCadenceValidationSamples) {
         void* sample = pull_compressed_sample(
             api, probe_sink, bus, sample_budget, deadline,
             "GStreamer parser-only probe timed out while verifying full-stream frame cadence");
@@ -2403,11 +2416,16 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
                                     inferred_frame_rate->denominator, kFrameRatePreferenceTolerance)
           ? inferred_frame_rate->timestamp_multiplicity
           : 1U;
+  if (timestamp_multiplicity == 0U ||
+      timestamp_multiplicity > reco::io::kMaximumIndexedTimestampMultiplicity) {
+    throw GpuVideoProbeError("video parser timestamp multiplicity exceeds the indexed limit");
+  }
   std::uint64_t duration_ns = 0;
   std::uint64_t total_frames = 0;
   std::optional<std::uint64_t> correlated_frame_count;
   bool duration_is_estimated = false;
   bool total_frames_is_estimated = false;
+  auto indexed_stream_time_origin = timing_scan.first_stream_time;
   if (timing_scan.reached_eos) {
     total_frames = timing_scan.sample_count;
     const bool complete_timestamps = timing_scan.timed_sample_count == timing_scan.sample_count &&
@@ -2464,6 +2482,9 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
       if (selected_duration.has_value()) {
         const auto untimed_prefix =
             infer_untimed_presentation_prefix(timing_scan, fps_num, fps_den);
+        if (untimed_prefix.stream_time_origin.has_value()) {
+          indexed_stream_time_origin = untimed_prefix.stream_time_origin;
+        }
         duration_ns = add_saturating(selected_duration->duration_ns, untimed_prefix.duration_ns);
         correlated_frame_count =
             add_saturating(selected_duration->frame_count, untimed_prefix.frame_count);
@@ -2490,6 +2511,10 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
     duration_ns =
         std::max(duration_ns, minimum_duration_for_frame_count(total_frames, fps_num, fps_den));
   }
+  if (exhaustive && (!timing_scan.reached_eos || !indexed_sampling_cadence_verified)) {
+    throw GpuVideoProbeError(
+        "video parser could not verify exact full-stream cadence for indexed calibration");
+  }
   return {.width = static_cast<std::uint32_t>(width),
           .height = static_cast<std::uint32_t>(height),
           .fps_numerator = fps_num,
@@ -2497,10 +2522,20 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
           .fps = fps,
           .duration_ns = duration_ns,
           .total_frames = total_frames,
+          .first_stream_time_ns = indexed_stream_time_origin,
+          .timestamp_multiplicity = static_cast<std::uint32_t>(timestamp_multiplicity),
           .duration_is_estimated = duration_is_estimated,
           .total_frames_is_estimated = total_frames_is_estimated,
           .selected_stream_caps_verified = selected_stream_caps_verified,
           .indexed_sampling_cadence_verified = indexed_sampling_cadence_verified};
 }
+
+namespace detail {
+GpuVideoProbe probe_gpu_video_exhaustive_for_test(const GpuFileDecodeConfig& config,
+                                                  std::uint64_t timeout_ns) {
+  return probe_gpu_video_in_process(config, timeout_ns,
+                                    GpuVideoProbePolicy::ExhaustiveIndexedCadence);
+}
+} // namespace detail
 
 } // namespace reco::io

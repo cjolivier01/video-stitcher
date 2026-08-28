@@ -22,9 +22,14 @@ namespace reco::io::detail {
 [[nodiscard]] std::uint64_t maximum_probe_worker_address_space_bytes_for_test();
 [[nodiscard]] std::uint64_t maximum_aggregate_probe_worker_address_space_bytes_for_test();
 [[nodiscard]] std::uint64_t reserved_probe_worker_address_space_bytes_for_test();
+
+[[nodiscard]] GpuVideoProbe probe_gpu_video_exhaustive_for_test(const GpuFileDecodeConfig& config,
+                                                                std::uint64_t timeout_ns);
 void hold_probe_worker_memory_reservation_for_test(std::uint64_t hold_ns);
 
 #if !defined(_WIN32)
+void hold_probe_worker_admission_lock_for_test(std::uint64_t hold_ns, int ready_descriptor);
+
 [[nodiscard]] GpuVideoProbe probe_gpu_video_with_pre_guardian_exec_delay_for_test(
     const GpuFileDecodeConfig& config, const std::filesystem::path& worker_path,
     std::uint64_t timeout_ns, std::uint64_t pre_guardian_exec_delay_ns,
@@ -34,6 +39,10 @@ void hold_probe_worker_memory_reservation_for_test(std::uint64_t hold_ns);
                                                             int wait_result, int wait_error,
                                                             std::int64_t observed_pid,
                                                             std::int64_t watchdog_pid);
+#endif
+
+#if defined(__linux__) && defined(__x86_64__)
+[[nodiscard]] bool probe_worker_rejects_x32_syscalls_for_test();
 #endif
 
 } // namespace reco::io::detail
