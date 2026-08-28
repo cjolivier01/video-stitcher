@@ -41,8 +41,10 @@ fn camera() -> CameraParams {
 }
 
 fn config() -> CalibrationConfig {
-    let mut config = CalibrationConfig::default();
-    config.num_frames = FRAME_INDICES.len();
+    let mut config = CalibrationConfig {
+        num_frames: FRAME_INDICES.len(),
+        ..CalibrationConfig::default()
+    };
     config.akaze.threshold = 0.0001;
     config.akaze.max_keypoints = 128;
     config.akaze.detect_y_min = 0.15;
