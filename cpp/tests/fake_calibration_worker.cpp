@@ -592,6 +592,27 @@ int main(int argc, char** argv) {
       }
       return EXIT_FAILURE;
     }
+    const auto modules = ::open("/proc/modules", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (modules < 0) {
+      return EXIT_FAILURE;
+    }
+    char module_byte = '\0';
+    ssize_t module_read = -1;
+    do {
+      module_read = ::read(modules, &module_byte, 1);
+    } while (module_read < 0 && errno == EINTR);
+    (void)::close(modules);
+    if (module_read < 0) {
+      return EXIT_FAILURE;
+    }
+    errno = 0;
+    const auto neighboring_proc = ::open("/proc/uptime", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (neighboring_proc >= 0 || (errno != EACCES && errno != EPERM)) {
+      if (neighboring_proc >= 0) {
+        (void)::close(neighboring_proc);
+      }
+      return EXIT_FAILURE;
+    }
     const char* scratch = std::getenv("TMPDIR");
     if (scratch == nullptr) {
       return EXIT_FAILURE;
@@ -806,8 +827,67 @@ int main(int argc, char** argv) {
     if (::setrlimit(RLIMIT_CORE, &raised_core) == 0 || errno != EPERM) {
       return EXIT_FAILURE;
     }
+    struct rlimit file_size{};
+    if (::getrlimit(RLIMIT_FSIZE, &file_size) != 0 || file_size.rlim_cur == RLIM_INFINITY ||
+        file_size.rlim_cur == 0 || file_size.rlim_cur != file_size.rlim_max) {
+      return EXIT_FAILURE;
+    }
+    const struct rlimit raised_file_size{.rlim_cur = file_size.rlim_cur,
+                                         .rlim_max = file_size.rlim_max + 1U};
+    errno = 0;
+    if (::setrlimit(RLIMIT_FSIZE, &raised_file_size) == 0 || errno != EPERM) {
+      return EXIT_FAILURE;
+    }
     write_bytes(descriptor, encode_calibration_worker_success(result()), deadline);
     return EXIT_SUCCESS;
+  }
+  if (scenario == "scratch-oversized-file") {
+    const char* scratch = std::getenv("TMPDIR");
+    if (scratch == nullptr) {
+      return EXIT_FAILURE;
+    }
+    const auto path = std::filesystem::path(scratch) / "oversized-worker-cache";
+    const auto output =
+        ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, S_IRUSR | S_IWUSR);
+    if (output < 0) {
+      return EXIT_FAILURE;
+    }
+    std::array<char, 64U * 1024U> block{};
+    constexpr std::size_t attack_bytes = 4U * 1024U * 1024U;
+    std::size_t written_bytes = 0;
+    while (written_bytes < attack_bytes) {
+      const auto written = ::write(output, block.data(), block.size());
+      if (written <= 0) {
+        (void)::close(output);
+        return EXIT_FAILURE;
+      }
+      written_bytes += static_cast<std::size_t>(written);
+    }
+    if (::fsync(output) != 0) {
+      (void)::close(output);
+      return EXIT_FAILURE;
+    }
+    (void)::close(output);
+    std::this_thread::sleep_for(std::chrono::seconds(30));
+    return EXIT_FAILURE;
+  }
+  if (scenario == "scratch-many-files") {
+    const char* scratch = std::getenv("TMPDIR");
+    if (scratch == nullptr) {
+      return EXIT_FAILURE;
+    }
+    constexpr std::size_t attack_entries = 5'000U;
+    for (std::size_t index = 0; index < attack_entries; ++index) {
+      const auto path = std::filesystem::path(scratch) / ("worker-entry-" + std::to_string(index));
+      const auto entry =
+          ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, S_IRUSR | S_IWUSR);
+      if (entry < 0) {
+        return EXIT_FAILURE;
+      }
+      (void)::close(entry);
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(30));
+    return EXIT_FAILURE;
   }
   if (scenario == "scratch-residue") {
     const char* scratch = std::getenv("TMPDIR");

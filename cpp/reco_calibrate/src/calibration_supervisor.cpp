@@ -96,8 +96,17 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 constexpr auto kCleanupReserve = std::chrono::milliseconds(500);
+constexpr auto kScratchMonitorInterval = std::chrono::milliseconds(10);
 constexpr std::uint64_t kAdmissionHeadroomBytes = 512ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kMaximumWorkerExecutableBytes = 64ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaximumRuntimeSnapshotFileBytes = 256ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaximumRuntimeSnapshotBytes = 256ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaximumScratchAllocatedBytes = 384ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaximumWorkerFileBytes = 512ULL * 1024ULL * 1024ULL;
+constexpr std::size_t kMaximumScratchEntries = 4'096U;
+constexpr std::size_t kMaximumScratchTraversalPathBytes = 4U * 1024U * 1024U;
+constexpr std::size_t kMaximumScratchRelativePathBytes = 4'096U;
+constexpr std::size_t kMaximumScratchTraversalComponents = 65'536U;
 constexpr std::string_view kAdmissionFileName = "reco-video-stitcher-calibration.lock";
 constexpr std::string_view kCgroupPrefix = "reco-calibration-";
 constexpr std::string_view kCleanupCgroupPrefix = "reco-calibration-cleanup-";
@@ -178,6 +187,21 @@ private:
 
 [[nodiscard]] std::string errno_message(std::string_view operation, int error = errno) {
   return std::string(operation) + ": " + std::strerror(error);
+}
+
+[[nodiscard]] std::uint64_t reduced_limit_from_environment(const char* name,
+                                                           std::uint64_t ceiling) {
+  const char* configured = std::getenv(name);
+  if (configured == nullptr || configured[0] == '\0') {
+    return ceiling;
+  }
+  const std::string_view text(configured);
+  std::uint64_t value = 0;
+  const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+  if (error != std::errc{} || end != text.data() + text.size() || value == 0 || value > ceiling) {
+    throw CalibrationExecutionError("calibration resource-limit override is invalid");
+  }
+  return value;
 }
 
 [[nodiscard]] bool inject_cgroup_setup_failure(std::string_view point) noexcept {
@@ -1383,6 +1407,197 @@ void bound_ipc_socket_buffers(int descriptor) {
 
 void enforce_resident_limit(const OwnedProcess& process, std::uint64_t limit);
 
+enum class ScratchQuotaState {
+  WithinLimit,
+  AllocatedBytesExceeded,
+  EntriesExceeded,
+  TraversalExceeded,
+  InspectionFailed,
+};
+
+struct ScratchQuotaInspection {
+  ScratchQuotaState state = ScratchQuotaState::WithinLimit;
+  int error = 0;
+};
+
+[[nodiscard]] ScratchQuotaInspection inspect_scratch_tree(const std::filesystem::path& root,
+                                                          std::uint64_t allocated_limit,
+                                                          std::size_t entry_limit) {
+  UniqueFd root_descriptor(::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+  struct stat root_status{};
+  if (!root_descriptor || ::fstat(root_descriptor.get(), &root_status) != 0) {
+    return {.state = ScratchQuotaState::InspectionFailed, .error = errno};
+  }
+  if (root_status.st_blocks < 0) {
+    return {.state = ScratchQuotaState::InspectionFailed, .error = EOVERFLOW};
+  }
+  constexpr std::uint64_t block_bytes = 512U;
+  const auto root_blocks = static_cast<std::uint64_t>(root_status.st_blocks);
+  if (root_blocks > allocated_limit / block_bytes) {
+    return {.state = ScratchQuotaState::AllocatedBytesExceeded};
+  }
+
+  std::vector<std::string> pending(1);
+  std::size_t pending_path_bytes = 0;
+  std::size_t entries = 0;
+  std::size_t traversed_components = 0;
+  std::uint64_t allocated_bytes = root_blocks * block_bytes;
+
+  while (!pending.empty()) {
+    auto relative = std::move(pending.back());
+    pending.pop_back();
+    pending_path_bytes -= relative.size();
+
+    UniqueFd directory(::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+    if (!directory) {
+      return {.state = ScratchQuotaState::InspectionFailed, .error = errno};
+    }
+    std::size_t component_start = 0;
+    bool vanished = false;
+    while (component_start < relative.size()) {
+      const auto component_end = relative.find('/', component_start);
+      const auto size =
+          (component_end == std::string::npos ? relative.size() : component_end) - component_start;
+      const std::string component = relative.substr(component_start, size);
+      ++traversed_components;
+      if (traversed_components > kMaximumScratchTraversalComponents) {
+        return {.state = ScratchQuotaState::TraversalExceeded};
+      }
+      const auto next = ::openat(directory.get(), component.c_str(),
+                                 O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+      if (next < 0) {
+        if (errno == ENOENT || errno == ENOTDIR || errno == ELOOP) {
+          vanished = true;
+          break;
+        }
+        return {.state = ScratchQuotaState::InspectionFailed, .error = errno};
+      }
+      directory.reset(next);
+      if (component_end == std::string::npos) {
+        break;
+      }
+      component_start = component_end + 1U;
+    }
+    if (vanished) {
+      continue;
+    }
+
+    DIR* stream = ::fdopendir(directory.get());
+    if (stream == nullptr) {
+      return {.state = ScratchQuotaState::InspectionFailed, .error = errno};
+    }
+    (void)directory.release();
+    ScratchQuotaInspection result;
+    while (true) {
+      errno = 0;
+      const auto* entry = ::readdir(stream);
+      if (entry == nullptr) {
+        if (errno != 0) {
+          result = {.state = ScratchQuotaState::InspectionFailed, .error = errno};
+        }
+        break;
+      }
+      const std::string_view name(entry->d_name);
+      if (name == "." || name == "..") {
+        continue;
+      }
+      ++entries;
+      if (entries > entry_limit) {
+        result.state = ScratchQuotaState::EntriesExceeded;
+        break;
+      }
+
+      struct stat status{};
+      if (::fstatat(::dirfd(stream), entry->d_name, &status, AT_SYMLINK_NOFOLLOW) != 0) {
+        if (errno == ENOENT) {
+          continue;
+        }
+        result = {.state = ScratchQuotaState::InspectionFailed, .error = errno};
+        break;
+      }
+      if (status.st_blocks < 0) {
+        result = {.state = ScratchQuotaState::InspectionFailed, .error = EOVERFLOW};
+        break;
+      }
+      const auto blocks = static_cast<std::uint64_t>(status.st_blocks);
+      if (blocks > (allocated_limit - std::min(allocated_bytes, allocated_limit)) / block_bytes) {
+        result.state = ScratchQuotaState::AllocatedBytesExceeded;
+        break;
+      }
+      allocated_bytes += blocks * block_bytes;
+
+      if (S_ISDIR(status.st_mode)) {
+        std::string child;
+        child.reserve(relative.size() + (relative.empty() ? 0U : 1U) + name.size());
+        child.append(relative);
+        if (!child.empty()) {
+          child.push_back('/');
+        }
+        child.append(name);
+        if (child.size() > kMaximumScratchRelativePathBytes ||
+            child.size() > kMaximumScratchTraversalPathBytes -
+                               std::min(pending_path_bytes, kMaximumScratchTraversalPathBytes)) {
+          result.state = ScratchQuotaState::TraversalExceeded;
+          break;
+        }
+        pending_path_bytes += child.size();
+        pending.push_back(std::move(child));
+      }
+    }
+    (void)::closedir(stream);
+    if (result.state != ScratchQuotaState::WithinLimit) {
+      return result;
+    }
+  }
+  return {};
+}
+
+class ScratchQuotaMonitor {
+public:
+  explicit ScratchQuotaMonitor(const std::filesystem::path& root)
+      : root_(root),
+        allocated_limit_(reduced_limit_from_environment("RECO_FAKE_CALIBRATION_SCRATCH_LIMIT_BYTES",
+                                                        kMaximumScratchAllocatedBytes)) {}
+
+  void enforce(const OwnedProcess& process, bool force = false) {
+    const auto now = Clock::now();
+    if (!force && now < next_inspection_) {
+      return;
+    }
+    next_inspection_ = now + kScratchMonitorInterval;
+
+    ScratchQuotaInspection inspection;
+    try {
+      inspection = inspect_scratch_tree(root_, allocated_limit_, kMaximumScratchEntries);
+    } catch (...) {
+      signal_pidfd_noexcept(process.pidfd(), SIGKILL);
+      throw CalibrationExecutionError("cannot enforce calibration worker scratch quota");
+    }
+    switch (inspection.state) {
+    case ScratchQuotaState::WithinLimit:
+      return;
+    case ScratchQuotaState::AllocatedBytesExceeded:
+      signal_pidfd_noexcept(process.pidfd(), SIGKILL);
+      throw CalibrationExecutionError("calibration worker exceeded its scratch disk quota");
+    case ScratchQuotaState::EntriesExceeded:
+      signal_pidfd_noexcept(process.pidfd(), SIGKILL);
+      throw CalibrationExecutionError("calibration worker exceeded its scratch inode quota");
+    case ScratchQuotaState::TraversalExceeded:
+      signal_pidfd_noexcept(process.pidfd(), SIGKILL);
+      throw CalibrationExecutionError("calibration worker exceeded its scratch traversal quota");
+    case ScratchQuotaState::InspectionFailed:
+      signal_pidfd_noexcept(process.pidfd(), SIGKILL);
+      throw CalibrationExecutionError(
+          errno_message("cannot enforce calibration worker scratch quota", inspection.error));
+    }
+  }
+
+private:
+  std::filesystem::path root_;
+  std::uint64_t allocated_limit_ = 0;
+  Clock::time_point next_inspection_ = Clock::time_point::min();
+};
+
 [[nodiscard]] UnixListener create_listener() {
   std::array<unsigned char, 16> random{};
   std::size_t offset = 0;
@@ -1422,8 +1637,12 @@ void enforce_resident_limit(const OwnedProcess& process, std::uint64_t limit);
 
 [[nodiscard]] UniqueFd accept_authenticated(const UnixListener& listener, OwnedProcess& process,
                                             Clock::time_point deadline,
-                                            std::uint64_t resident_limit = 0) {
+                                            std::uint64_t resident_limit = 0,
+                                            ScratchQuotaMonitor* scratch_monitor = nullptr) {
   while (Clock::now() < deadline) {
+    if (scratch_monitor != nullptr) {
+      scratch_monitor->enforce(process);
+    }
     enforce_resident_limit(process, resident_limit);
     std::array<pollfd, 2> items{
         pollfd{.fd = listener.descriptor.get(), .events = POLLIN, .revents = 0},
@@ -1466,8 +1685,12 @@ void enforce_resident_limit(const OwnedProcess& process, std::uint64_t limit);
 }
 
 void wait_for_process_monitored(const OwnedProcess& process, Clock::time_point deadline,
-                                std::uint64_t resident_limit) {
+                                std::uint64_t resident_limit,
+                                ScratchQuotaMonitor* scratch_monitor = nullptr) {
   while (!process.exited()) {
+    if (scratch_monitor != nullptr) {
+      scratch_monitor->enforce(process);
+    }
     enforce_resident_limit(process, resident_limit);
     if (Clock::now() >= deadline) {
       throw CalibrationExecutionError("calibration worker exceeded its end-to-end deadline");
@@ -1539,8 +1762,12 @@ void enforce_resident_limit(const OwnedProcess& process, std::uint64_t limit) {
 
 void wait_for_socket(int socket, const OwnedProcess& process, short events,
                      Clock::time_point deadline, int abort_socket = -1,
-                     std::uint64_t resident_limit = 0) {
+                     std::uint64_t resident_limit = 0,
+                     ScratchQuotaMonitor* scratch_monitor = nullptr) {
   while (Clock::now() < deadline) {
+    if (scratch_monitor != nullptr) {
+      scratch_monitor->enforce(process);
+    }
     enforce_resident_limit(process, resident_limit);
     std::array<pollfd, 3> items{
         pollfd{.fd = socket, .events = events, .revents = 0},
@@ -1574,11 +1801,12 @@ void wait_for_socket(int socket, const OwnedProcess& process, short events,
 }
 
 void write_all(int socket, const OwnedProcess& process, std::string_view bytes,
-               Clock::time_point deadline, int abort_socket = -1,
-               std::uint64_t resident_limit = 0) {
+               Clock::time_point deadline, int abort_socket = -1, std::uint64_t resident_limit = 0,
+               ScratchQuotaMonitor* scratch_monitor = nullptr) {
   std::size_t offset = 0;
   while (offset < bytes.size()) {
-    wait_for_socket(socket, process, POLLOUT, deadline, abort_socket, resident_limit);
+    wait_for_socket(socket, process, POLLOUT, deadline, abort_socket, resident_limit,
+                    scratch_monitor);
     const auto written = ::send(socket, bytes.data() + offset, bytes.size() - offset, MSG_NOSIGNAL);
     if (written < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
       continue;
@@ -1591,11 +1819,12 @@ void write_all(int socket, const OwnedProcess& process, std::string_view bytes,
 }
 
 void read_exact(int socket, const OwnedProcess& process, char* destination, std::size_t size,
-                Clock::time_point deadline, int abort_socket = -1,
-                std::uint64_t resident_limit = 0) {
+                Clock::time_point deadline, int abort_socket = -1, std::uint64_t resident_limit = 0,
+                ScratchQuotaMonitor* scratch_monitor = nullptr) {
   std::size_t offset = 0;
   while (offset < size) {
-    wait_for_socket(socket, process, POLLIN, deadline, abort_socket, resident_limit);
+    wait_for_socket(socket, process, POLLIN, deadline, abort_socket, resident_limit,
+                    scratch_monitor);
     const auto received = ::recv(socket, destination + offset, size - offset, 0);
     if (received < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
       continue;
@@ -1609,21 +1838,24 @@ void read_exact(int socket, const OwnedProcess& process, char* destination, std:
 
 [[nodiscard]] std::string read_frame(int socket, const OwnedProcess& process,
                                      Clock::time_point deadline, int abort_socket = -1,
-                                     std::uint64_t resident_limit = 0) {
+                                     std::uint64_t resident_limit = 0,
+                                     ScratchQuotaMonitor* scratch_monitor = nullptr) {
   CalibrationWorkerFrameHeader header{};
-  read_exact(socket, process, header.data(), header.size(), deadline, abort_socket, resident_limit);
+  read_exact(socket, process, header.data(), header.size(), deadline, abort_socket, resident_limit,
+             scratch_monitor);
   const auto decoded = decode_calibration_worker_header(header);
   std::string response(header.data(), header.size());
   const auto payload_offset = response.size();
   response.resize(payload_offset + decoded.payload_size);
   read_exact(socket, process, response.data() + payload_offset, decoded.payload_size, deadline,
-             abort_socket, resident_limit);
+             abort_socket, resident_limit, scratch_monitor);
   return response;
 }
 
 void send_file_fd(int socket, const OwnedProcess& process, char marker, int file_descriptor,
                   Clock::time_point deadline, int abort_socket = -1,
-                  std::uint64_t resident_limit = 0) {
+                  std::uint64_t resident_limit = 0,
+                  ScratchQuotaMonitor* scratch_monitor = nullptr) {
   std::array<char, CMSG_SPACE(sizeof(int))> control{};
   iovec bytes{.iov_base = &marker, .iov_len = 1};
   msghdr message{};
@@ -1638,7 +1870,8 @@ void send_file_fd(int socket, const OwnedProcess& process, char marker, int file
   std::memcpy(CMSG_DATA(header), &file_descriptor, sizeof(file_descriptor));
 
   while (true) {
-    wait_for_socket(socket, process, POLLOUT, deadline, abort_socket, resident_limit);
+    wait_for_socket(socket, process, POLLOUT, deadline, abort_socket, resident_limit,
+                    scratch_monitor);
     const auto sent = ::sendmsg(socket, &message, MSG_NOSIGNAL);
     if (sent < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
       continue;
@@ -2087,6 +2320,21 @@ void close_child_descriptors_except(int preserved) noexcept {
     return ::syscall(SYS_landlock_add_rule, ruleset.get(), LANDLOCK_RULE_PATH_BENEATH, &rule, 0U) ==
            0;
   };
+  const auto allow_optional_readonly_system_file = [&](const char* path) {
+    UniqueFd file(::open(path, O_PATH | O_CLOEXEC | O_NOFOLLOW));
+    if (!file) {
+      return errno == ENOENT;
+    }
+    struct stat status{};
+    if (::fstat(file.get(), &status) != 0 || !S_ISREG(status.st_mode) || status.st_uid != 0 ||
+        (status.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+      return false;
+    }
+    const landlock_path_beneath_attr rule{.allowed_access = LANDLOCK_ACCESS_FS_READ_FILE,
+                                          .parent_fd = file.get()};
+    return ::syscall(SYS_landlock_add_rule, ruleset.get(), LANDLOCK_RULE_PATH_BENEATH, &rule, 0U) ==
+           0;
+  };
   const auto allow_optional_device = [&](const char* path) {
     UniqueFd device(::open(path, O_PATH | O_CLOEXEC | O_NOFOLLOW));
     if (!device) {
@@ -2137,7 +2385,9 @@ void close_child_descriptors_except(int preserved) noexcept {
       allow_optional_system_file("/etc/localtime") && allow_optional_system_file("/proc/cpuinfo") &&
       allow_optional_system_file("/proc/devices") &&
       allow_optional_system_file("/proc/filesystems") &&
-      allow_optional_system_file("/proc/meminfo") && allow_optional_system_file("/proc/version");
+      allow_optional_system_file("/proc/meminfo") &&
+      allow_optional_readonly_system_file("/proc/modules") &&
+      allow_optional_system_file("/proc/version");
   bool devices_allowed =
       allow_optional_device("/dev/null") && allow_optional_device("/dev/urandom") &&
       allow_optional_device("/dev/zero") && allow_optional_device("/dev/nvidiactl") &&
@@ -2483,6 +2733,21 @@ void apply_worker_limit(std::uint64_t bytes) noexcept {
   if (::setrlimit(RLIMIT_CORE, &core_limit) != 0) {
     child_exit();
   }
+  if (kMaximumWorkerFileBytes > std::numeric_limits<rlim_t>::max()) {
+    child_exit();
+  }
+  struct rlimit inherited_file_limit{};
+  if (::getrlimit(RLIMIT_FSIZE, &inherited_file_limit) != 0) {
+    child_exit();
+  }
+  auto maximum_file_bytes = static_cast<rlim_t>(kMaximumWorkerFileBytes);
+  if (inherited_file_limit.rlim_max != RLIM_INFINITY) {
+    maximum_file_bytes = std::min(maximum_file_bytes, inherited_file_limit.rlim_max);
+  }
+  const struct rlimit file_limit{.rlim_cur = maximum_file_bytes, .rlim_max = maximum_file_bytes};
+  if (::setrlimit(RLIMIT_FSIZE, &file_limit) != 0) {
+    child_exit();
+  }
 #if defined(RECO_CALIBRATION_WIDE_ADDRESS_SANITIZER)
   (void)bytes;
 #else
@@ -2623,7 +2888,9 @@ private:
       throw CalibrationExecutionError(
           errno_message("cannot create calibration worker runtime directory"));
     }
-    constexpr std::uint64_t maximum_runtime_bytes = 256ULL * 1024ULL * 1024ULL;
+    const auto maximum_runtime_bytes = reduced_limit_from_environment(
+        "RECO_FAKE_CALIBRATION_RUNTIME_SNAPSHOT_LIMIT_BYTES", kMaximumRuntimeSnapshotBytes);
+    std::uint64_t runtime_bytes = 0;
     std::size_t runtime_index = 0;
     for (const char* name : environment_names) {
       const char* raw_path = std::getenv(name);
@@ -2638,9 +2905,15 @@ private:
       struct stat before{};
       if (!source || ::fstat(source.get(), &before) != 0 || !S_ISREG(before.st_mode) ||
           before.st_size <= 0 ||
-          static_cast<std::uint64_t>(before.st_size) > maximum_runtime_bytes) {
+          static_cast<std::uint64_t>(before.st_size) > kMaximumRuntimeSnapshotFileBytes) {
         throw CalibrationExecutionError("calibration worker runtime path must name a regular file");
       }
+      const auto source_bytes = static_cast<std::uint64_t>(before.st_size);
+      if (source_bytes > maximum_runtime_bytes - std::min(runtime_bytes, maximum_runtime_bytes)) {
+        throw CalibrationExecutionError(
+            "calibration worker runtime snapshots exceed their aggregate byte limit");
+      }
+      runtime_bytes += source_bytes;
       const auto destination = runtime_directory / ("runtime-" + std::to_string(runtime_index++));
       UniqueFd output(::open(destination.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0500));
       if (!output) {
@@ -2648,17 +2921,20 @@ private:
             errno_message("cannot create calibration worker runtime snapshot"));
       }
       std::array<char, 64U * 1024U> buffer{};
-      while (true) {
+      std::uint64_t remaining = source_bytes;
+      while (remaining > 0) {
         ssize_t received = -1;
         do {
-          received = ::read(source.get(), buffer.data(), buffer.size());
+          received =
+              ::read(source.get(), buffer.data(),
+                     static_cast<std::size_t>(std::min<std::uint64_t>(remaining, buffer.size())));
         } while (received < 0 && errno == EINTR);
         if (received < 0) {
           throw CalibrationExecutionError(
               errno_message("cannot read calibration worker runtime snapshot"));
         }
         if (received == 0) {
-          break;
+          throw CalibrationExecutionError("calibration worker runtime changed while snapshotted");
         }
         std::size_t offset = 0;
         while (offset < static_cast<std::size_t>(received)) {
@@ -2673,6 +2949,19 @@ private:
           }
           offset += static_cast<std::size_t>(written);
         }
+        remaining -= static_cast<std::uint64_t>(received);
+      }
+      char trailing = '\0';
+      ssize_t trailing_size = -1;
+      do {
+        trailing_size = ::read(source.get(), &trailing, 1);
+      } while (trailing_size < 0 && errno == EINTR);
+      if (trailing_size < 0) {
+        throw CalibrationExecutionError(
+            errno_message("cannot read calibration worker runtime snapshot"));
+      }
+      if (trailing_size != 0) {
+        throw CalibrationExecutionError("calibration worker runtime changed while snapshotted");
       }
       struct stat after{};
       struct stat snapshot{};
@@ -3093,8 +3382,9 @@ public:
   GatedWorker& operator=(GatedWorker&&) noexcept = default;
 
   [[nodiscard]] OwnedProcess& process() { return process_; }
-  void release(Clock::time_point deadline) {
-    wait_for_socket(gate_.get(), process_, POLLOUT, deadline);
+  [[nodiscard]] const std::filesystem::path& scratch() const { return sandbox_->scratch(); }
+  void release(Clock::time_point deadline, ScratchQuotaMonitor* scratch_monitor = nullptr) {
+    wait_for_socket(gate_.get(), process_, POLLOUT, deadline, -1, 0, scratch_monitor);
     const char release = '1';
     ssize_t sent = -1;
     do {
@@ -3196,38 +3486,41 @@ supervise_worker(int caller_socket, const std::string& executable, int executabl
       spawn_worker(executable, executable_fd, cgroup_fd, listener.address, worker_deadline,
                    cleanup_deadline, request.calibration_host_memory_limit_bytes, left_input_fd,
                    right_input_fd, left_profile_fd, right_profile_fd);
+  ScratchQuotaMonitor scratch_monitor(worker.scratch());
   try {
     send_file_fd(caller_socket, worker.process(), 'P', worker.process().pidfd(), worker_deadline,
-                 -1, request.calibration_host_memory_limit_bytes);
+                 -1, request.calibration_host_memory_limit_bytes, &scratch_monitor);
     *authority_reported = true;
-    worker.release(worker_deadline);
-    auto channel = accept_authenticated(listener, worker.process(), worker_deadline,
-                                        request.calibration_host_memory_limit_bytes);
+    worker.release(worker_deadline, &scratch_monitor);
+    auto channel =
+        accept_authenticated(listener, worker.process(), worker_deadline,
+                             request.calibration_host_memory_limit_bytes, &scratch_monitor);
     write_all(channel.get(), worker.process(), encoded_request, worker_deadline, caller_socket,
-              request.calibration_host_memory_limit_bytes);
+              request.calibration_host_memory_limit_bytes, &scratch_monitor);
     if (left_input_fd >= 0) {
       send_file_fd(channel.get(), worker.process(), 'I', left_input_fd, worker_deadline,
-                   caller_socket, request.calibration_host_memory_limit_bytes);
+                   caller_socket, request.calibration_host_memory_limit_bytes, &scratch_monitor);
     }
     if (right_input_fd >= 0) {
       send_file_fd(channel.get(), worker.process(), 'J', right_input_fd, worker_deadline,
-                   caller_socket, request.calibration_host_memory_limit_bytes);
+                   caller_socket, request.calibration_host_memory_limit_bytes, &scratch_monitor);
     }
     if (left_profile_fd >= 0) {
       send_file_fd(channel.get(), worker.process(), 'K', left_profile_fd, worker_deadline,
-                   caller_socket, request.calibration_host_memory_limit_bytes);
+                   caller_socket, request.calibration_host_memory_limit_bytes, &scratch_monitor);
     }
     if (right_profile_fd >= 0) {
       send_file_fd(channel.get(), worker.process(), 'M', right_profile_fd, worker_deadline,
-                   caller_socket, request.calibration_host_memory_limit_bytes);
+                   caller_socket, request.calibration_host_memory_limit_bytes, &scratch_monitor);
     }
     if (::shutdown(channel.get(), SHUT_WR) != 0) {
       throw CalibrationExecutionError("cannot finish the calibration worker request");
     }
     auto response = read_frame(channel.get(), worker.process(), worker_deadline, caller_socket,
-                               request.calibration_host_memory_limit_bytes);
+                               request.calibration_host_memory_limit_bytes, &scratch_monitor);
     wait_for_process_monitored(worker.process(), worker_deadline,
-                               request.calibration_host_memory_limit_bytes);
+                               request.calibration_host_memory_limit_bytes, &scratch_monitor);
+    scratch_monitor.enforce(worker.process(), true);
     const auto status = worker.process().reap();
     certify_channel_eof(channel.get());
 
@@ -3245,6 +3538,7 @@ supervise_worker(int caller_socket, const std::string& executable, int executabl
     if (cgroup_oom_killed_noexcept(cgroup_fd)) {
       throw CalibrationExecutionError("calibration worker exceeded its cgroup host memory limit");
     }
+    scratch_monitor.enforce(worker.process(), true);
     throw;
   }
 }

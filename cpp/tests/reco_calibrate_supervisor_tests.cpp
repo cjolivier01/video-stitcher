@@ -164,6 +164,31 @@ public:
   ~Scenario() { (void)::unsetenv("RECO_FAKE_CALIBRATION_WORKER_SCENARIO"); }
 };
 
+class EnvironmentValue {
+public:
+  EnvironmentValue(std::string name, std::string_view value) : name_(std::move(name)) {
+    if (const char* previous = std::getenv(name_.c_str()); previous != nullptr) {
+      previous_ = previous;
+    }
+    if (::setenv(name_.c_str(), std::string(value).c_str(), 1) != 0) {
+      throw std::runtime_error("cannot set test environment value");
+    }
+  }
+  EnvironmentValue(const EnvironmentValue&) = delete;
+  EnvironmentValue& operator=(const EnvironmentValue&) = delete;
+  ~EnvironmentValue() {
+    if (previous_.has_value()) {
+      (void)::setenv(name_.c_str(), previous_->c_str(), 1);
+    } else {
+      (void)::unsetenv(name_.c_str());
+    }
+  }
+
+private:
+  std::string name_;
+  std::optional<std::string> previous_;
+};
+
 std::filesystem::path temporary_path(std::string_view suffix) {
   return std::filesystem::temp_directory_path() /
          ("reco-calibration-supervisor-" + std::to_string(::getpid()) + "-" + std::string(suffix));
@@ -542,6 +567,70 @@ void worker_scratch_is_removed_recursively() {
   }
   expect_true(calibration_scratch_roots() == before,
               "supervisor removes nested worker scratch contents");
+}
+
+void runtime_snapshots_have_an_aggregate_byte_limit() {
+  const auto first = temporary_path("runtime-snapshot-first");
+  const auto second = temporary_path("runtime-snapshot-second");
+  std::filesystem::remove(first);
+  std::filesystem::remove(second);
+  const std::string contents(700U * 1024U, 'r');
+  {
+    std::ofstream output(first, std::ios::binary | std::ios::trunc);
+    output.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+    expect_true(static_cast<bool>(output), "first runtime snapshot fixture is written");
+  }
+  {
+    std::ofstream output(second, std::ios::binary | std::ios::trunc);
+    output.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+    expect_true(static_cast<bool>(output), "second runtime snapshot fixture is written");
+  }
+
+  const auto before = calibration_scratch_roots();
+  {
+    EnvironmentValue aggregate_limit("RECO_FAKE_CALIBRATION_RUNTIME_SNAPSHOT_LIMIT_BYTES",
+                                     "1048576");
+    EnvironmentValue first_runtime("RECO_CUDA_DRIVER_DYLIB_PATH", first.string());
+    EnvironmentValue second_runtime("RECO_GSTREAMER_DYLIB_PATH", second.string());
+    expect_execution_error([&] { (void)run_gpu_calibration(request_fixture(), ready_backends()); },
+                           "aggregate byte limit",
+                           "runtime snapshots cannot exhaust aggregate scratch storage");
+  }
+  expect_true(calibration_scratch_roots() == before,
+              "failed aggregate runtime snapshots leave no scratch tree");
+  std::filesystem::remove(first);
+  std::filesystem::remove(second);
+}
+
+void oversized_scratch_file_is_terminated_by_pidfd() {
+  const auto before = calibration_scratch_roots();
+  const auto started = std::chrono::steady_clock::now();
+  {
+    EnvironmentValue scratch_limit("RECO_FAKE_CALIBRATION_SCRATCH_LIMIT_BYTES", "1048576");
+    Scenario scenario("scratch-oversized-file");
+    expect_execution_error(
+        [&] { (void)run_gpu_calibration(lifecycle_request_fixture(), ready_backends()); },
+        "scratch disk quota", "oversized scratch allocation is terminated with a quota error");
+  }
+  expect_true(std::chrono::steady_clock::now() - started < std::chrono::seconds(2),
+              "scratch disk monitor terminates the worker before its deadline");
+  expect_true(calibration_scratch_roots() == before,
+              "oversized scratch allocation leaves no scratch tree");
+}
+
+void excessive_scratch_entries_are_terminated_by_pidfd() {
+  const auto before = calibration_scratch_roots();
+  const auto started = std::chrono::steady_clock::now();
+  {
+    Scenario scenario("scratch-many-files");
+    expect_execution_error(
+        [&] { (void)run_gpu_calibration(lifecycle_request_fixture(), ready_backends()); },
+        "scratch inode quota", "excessive scratch entries are terminated with a quota error");
+  }
+  expect_true(std::chrono::steady_clock::now() - started < std::chrono::seconds(2),
+              "scratch inode monitor terminates the worker before its deadline");
+  expect_true(calibration_scratch_roots() == before,
+              "excessive scratch entries leave no scratch tree");
 }
 
 void caller_sigchld_policy_cannot_steal_worker_ownership() {
@@ -988,6 +1077,9 @@ int main() {
   run_case("hard memory boundary", worker_starts_inside_the_hard_memory_boundary);
   run_case("cgroup setup failure cleanup", cgroup_setup_failures_remove_the_cleanup_boundary);
   run_case("recursive scratch cleanup", worker_scratch_is_removed_recursively);
+  run_case("runtime snapshot aggregate quota", runtime_snapshots_have_an_aggregate_byte_limit);
+  run_case("scratch disk quota", oversized_scratch_file_is_terminated_by_pidfd);
+  run_case("scratch inode quota", excessive_scratch_entries_are_terminated_by_pidfd);
   run_case("SIGCHLD ownership", caller_sigchld_policy_cannot_steal_worker_ownership);
   run_case("descriptor isolation", worker_descriptors_are_isolated_across_exec);
 #if !defined(RECO_CALIBRATION_THREAD_SANITIZER)
