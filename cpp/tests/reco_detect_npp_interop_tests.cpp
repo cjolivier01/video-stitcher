@@ -90,6 +90,9 @@ int main() {
   expect_invalid_argument([] { npp_nv12_to_rgb(1, 8, 3, 4, 4, 4, 4); }, "nv12 mismatched pitch");
   expect_invalid_argument([] { npp_resize_c3(0, 2, 2, 1, 2, 2, {0, 0, 2, 2}); },
                           "resize c3 null src");
+  expect_invalid_argument([] { npp_resize_c1(0, 2, 2, 2, 1, 2, 2, 2); }, "resize c1 null src");
+  expect_invalid_argument([] { npp_resize_c1(1, 1, 2, 2, 3, 2, 2, 2); },
+                          "resize c1 narrow source pitch");
   expect_invalid_argument([] { npp_resize_c3(1, 2, 2, 0, 2, 2, {0, 0, 2, 2}); },
                           "resize c3 null dst");
   expect_invalid_argument([] { npp_resize_c4(1, 2, 2, 3, 2, 2, {1, 0, 2, 2}); },
@@ -133,6 +136,24 @@ int main() {
     npp_resize_c3(rgb_src.ptr(), width, height, rgb_dst.ptr(), width, height, {0, 0, 2, 2});
     backend.synchronize();
     expect_bytes(backend, rgb_dst, rgb, "resize c3 identity");
+
+    const std::vector<std::uint8_t> gray{1, 2, 3, 4};
+    auto gray_src = backend.allocate(gray.size());
+    auto gray_dst = backend.allocate(gray.size());
+    upload_bytes(backend, gray, gray_src);
+    npp_resize_c1(gray_src.ptr(), width, width, height, gray_dst.ptr(), width, width, height);
+    backend.synchronize();
+    expect_bytes(backend, gray_dst, gray, "resize c1 identity");
+
+    const std::vector<std::uint8_t> gray_large{
+        10, 10, 20, 20, 10, 10, 20, 20, 30, 30, 40, 40, 30, 30, 40, 40,
+    };
+    auto gray_large_src = backend.allocate(gray_large.size());
+    auto gray_small_dst = backend.allocate(4);
+    upload_bytes(backend, gray_large, gray_large_src);
+    npp_resize_c1(gray_large_src.ptr(), 4, 4, 4, gray_small_dst.ptr(), 2, 2, 2);
+    backend.synchronize();
+    expect_bytes(backend, gray_small_dst, {10, 20, 30, 40}, "resize c1 area downscale");
 
     auto mirror_dst = backend.allocate(rgb.size());
     npp_mirror_c3(rgb_src.ptr(), mirror_dst.ptr(), width, height);

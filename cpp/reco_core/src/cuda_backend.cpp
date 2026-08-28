@@ -789,6 +789,9 @@ std::vector<std::uint8_t> CudaBackend::copy_to_host(const CudaDeviceBuffer& buff
   impl_->ensure_primary_context(0);
   std::vector<std::uint8_t> out(buffer.size());
   check_cuda("cuMemcpyDtoH_v2", impl_->cu_memcpy_dtoh(out.data(), buffer.ptr(), buffer.size()));
+  if (trace_sink_) {
+    trace_sink_->device_to_host_copy_submitted(buffer.size(), 1);
+  }
   return out;
 }
 
@@ -850,6 +853,9 @@ void CudaBackend::copy_device_to_host_2d(const CudaDeviceToHost2DCopy& copy) con
       .height = copy.height,
   };
   check_cuda("cuMemcpy2D_v2 (DtoH)", impl_->cu_memcpy_2d(&desc));
+  if (trace_sink_) {
+    trace_sink_->device_to_host_copy_submitted(copy.width_bytes, copy.height);
+  }
 }
 
 CudaModule CudaBackend::load_module_from_ptx(std::string_view ptx) const {

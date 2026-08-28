@@ -161,6 +161,7 @@ using Command = std::variant<StitchCommand, PreviewCommand, CalibrateCommand, Ca
 [[nodiscard]] std::variant<Command, ParseError> parse_args(const std::vector<std::string>& args);
 [[nodiscard]] std::string_view command_name(const Command& command);
 [[nodiscard]] std::string help_text();
-int run_command(const Command& command, std::ostream& out, std::ostream& err);
+int run_command(const Command& command, std::ostream& out, std::ostream& err,
+                std::string_view executable_path = {});
 
 } // namespace reco::cli

@@ -1,3 +1,4 @@
+#include "reco/calibrate/pipeline.hpp"
 #include "reco/calibrate/sampling.hpp"
 #include "reco/io/detail/nvbufsurface_9_1.hpp"
 
@@ -132,9 +133,9 @@ void extraction_contract_rejects_invalid_streams(CudaBackend& backend) {
 
   expect_error<std::invalid_argument>(
       [&] {
-        (void)extract_gpu_gray_frames_from_file(
-            backend, fixture_config(true), NvbufSurfaceAbi::DeepStream9_1,
-            std::vector<std::uint64_t>{0});
+        (void)extract_gpu_gray_frames_from_file(backend, fixture_config(true),
+                                                NvbufSurfaceAbi::DeepStream9_1,
+                                                std::vector<std::uint64_t>{0});
       },
       "dropping to be disabled", "drop-enabled file config rejected before decoder startup");
 
@@ -373,6 +374,46 @@ void selected_y_planes_are_copied_device_to_device(CudaBackend& backend) {
       "dimensions changed", "mid-stream dimension changes are rejected");
 }
 
+void sequential_source_calibration_releases_each_pair(CudaBackend& backend) {
+  std::vector<GpuDecodedFrame> left_frames;
+  std::vector<GpuDecodedFrame> right_frames;
+  std::vector<std::weak_ptr<CudaNvmmOwner>> lifetimes;
+  for (std::uint64_t index = 0; index < 3; ++index) {
+    auto [left, left_lifetime] = make_cuda_frame(backend, index, 32, 854, 64, 864);
+    auto [right, right_lifetime] = make_cuda_frame(backend, index, 224, 854, 64, 864);
+    left_frames.push_back(std::move(left));
+    right_frames.push_back(std::move(right));
+    lifetimes.push_back(std::move(left_lifetime));
+    lifetimes.push_back(std::move(right_lifetime));
+  }
+  VectorSource left_source(std::move(left_frames));
+  VectorSource right_source(std::move(right_frames));
+  constexpr std::array<std::uint64_t, 3> indices{0, 1, 2};
+  const CameraParams params{.width = 854,
+                            .height = 64,
+                            .fx = 1.0e10,
+                            .fy = 1.0e10,
+                            .cx = 427.0,
+                            .cy = 32.0,
+                            .d = {0.0, 0.0, 0.0, 0.0}};
+  CalibrationConfig config;
+  config.num_frames = indices.size();
+  config.akaze.max_keypoints = 32;
+  config.optimizer.max_iters = 10;
+
+  expect_error<CalibrationExecutionError>(
+      [&] {
+        (void)run_gpu_calibration_sources(backend, left_source, right_source, indices, indices,
+                                          params, params, config);
+      },
+      "no usable frame pairs", "uniform sequential frames produce no calibration features");
+  expect_eq(left_source.read_count(), indices.size(), "left source is consumed sequentially");
+  expect_eq(right_source.read_count(), indices.size(), "right source is consumed sequentially");
+  expect_true(std::all_of(lifetimes.begin(), lifetimes.end(),
+                          [](const auto& lifetime) { return lifetime.expired(); }),
+              "sequential calibration releases every decoder-owned surface");
+}
+
 #endif
 
 } // namespace
@@ -394,6 +435,7 @@ int main() {
   extraction_contract_rejects_invalid_streams(backend);
 #if defined(__linux__)
   selected_y_planes_are_copied_device_to_device(backend);
+  sequential_source_calibration_releases_each_pair(backend);
 #else
   std::cerr << "SKIP: NvBufSurface CUDA mapping tests require Linux\n";
 #endif

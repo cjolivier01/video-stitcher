@@ -109,6 +109,8 @@ public:
   /// Runs bidirectional Hamming/Lowe matching and reads back only accepted point pairs.
   [[nodiscard]] std::vector<GpuMatchedPoint>
   match(const GpuFeatureView& left, const GpuFeatureView& right, double lowe_ratio) const;
+  /// Reads back the bounded scalar feature count, never descriptor or image data.
+  [[nodiscard]] std::uint32_t feature_count(const GpuFeatureView& features) const;
   [[nodiscard]] std::vector<GpuMatchedPoint> detect_and_match(const GpuGrayFrame& left,
                                                               const GpuGrayFrame& right,
                                                               const GpuAkazeConfig& config) const;

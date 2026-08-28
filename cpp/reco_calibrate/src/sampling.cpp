@@ -59,6 +59,46 @@ std::vector<std::uint64_t> select_frame_indices(std::uint64_t total_frames, doub
   return indices;
 }
 
+std::pair<std::vector<std::uint64_t>, std::vector<std::uint64_t>>
+select_synchronized_frame_indices(std::uint64_t left_total_frames, std::uint64_t right_total_frames,
+                                  double fps, std::size_t num_samples, double skip_start_secs,
+                                  double skip_end_secs, std::int64_t sync_offset) {
+  if (sync_offset < -reco::core::kMaxSyncOffsetFrames ||
+      sync_offset > reco::core::kMaxSyncOffsetFrames) {
+    throw std::invalid_argument("calibration sync offset exceeds the supported limit");
+  }
+
+  const auto offset = static_cast<std::uint64_t>(sync_offset >= 0 ? sync_offset : -sync_offset);
+  std::uint64_t usable_left = left_total_frames;
+  std::uint64_t usable_right = right_total_frames;
+  if (sync_offset >= 0) {
+    if (offset >= right_total_frames) {
+      return {};
+    }
+    usable_right -= offset;
+  } else {
+    if (offset >= left_total_frames) {
+      return {};
+    }
+    usable_left -= offset;
+  }
+
+  auto base = select_frame_indices(std::min(usable_left, usable_right), fps, num_samples,
+                                   skip_start_secs, skip_end_secs);
+  auto left = base;
+  auto right = base;
+  if (sync_offset >= 0) {
+    for (auto& index : right) {
+      index += offset;
+    }
+  } else {
+    for (auto& index : left) {
+      index += offset;
+    }
+  }
+  return {std::move(left), std::move(right)};
+}
+
 GrayFrame downscale_if_needed(const GrayFrame& frame, std::uint32_t target_width) {
   if (target_width == 0) {
     throw std::invalid_argument("target_width must be nonzero");
@@ -105,9 +145,9 @@ GpuGrayFrame GpuCalibrationFrame::view() const {
           .color_range = color_range};
 }
 
-std::vector<GpuCalibrationFrame>
-extract_gpu_gray_frames(reco::core::CudaBackend& backend, reco::io::GpuFileDecodeSource& source,
-                        std::span<const std::uint64_t> frame_indices) {
+GpuCalibrationFrameReader::GpuCalibrationFrameReader(reco::core::CudaBackend& backend,
+                                                     reco::io::GpuFileDecodeSource& source)
+    : backend_(&backend), source_(&source) {
   if (!source.gpu_resident()) {
     throw std::invalid_argument("calibration frame extraction requires a GPU-resident source");
   }
@@ -115,8 +155,73 @@ extract_gpu_gray_frames(reco::core::CudaBackend& backend, reco::io::GpuFileDecod
     throw std::invalid_argument(
         "calibration frame extraction requires decoder frame dropping to be disabled");
   }
-  for (std::size_t i = 1; i < frame_indices.size(); ++i) {
-    if (frame_indices[i] <= frame_indices[i - 1]) {
+}
+
+GpuCalibrationFrame GpuCalibrationFrameReader::read(std::uint64_t frame_index) {
+  if (previous_requested_index_.has_value() && frame_index <= *previous_requested_index_) {
+    throw std::invalid_argument("calibration frame indices must be sorted and unique");
+  }
+  previous_requested_index_ = frame_index;
+
+  while (true) {
+    auto result = source_->read();
+    if (result.status == reco::io::GpuDecodeFrameStatus::EndOfStream) {
+      throw GpuFrameExtractionError("GPU decode reached EOS before calibration frame " +
+                                    std::to_string(frame_index));
+    }
+    if (!result.frame.has_value()) {
+      throw GpuFrameExtractionError("GPU decode returned frame status without a frame payload");
+    }
+
+    const auto& decoded = *result.frame;
+    if (previous_source_index_.has_value() && decoded.frame_index <= *previous_source_index_) {
+      throw GpuFrameExtractionError("GPU decode frame indices are not strictly increasing");
+    }
+    previous_source_index_ = decoded.frame_index;
+    if (decoded.frame_index < frame_index) {
+      continue;
+    }
+    if (decoded.frame_index > frame_index) {
+      throw GpuFrameExtractionError("GPU decode skipped requested calibration frame " +
+                                    std::to_string(frame_index));
+    }
+
+    const auto mapped = reco::io::map_gpu_decoded_frame_to_cuda(decoded);
+    const auto current_dimensions = std::pair(mapped.width, mapped.height);
+    if (!dimensions_.has_value()) {
+      dimensions_ = current_dimensions;
+    } else if (*dimensions_ != current_dimensions) {
+      throw GpuFrameExtractionError("GPU calibration frame dimensions changed during decode");
+    }
+    if (mapped.width > std::numeric_limits<std::size_t>::max() / mapped.height) {
+      throw GpuFrameExtractionError("GPU calibration frame allocation size overflows");
+    }
+
+    auto allocation = backend_->allocate_pitched(mapped.width, mapped.height, 16);
+    backend_->copy_device_to_device_2d({.src = mapped.y_ptr,
+                                        .src_pitch = mapped.y_pitch,
+                                        .dst = allocation.buffer.ptr(),
+                                        .dst_pitch = allocation.pitch,
+                                        .width_bytes = mapped.width,
+                                        .height = mapped.height});
+    // The decoder may recycle its surface when `decoded` is released.
+    backend_->synchronize();
+    return {.y_plane = std::move(allocation.buffer),
+            .pitch = allocation.pitch,
+            .width = mapped.width,
+            .height = mapped.height,
+            .color_range = mapped.color_range,
+            .frame_index = decoded.frame_index,
+            .pts_ns = decoded.pts_ns,
+            .duration_ns = decoded.duration_ns};
+  }
+}
+
+std::vector<GpuCalibrationFrame>
+extract_gpu_gray_frames(reco::core::CudaBackend& backend, reco::io::GpuFileDecodeSource& source,
+                        std::span<const std::uint64_t> frame_indices) {
+  for (std::size_t index = 1; index < frame_indices.size(); ++index) {
+    if (frame_indices[index] <= frame_indices[index - 1U]) {
       throw std::invalid_argument("calibration frame indices must be sorted and unique");
     }
   }
@@ -124,67 +229,11 @@ extract_gpu_gray_frames(reco::core::CudaBackend& backend, reco::io::GpuFileDecod
     return {};
   }
 
+  GpuCalibrationFrameReader reader(backend, source);
   std::vector<GpuCalibrationFrame> extracted;
   extracted.reserve(frame_indices.size());
-  std::optional<std::uint64_t> previous_source_index;
-  std::optional<std::pair<std::uint32_t, std::uint32_t>> dimensions;
-  std::size_t next_target = 0;
-
-  while (next_target < frame_indices.size()) {
-    auto result = source.read();
-    if (result.status == reco::io::GpuDecodeFrameStatus::EndOfStream) {
-      throw GpuFrameExtractionError("GPU decode reached EOS before calibration frame " +
-                                    std::to_string(frame_indices[next_target]));
-    }
-    if (!result.frame.has_value()) {
-      throw GpuFrameExtractionError("GPU decode returned frame status without a frame payload");
-    }
-
-    const auto& decoded = *result.frame;
-    if (previous_source_index.has_value() && decoded.frame_index <= *previous_source_index) {
-      throw GpuFrameExtractionError("GPU decode frame indices are not strictly increasing");
-    }
-    previous_source_index = decoded.frame_index;
-
-    const auto target = frame_indices[next_target];
-    if (decoded.frame_index < target) {
-      continue;
-    }
-    if (decoded.frame_index > target) {
-      throw GpuFrameExtractionError("GPU decode skipped requested calibration frame " +
-                                    std::to_string(target));
-    }
-
-    const auto mapped = reco::io::map_gpu_decoded_frame_to_cuda(decoded);
-    const auto current_dimensions = std::pair(mapped.width, mapped.height);
-    if (!dimensions.has_value()) {
-      dimensions = current_dimensions;
-    } else if (*dimensions != current_dimensions) {
-      throw GpuFrameExtractionError("GPU calibration frame dimensions changed during decode");
-    }
-    if (mapped.width > std::numeric_limits<std::size_t>::max() / mapped.height) {
-      throw GpuFrameExtractionError("GPU calibration frame allocation size overflows");
-    }
-
-    auto allocation = backend.allocate_pitched(mapped.width, mapped.height, 16);
-    backend.copy_device_to_device_2d({.src = mapped.y_ptr,
-                                      .src_pitch = mapped.y_pitch,
-                                      .dst = allocation.buffer.ptr(),
-                                      .dst_pitch = allocation.pitch,
-                                      .width_bytes = mapped.width,
-                                      .height = mapped.height});
-    // The decoder may recycle its surface as soon as this iteration releases
-    // mapped. Confirm the D2D read is complete before returning that surface.
-    backend.synchronize();
-    extracted.push_back({.y_plane = std::move(allocation.buffer),
-                         .pitch = allocation.pitch,
-                         .width = mapped.width,
-                         .height = mapped.height,
-                         .color_range = mapped.color_range,
-                         .frame_index = decoded.frame_index,
-                         .pts_ns = decoded.pts_ns,
-                         .duration_ns = decoded.duration_ns});
-    ++next_target;
+  for (const auto frame_index : frame_indices) {
+    extracted.push_back(reader.read(frame_index));
   }
   return extracted;
 }

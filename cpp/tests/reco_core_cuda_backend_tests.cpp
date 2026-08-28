@@ -240,9 +240,16 @@ INCREMENT_DONE:
 
 struct CountingCudaTrace final : CudaBackendTraceSink {
   void device_to_device_copy_submitted() noexcept override { ++copies; }
+  void device_to_host_copy_submitted(std::size_t width_bytes,
+                                     std::size_t height) noexcept override {
+    ++host_copies;
+    host_copy_bytes += width_bytes * height;
+  }
   void context_synchronized() noexcept override { ++synchronizations; }
 
   std::size_t copies = 0;
+  std::size_t host_copies = 0;
+  std::size_t host_copy_bytes = 0;
   std::size_t synchronizations = 0;
 };
 
@@ -320,8 +327,10 @@ int main() {
     auto observed_backend = backend.with_trace_sink(trace);
     observed_backend.synchronize();
     expect_eq(trace->synchronizations, 1U, "successful CUDA synchronization observed");
-    const auto host = backend.copy_to_host(buffer);
+    const auto host = observed_backend.copy_to_host(buffer);
     expect_eq(host.size(), 4096U, "host copy size");
+    expect_eq(trace->host_copies, 1U, "successful CUDA D2H submission observed");
+    expect_eq(trace->host_copy_bytes, 4096U, "linear CUDA D2H byte count observed");
     for (const auto byte : host) {
       if (byte != 0xA5) {
         expect_true(false, "device memset byte pattern");
@@ -625,12 +634,15 @@ int main() {
                                                .height = height});
     expect_eq(trace->copies, 1U, "successful CUDA D2D submission observed");
     std::vector<std::uint8_t> host_dst(dst_pitch * height, 0xCD);
-    backend.copy_device_to_host_2d({.dst = host_dst.data(),
-                                    .dst_pitch = dst_pitch,
-                                    .src = dst_device.ptr(),
-                                    .src_pitch = device_dst_pitch,
-                                    .width_bytes = width,
-                                    .height = height});
+    observed_backend.copy_device_to_host_2d({.dst = host_dst.data(),
+                                             .dst_pitch = dst_pitch,
+                                             .src = dst_device.ptr(),
+                                             .src_pitch = device_dst_pitch,
+                                             .width_bytes = width,
+                                             .height = height});
+    expect_eq(trace->host_copies, 2U, "2D CUDA D2H submission observed");
+    expect_eq(trace->host_copy_bytes, 4096U + width * height,
+              "2D CUDA D2H payload byte count observed");
     backend.synchronize();
     for (std::size_t row = 0; row < height; ++row) {
       for (std::size_t col = 0; col < width; ++col) {

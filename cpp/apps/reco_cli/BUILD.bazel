@@ -17,5 +17,6 @@ cc_library(
 cc_binary(
     name = "reco",
     srcs = ["src/main.cpp"],
+    data = ["//cpp/reco_io:reco_video_probe_worker"],
     deps = [":reco_cli_lib"],
 )

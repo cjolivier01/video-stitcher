@@ -11,9 +11,13 @@
 #include "reco/io/gstreamer.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -21,8 +25,132 @@
 #include <type_traits>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace reco::cli {
 namespace {
+
+std::optional<std::string> existing_absolute_path(const std::filesystem::path& path) {
+  std::error_code error;
+  if (path.empty() || !std::filesystem::is_regular_file(path, error) || error) {
+    return std::nullopt;
+  }
+  auto absolute = std::filesystem::absolute(path, error);
+  if (error) {
+    return std::nullopt;
+  }
+  return absolute.lexically_normal().string();
+}
+
+std::optional<std::string> resolve_video_probe_worker(std::string_view executable_path) {
+  if (const char* configured = std::getenv("RECO_VIDEO_PROBE_WORKER");
+      configured != nullptr && configured[0] != '\0') {
+    return existing_absolute_path(configured);
+  }
+
+#if defined(_WIN32)
+  constexpr std::string_view worker_name = "reco_video_probe_worker.exe";
+#else
+  constexpr std::string_view worker_name = "reco_video_probe_worker";
+#endif
+  std::vector<std::filesystem::path> candidates;
+  if (!executable_path.empty()) {
+    std::error_code error;
+    const auto executable = std::filesystem::absolute(executable_path, error);
+    if (!error) {
+      const auto directory = executable.parent_path();
+      candidates.push_back(directory / worker_name);
+      candidates.push_back(directory / ".." / ".." / "reco_io" / worker_name);
+      candidates.push_back(std::filesystem::path(executable.string() + ".runfiles") /
+                           "reco_video_stitcher" / "cpp" / "reco_io" / worker_name);
+    }
+  }
+  if (const char* runfiles = std::getenv("RUNFILES_DIR"); runfiles != nullptr) {
+    candidates.emplace_back(std::filesystem::path(runfiles) / "reco_video_stitcher" / "cpp" /
+                            "reco_io" / worker_name);
+  }
+  if (const char* test_srcdir = std::getenv("TEST_SRCDIR"); test_srcdir != nullptr) {
+    candidates.emplace_back(std::filesystem::path(test_srcdir) / "reco_video_stitcher" / "cpp" /
+                            "reco_io" / worker_name);
+  }
+  for (const auto& candidate : candidates) {
+    if (auto resolved = existing_absolute_path(candidate); resolved.has_value()) {
+      return resolved;
+    }
+  }
+  return std::nullopt;
+}
+
+void write_calibration_result(const reco::calibrate::CalibrationResult& result,
+                              const std::string& path) {
+  const auto json = reco::core::calibration_to_json(result.calibration);
+  const auto reparsed = reco::core::parse_match_calibration_json(json);
+  if (!reparsed.has_value() || !reparsed->validate().empty()) {
+    throw std::runtime_error("calibration result failed serialization validation");
+  }
+
+  static std::atomic<std::uint64_t> temporary_sequence{0};
+  auto temporary = std::filesystem::path(path);
+  temporary += ".tmp." + std::to_string(temporary_sequence.fetch_add(1, std::memory_order_relaxed));
+  try {
+    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+    if (!output) {
+      throw std::runtime_error("cannot open temporary calibration output " + temporary.string());
+    }
+    output << json << '\n';
+    output.flush();
+    if (!output) {
+      throw std::runtime_error("failed to write temporary calibration output " +
+                               temporary.string());
+    }
+    output.close();
+    if (!output) {
+      throw std::runtime_error("failed to close temporary calibration output " +
+                               temporary.string());
+    }
+
+#if defined(_WIN32)
+    if (MoveFileExW(temporary.c_str(), std::filesystem::path(path).c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0) {
+      throw std::runtime_error("failed to replace calibration output " + path);
+    }
+#else
+    if (std::rename(temporary.c_str(), path.c_str()) != 0) {
+      throw std::runtime_error("failed to replace calibration output " + path);
+    }
+#endif
+  } catch (...) {
+    std::error_code ignored;
+    std::filesystem::remove(temporary, ignored);
+    throw;
+  }
+}
+
+void write_calibration_result_summary(const reco::calibrate::CalibrationResult& result,
+                                      const std::string& output_path, std::ostream& out) {
+  out << "Calibration result:\n"
+      << "  output: " << output_path << '\n'
+      << "  frames used: " << result.frames_used << '\n'
+      << "  total matches: " << result.total_matches << '\n'
+      << "  confidence: " << result.confidence * 100.0 << "%\n"
+      << "  residual error: " << result.residual_error << '\n';
+  if (result.quality.has_value()) {
+    out << "  mean reprojection error: " << result.quality->mean_reprojection_error << '\n'
+        << "  trimmed reprojection error: " << result.quality->trimmed_reprojection_error << '\n'
+        << "  angular error: " << result.quality->angular_error << '\n';
+  }
+  for (std::size_t index = 0; index < result.per_frame.size(); ++index) {
+    const auto& frame = result.per_frame[index];
+    out << "  frame " << index << ": keypoints " << frame.keypoints_left << "/"
+        << frame.keypoints_right << ", matches " << frame.post_ratio_test << " -> "
+        << frame.post_spatial_filter << " -> " << frame.post_ransac << '\n';
+  }
+}
 
 template <typename T>
 std::variant<T, ParseError> parse_integral(std::string_view value, std::string_view name) {
@@ -1118,7 +1246,8 @@ std::string help_text() {
          "Runtime command execution is staged behind the remaining GPU/backend ports.";
 }
 
-int run_command(const Command& command, std::ostream& out, std::ostream& err) {
+int run_command(const Command& command, std::ostream& out, std::ostream& err,
+                std::string_view executable_path) {
   if (std::holds_alternative<HelpCommand>(command)) {
     out << help_text() << '\n';
     return 0;
@@ -1197,6 +1326,7 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err) {
     request.manual_sync_offset = calibrate->sync_offset;
     request.debug_dir = calibrate->debug_dir;
     request.output = calibrate->output;
+    request.probe_worker = resolve_video_probe_worker(executable_path).value_or("");
 
     const auto backends = reco::calibrate::probe_calibration_backends();
     const auto plan = reco::calibrate::build_gpu_calibration_plan(request, backends);
@@ -1208,8 +1338,10 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err) {
     }
 
     try {
-      (void)reco::calibrate::run_gpu_calibration(request, backends);
-    } catch (const reco::calibrate::CalibrationExecutionError& error) {
+      const auto result = reco::calibrate::run_gpu_calibration(request, backends);
+      write_calibration_result(result, request.output);
+      write_calibration_result_summary(result, request.output, out);
+    } catch (const std::exception& error) {
       err << "error: " << error.what() << '\n';
       return 2;
     }

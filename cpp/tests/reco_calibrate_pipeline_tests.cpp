@@ -39,7 +39,9 @@ GpuCalibrationRequest valid_request() {
   request.config.matching.spatial_x_threshold = 0.5;
   request.config.optimizer.trim_fraction = 0.3;
   request.config.optimizer.seam_sigma = 0.08;
+  request.auto_sync = false;
   request.output = "match.json";
+  request.probe_worker = "/opt/reco/reco_video_probe_worker";
   return request;
 }
 
@@ -79,20 +81,33 @@ void validation_rejects_invalid_requests() {
   request.config.akaze.detect_y_min = std::numeric_limits<double>::quiet_NaN();
   error = validate_gpu_calibration_request(request);
   expect_true(error.has_value(), "nan Y detection range rejected");
+
+  request = valid_request();
+  request.manual_sync_offset = reco::core::kMaxSyncOffsetFrames + 1;
+  error = validate_gpu_calibration_request(request);
+  expect_true(error.has_value(), "out-of-range sync offset rejected");
+
+  request = valid_request();
+  request.left.lens_profile.reset();
+  error = validate_gpu_calibration_request(request);
+  expect_true(error.has_value(), "right-only lens profile rejected");
+
+  request = valid_request();
+  request.probe_worker = "relative/probe-worker";
+  error = validate_gpu_calibration_request(request);
+  expect_true(error.has_value(), "relative probe worker rejected");
 }
 
 void plan_keeps_calibration_gpu_resident() {
   const auto plan = build_gpu_calibration_plan(valid_request(), ready_backends());
-  expect_true(!plan.gpu_resident, "blocked plan is not marked GPU resident");
+  expect_true(plan.gpu_resident, "ready plan is marked GPU resident");
   expect_eq(plan.steps.size(), 7U, "all Rust calibration stages are represented");
-  expect_true(!plan.ready, "AKAZE execution remains explicitly blocked");
-  expect_true(plan.blocked_reason.has_value(), "blocked reason present");
-  expect_true(plan.blocked_reason->find("CPU fallback") != std::string::npos,
-              "blocked reason refuses CPU fallback");
+  expect_true(plan.ready, "complete GPU calibration pipeline is ready");
+  expect_true(!plan.blocked_reason.has_value(), "ready plan has no blocked reason");
 
   const auto description = describe_calibration_plan(plan);
-  expect_true(description.find("(device-resident)") == std::string::npos,
-              "blocked plan does not claim verified device residency");
+  expect_true(description.find("(device-resident)") != std::string::npos,
+              "ready plan reports verified device residency");
   expect_true(description.find("nvv4l2decoder") != std::string::npos,
               "plan describes hardware decode pipeline");
   expect_true(description.find("qtdemux ! capsfilter caps=\"video/x-h264;video/x-h265\" ! "
@@ -141,6 +156,44 @@ void plan_reports_missing_required_backend_first() {
   expect_true(!plan.ready, "missing NPP blocks plan");
   expect_true(plan.blocked_reason->find("NPP is required") != std::string::npos,
               "NPP block is reported");
+
+  backends = ready_backends();
+  backends.nvbufsurface = {.available = false, .detail = "no nvbufsurface"};
+  plan = build_gpu_calibration_plan(valid_request(), backends);
+  expect_true(!plan.ready, "missing NvBufSurface blocks plan");
+  expect_true(plan.blocked_reason->find("NvBufSurface is required") != std::string::npos,
+              "NvBufSurface block is reported");
+}
+
+void plan_reports_unported_optional_stages() {
+  auto request = valid_request();
+  request.probe_worker.clear();
+  auto plan = build_gpu_calibration_plan(request, ready_backends());
+  expect_true(!plan.ready, "missing probe worker blocks plan");
+  expect_true(plan.blocked_reason->find("probe worker") != std::string::npos,
+              "missing probe worker is reported");
+
+  request = valid_request();
+  request.left.lens_profile.reset();
+  request.right.lens_profile.reset();
+  plan = build_gpu_calibration_plan(request, ready_backends());
+  expect_true(!plan.ready, "automatic lens detection blocks plan");
+  expect_true(plan.blocked_reason->find("lens profile detection") != std::string::npos,
+              "automatic lens detection gap is reported");
+
+  request = valid_request();
+  request.auto_sync = true;
+  plan = build_gpu_calibration_plan(request, ready_backends());
+  expect_true(!plan.ready, "automatic sync blocks plan");
+  expect_true(plan.blocked_reason->find("sync extraction") != std::string::npos,
+              "automatic sync gap is reported");
+
+  request = valid_request();
+  request.debug_dir = "debug";
+  plan = build_gpu_calibration_plan(request, ready_backends());
+  expect_true(!plan.ready, "debug export blocks plan");
+  expect_true(plan.blocked_reason->find("debug image export") != std::string::npos,
+              "debug export gap is reported");
 }
 
 void invalid_decode_paths_block_calibration_plan() {
@@ -160,6 +213,7 @@ int main() {
   plan_keeps_calibration_gpu_resident();
   calibration_plan_selects_hevc_decode_for_hevc_paths();
   plan_reports_missing_required_backend_first();
+  plan_reports_unported_optional_stages();
   invalid_decode_paths_block_calibration_plan();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -1169,6 +1169,18 @@ std::vector<GpuMatchedPoint> GpuAkazePipeline::match(const GpuFeatureView& left,
   return result;
 }
 
+std::uint32_t GpuAkazePipeline::feature_count(const GpuFeatureView& features) const {
+  if (impl_ == nullptr) {
+    throw std::logic_error("cannot use a moved-from GPU AKAZE pipeline");
+  }
+  validate_feature_view(features, "feature-count");
+  const auto count = download_u32(impl_->backend, features.count);
+  if (count > features.capacity) {
+    throw std::runtime_error("GPU AKAZE feature count exceeded its allocation capacity");
+  }
+  return count;
+}
+
 std::vector<GpuMatchedPoint>
 GpuAkazePipeline::detect_and_match(const GpuGrayFrame& left, const GpuGrayFrame& right,
                                    const GpuAkazeConfig& config) const {

@@ -18,5 +18,6 @@ int main(int argc, char** argv) {
   }
 
   const auto command = std::get<reco::cli::Command>(std::move(parsed));
-  return reco::cli::run_command(command, std::cout, std::cerr);
+  return reco::cli::run_command(command, std::cout, std::cerr,
+                                argc > 0 ? std::string_view(argv[0]) : std::string_view{});
 }
