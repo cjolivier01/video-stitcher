@@ -65,6 +65,44 @@ cc_test(
 )
 
 cc_test(
+    name = "reco_core_cuda_frame_tests",
+    size = "small",
+    srcs = ["reco_core_cuda_frame_tests.cpp"],
+    deps = [
+        "//cpp/reco_core",
+    ],
+)
+
+cc_binary(
+    name = "libreco_core_fake_nvrtc_runtime.so",
+    testonly = True,
+    srcs = ["reco_core_fake_nvrtc_runtime.cpp"],
+    linkshared = True,
+)
+
+cc_binary(
+    name = "libreco_core_fake_nvrtc_incomplete_runtime.so",
+    testonly = True,
+    srcs = ["reco_core_fake_nvrtc_runtime.cpp"],
+    linkshared = True,
+    local_defines = ["RECO_FAKE_NVRTC_INCOMPLETE"],
+)
+
+cc_test(
+    name = "reco_core_nvrtc_tests",
+    size = "large",
+    srcs = ["reco_core_nvrtc_tests.cpp"],
+    data = [
+        ":libreco_core_fake_nvrtc_incomplete_runtime.so",
+        ":libreco_core_fake_nvrtc_runtime.so",
+    ],
+    deps = [
+        "//cpp/reco_core",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
+cc_test(
     name = "reco_io_config_tests",
     size = "small",
     srcs = ["reco_io_config_tests.cpp"],
