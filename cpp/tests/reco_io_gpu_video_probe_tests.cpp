@@ -739,6 +739,42 @@ void probe_contracts(const std::filesystem::path& video_path,
   expect_eq(duplicate_pts.timestamp_multiplicity, 2U,
             "duplicate PTS pair multiplicity remains explicit");
 
+  set_scenario("probe-short-duplicate-pts-pairs");
+  const auto short_duplicate_pts = probe_video(container_config(video_path), timeout_ns);
+  expect_eq(short_duplicate_pts.total_frames, 6ULL,
+            "short duplicate-PTS calibration clip retains every physical frame");
+  expect_eq(short_duplicate_pts.timestamp_multiplicity, 2U,
+            "short duplicate-PTS calibration clip proves pair multiplicity");
+  expect_true(short_duplicate_pts.indexed_sampling_cadence_verified,
+              "short duplicate-PTS calibration clip is safe for indexed sampling");
+  auto short_duplicate_config = container_config(video_path);
+  short_duplicate_config.indexed_fps_numerator = short_duplicate_pts.fps_numerator;
+  short_duplicate_config.indexed_fps_denominator = short_duplicate_pts.fps_denominator;
+  short_duplicate_config.indexed_timestamp_multiplicity =
+      short_duplicate_pts.timestamp_multiplicity;
+  short_duplicate_config.indexed_stream_time_origin_ns = short_duplicate_pts.first_stream_time_ns;
+  short_duplicate_config.start_frame_index = 0U;
+  auto short_duplicate_source =
+      open_gstreamer_gpu_file_decode_source(short_duplicate_config, NvbufSurfaceAbi::DeepStream9_1);
+  const auto short_duplicate_frame_zero = short_duplicate_source->read();
+  expect_true(short_duplicate_frame_zero.frame.has_value(),
+              "short duplicate-PTS calibration clip decodes frame zero");
+  if (short_duplicate_frame_zero.frame.has_value()) {
+    expect_eq(short_duplicate_frame_zero.frame->frame_index, 0ULL,
+              "short duplicate-PTS calibration clip retains frame-zero index");
+    expect_eq(short_duplicate_frame_zero.frame->nvmm.cuda_base_ptr, 0x10000000ULL,
+              "frame-zero seek returns the first physical duplicate-PTS frame");
+  }
+  short_duplicate_source->seek_to_frame(0U);
+  const auto repeated_short_duplicate_frame_zero = short_duplicate_source->read();
+  expect_true(repeated_short_duplicate_frame_zero.frame.has_value(),
+              "repeated duplicate-PTS frame-zero seek decodes a frame");
+  if (repeated_short_duplicate_frame_zero.frame.has_value()) {
+    expect_eq(repeated_short_duplicate_frame_zero.frame->nvmm.cuda_base_ptr, 0x10000000ULL,
+              "repeated frame-zero seek rewinds to the first physical duplicate-PTS frame");
+  }
+
+  set_scenario("probe-duplicate-pts-pairs");
   auto duplicate_decode_config = container_config(video_path);
   duplicate_decode_config.indexed_fps_numerator = duplicate_pts.fps_numerator;
   duplicate_decode_config.indexed_fps_denominator = duplicate_pts.fps_denominator;
@@ -781,6 +817,41 @@ void probe_contracts(const std::filesystem::path& video_path,
               "verified cadence and exact count provide an exact triplicate duration");
   expect_eq(triplicate_pts.timestamp_multiplicity, 3U,
             "triplicate PTS multiplicity remains explicit");
+
+  set_scenario("probe-short-triplicate-pts");
+  const auto short_triplicate_pts = probe_video(container_config(video_path), timeout_ns);
+  expect_eq(short_triplicate_pts.total_frames, 9ULL,
+            "short triplicate-PTS calibration clip retains every physical frame");
+  expect_eq(short_triplicate_pts.timestamp_multiplicity, 3U,
+            "short triplicate-PTS calibration clip proves triplicate multiplicity");
+  expect_true(short_triplicate_pts.indexed_sampling_cadence_verified,
+              "short triplicate-PTS calibration clip is safe for indexed sampling");
+  auto short_triplicate_config = container_config(video_path);
+  short_triplicate_config.indexed_fps_numerator = short_triplicate_pts.fps_numerator;
+  short_triplicate_config.indexed_fps_denominator = short_triplicate_pts.fps_denominator;
+  short_triplicate_config.indexed_timestamp_multiplicity =
+      short_triplicate_pts.timestamp_multiplicity;
+  short_triplicate_config.indexed_stream_time_origin_ns = short_triplicate_pts.first_stream_time_ns;
+  short_triplicate_config.start_frame_index = 0U;
+  auto short_triplicate_source = open_gstreamer_gpu_file_decode_source(
+      short_triplicate_config, NvbufSurfaceAbi::DeepStream9_1);
+  const auto short_triplicate_frame_zero = short_triplicate_source->read();
+  expect_true(short_triplicate_frame_zero.frame.has_value(),
+              "short triplicate-PTS calibration clip decodes frame zero");
+  if (short_triplicate_frame_zero.frame.has_value()) {
+    expect_eq(short_triplicate_frame_zero.frame->frame_index, 0ULL,
+              "short triplicate-PTS calibration clip retains frame-zero index");
+    expect_eq(short_triplicate_frame_zero.frame->nvmm.cuda_base_ptr, 0x10000000ULL,
+              "frame-zero seek returns the first physical triplicate-PTS frame");
+  }
+  short_triplicate_source->seek_to_frame(0U);
+  const auto repeated_short_triplicate_frame_zero = short_triplicate_source->read();
+  expect_true(repeated_short_triplicate_frame_zero.frame.has_value(),
+              "repeated triplicate-PTS frame-zero seek decodes a frame");
+  if (repeated_short_triplicate_frame_zero.frame.has_value()) {
+    expect_eq(repeated_short_triplicate_frame_zero.frame->nvmm.cuda_base_ptr, 0x10000000ULL,
+              "repeated frame-zero seek rewinds to the first physical triplicate-PTS frame");
+  }
 
   set_scenario("probe-long-duplicate-pts-pairs");
   const auto long_duplicate_pts = probe_video(container_config(video_path), timeout_ns);

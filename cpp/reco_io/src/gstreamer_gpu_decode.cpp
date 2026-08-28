@@ -31,6 +31,7 @@ namespace {
 
 constexpr std::uint32_t kGstMapRead = 1;
 constexpr int kGstStateNull = 1;
+constexpr int kGstStateReady = 2;
 constexpr int kGstStatePaused = 3;
 constexpr int kGstStatePlaying = 4;
 constexpr int kGstStateChangeFailure = 0;
@@ -938,11 +939,17 @@ private:
     }
     const auto multiplicity = static_cast<std::uint64_t>(config_.indexed_timestamp_multiplicity);
     const auto group_base_index = frame_index - frame_index % multiplicity;
+    const auto operation = initial ? "initial seek" : "indexed seek";
+    // Group zero has no preceding timestamp. Restart below PAUSED so decoder
+    // and appsink queues are flushed and physical access unit zero is emitted.
+    if (multiplicity > 1U && group_base_index == 0U) {
+      restart_pipeline_at_frame_zero(initial, operation);
+      return;
+    }
     // An exact seek to a shared PTS may land on any member of that group. Seek
     // to the preceding empty cadence slot so every equal-PTS member is emitted.
     const auto seek_index =
         multiplicity > 1U && group_base_index > 0U ? group_base_index - 1U : group_base_index;
-    const auto operation = initial ? "initial seek" : "indexed seek";
     if (api_->element_set_state(pipeline_, kGstStatePaused) == kGstStateChangeFailure) {
       throw GpuDecodeError("GStreamer pipeline rejected the PAUSED state for " +
                            std::string(operation));
@@ -969,15 +976,35 @@ private:
     }
     wait_for_state(kGstStatePaused, "after " + std::string(operation));
 
+    reset_indexed_position(group_base_index);
+    if (api_->element_set_state(pipeline_, kGstStatePlaying) == kGstStateChangeFailure) {
+      throw GpuDecodeError("GStreamer pipeline rejected the PLAYING state after " +
+                           std::string(operation));
+    }
+  }
+
+  void restart_pipeline_at_frame_zero(bool initial, std::string_view operation) {
+    if (!initial) {
+      if (api_->element_set_state(pipeline_, kGstStateReady) == kGstStateChangeFailure) {
+        throw GpuDecodeError("GStreamer pipeline rejected the READY state for " +
+                             std::string(operation));
+      }
+      wait_for_state(kGstStateReady, "before " + std::string(operation));
+    }
+    geometry_probe_state_->reset_before_seek();
+    reset_indexed_position(0U);
+    if (api_->element_set_state(pipeline_, kGstStatePlaying) == kGstStateChangeFailure) {
+      throw GpuDecodeError("GStreamer pipeline rejected the PLAYING state after " +
+                           std::string(operation));
+    }
+  }
+
+  void reset_indexed_position(std::uint64_t group_base_index) {
     next_frame_index_ = group_base_index;
     post_seek_expected_base_index_ = group_base_index;
     last_indexed_stream_time_ns_.reset();
     timestamp_group_ordinal_ = 0;
     ended_ = false;
-    if (api_->element_set_state(pipeline_, kGstStatePlaying) == kGstStateChangeFailure) {
-      throw GpuDecodeError("GStreamer pipeline rejected the PLAYING state after " +
-                           std::string(operation));
-    }
   }
 
   void wait_for_state(int expected, std::string_view operation) {
@@ -986,8 +1013,9 @@ private:
     const auto result =
         api_->element_get_state(pipeline_, &state, &pending, config_.read_timeout_ns);
     if (result == kGstStateChangeFailure || state != expected) {
-      throw GpuDecodeError("GStreamer pipeline did not reach the PAUSED state " +
-                           std::string(operation));
+      const auto expected_name = expected == kGstStateReady ? "READY" : "PAUSED";
+      throw GpuDecodeError("GStreamer pipeline did not reach the " + std::string(expected_name) +
+                           " state " + std::string(operation));
     }
   }
 

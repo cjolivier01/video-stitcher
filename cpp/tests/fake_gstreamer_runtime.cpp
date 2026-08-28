@@ -170,6 +170,7 @@ struct FakePipeline : FakeObject {
   FakePad* probe_pad = nullptr;
   std::uint64_t compressed_input_count = 0;
   bool dequeue_race_emitted = false;
+  int state = 1;
 };
 
 constexpr std::uint64_t kFakeCapsMagic = 0x5245434f43415053ULL;
@@ -331,12 +332,13 @@ FakeCaps parser_sample_caps() {
     caps.fps_numerator = 45;
     caps.fps_denominator = 1;
   } else if (scenario() == "probe-duplicate-pts-pairs" ||
+             scenario() == "probe-short-duplicate-pts-pairs" ||
              scenario() == "probe-long-duplicate-pts-pairs" ||
              scenario() == "probe-duplicate-clustered-missing-groups" ||
              scenario() == "probe-terminal-duplicate-pts-transition") {
     caps.fps_numerator = 50;
     caps.fps_denominator = 1;
-  } else if (scenario() == "probe-triplicate-pts") {
+  } else if (scenario() == "probe-triplicate-pts" || scenario() == "probe-short-triplicate-pts") {
     caps.fps_numerator = 75;
     caps.fps_denominator = 1;
   } else if (scenario() == "probe-paired-au-missing-pts") {
@@ -483,13 +485,15 @@ std::uint64_t parser_timing_offset(std::uint64_t frame_index, const FakeCaps& ca
     return frame_index <= 90U ? frame_index * 1'000'000'000ULL / 30U
                               : 3'000'000'000ULL + (frame_index - 90U) * 1'000'000'000ULL / 15U;
   }
-  if (scenario() == "probe-duplicate-pts-pairs" || scenario() == "probe-long-duplicate-pts-pairs" ||
+  if (scenario() == "probe-duplicate-pts-pairs" ||
+      scenario() == "probe-short-duplicate-pts-pairs" ||
+      scenario() == "probe-long-duplicate-pts-pairs" ||
       scenario() == "probe-paired-au-missing-pts" ||
       scenario() == "probe-duplicate-clustered-missing-groups" ||
       scenario() == "probe-terminal-duplicate-pts-transition") {
     return (frame_index / 2U) * 40'000'000ULL;
   }
-  if (scenario() == "probe-triplicate-pts") {
+  if (scenario() == "probe-triplicate-pts" || scenario() == "probe-short-triplicate-pts") {
     return (frame_index / 3U) * 40'000'000ULL;
   }
   if (scenario() == "probe-quantized-no-vui-5994") {
@@ -583,6 +587,11 @@ FakeSample* make_sample(std::uint32_t sample_index = 0) {
   sample->params.layout = abi::kLayoutPitch;
   sample->params.data_size = sample->params.pitch * sample->params.height * 3U / 2U;
   sample->params.data_ptr = reinterpret_cast<void*>(0x10000000);
+  if (scenario() == "probe-short-duplicate-pts-pairs" ||
+      scenario() == "probe-short-triplicate-pts") {
+    sample->params.data_ptr = reinterpret_cast<void*>(
+        std::uintptr_t{0x10000000U} + static_cast<std::uintptr_t>(sample_index) * 0x01000000U);
+  }
   sample->params.plane_params.num_planes = 2;
   sample->params.plane_params.width[0] = sample->params.width;
   sample->params.plane_params.height[0] = sample->params.height;
@@ -865,22 +874,31 @@ RECO_FAKE_EXPORT void* gst_element_get_static_pad(void* element_pointer, const c
 }
 
 RECO_FAKE_EXPORT int gst_element_set_state(void* pipeline_pointer, int state) {
-  record(state == 4 ? "state-playing" : state == 3 ? "state-paused" : "state-null");
+  record(state == 4   ? "state-playing"
+         : state == 3 ? "state-paused"
+         : state == 2 ? "state-ready"
+                      : "state-null");
   if (state == 1 && scenario() == "probe-blocking-null-state") {
     std::this_thread::sleep_for(std::chrono::seconds(30));
   } else if (state == 4 && scenario() == "probe-blocking-playing") {
     std::this_thread::sleep_for(std::chrono::seconds(30));
   }
-  const auto* pipeline = static_cast<FakePipeline*>(pipeline_pointer);
+  auto* pipeline = static_cast<FakePipeline*>(pipeline_pointer);
   if (state == 4 && ((!pipeline->parser_probe && scenario() == "state-error") ||
                      (pipeline->parser_probe &&
                       (scenario() == "probe-state-error" || scenario() == "probe-stream-error")))) {
     return 0;
   }
+  pipeline->state = state;
+  if (state == 2 && !pipeline->parser_probe) {
+    pipeline->has_seek = false;
+    ++pipeline->seek_generation;
+  }
   return 1;
 }
 
-RECO_FAKE_EXPORT int gst_element_get_state(void*, int* state, int* pending, std::uint64_t) {
+RECO_FAKE_EXPORT int gst_element_get_state(void* pipeline_pointer, int* state, int* pending,
+                                           std::uint64_t) {
   record("get-state");
   if (pending != nullptr) {
     *pending = 0;
@@ -895,7 +913,7 @@ RECO_FAKE_EXPORT int gst_element_get_state(void*, int* state, int* pending, std:
     return 2;
   }
   if (state != nullptr) {
-    *state = 3;
+    *state = static_cast<FakePipeline*>(pipeline_pointer)->state;
   }
   return 1;
 }
@@ -1091,6 +1109,11 @@ RECO_FAKE_EXPORT int gst_element_query_duration(void*, int format, std::int64_t*
   }
   if (scenario() == "probe-long-duplicate-pts-pairs") {
     *duration = 11'980'000'000;
+    return 1;
+  }
+  if (scenario() == "probe-short-duplicate-pts-pairs" ||
+      scenario() == "probe-short-triplicate-pts") {
+    *duration = 120'000'000;
     return 1;
   }
   if (scenario() == "probe-duplicate-pts-pairs" || scenario() == "probe-paired-au-missing-pts" ||
@@ -1491,7 +1514,9 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
         : current_scenario == "probe-retimed-constant-pts"                  ? 5'000'000'000ULL
         : current_scenario == "probe-long-untimed-elementary"               ? 600'000'000'000ULL
         : current_scenario == "probe-duplicate-pts-pairs"                   ? 4'000'000'000ULL
+        : current_scenario == "probe-short-duplicate-pts-pairs"             ? 120'000'000ULL
         : current_scenario == "probe-triplicate-pts"                        ? 4'000'000'000ULL
+        : current_scenario == "probe-short-triplicate-pts"                  ? 120'000'000ULL
         : current_scenario == "probe-long-duplicate-pts-pairs"              ? 12'000'000'000ULL
         : current_scenario == "probe-duplicate-clustered-missing-groups"    ? 4'000'000'000ULL
         : current_scenario == "probe-duplicate-pts-transition"              ? 20'000'000'000ULL
@@ -1707,7 +1732,8 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     sample->buffer.duration =
         remaining_ns > frame_duration_ns && remaining_ns - frame_duration_ns > 1 ? frame_duration_ns
                                                                                  : remaining_ns;
-    if (current_scenario == "probe-triplicate-pts") {
+    if (current_scenario == "probe-triplicate-pts" ||
+        current_scenario == "probe-short-triplicate-pts") {
       sample->buffer.duration = 1'000'000'000ULL / 75U;
     }
     if (current_scenario == "probe-vfr-missing-durations") {
@@ -1730,12 +1756,17 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     return sample;
   }
   record("pull");
+  const auto current_scenario = scenario();
   if (sink->observed_seek_generation != sink->pipeline->seek_generation) {
     sink->observed_seek_generation = sink->pipeline->seek_generation;
-    sink->pull_count = 0;
+    const bool ambiguous_zero_seek =
+        sink->pipeline->has_seek && sink->pipeline->seek_target_ns == 0;
+    sink->pull_count =
+        current_scenario == "probe-short-duplicate-pts-pairs" && ambiguous_zero_seek ? 1U
+        : current_scenario == "probe-short-triplicate-pts" && ambiguous_zero_seek    ? 2U
+                                                                                     : 0U;
   }
   const auto current = sink->pull_count++;
-  const auto current_scenario = scenario();
   if (current_scenario == "duplicate-transition-pts" && current < 2) {
     auto* sample = make_sample(current);
     push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, 1280, 720);
@@ -1843,6 +1874,19 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, 1280, 720);
     return deliver_output(sink, sample);
   }
+  const auto short_group_multiplicity =
+      current_scenario == "probe-short-duplicate-pts-pairs" ? 2U : 3U;
+  const auto short_frame_count = short_group_multiplicity * 3U;
+  if ((current_scenario == "probe-short-duplicate-pts-pairs" ||
+       current_scenario == "probe-short-triplicate-pts") &&
+      current < short_frame_count) {
+    auto* sample = make_sample(current);
+    sample->buffer.pts =
+        static_cast<std::uint64_t>(current / short_group_multiplicity) * 40'000'000ULL;
+    sample->buffer.duration = 40'000'000ULL / short_group_multiplicity;
+    push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, 1280, 720);
+    return deliver_output(sink, sample);
+  }
   if ((current_scenario == "indexed-cfr" || current_scenario == "indexed-gap" ||
        current_scenario == "indexed-off-cadence" || current_scenario == "indexed-seek" ||
        current_scenario == "indexed-seek-nonzero-origin" ||
@@ -1926,7 +1970,9 @@ RECO_FAKE_EXPORT int gst_app_sink_is_eos(void* sink_pointer) {
           current_scenario == "orientation-90" || current_scenario == "orientation-flip" ||
           current_scenario == "indexed-cfr" || current_scenario == "indexed-gap" ||
           current_scenario == "indexed-off-cadence" || current_scenario == "indexed-seek" ||
-          current_scenario == "probe-duplicate-pts-pairs") &&
+          current_scenario == "probe-duplicate-pts-pairs" ||
+          current_scenario == "probe-short-duplicate-pts-pairs" ||
+          current_scenario == "probe-short-triplicate-pts") &&
          sink->pull_count >= (current_scenario == "caps-runahead" ||
                                       current_scenario == "caps-runahead-unknown-time" ||
                                       current_scenario == "caps-runahead-stale-caps" ||
@@ -1937,7 +1983,9 @@ RECO_FAKE_EXPORT int gst_app_sink_is_eos(void* sink_pointer) {
                                       current_scenario == "indexed-seek" ||
                                       current_scenario == "probe-duplicate-pts-pairs"
                                   ? 3U
-                                  : 2U);
+                              : current_scenario == "probe-short-duplicate-pts-pairs" ? 7U
+                              : current_scenario == "probe-short-triplicate-pts"      ? 10U
+                                                                                      : 2U);
 }
 
 RECO_FAKE_EXPORT void* gst_sample_get_buffer(void* sample) {
