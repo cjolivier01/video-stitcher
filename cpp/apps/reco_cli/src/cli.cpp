@@ -260,6 +260,7 @@ private:
 
 struct PinnedFileIdentity {
   std::string label;
+  std::filesystem::path path;
   UniqueFileDescriptor descriptor;
   struct stat identity{};
 
@@ -282,21 +283,26 @@ struct PinnedFileIdentity {
   }
 
   void verify_unchanged() const {
-    struct stat current{};
-    if (::fstat(descriptor.get(), &current) != 0) {
+    struct stat descriptor_identity{};
+    struct stat named_identity{};
+    if (::fstat(descriptor.get(), &descriptor_identity) != 0 ||
+        ::stat(path.c_str(), &named_identity) != 0) {
       throw std::runtime_error("cannot re-inspect " + label + " before publication");
     }
-    const auto observed = reco::calibrate::CalibrationFileIdentity{
-        .device = static_cast<std::uint64_t>(current.st_dev),
-        .inode = static_cast<std::uint64_t>(current.st_ino),
-        .size = static_cast<std::uint64_t>(current.st_size),
-        .mode = static_cast<std::uint32_t>(current.st_mode),
-        .modified_seconds = static_cast<std::int64_t>(current.st_mtim.tv_sec),
-        .modified_nanoseconds = static_cast<std::int64_t>(current.st_mtim.tv_nsec),
-        .changed_seconds = static_cast<std::int64_t>(current.st_ctim.tv_sec),
-        .changed_nanoseconds = static_cast<std::int64_t>(current.st_ctim.tv_nsec),
+    const auto portable = [](const struct stat& value) {
+      return reco::calibrate::CalibrationFileIdentity{
+          .device = static_cast<std::uint64_t>(value.st_dev),
+          .inode = static_cast<std::uint64_t>(value.st_ino),
+          .size = static_cast<std::uint64_t>(value.st_size),
+          .mode = static_cast<std::uint32_t>(value.st_mode),
+          .modified_seconds = static_cast<std::int64_t>(value.st_mtim.tv_sec),
+          .modified_nanoseconds = static_cast<std::int64_t>(value.st_mtim.tv_nsec),
+          .changed_seconds = static_cast<std::int64_t>(value.st_ctim.tv_sec),
+          .changed_nanoseconds = static_cast<std::int64_t>(value.st_ctim.tv_nsec),
+      };
     };
-    if (observed != portable_identity()) {
+    if (portable(descriptor_identity) != portable_identity() ||
+        portable(named_identity) != portable_identity()) {
       throw std::runtime_error(label + " changed before calibration output publication");
     }
   }
@@ -308,8 +314,8 @@ struct PinnedFileIdentity {
   if (descriptor < 0) {
     throw_file_error("cannot open " + std::string(label), path, errno);
   }
-  PinnedFileIdentity pinned{.label = std::string(label),
-                            .descriptor = UniqueFileDescriptor(descriptor)};
+  PinnedFileIdentity pinned{
+      .label = std::string(label), .path = path, .descriptor = UniqueFileDescriptor(descriptor)};
   if (::fstat(descriptor, &pinned.identity) != 0) {
     throw_file_error("cannot inspect " + std::string(label), path, errno);
   }
@@ -340,6 +346,11 @@ validate_pinned_output_identity(int directory_descriptor, std::string_view desti
                                 const PinnedFileIdentity& left_input,
                                 const PinnedFileIdentity& right_input,
                                 const std::vector<PinnedFileIdentity>& lens_profiles) {
+  left_input.verify_unchanged();
+  right_input.verify_unchanged();
+  for (const auto& profile : lens_profiles) {
+    profile.verify_unchanged();
+  }
   struct stat destination_identity{};
   const std::string name(destination_name);
   if (::fstatat(directory_descriptor, name.c_str(), &destination_identity, AT_SYMLINK_NOFOLLOW) !=

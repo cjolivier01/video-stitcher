@@ -606,6 +606,9 @@ std::optional<std::string> validate_gpu_calibration_request(const GpuCalibration
   if (request.config.num_frames > kMaximumCalibrationRequestFrames) {
     return "calibration frame count exceeds the isolated worker limit of 256";
   }
+  if (request.config.akaze.max_keypoints > kMaxGpuAkazeFeatures) {
+    return "calibration AKAZE keypoint count exceeds the GPU launch limit of 8192";
+  }
   if (!std::isfinite(request.config.skip_start_secs) ||
       !std::isfinite(request.config.skip_end_secs) || request.config.skip_start_secs < 0.0 ||
       request.config.skip_end_secs < 0.0) {

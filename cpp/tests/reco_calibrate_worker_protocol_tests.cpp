@@ -256,7 +256,7 @@ CalibrationResult compact_result_fixture() {
 void request_round_trip_is_exact_and_bounded() {
   const auto expected = request_fixture();
   const auto encoded = encode_calibration_worker_request(expected);
-  expect_true(encoded.size() <= kMaximumCalibrationWorkerFrameBytes,
+  expect_true(encoded.size() <= kMaximumCalibrationWorkerRequestFrameBytes,
               "request frame respects hard byte ceiling");
   const auto decoded = decode_calibration_worker_request(encoded);
   expect_eq(decoded.left.path, expected.left.path, "left path round trip");
@@ -356,11 +356,52 @@ void result_round_trip_preserves_correspondences_exactly() {
   expect_eq(decoded.left_lens_profile->camera, std::string("GoPro"), "lens metadata round trip");
 }
 
+void result_envelope_covers_maximum_valid_gpu_output() {
+  expect_eq(kMaximumCalibrationWorkerCorrespondences,
+            kMaximumCalibrationWorkerResultFrames * static_cast<std::size_t>(kMaxGpuAkazeFeatures),
+            "result envelope covers every retained feature from every allowed frame");
+  expect_eq(kMaximumCalibrationWorkerSuccessFrameBytes,
+            kCalibrationWorkerFrameHeaderBytes + kCalibrationWorkerResultMetadataBytes +
+                kMaximumCalibrationWorkerCorrespondences * kCalibrationWorkerMatchedPointBytes,
+            "success frame ceiling includes metadata and every valid correspondence");
+
+  auto maximum_counts = compact_result_fixture();
+  const auto summary_fixture = maximum_counts.per_frame.front();
+  maximum_counts.per_frame.assign(kMaximumCalibrationWorkerResultFrames, summary_fixture);
+  for (auto& summary : maximum_counts.per_frame) {
+    summary.keypoints_left = kMaxGpuAkazeFeatures;
+    summary.keypoints_right = kMaxGpuAkazeFeatures;
+    summary.min_descriptors = kMaxGpuAkazeFeatures;
+    summary.post_ratio_test = kMaxGpuAkazeFeatures;
+    summary.post_spatial_filter = kMaxGpuAkazeFeatures;
+    summary.post_ransac = kMaxGpuAkazeFeatures;
+    summary.points.clear();
+  }
+  maximum_counts.frames_used = kMaximumCalibrationWorkerResultFrames;
+  maximum_counts.total_matches = kMaximumCalibrationWorkerCorrespondences;
+  maximum_counts.calibration.field_roi = reco::core::FieldRoi{
+      .left = std::vector<std::array<double, 2>>(kMaximumCalibrationWorkerRoiPoints, {0.5, 0.5}),
+      .right = std::vector<std::array<double, 2>>(kMaximumCalibrationWorkerRoiPoints, {0.5, 0.5})};
+  const auto maximum_profile =
+      LensProfileInfo{.camera = std::string(kMaximumCalibrationWorkerProfileTextBytes, 'c'),
+                      .lens = std::string(kMaximumCalibrationWorkerProfileTextBytes, 'l'),
+                      .source = ProfileSource::File,
+                      .path = std::string(kMaximumCalibrationWorkerPathBytes, 'p')};
+  maximum_counts.left_lens_profile = maximum_profile;
+  maximum_counts.right_lens_profile = maximum_profile;
+  maximum_counts.quality = CalibrationQuality{};
+  const auto maximum_metadata = encode_calibration_worker_success(maximum_counts);
+  expect_eq(maximum_metadata.size(),
+            kCalibrationWorkerFrameHeaderBytes + kCalibrationWorkerResultMetadataBytes,
+            "result metadata envelope exactly accounts for every bounded field");
+  expect_true(maximum_metadata.size() <= kMaximumCalibrationWorkerSuccessFrameBytes,
+              "maximum valid frame and feature counts serialize within the response envelope");
+}
+
 void correspondence_limits_and_numeric_validation_are_strict() {
   auto too_many = compact_result_fixture();
   const auto valid_point = too_many.per_frame.front().points.front();
-  too_many.per_frame.front().points.assign(kMaximumCalibrationWorkerCorrespondences + 1U,
-                                           valid_point);
+  too_many.per_frame.front().points.assign(kMaxGpuAkazeFeatures + 1U, valid_point);
   too_many.per_frame.front().keypoints_left = too_many.per_frame.front().points.size();
   too_many.per_frame.front().keypoints_right = too_many.per_frame.front().points.size();
   too_many.per_frame.front().min_descriptors = too_many.per_frame.front().points.size();
@@ -368,20 +409,8 @@ void correspondence_limits_and_numeric_validation_are_strict() {
   too_many.per_frame.front().post_spatial_filter = too_many.per_frame.front().points.size();
   too_many.per_frame.front().post_ransac = too_many.per_frame.front().points.size();
   too_many.total_matches = too_many.per_frame.front().points.size();
-  expect_error([&] { (void)encode_calibration_worker_success(too_many); },
-               "too many correspondences", "oversized correspondence vector rejected");
-
-  auto payload_overflow = too_many;
-  payload_overflow.per_frame.front().points.pop_back();
-  payload_overflow.per_frame.front().keypoints_left--;
-  payload_overflow.per_frame.front().keypoints_right--;
-  payload_overflow.per_frame.front().min_descriptors--;
-  payload_overflow.per_frame.front().post_ratio_test--;
-  payload_overflow.per_frame.front().post_spatial_filter--;
-  payload_overflow.per_frame.front().post_ransac--;
-  payload_overflow.total_matches--;
-  expect_error([&] { (void)encode_calibration_worker_success(payload_overflow); },
-               "payload exceeds", "correspondences cannot overflow the bounded payload writer");
+  expect_error([&] { (void)encode_calibration_worker_success(too_many); }, "inconsistent",
+               "per-frame correspondence limit is enforced before serialization");
 
   auto inconsistent = compact_result_fixture();
   inconsistent.per_frame.front().post_ransac = inconsistent.per_frame.front().points.size() - 1U;
@@ -414,21 +443,21 @@ void correspondence_limits_and_numeric_validation_are_strict() {
   }
 
   auto count_carrier = compact_result_fixture();
-  constexpr auto impossible_count = kMaximumCalibrationWorkerCorrespondences + 1U;
+  constexpr auto maximum_count = static_cast<std::size_t>(kMaxGpuAkazeFeatures);
   auto& carrier_summary = count_carrier.per_frame.front();
-  carrier_summary.keypoints_left = impossible_count;
-  carrier_summary.keypoints_right = impossible_count;
-  carrier_summary.min_descriptors = impossible_count;
-  carrier_summary.post_ratio_test = impossible_count;
-  carrier_summary.post_spatial_filter = impossible_count;
-  carrier_summary.post_ransac = impossible_count;
-  count_carrier.total_matches = impossible_count;
+  carrier_summary.keypoints_left = maximum_count;
+  carrier_summary.keypoints_right = maximum_count;
+  carrier_summary.min_descriptors = maximum_count;
+  carrier_summary.post_ratio_test = maximum_count;
+  carrier_summary.post_spatial_filter = maximum_count;
+  carrier_summary.post_ransac = maximum_count;
+  count_carrier.total_matches = maximum_count;
   auto oversized_count = encode_calibration_worker_success(count_carrier);
-  const auto oversized_anchor = find_u64(oversized_count, impossible_count, 6U);
+  const auto oversized_anchor = find_u64(oversized_count, maximum_count, 6U);
   expect_true(oversized_anchor.has_value(), "oversized count mutation anchor found");
   if (oversized_anchor.has_value()) {
     replace_u32_at(oversized_count, *oversized_anchor + sizeof(std::uint64_t),
-                   static_cast<std::uint32_t>(impossible_count));
+                   static_cast<std::uint32_t>(maximum_count + 1U));
     expect_error([&] { (void)decode_calibration_worker_response(oversized_count); },
                  "too many correspondences",
                  "oversized decoded point count rejected before allocation");
@@ -444,6 +473,33 @@ void correspondence_limits_and_numeric_validation_are_strict() {
                "non-finite correspondence rejected on decode");
 }
 
+void result_metric_ranges_are_validated_on_encode_and_decode() {
+  const std::array<std::pair<std::string_view, std::function<void(CalibrationResult&)>>, 6> cases{{
+      {"negative residual", [](CalibrationResult& value) { value.residual_error = -0.1; }},
+      {"negative confidence", [](CalibrationResult& value) { value.confidence = -0.1; }},
+      {"excess confidence", [](CalibrationResult& value) { value.confidence = 1.1; }},
+      {"negative mean error",
+       [](CalibrationResult& value) { value.quality->mean_reprojection_error = -0.1; }},
+      {"negative trimmed error",
+       [](CalibrationResult& value) { value.quality->trimmed_reprojection_error = -0.1; }},
+      {"negative angular error",
+       [](CalibrationResult& value) { value.quality->angular_error = -0.1; }},
+  }};
+  for (const auto& [name, mutate] : cases) {
+    auto invalid = result_fixture();
+    mutate(invalid);
+    expect_error([&] { (void)encode_calibration_worker_success(invalid); }, "out-of-range",
+                 std::string(name) + " is rejected on encode");
+  }
+
+  auto invalid_confidence = encode_calibration_worker_success(result_fixture());
+  expect_eq(replace_u64(invalid_confidence, std::bit_cast<std::uint64_t>(0.8),
+                        std::bit_cast<std::uint64_t>(1.1), 1U),
+            1U, "invalid confidence decoder fixture mutation");
+  expect_error([&] { (void)decode_calibration_worker_response(invalid_confidence); },
+               "out-of-range", "out-of-range confidence is rejected on decode");
+}
+
 void malformed_frames_fail_before_unbounded_allocation() {
   auto request = encode_calibration_worker_request(request_fixture());
 
@@ -454,7 +510,8 @@ void malformed_frames_fail_before_unbounded_allocation() {
                "unknown protocol version rejected");
 
   auto oversized = request;
-  constexpr auto impossible = static_cast<std::uint32_t>(kMaximumCalibrationWorkerFrameBytes);
+  constexpr auto impossible =
+      static_cast<std::uint32_t>(kMaximumCalibrationWorkerRequestFrameBytes);
   oversized[8] = static_cast<char>(impossible >> 24U);
   oversized[9] = static_cast<char>(impossible >> 16U);
   oversized[10] = static_cast<char>(impossible >> 8U);
@@ -568,7 +625,7 @@ void worker_converts_malformed_input_to_a_bounded_failure() {
   std::ostringstream output;
   expect_eq(run_calibration_worker(input, output), EXIT_FAILURE,
             "malformed worker input exits unsuccessfully");
-  expect_true(output.str().size() <= kMaximumCalibrationWorkerFrameBytes,
+  expect_true(output.str().size() <= kMaximumCalibrationWorkerFailureFrameBytes,
               "worker failure remains bounded");
   expect_error([&] { (void)decode_calibration_worker_response(output.str()); }, "truncated",
                "worker reports malformed input without attempting calibration");
@@ -679,7 +736,9 @@ int main() {
   request_round_trip_is_exact_and_bounded();
   request_identity_validation_is_strict();
   result_round_trip_preserves_correspondences_exactly();
+  result_envelope_covers_maximum_valid_gpu_output();
   correspondence_limits_and_numeric_validation_are_strict();
+  result_metric_ranges_are_validated_on_encode_and_decode();
   malformed_frames_fail_before_unbounded_allocation();
   inconsistent_result_counts_are_rejected_on_encode_and_decode();
   result_match_summation_overflow_is_rejected_on_encode_and_decode();

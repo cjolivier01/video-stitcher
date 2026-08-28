@@ -348,6 +348,22 @@ int main(int argc, char** argv) {
     write_bytes(descriptor, encode_calibration_worker_success(result()), deadline);
     return EXIT_SUCCESS;
   }
+  if (scenario == "profile-metadata") {
+    auto value = result();
+    value.left_lens_profile = LensProfileInfo{.camera = "test camera",
+                                              .lens = "left lens",
+                                              .source = ProfileSource::File,
+                                              .path = request.left.lens_profile};
+    value.right_lens_profile =
+        LensProfileInfo{.camera = "test camera",
+                        .lens = "right lens",
+                        .source = request.right.lens_profile.has_value() ? ProfileSource::File
+                                                                         : ProfileSource::Fallback,
+                        .path = request.right.lens_profile.has_value() ? request.right.lens_profile
+                                                                       : request.left.lens_profile};
+    write_bytes(descriptor, encode_calibration_worker_success(value), deadline);
+    return EXIT_SUCCESS;
+  }
   if (scenario == "success") {
     std::atomic<bool> thread_ready{false};
     std::atomic<bool> release_thread{false};
@@ -410,9 +426,15 @@ int main(int argc, char** argv) {
         0,
         2,
         0,
-        1,
         0,
-        1};
+        0,
+        0};
+    constexpr auto oversized_payload =
+        static_cast<std::uint32_t>(kMaximumCalibrationWorkerSuccessFrameBytes);
+    header[8] = static_cast<char>(oversized_payload >> 24U);
+    header[9] = static_cast<char>(oversized_payload >> 16U);
+    header[10] = static_cast<char>(oversized_payload >> 8U);
+    header[11] = static_cast<char>(oversized_payload);
     write_bytes(descriptor, std::string_view(header.data(), header.size()), deadline);
     return EXIT_FAILURE;
   }

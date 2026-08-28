@@ -1,10 +1,12 @@
 #pragma once
 
+#include "reco/calibrate/gpu_features.hpp"
 #include "reco/calibrate/pipeline.hpp"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <string_view>
 
@@ -12,15 +14,41 @@ namespace reco::calibrate::detail {
 
 inline constexpr std::uint16_t kCalibrationWorkerProtocolVersion = 4;
 inline constexpr std::size_t kCalibrationWorkerFrameHeaderBytes = 12;
-inline constexpr std::size_t kMaximumCalibrationWorkerFrameBytes = 64U * 1024U;
+inline constexpr std::size_t kMaximumCalibrationWorkerRequestFrameBytes = 64U * 1024U;
 inline constexpr std::size_t kMaximumCalibrationWorkerPathBytes = 16U * 1024U;
 inline constexpr std::size_t kMaximumCalibrationWorkerErrorBytes = 2U * 1024U;
 inline constexpr std::size_t kMaximumCalibrationWorkerResultFrames = 256;
 inline constexpr std::size_t kMaximumCalibrationWorkerRoiPoints = 256;
+inline constexpr std::size_t kMaximumCalibrationWorkerProfileTextBytes = 4U * 1024U;
 inline constexpr std::size_t kCalibrationWorkerMatchedPointBytes = 6U * sizeof(std::uint64_t);
 inline constexpr std::size_t kMaximumCalibrationWorkerCorrespondences =
-    (kMaximumCalibrationWorkerFrameBytes - kCalibrationWorkerFrameHeaderBytes) /
-    kCalibrationWorkerMatchedPointBytes;
+    kMaximumCalibrationWorkerResultFrames * kMaxGpuAkazeFeatures;
+
+inline constexpr std::size_t kCalibrationWorkerCameraBytes =
+    2U * (2U * sizeof(std::uint32_t) + 8U * sizeof(std::uint64_t));
+inline constexpr std::size_t kCalibrationWorkerRoiBytes =
+    1U +
+    2U * (sizeof(std::uint32_t) + kMaximumCalibrationWorkerRoiPoints * 2U * sizeof(std::uint64_t));
+inline constexpr std::size_t kCalibrationWorkerProfileBytes =
+    1U + 2U * (sizeof(std::uint32_t) + kMaximumCalibrationWorkerProfileTextBytes) + 1U + 1U +
+    sizeof(std::uint32_t) + kMaximumCalibrationWorkerPathBytes;
+inline constexpr std::size_t kCalibrationWorkerResultMetadataBytes =
+    kCalibrationWorkerCameraBytes + 9U * sizeof(std::uint64_t) + sizeof(std::int64_t) +
+    kCalibrationWorkerRoiBytes + 2U * sizeof(std::uint32_t) + 4U * sizeof(std::uint64_t) +
+    sizeof(std::uint32_t) +
+    kMaximumCalibrationWorkerResultFrames * (6U * sizeof(std::uint64_t) + sizeof(std::uint32_t)) +
+    2U * kCalibrationWorkerProfileBytes + 1U + 3U * sizeof(std::uint64_t);
+inline constexpr std::size_t kMaximumCalibrationWorkerSuccessFrameBytes =
+    kCalibrationWorkerFrameHeaderBytes + kCalibrationWorkerResultMetadataBytes +
+    kMaximumCalibrationWorkerCorrespondences * kCalibrationWorkerMatchedPointBytes;
+inline constexpr std::size_t kMaximumCalibrationWorkerFailureFrameBytes =
+    kCalibrationWorkerFrameHeaderBytes + sizeof(std::uint32_t) +
+    kMaximumCalibrationWorkerErrorBytes;
+inline constexpr std::size_t kMaximumCalibrationWorkerFrameBytes =
+    kMaximumCalibrationWorkerSuccessFrameBytes;
+
+static_assert(kMaximumCalibrationWorkerSuccessFrameBytes <=
+              static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max()));
 
 enum class CalibrationWorkerMessage : std::uint16_t {
   Request = 1,

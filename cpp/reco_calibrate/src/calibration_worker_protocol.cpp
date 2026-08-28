@@ -16,7 +16,18 @@ namespace reco::calibrate::detail {
 namespace {
 
 constexpr std::array<char, 4> kMagic = {'R', 'C', 'A', 'L'};
-constexpr std::size_t kMaximumProfileTextBytes = 4U * 1024U;
+
+constexpr std::size_t maximum_frame_bytes(CalibrationWorkerMessage message) {
+  switch (message) {
+  case CalibrationWorkerMessage::Request:
+    return kMaximumCalibrationWorkerRequestFrameBytes;
+  case CalibrationWorkerMessage::Success:
+    return kMaximumCalibrationWorkerSuccessFrameBytes;
+  case CalibrationWorkerMessage::Failure:
+    return kMaximumCalibrationWorkerFailureFrameBytes;
+  }
+  return 0;
+}
 
 class Writer {
 public:
@@ -170,8 +181,9 @@ private:
 };
 
 std::string frame(CalibrationWorkerMessage message, std::string payload) {
-  if (payload.empty() ||
-      payload.size() > kMaximumCalibrationWorkerFrameBytes - kCalibrationWorkerFrameHeaderBytes) {
+  const auto frame_limit = maximum_frame_bytes(message);
+  if (payload.empty() || frame_limit < kCalibrationWorkerFrameHeaderBytes ||
+      payload.size() > frame_limit - kCalibrationWorkerFrameHeaderBytes) {
     throw CalibrationExecutionError("calibration worker payload exceeds the protocol limit");
   }
   Writer header;
@@ -255,8 +267,8 @@ void write_profile(Writer& writer, const std::optional<LensProfileInfo>& profile
   if (!profile.has_value()) {
     return;
   }
-  writer.text(profile->camera, kMaximumProfileTextBytes, "lens profile camera");
-  writer.text(profile->lens, kMaximumProfileTextBytes, "lens profile lens");
+  writer.text(profile->camera, kMaximumCalibrationWorkerProfileTextBytes, "lens profile camera");
+  writer.text(profile->lens, kMaximumCalibrationWorkerProfileTextBytes, "lens profile lens");
   writer.u8(static_cast<std::uint8_t>(profile->source));
   writer.optional_text(profile->path, kMaximumCalibrationWorkerPathBytes, "lens profile path");
 }
@@ -266,8 +278,8 @@ std::optional<LensProfileInfo> read_profile(Reader& reader) {
     return std::nullopt;
   }
   LensProfileInfo profile;
-  profile.camera = reader.text(kMaximumProfileTextBytes, "lens profile camera");
-  profile.lens = reader.text(kMaximumProfileTextBytes, "lens profile lens");
+  profile.camera = reader.text(kMaximumCalibrationWorkerProfileTextBytes, "lens profile camera");
+  profile.lens = reader.text(kMaximumCalibrationWorkerProfileTextBytes, "lens profile lens");
   const auto source = reader.u8("lens profile source");
   if (source > static_cast<std::uint8_t>(ProfileSource::Fallback)) {
     throw CalibrationExecutionError("calibration worker returned an invalid lens profile source");
@@ -370,6 +382,12 @@ void validate_finite_result(const CalibrationResult& result) {
                                       !std::isfinite(result.quality->angular_error)))) {
     throw CalibrationExecutionError("calibration worker returned non-finite result metrics");
   }
+  if (result.residual_error < 0.0 || result.confidence < 0.0 || result.confidence > 1.0 ||
+      (result.quality.has_value() &&
+       (result.quality->mean_reprojection_error < 0.0 ||
+        result.quality->trimmed_reprojection_error < 0.0 || result.quality->angular_error < 0.0))) {
+    throw CalibrationExecutionError("calibration worker returned out-of-range result metrics");
+  }
   if (const auto error = result.calibration.validate(); !error.empty()) {
     throw CalibrationExecutionError("calibration worker returned an invalid calibration: " + error);
   }
@@ -379,7 +397,9 @@ void validate_result_counts(const CalibrationResult& result) {
   std::size_t summarized_matches = 0;
   std::size_t correspondence_count = 0;
   for (const auto& summary : result.per_frame) {
-    if (summary.min_descriptors != std::min(summary.keypoints_left, summary.keypoints_right) ||
+    if (summary.keypoints_left > kMaxGpuAkazeFeatures ||
+        summary.keypoints_right > kMaxGpuAkazeFeatures ||
+        summary.min_descriptors != std::min(summary.keypoints_left, summary.keypoints_right) ||
         summary.post_ratio_test > summary.min_descriptors ||
         summary.post_spatial_filter > summary.post_ratio_test ||
         summary.post_ransac > summary.post_spatial_filter ||
@@ -421,14 +441,15 @@ decode_calibration_worker_header(const CalibrationWorkerFrameHeader& header) {
       raw_message > static_cast<std::uint16_t>(CalibrationWorkerMessage::Failure)) {
     throw CalibrationExecutionError("calibration worker message type is invalid");
   }
+  const auto message = static_cast<CalibrationWorkerMessage>(raw_message);
   const auto payload_size = reader.u32("calibration worker payload size");
   reader.finish("calibration worker frame header");
-  if (payload_size == 0 ||
-      payload_size > kMaximumCalibrationWorkerFrameBytes - kCalibrationWorkerFrameHeaderBytes) {
+  const auto frame_limit = maximum_frame_bytes(message);
+  if (payload_size == 0 || frame_limit < kCalibrationWorkerFrameHeaderBytes ||
+      payload_size > frame_limit - kCalibrationWorkerFrameHeaderBytes) {
     throw CalibrationExecutionError("calibration worker payload size is invalid");
   }
-  return {.message = static_cast<CalibrationWorkerMessage>(raw_message),
-          .payload_size = payload_size};
+  return {.message = message, .payload_size = payload_size};
 }
 
 std::string encode_calibration_worker_request(const GpuCalibrationRequest& request) {
@@ -680,6 +701,9 @@ CalibrationResult decode_calibration_worker_response(std::string_view value) {
     summary.post_spatial_filter = read_size(reader, "spatial match count");
     summary.post_ransac = read_size(reader, "RANSAC match count");
     const auto point_count = reader.u32("correspondence count");
+    if (point_count > kMaxGpuAkazeFeatures) {
+      throw CalibrationExecutionError("calibration worker returned too many correspondences");
+    }
     if (point_count > summary.post_ransac) {
       throw CalibrationExecutionError("calibration worker returned inconsistent result counts");
     }

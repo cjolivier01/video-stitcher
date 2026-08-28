@@ -1,3 +1,4 @@
+#include "reco/calibrate/gpu_features.hpp"
 #include "reco/calibrate/pipeline.hpp"
 #include "reco/io/gpu_video_probe.hpp"
 
@@ -169,6 +170,12 @@ void validation_rejects_invalid_requests() {
   request.config.num_frames = 0;
   error = validate_gpu_calibration_request(request);
   expect_true(error.has_value(), "zero calibration frames rejected");
+
+  request = valid_request();
+  request.config.akaze.max_keypoints = static_cast<std::size_t>(kMaxGpuAkazeFeatures) + 1U;
+  error = validate_gpu_calibration_request(request);
+  expect_true(error.has_value() && error->find("8192") != std::string::npos,
+              "GPU keypoint launch limit rejected before calibration execution");
 
   request = valid_request();
   request.config.akaze.detect_y_min = 0.9;

@@ -658,6 +658,41 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
             "publication recheck preserves aliased input contents");
 
 #if defined(__linux__)
+  const auto mutable_input = root.path() / "mutable-left.mp4";
+  const auto mutable_output = root.path() / "mutable-match.json";
+  write_text_file(mutable_input, "calibrated media identity\n");
+  bool mutable_input_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"mutable-input"})json", mutable_output, mutable_input, right_input,
+        [&] { write_text_file(mutable_input, "mutated media identity after calibration\n"); });
+  } catch (const std::exception& error) {
+    mutable_input_rejected =
+        std::string_view(error.what()).find("left video input") != std::string_view::npos;
+  }
+  expect_true(mutable_input_rejected,
+              "publication rejects in-place media mutation after calibration");
+  expect_true(!std::filesystem::exists(mutable_output), "rejected media mutation is not published");
+
+  const auto mutable_profile = root.path() / "mutable-profile.json";
+  const auto mutable_profile_output = root.path() / "mutable-profile-match.json";
+  write_text_file(mutable_profile, "calibrated profile identity\n");
+  const std::array<std::filesystem::path, 1> mutable_profiles{mutable_profile};
+  bool mutable_profile_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"mutable-profile"})json", mutable_profile_output, left_input, right_input,
+        [&] { write_text_file(mutable_profile, "mutated profile identity after calibration\n"); },
+        mutable_profiles);
+  } catch (const std::exception& error) {
+    mutable_profile_rejected =
+        std::string_view(error.what()).find("left lens profile") != std::string_view::npos;
+  }
+  expect_true(mutable_profile_rejected,
+              "publication rejects in-place profile mutation after calibration");
+  expect_true(!std::filesystem::exists(mutable_profile_output),
+              "rejected profile mutation is not published");
+
   const auto symlink_alias = root.path() / "symlink-alias.json";
   std::filesystem::create_symlink(left_input, symlink_alias);
   bool symlink_alias_rejected = false;

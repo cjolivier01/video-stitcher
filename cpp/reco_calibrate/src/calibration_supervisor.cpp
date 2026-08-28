@@ -3652,12 +3652,12 @@ CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest& re
             std::to_string(descriptor))
         .string();
   };
-  auto left_input =
-      open_retained_input(request.left.retained_path.value_or(request.left.path),
-                          "left calibration video", worker_request.left.expected_identity);
-  auto right_input =
-      open_retained_input(request.right.retained_path.value_or(request.right.path),
-                          "right calibration video", worker_request.right.expected_identity);
+  const auto left_open_path = request.left.retained_path.value_or(request.left.path);
+  const auto right_open_path = request.right.retained_path.value_or(request.right.path);
+  auto left_input = open_retained_input(left_open_path, "left calibration video",
+                                        worker_request.left.expected_identity);
+  auto right_input = open_retained_input(right_open_path, "right calibration video",
+                                         worker_request.right.expected_identity);
   worker_request.left.retained_path = retained_descriptor_path(left_input.get());
   worker_request.right.retained_path = retained_descriptor_path(right_input.get());
   UniqueFd left_profile;
@@ -3670,11 +3670,15 @@ CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest& re
     right_profile = open_retained_input(*request.right.lens_profile, "right lens profile",
                                         worker_request.right.lens_profile_expected_identity);
   }
-  const auto verify_retained_input = [](int descriptor, std::string_view label,
+  const auto verify_retained_input = [](int descriptor, const std::string& path,
+                                        std::string_view label,
                                         const std::optional<CalibrationFileIdentity>& identity) {
-    struct stat current{};
-    if (descriptor < 0 || !identity.has_value() || ::fstat(descriptor, &current) != 0 ||
-        portable_file_identity(current) != *identity) {
+    struct stat descriptor_identity{};
+    struct stat named_identity{};
+    if (descriptor < 0 || !identity.has_value() || ::fstat(descriptor, &descriptor_identity) != 0 ||
+        portable_file_identity(descriptor_identity) != *identity ||
+        ::stat(path.c_str(), &named_identity) != 0 ||
+        portable_file_identity(named_identity) != *identity) {
       throw CalibrationExecutionError(std::string(label) + " changed during isolated calibration");
     }
   };
@@ -3713,16 +3717,24 @@ CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest& re
       throw CalibrationExecutionError("calibration worker exceeded its cgroup host memory limit");
     }
     auto result = decode_calibration_worker_response(response);
-    verify_retained_input(left_input.get(), "left calibration video",
+    if (result.left_lens_profile.has_value()) {
+      result.left_lens_profile->path = request.left.lens_profile;
+    }
+    if (result.right_lens_profile.has_value()) {
+      result.right_lens_profile->path = request.right.lens_profile.has_value()
+                                            ? request.right.lens_profile
+                                            : request.left.lens_profile;
+    }
+    verify_retained_input(left_input.get(), left_open_path, "left calibration video",
                           worker_request.left.expected_identity);
-    verify_retained_input(right_input.get(), "right calibration video",
+    verify_retained_input(right_input.get(), right_open_path, "right calibration video",
                           worker_request.right.expected_identity);
     if (left_profile) {
-      verify_retained_input(left_profile.get(), "left lens profile",
+      verify_retained_input(left_profile.get(), *request.left.lens_profile, "left lens profile",
                             worker_request.left.lens_profile_expected_identity);
     }
     if (right_profile) {
-      verify_retained_input(right_profile.get(), "right lens profile",
+      verify_retained_input(right_profile.get(), *request.right.lens_profile, "right lens profile",
                             worker_request.right.lens_profile_expected_identity);
     }
     memory_boundary.finish();

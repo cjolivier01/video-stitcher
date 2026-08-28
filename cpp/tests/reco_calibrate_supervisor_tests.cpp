@@ -343,6 +343,18 @@ void retained_input_descriptors_reach_the_sandboxed_worker() {
     expect_eq(run_gpu_calibration(request, ready_backends()).total_matches, 12U,
               "public calibration API pins original media paths before sandboxing");
   }
+  {
+    auto metadata_request = request;
+    metadata_request.right.lens_profile.reset();
+    Scenario scenario("profile-metadata");
+    const auto result = run_gpu_calibration(metadata_request, ready_backends());
+    expect_true(result.left_lens_profile.has_value() &&
+                    result.left_lens_profile->path == metadata_request.left.lens_profile,
+                "public calibration API restores the selected left profile path");
+    expect_true(result.right_lens_profile.has_value() &&
+                    result.right_lens_profile->path == metadata_request.left.lens_profile,
+                "public calibration API restores the fallback right profile path");
+  }
   request.left.expected_identity = CalibrationFileIdentity{};
   expect_execution_error([&] { (void)run_gpu_calibration(request, ready_backends()); },
                          "left calibration video changed",
@@ -353,7 +365,7 @@ void retained_input_descriptors_reach_the_sandboxed_worker() {
   std::filesystem::remove(right_profile);
 }
 
-void in_place_input_mutation_is_rejected() {
+void input_mutation_is_rejected() {
   const auto left = temporary_path("mutated-left.mp4");
   const auto right = temporary_path("mutated-right.mp4");
   const auto profile = temporary_path("mutated-profile.json");
@@ -366,8 +378,8 @@ void in_place_input_mutation_is_rejected() {
   write_fixture(right, "original right input\n");
   write_fixture(profile, "original lens profile\n");
 
-  const auto run_mutation = [&](const std::filesystem::path& target, std::string_view replacement,
-                                std::string_view expected_label) {
+  const auto run_mutation = [&](const auto& mutate, std::string_view expected_label,
+                                std::string_view expectation) {
     std::filesystem::remove(marker);
     auto request = lifecycle_request_fixture();
     request.left.path = left.string();
@@ -390,7 +402,7 @@ void in_place_input_mutation_is_rejected() {
       const auto guardian = wait_for_pid_marker(marker, std::chrono::seconds(1));
       expect_true(guardian.has_value(), "guardian reports readiness before input mutation");
       if (guardian.has_value()) {
-        write_fixture(target, replacement);
+        mutate();
       }
       calibration.join();
     }
@@ -402,12 +414,39 @@ void in_place_input_mutation_is_rejected() {
     } catch (const CalibrationExecutionError& failure) {
       rejected = std::string_view(failure.what()).find(expected_label) != std::string_view::npos;
     }
-    expect_true(rejected, "in-place mutation is rejected after supervisor descriptor pinning");
+    expect_true(rejected, expectation);
   };
 
-  run_mutation(left, "mutated left input with a different identity\n", "left calibration video");
+  run_mutation([&] { write_fixture(left, "mutated left input with a different identity\n"); },
+               "left calibration video",
+               "in-place media mutation is rejected after descriptor pinning");
   write_fixture(left, "restored left input\n");
-  run_mutation(profile, "mutated lens profile with a different identity\n", "left lens profile");
+  run_mutation([&] { write_fixture(profile, "mutated lens profile with a different identity\n"); },
+               "left lens profile",
+               "in-place profile mutation is rejected after descriptor pinning");
+  write_fixture(profile, "restored lens profile\n");
+
+  const auto moved_left = temporary_path("mutated-left-original.mp4");
+  std::filesystem::remove(moved_left);
+  run_mutation(
+      [&] {
+        std::filesystem::rename(left, moved_left);
+        write_fixture(left, "replacement left input\n");
+      },
+      "left calibration video", "media path replacement is rejected after descriptor pinning");
+  std::filesystem::remove(left);
+  std::filesystem::rename(moved_left, left);
+
+  const auto moved_profile = temporary_path("mutated-profile-original.json");
+  std::filesystem::remove(moved_profile);
+  run_mutation(
+      [&] {
+        std::filesystem::rename(profile, moved_profile);
+        write_fixture(profile, "replacement lens profile\n");
+      },
+      "left lens profile", "profile path replacement is rejected after descriptor pinning");
+  std::filesystem::remove(profile);
+  std::filesystem::rename(moved_profile, profile);
 
   std::filesystem::remove(left);
   std::filesystem::remove(right);
@@ -1141,7 +1180,7 @@ int main() {
     throw;
   }
   run_case("retained media descriptors", retained_input_descriptors_reach_the_sandboxed_worker);
-  run_case("in-place input mutation", in_place_input_mutation_is_rejected);
+  run_case("input mutation", input_mutation_is_rejected);
   run_case("native stdout isolation", native_stdout_noise_does_not_corrupt_protocol);
   run_case("delayed worker request", delayed_worker_request_io_obeys_the_deadline);
   run_case("worker failure containment", worker_failures_crashes_and_bad_frames_are_contained);
