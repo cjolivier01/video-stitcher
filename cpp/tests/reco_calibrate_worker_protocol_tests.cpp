@@ -64,9 +64,49 @@ GpuCalibrationRequest request_fixture() {
   request.left.path = "left.mp4";
   request.left.lens_profile = "/profiles/left.json";
   request.left.retained_path = "/proc/100/fd/10";
+  request.left.expected_identity = CalibrationFileIdentity{
+      .device = 0x0102'0304'0506'0708ULL,
+      .inode = 0x1112'1314'1516'1718ULL,
+      .size = 0x2122'2324'2526'2728ULL,
+      .mode = 0100644,
+      .modified_seconds = -1234567,
+      .modified_nanoseconds = 123456789,
+      .changed_seconds = 2345678,
+      .changed_nanoseconds = 987654321,
+  };
+  request.left.lens_profile_expected_identity = CalibrationFileIdentity{
+      .device = 0x3132'3334'3536'3738ULL,
+      .inode = 0x4142'4344'4546'4748ULL,
+      .size = 0x5152'5354'5556'5758ULL,
+      .mode = 0100600,
+      .modified_seconds = 3456789,
+      .modified_nanoseconds = 456789123,
+      .changed_seconds = -4567890,
+      .changed_nanoseconds = 567891234,
+  };
   request.right.path = "right.h265";
   request.right.lens_profile = "/profiles/right.json";
   request.right.retained_path = "/proc/100/fd/11";
+  request.right.expected_identity = CalibrationFileIdentity{
+      .device = 0x6162'6364'6566'6768ULL,
+      .inode = 0x7172'7374'7576'7778ULL,
+      .size = 0x8182'8384'8586'8788ULL,
+      .mode = 0100640,
+      .modified_seconds = 5678901,
+      .modified_nanoseconds = 678912345,
+      .changed_seconds = 6789012,
+      .changed_nanoseconds = 789123456,
+  };
+  request.right.lens_profile_expected_identity = CalibrationFileIdentity{
+      .device = 0x9192'9394'9596'9798ULL,
+      .inode = 0xa1a2'a3a4'a5a6'a7a8ULL,
+      .size = 0xb1b2'b3b4'b5b6'b7b8ULL,
+      .mode = 0100440,
+      .modified_seconds = -7890123,
+      .modified_nanoseconds = 891234567,
+      .changed_seconds = 8901234,
+      .changed_nanoseconds = 912345678,
+  };
   request.config.num_frames = 11;
   request.config.skip_start_secs = 1.25;
   request.config.skip_end_secs = 2.5;
@@ -226,6 +266,16 @@ void request_round_trip_is_exact_and_bounded() {
             "right lens path round trip");
   expect_eq(*decoded.right.retained_path, *expected.right.retained_path,
             "right retained path round trip");
+  expect_true(decoded.left.expected_identity == expected.left.expected_identity,
+              "left video identity round trip");
+  expect_true(decoded.right.expected_identity == expected.right.expected_identity,
+              "right video identity round trip");
+  expect_true(decoded.left.lens_profile_expected_identity ==
+                  expected.left.lens_profile_expected_identity,
+              "left lens profile identity round trip");
+  expect_true(decoded.right.lens_profile_expected_identity ==
+                  expected.right.lens_profile_expected_identity,
+              "right lens profile identity round trip");
   expect_eq(decoded.config.num_frames, expected.config.num_frames, "frame count round trip");
   expect_eq(decoded.config.optimizer.max_iters, expected.config.optimizer.max_iters,
             "optimizer iterations round trip");
@@ -235,6 +285,43 @@ void request_round_trip_is_exact_and_bounded() {
             expected.calibration_host_memory_limit_bytes, "memory limit round trip");
   expect_true(decoded.nvbufsurface_abi == reco::io::NvbufSurfaceAbi::DeepStream9_1,
               "NvBufSurface ABI round trip");
+}
+
+void request_identity_validation_is_strict() {
+  const auto fixture = request_fixture();
+  auto malformed_encoder = fixture;
+  malformed_encoder.left.expected_identity->modified_nanoseconds = -1;
+  expect_error([&] { (void)encode_calibration_worker_request(malformed_encoder); },
+               "modified nanoseconds", "negative identity nanoseconds rejected on encode");
+
+  auto malformed_wire = encode_calibration_worker_request(fixture);
+  expect_eq(replace_u64(malformed_wire, 123456789, 1'000'000'000, 0U), 1U,
+            "malformed identity nanoseconds fixture mutation");
+  expect_error([&] { (void)decode_calibration_worker_request(malformed_wire); },
+               "modified nanoseconds", "out-of-range identity nanoseconds rejected on decode");
+
+  auto truncated_identity = encode_calibration_worker_request(fixture);
+  const auto device = find_u64(truncated_identity, fixture.left.expected_identity->device);
+  expect_true(device.has_value(), "truncated identity fixture anchor found");
+  if (device.has_value()) {
+    truncated_identity.resize(*device + sizeof(std::uint64_t) + 4U);
+    replace_u32_at(
+        truncated_identity, 8U,
+        static_cast<std::uint32_t>(truncated_identity.size() - kCalibrationWorkerFrameHeaderBytes));
+    expect_error([&] { (void)decode_calibration_worker_request(truncated_identity); }, "truncated",
+                 "truncated identity rejected before request processing");
+  }
+
+  auto mismatched_wire = encode_calibration_worker_request(fixture);
+  constexpr std::uint64_t replacement_device = 0xc1c2'c3c4'c5c6'c7c8ULL;
+  expect_eq(
+      replace_u64(mismatched_wire, fixture.left.expected_identity->device, replacement_device, 0U),
+      1U, "identity mismatch fixture mutation");
+  const auto mismatched = decode_calibration_worker_request(mismatched_wire);
+  expect_eq(mismatched.left.expected_identity->device, replacement_device,
+            "wire identity mismatch is preserved for descriptor revalidation");
+  expect_true(mismatched.left.expected_identity != fixture.left.expected_identity,
+              "wire identity mismatch cannot collapse to the pinned identity");
 }
 
 void expect_double_exact(double actual, double expected, std::string_view message) {
@@ -362,7 +449,7 @@ void malformed_frames_fail_before_unbounded_allocation() {
 
   auto bad_version = request;
   bad_version[4] = 0;
-  bad_version[5] = 4;
+  bad_version[5] = static_cast<char>(kCalibrationWorkerProtocolVersion + 1U);
   expect_error([&] { (void)decode_calibration_worker_request(bad_version); }, "version",
                "unknown protocol version rejected");
 
@@ -590,6 +677,7 @@ void production_fd_transport_enforces_its_deadline() {
 
 int main() {
   request_round_trip_is_exact_and_bounded();
+  request_identity_validation_is_strict();
   result_round_trip_preserves_correspondences_exactly();
   correspondence_limits_and_numeric_validation_are_strict();
   malformed_frames_fail_before_unbounded_allocation();

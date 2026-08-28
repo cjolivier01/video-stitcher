@@ -277,6 +277,55 @@ std::optional<LensProfileInfo> read_profile(Reader& reader) {
   return profile;
 }
 
+void validate_identity_nanoseconds(std::int64_t value, std::string_view description) {
+  constexpr std::int64_t nanoseconds_per_second = 1'000'000'000;
+  if (value < 0 || value >= nanoseconds_per_second) {
+    throw CalibrationExecutionError(std::string(description) +
+                                    " must be in the range [0, 1000000000)");
+  }
+}
+
+void write_file_identity(Writer& writer, const std::optional<CalibrationFileIdentity>& identity,
+                         std::string_view description) {
+  writer.boolean(identity.has_value());
+  if (!identity.has_value()) {
+    return;
+  }
+  validate_identity_nanoseconds(identity->modified_nanoseconds,
+                                std::string(description) + " modified nanoseconds");
+  validate_identity_nanoseconds(identity->changed_nanoseconds,
+                                std::string(description) + " changed nanoseconds");
+  writer.u64(identity->device);
+  writer.u64(identity->inode);
+  writer.u64(identity->size);
+  writer.u32(identity->mode);
+  writer.i64(identity->modified_seconds);
+  writer.i64(identity->modified_nanoseconds);
+  writer.i64(identity->changed_seconds);
+  writer.i64(identity->changed_nanoseconds);
+}
+
+std::optional<CalibrationFileIdentity> read_file_identity(Reader& reader,
+                                                          std::string_view description) {
+  if (!reader.boolean(std::string(description) + " presence")) {
+    return std::nullopt;
+  }
+  CalibrationFileIdentity identity;
+  identity.device = reader.u64(std::string(description) + " device");
+  identity.inode = reader.u64(std::string(description) + " inode");
+  identity.size = reader.u64(std::string(description) + " size");
+  identity.mode = reader.u32(std::string(description) + " mode");
+  identity.modified_seconds = reader.i64(std::string(description) + " modified seconds");
+  identity.modified_nanoseconds = reader.i64(std::string(description) + " modified nanoseconds");
+  identity.changed_seconds = reader.i64(std::string(description) + " changed seconds");
+  identity.changed_nanoseconds = reader.i64(std::string(description) + " changed nanoseconds");
+  validate_identity_nanoseconds(identity.modified_nanoseconds,
+                                std::string(description) + " modified nanoseconds");
+  validate_identity_nanoseconds(identity.changed_nanoseconds,
+                                std::string(description) + " changed nanoseconds");
+  return identity;
+}
+
 std::size_t read_size(Reader& reader, std::string_view description) {
   const auto value = reader.u64(description);
   if (value > std::numeric_limits<std::size_t>::max()) {
@@ -390,6 +439,9 @@ std::string encode_calibration_worker_request(const GpuCalibrationRequest& reque
                          "calibration lens profile path");
     writer.optional_text(input.retained_path, kMaximumCalibrationWorkerPathBytes,
                          "retained calibration video path");
+    write_file_identity(writer, input.expected_identity, "calibration video identity");
+    write_file_identity(writer, input.lens_profile_expected_identity,
+                        "calibration lens profile identity");
   };
   write_input(request.left);
   write_input(request.right);
@@ -453,6 +505,9 @@ GpuCalibrationRequest decode_calibration_worker_request(std::string_view value) 
         reader.optional_text(kMaximumCalibrationWorkerPathBytes, "calibration lens profile path");
     input.retained_path =
         reader.optional_text(kMaximumCalibrationWorkerPathBytes, "retained calibration video path");
+    input.expected_identity = read_file_identity(reader, "calibration video identity");
+    input.lens_profile_expected_identity =
+        read_file_identity(reader, "calibration lens profile identity");
   };
   read_input(request.left);
   read_input(request.right);

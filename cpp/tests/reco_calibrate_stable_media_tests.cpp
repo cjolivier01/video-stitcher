@@ -14,6 +14,10 @@
 #include <string_view>
 #include <thread>
 
+#if defined(__linux__)
+#include <sys/stat.h>
+#endif
+
 using reco::calibrate::CalibrationExecutionError;
 using reco::calibrate::detail::StableLensProfileFile;
 using reco::calibrate::detail::StableMediaFile;
@@ -135,6 +139,35 @@ void invalid_inputs_fail_before_gstreamer() {
 #endif
 }
 
+void expected_identity_mismatch_fails_before_processing() {
+#if defined(__linux__)
+  TemporaryDirectory directory;
+  const auto input = directory.path() / "input.mp4";
+  write_file(input, "pinned calibration media");
+  struct stat metadata{};
+  expect_true(::stat(input.c_str(), &metadata) == 0, "identity mismatch fixture can be inspected");
+  auto expected = reco::calibrate::CalibrationFileIdentity{
+      .device = static_cast<std::uint64_t>(metadata.st_dev),
+      .inode = static_cast<std::uint64_t>(metadata.st_ino),
+      .size = static_cast<std::uint64_t>(metadata.st_size),
+      .mode = static_cast<std::uint32_t>(metadata.st_mode),
+      .modified_seconds = static_cast<std::int64_t>(metadata.st_mtim.tv_sec),
+      .modified_nanoseconds = static_cast<std::int64_t>(metadata.st_mtim.tv_nsec),
+      .changed_seconds = static_cast<std::int64_t>(metadata.st_ctim.tv_sec),
+      .changed_nanoseconds = static_cast<std::int64_t>(metadata.st_ctim.tv_nsec),
+  };
+  ++expected.inode;
+  bool mismatch_rejected = false;
+  try {
+    StableMediaFile stable(input, expected);
+  } catch (const CalibrationExecutionError& error) {
+    mismatch_rejected = std::string_view(error.what()).find("changed before isolated processing") !=
+                        std::string_view::npos;
+  }
+  expect_true(mismatch_rejected, "initial media identity mismatch fails before processing");
+#endif
+}
+
 void retained_lens_profile_survives_path_replacement() {
 #if defined(__linux__)
   TemporaryDirectory directory;
@@ -181,6 +214,7 @@ int main() {
   retained_handle_survives_path_replacement();
   same_size_mtime_restored_mutation_is_rejected();
   invalid_inputs_fail_before_gstreamer();
+  expected_identity_mismatch_fails_before_processing();
   retained_lens_profile_survives_path_replacement();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

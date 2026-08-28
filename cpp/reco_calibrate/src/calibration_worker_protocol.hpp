@@ -10,7 +10,7 @@
 
 namespace reco::calibrate::detail {
 
-inline constexpr std::uint16_t kCalibrationWorkerProtocolVersion = 3;
+inline constexpr std::uint16_t kCalibrationWorkerProtocolVersion = 4;
 inline constexpr std::size_t kCalibrationWorkerFrameHeaderBytes = 12;
 inline constexpr std::size_t kMaximumCalibrationWorkerFrameBytes = 64U * 1024U;
 inline constexpr std::size_t kMaximumCalibrationWorkerPathBytes = 16U * 1024U;
