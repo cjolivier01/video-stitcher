@@ -13,6 +13,7 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -59,6 +60,11 @@ template <typename Fn> void expect_invalid_argument(Fn&& fn, std::string_view me
 
 bool require_cuda() {
   const char* value = std::getenv("RECO_REQUIRE_CUDA_TEST");
+  return value != nullptr && std::string_view(value) == "1";
+}
+
+bool compute_sanitizer_run() {
+  const char* value = std::getenv("RECO_COMPUTE_SANITIZER_TEST");
   return value != nullptr && std::string_view(value) == "1";
 }
 
@@ -220,6 +226,23 @@ std::vector<GpuFeaturePoint> download_points(CudaBackend& backend, const GpuFeat
                                     .height = 1});
   }
   return points;
+}
+
+void hash_bytes(std::uint64_t& hash, const void* data, std::size_t size) {
+  const auto* bytes = static_cast<const std::uint8_t*>(data);
+  for (std::size_t index = 0; index < size; ++index) {
+    hash ^= bytes[index];
+    hash *= 1099511628211ULL;
+  }
+}
+
+std::uint64_t feature_set_hash(CudaBackend& backend, const GpuFeatureSet& features) {
+  const auto points = download_points(backend, features);
+  const auto descriptors = feature_descriptors(backend, features);
+  std::uint64_t hash = 14695981039346656037ULL;
+  hash_bytes(hash, points.data(), points.size() * sizeof(GpuFeaturePoint));
+  hash_bytes(hash, descriptors.data(), descriptors.size() * sizeof(Descriptor));
+  return hash;
 }
 
 GpuAkazeConfig detector_config(std::uint32_t max_keypoints = 32) {
@@ -787,11 +810,89 @@ void single_sublevel_multi_octave_matches_rust_golden(CudaBackend& backend,
   }
 }
 
-void adversarial_selection_is_bounded_at_resolution(CudaBackend& backend,
-                                                    const GpuAkazePipeline& pipeline,
-                                                    std::uint32_t width, std::uint32_t height,
-                                                    std::size_t pitch,
-                                                    std::chrono::seconds maximum_latency) {
+DeviceFrame make_selection_stress_frame(CudaBackend& backend, std::uint32_t width,
+                                        std::uint32_t height, std::size_t pitch,
+                                        std::uint32_t seed) {
+  std::vector<std::uint8_t> pixels(pitch * height, 0xA5U);
+  for (std::uint32_t y = 0; y < height; ++y) {
+    for (std::uint32_t x = 0; x < width; ++x) {
+      std::uint32_t hash = seed ^ (x * 0x9e3779b9U) ^ (y * 0x85ebca6bU);
+      hash ^= hash >> 16U;
+      hash *= 0x7feb352dU;
+      hash ^= hash >> 15U;
+      hash *= 0x846ca68bU;
+      hash ^= hash >> 16U;
+      pixels[static_cast<std::size_t>(y) * pitch + x] = static_cast<std::uint8_t>(hash >> 24U);
+    }
+  }
+  auto device = backend.allocate(pitch * height);
+  backend.copy_host_to_device_2d({.src = pixels.data(),
+                                  .src_pitch = pitch,
+                                  .dst = device.ptr(),
+                                  .dst_pitch = pitch,
+                                  .width_bytes = width,
+                                  .height = height});
+  return {.pixels = std::move(device), .pitch = pitch, .width = width, .height = height};
+}
+
+void dense_selection_matches_serial_reference(CudaBackend& backend,
+                                              const GpuAkazePipeline& pipeline) {
+  struct Fixture {
+    std::uint32_t width;
+    std::uint32_t height;
+    std::size_t pitch;
+    std::uint32_t seed;
+    std::uint32_t sublevels;
+    std::uint32_t octaves;
+  };
+  constexpr std::array<Fixture, 3> fixtures{{
+      {.width = 512,
+       .height = 320,
+       .pitch = 528,
+       .seed = 0x13579bdfU,
+       .sublevels = 2,
+       .octaves = 3},
+      {.width = 704,
+       .height = 432,
+       .pitch = 720,
+       .seed = 0x2468ace0U,
+       .sublevels = 4,
+       .octaves = 4},
+      {.width = 960,
+       .height = 256,
+       .pitch = 976,
+       .seed = 0xf00dcafeU,
+       .sublevels = 8,
+       .octaves = 2},
+  }};
+  constexpr std::array<std::uint64_t, fixtures.size()> serial_reference_hashes{
+      0xbab2c016f0836262ULL,
+      0x95a65f598c631d5dULL,
+      0x8c3f0a891ca33b7cULL,
+  };
+
+  for (std::size_t fixture_index = 0; fixture_index < fixtures.size(); ++fixture_index) {
+    const auto& fixture = fixtures[fixture_index];
+    const auto frame = make_selection_stress_frame(backend, fixture.width, fixture.height,
+                                                   fixture.pitch, fixture.seed);
+    auto config = detector_config(512);
+    config.threshold = 1.0e-8F;
+    config.max_detection_width = fixture.width;
+    config.num_sublevels = fixture.sublevels;
+    config.max_octaves = fixture.octaves;
+    for (std::uint32_t repeat = 0; repeat < 3U; ++repeat) {
+      const auto features = pipeline.detect(frame.view(), config);
+      expect_eq(feature_count(backend, features), 512U,
+                "dense selection serial-reference feature count");
+      expect_eq(feature_set_hash(backend, features), serial_reference_hashes[fixture_index],
+                "dense selection serial-reference bytes and order");
+    }
+  }
+}
+
+std::chrono::steady_clock::duration adversarial_selection_is_bounded_at_resolution(
+    CudaBackend& backend, const GpuAkazePipeline& pipeline, std::uint32_t width,
+    std::uint32_t height, std::size_t pitch, std::chrono::steady_clock::duration maximum_latency) {
   std::vector<std::uint8_t> pixels(pitch * height, 0);
   for (std::uint32_t y = 0; y < height; ++y) {
     for (std::uint32_t x = 0; x < width; ++x) {
@@ -825,18 +926,28 @@ void adversarial_selection_is_bounded_at_resolution(CudaBackend& backend,
             "adversarial detector reaches its bounded output cap");
   expect_true(elapsed < maximum_latency,
               "adversarial selection completes without watchdog-scale latency");
+  return elapsed;
 }
 
 void full_resolution_adversarial_selection_is_bounded(CudaBackend& backend,
                                                       const GpuAkazePipeline& pipeline) {
-  adversarial_selection_is_bounded_at_resolution(backend, pipeline, 1920, 1080, 1936,
-                                                 std::chrono::seconds(10));
+  const auto device = backend.device_info();
+  const auto maximum_latency = device.name.find("RTX 5090") != std::string::npos
+                                   ? std::chrono::milliseconds(1'000)
+                                   : std::chrono::seconds(5);
+  const auto elapsed = adversarial_selection_is_bounded_at_resolution(backend, pipeline, 1920, 1080,
+                                                                      1936, maximum_latency);
+  std::cerr << "GPU AKAZE 1920x1080 device=\"" << device.name
+            << "\" elapsed_ms=" << std::chrono::duration<double, std::milli>(elapsed).count()
+            << " gate_ms=" << std::chrono::duration<double, std::milli>(maximum_latency).count()
+            << '\n';
 }
 
 void racecheck_adversarial_selection_is_bounded(CudaBackend& backend,
                                                 const GpuAkazePipeline& pipeline) {
-  adversarial_selection_is_bounded_at_resolution(backend, pipeline, 480, 270, 496,
-                                                 std::chrono::seconds(5));
+  const auto maximum_latency =
+      compute_sanitizer_run() ? std::chrono::seconds(60) : std::chrono::seconds(2);
+  adversarial_selection_is_bounded_at_resolution(backend, pipeline, 480, 270, 496, maximum_latency);
 }
 
 void roi_boundaries_are_enforced(CudaBackend& backend, const GpuAkazePipeline& pipeline) {
@@ -1046,8 +1157,8 @@ int main() {
   const auto shard = test_shard();
   if (shard != "all" && shard != "contracts" && shard != "detection" && shard != "golden" &&
       shard != "triangle" && shard != "crop" && shard != "contrast" && shard != "selection" &&
-      shard != "selection-race" && shard != "selection-full" && shard != "rotation" &&
-      shard != "matching") {
+      shard != "selection-race" && shard != "selection-reference" && shard != "selection-full" &&
+      shard != "rotation" && shard != "matching") {
     std::cerr << "FAIL: unknown CUDA feature test shard: " << shard << '\n';
     return EXIT_FAILURE;
   }
@@ -1081,6 +1192,9 @@ int main() {
     }
     if (shard == "all" || shard == "selection" || shard == "selection-race") {
       racecheck_adversarial_selection_is_bounded(backend, pipeline);
+    }
+    if (shard == "all" || shard == "selection" || shard == "selection-reference") {
+      dense_selection_matches_serial_reference(backend, pipeline);
     }
     if (shard_enabled(shard, "golden") || shard == "rotation") {
       rotated_descriptors_match_known_vectors(backend, pipeline);

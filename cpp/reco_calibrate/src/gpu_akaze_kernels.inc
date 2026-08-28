@@ -814,21 +814,81 @@ __device__ unsigned int akaze_first_cached_overlap(
   return matched_slot;
 }
 
+// Every lane cooperatively scans one candidate's spatial window, then reduces
+// to the lowest cache slot. The minimum-slot reduction is scheduling-independent
+// and exactly preserves Rust's first-cache-entry replacement rule.
+__device__ void akaze_first_cached_overlap_block(
+    const AkazeCandidate& current,
+    unsigned int target_level,
+    const AkazeSelectionLevel* levels,
+    const AkazeCandidate* candidates,
+    const unsigned int* cache_indices,
+    const unsigned int* cache_cells,
+    unsigned int cache_count,
+    unsigned int first_slot,
+    bool current_is_cached,
+    unsigned int* matched_slot) {
+  if (threadIdx.x == 0U) {
+    *matched_slot = 0xffffffffU;
+  }
+  __syncthreads();
+
+  const AkazeSelectionLevel level = levels[target_level];
+  const float current_ratio = akaze_octave_ratio(current.octave);
+  const float current_offset = current_is_cached ? 0.5f * (current_ratio - 1.0f) : 0.0f;
+  const float current_x = current.x * current_ratio + current_offset;
+  const float current_y = current.y * current_ratio + current_offset;
+  const float target_ratio = akaze_octave_ratio(level.octave);
+  const float target_offset = 0.5f * (target_ratio - 1.0f);
+  const float target_x = (current_x - target_offset) / target_ratio;
+  const float target_y = (current_y - target_offset) / target_ratio;
+  const float local_radius = current.size / target_ratio;
+  const int first_x = akaze_clamp_int(
+      (int)floorf(target_x - local_radius), 0, (int)level.width - 1);
+  const int last_x = akaze_clamp_int(
+      (int)ceilf(target_x + local_radius), 0, (int)level.width - 1);
+  const int first_y = akaze_clamp_int(
+      (int)floorf(target_y - local_radius), 0, (int)level.height - 1);
+  const int last_y = akaze_clamp_int(
+      (int)ceilf(target_y + local_radius), 0, (int)level.height - 1);
+  const unsigned int span_x = (unsigned int)(last_x - first_x + 1);
+  const unsigned int span_y = (unsigned int)(last_y - first_y + 1);
+  const unsigned int cell_count = span_x * span_y;
+  unsigned int lane_match = 0xffffffffU;
+  for (unsigned int offset = threadIdx.x; offset < cell_count; offset += blockDim.x) {
+    const unsigned int x = (unsigned int)first_x + offset % span_x;
+    const unsigned int y = (unsigned int)first_y + offset / span_x;
+    const unsigned int slot =
+        cache_cells[level.pixel_base + y * level.width + x];
+    if (slot >= first_slot && slot < cache_count && slot < lane_match) {
+      const AkazeCandidate previous = candidates[cache_indices[slot]];
+      const float previous_ratio = akaze_octave_ratio(previous.octave);
+      const float dx = current_x - akaze_global_coordinate(previous.x, previous_ratio);
+      const float dy = current_y - akaze_global_coordinate(previous.y, previous_ratio);
+      if (dx * dx + dy * dy <= current.size * current.size) {
+        lane_match = slot;
+      }
+    }
+  }
+  if (lane_match != 0xffffffffU) {
+    atomicMin(matched_slot, lane_match);
+  }
+  __syncthreads();
+}
+
 // Executes Rust's accepted-cache replacement semantics in candidate order.
-// Spatial cell lookup keeps each comparison bounded by the feature radius;
-// the kernel never scans all preceding raw NMS candidates.
+// One persistent block owns that order while its lanes parallelize each bounded
+// spatial lookup; candidates and cache state never leave device memory.
 extern "C" __global__ void akaze_select_scale_extrema(
     unsigned long long candidates,
     unsigned int candidate_count,
-    unsigned int candidate_begin,
-    unsigned int batch_count,
     unsigned long long levels,
     unsigned int level_count,
     unsigned long long cache_indices,
     unsigned long long cache_cells,
     unsigned long long cache_count,
     unsigned long long selected_flags) {
-  if (blockIdx.x != 0U || threadIdx.x != 0U) {
+  if (blockIdx.x != 0U) {
     return;
   }
   const AkazeCandidate* values = akaze_const_pointer<AkazeCandidate>(candidates);
@@ -838,63 +898,77 @@ extern "C" __global__ void akaze_select_scale_extrema(
   unsigned int* cells = akaze_pointer<unsigned int>(cache_cells);
   unsigned int* count = akaze_pointer<unsigned int>(cache_count);
   unsigned int* selected = akaze_pointer<unsigned int>(selected_flags);
+  __shared__ unsigned int accepted_count;
+  __shared__ unsigned int repeated_same_level;
+  __shared__ unsigned int repeated_previous_level;
+  if (threadIdx.x == 0U) {
+    accepted_count = *count;
+  }
+  __syncthreads();
 
-  const unsigned int available = candidate_begin < candidate_count
-      ? candidate_count - candidate_begin
-      : 0U;
-  const unsigned int candidate_end = candidate_begin +
-      (batch_count < available ? batch_count : available);
-  for (unsigned int index = candidate_begin; index < candidate_end; ++index) {
+  for (unsigned int index = 0U; index < candidate_count; ++index) {
     const AkazeCandidate current = values[index];
     if (current.level >= level_count) {
       continue;
     }
-    unsigned int repeated_slot = akaze_first_cached_overlap(
-        current, current.level, selection_levels, values, indices, cells, *count, 0U, false);
+    akaze_first_cached_overlap_block(
+        current, current.level, selection_levels, values, indices, cells, accepted_count, 0U,
+        false, &repeated_same_level);
     if (current.level != 0U) {
-      const unsigned int previous_slot = akaze_first_cached_overlap(
-          current, current.level - 1U, selection_levels, values, indices, cells, *count, 0U,
-          false);
-      if (previous_slot < repeated_slot) {
-        repeated_slot = previous_slot;
-      }
-    }
-    if (repeated_slot != 0xffffffffU) {
-      const AkazeCandidate previous = values[indices[repeated_slot]];
-      if (!(current.response > previous.response)) {
-        continue;
-      }
-    }
-    if (!akaze_descriptor_bounds_ok(current)) {
-      continue;
-    }
-
-    unsigned int slot = repeated_slot;
-    if (slot == 0xffffffffU) {
-      slot = *count;
-      if (slot >= candidate_count) {
-        return;
-      }
-      *count = slot + 1U;
+      akaze_first_cached_overlap_block(
+          current, current.level - 1U, selection_levels, values, indices, cells, accepted_count,
+          0U, false, &repeated_previous_level);
     } else {
-      const unsigned int old_index = indices[slot];
-      const AkazeCandidate old = values[old_index];
-      if (old.level < level_count && old.x >= 0.0f && old.y >= 0.0f &&
-          old.x < (float)selection_levels[old.level].width &&
-          old.y < (float)selection_levels[old.level].height) {
-        const AkazeSelectionLevel old_level = selection_levels[old.level];
-        cells[old_level.pixel_base + (unsigned int)old.y * old_level.width +
-              (unsigned int)old.x] = 0xffffffffU;
+      if (threadIdx.x == 0U) {
+        repeated_previous_level = 0xffffffffU;
       }
-      selected[old_index] = 0U;
+      __syncthreads();
     }
-    indices[slot] = index;
-    const AkazeSelectionLevel level = selection_levels[current.level];
-    cells[level.pixel_base + (unsigned int)current.y * level.width +
-          (unsigned int)current.x] = slot;
-    selected[index] = 1U;
-  }
 
+    if (threadIdx.x == 0U) {
+      const unsigned int repeated_slot = repeated_previous_level < repeated_same_level
+          ? repeated_previous_level
+          : repeated_same_level;
+      bool retain_current = true;
+      if (repeated_slot != 0xffffffffU) {
+        const AkazeCandidate previous = values[indices[repeated_slot]];
+        retain_current = current.response > previous.response;
+      }
+      retain_current = retain_current && akaze_descriptor_bounds_ok(current);
+
+      if (retain_current) {
+        unsigned int slot = repeated_slot;
+        if (slot == 0xffffffffU) {
+          slot = accepted_count;
+          if (slot < candidate_count) {
+            accepted_count = slot + 1U;
+          }
+        } else {
+          const unsigned int old_index = indices[slot];
+          const AkazeCandidate old = values[old_index];
+          if (old.level < level_count && old.x >= 0.0f && old.y >= 0.0f &&
+              old.x < (float)selection_levels[old.level].width &&
+              old.y < (float)selection_levels[old.level].height) {
+            const AkazeSelectionLevel old_level = selection_levels[old.level];
+            cells[old_level.pixel_base + (unsigned int)old.y * old_level.width +
+                  (unsigned int)old.x] = 0xffffffffU;
+          }
+          selected[old_index] = 0U;
+        }
+        if (slot < candidate_count) {
+          indices[slot] = index;
+          const AkazeSelectionLevel level = selection_levels[current.level];
+          cells[level.pixel_base + (unsigned int)current.y * level.width +
+                (unsigned int)current.x] = slot;
+          selected[index] = 1U;
+        }
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0U) {
+    *count = accepted_count;
+  }
 }
 
 extern "C" __global__ void akaze_discard_lower_scale_extrema(
