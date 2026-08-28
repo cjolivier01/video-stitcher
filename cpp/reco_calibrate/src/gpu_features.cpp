@@ -32,7 +32,6 @@ constexpr double kContrastPercentile = 0.7;
 constexpr float kMinimumContrast = 1.0e-6F;
 constexpr double kFedMaximumStep = 0.25;
 constexpr std::size_t kCandidateBytes = 76;
-constexpr std::uint32_t kSelectionBatchCandidates = 256;
 constexpr std::size_t kImageRowAlignment = 256;
 constexpr std::size_t kWorkspaceAccountingMarginBytes = std::size_t{64} * 1'024U * 1'024U;
 constexpr std::size_t kHistogramBytes = 300U * sizeof(std::uint32_t);
@@ -1144,17 +1143,10 @@ GpuFeatureSet GpuAkazePipeline::detect(const GpuGrayFrame& frame,
     auto cache_indices_ptr = cache_indices.ptr();
     auto cache_cells_ptr = cache_cells.ptr();
     auto cache_count_ptr = cache_count.ptr();
-    for (std::uint32_t candidate_begin = 0; candidate_begin < candidate_count;) {
-      const auto batch_count =
-          std::min(kSelectionBatchCandidates, candidate_count - candidate_begin);
-      auto candidate_begin_arg = candidate_begin;
-      auto batch_count_arg = batch_count;
-      launch(impl_->select_scale_extrema,
-             {.grid = {.x = 1, .y = 1, .z = 1}, .block = {.x = 1, .y = 1, .z = 1}}, candidates_ptr,
-             candidate_count_arg, candidate_begin_arg, batch_count_arg, selection_levels_ptr,
-             level_count, cache_indices_ptr, cache_cells_ptr, cache_count_ptr, selected_flags_ptr);
-      candidate_begin += batch_count;
-    }
+    launch(impl_->select_scale_extrema,
+           {.grid = {.x = 1, .y = 1, .z = 1}, .block = {.x = kLinearBlockSize, .y = 1, .z = 1}},
+           candidates_ptr, candidate_count_arg, selection_levels_ptr, level_count,
+           cache_indices_ptr, cache_cells_ptr, cache_count_ptr, selected_flags_ptr);
     launch(impl_->discard_lower_scale_extrema, linear_launch(candidate_count), candidates_ptr,
            candidate_count_arg, selection_levels_ptr, level_count, cache_indices_ptr,
            cache_cells_ptr, cache_count_ptr, selected_flags_ptr);
