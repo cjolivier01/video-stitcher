@@ -11,6 +11,8 @@ cc_library(
     srcs = [
         "src/calibration.cpp",
         "src/cuda_backend.cpp",
+        "src/cuda_frame.cpp",
+        "src/nvrtc_compiler.cpp",
         "src/path.cpp",
         "src/pipeline_event.cpp",
         "src/performance.cpp",
@@ -25,6 +27,8 @@ cc_library(
     hdrs = [
         "include/reco/core/calibration.hpp",
         "include/reco/core/cuda_backend.hpp",
+        "include/reco/core/cuda_frame.hpp",
+        "include/reco/core/nvrtc_compiler.hpp",
         "include/reco/core/path.hpp",
         "include/reco/core/pipeline_event.hpp",
         "include/reco/core/performance.hpp",
