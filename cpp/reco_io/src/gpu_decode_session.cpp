@@ -147,6 +147,8 @@ public:
         discarded_right.swap(right_.frames);
         state_changed_.notify_all();
         lock.unlock();
+        discarded_left.clear();
+        discarded_right.clear();
         finish_stop(first_stop);
         return {.status = GpuStereoDecodeStatus::EndOfStream, .frames = std::nullopt};
       }
@@ -169,6 +171,8 @@ public:
       discarded_left.swap(left_.frames);
       discarded_right.swap(right_.frames);
     }
+    discarded_left.clear();
+    discarded_right.clear();
     finish_stop(first_stop);
   }
 
@@ -242,6 +246,8 @@ private:
         return;
       }
     }
+    discarded_left.clear();
+    discarded_right.clear();
     finish_stop(true);
   }
 
