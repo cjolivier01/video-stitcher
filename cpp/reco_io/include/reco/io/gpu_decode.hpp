@@ -88,7 +88,7 @@ public:
   [[nodiscard]] virtual bool gpu_resident() const = 0;
   [[nodiscard]] virtual GpuDecodeReadResult read() = 0;
   /// Idempotently interrupts a blocked read and prevents further decoding.
-  virtual void request_stop() noexcept;
+  virtual void request_stop() noexcept = 0;
   /// Accurately seeks an indexed source without rebuilding its decode pipeline.
   virtual void seek_to_frame(std::uint64_t frame_index);
 };
