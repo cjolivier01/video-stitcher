@@ -74,6 +74,34 @@ cc_test(
 )
 
 cc_binary(
+    name = "libreco_core_fake_cuda_stitch_driver.so",
+    testonly = True,
+    srcs = ["reco_core_fake_cuda_stitch_driver.cpp"],
+    linkshared = True,
+)
+
+cc_test(
+    name = "reco_core_cuda_stitch_renderer_tests",
+    size = "small",
+    srcs = ["reco_core_cuda_stitch_renderer_tests.cpp"],
+    data = [
+        ":libreco_core_fake_cuda_stitch_driver.so",
+        ":libreco_core_fake_nvrtc_runtime.so",
+    ],
+    deps = [
+        "//cpp/reco_core",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
+cc_test(
+    name = "reco_core_cuda_stitch_parity_tests",
+    size = "large",
+    srcs = ["reco_core_cuda_stitch_parity_tests.cpp"],
+    deps = ["//cpp/reco_core"],
+)
+
+cc_binary(
     name = "libreco_core_fake_nvrtc_runtime.so",
     testonly = True,
     srcs = ["reco_core_fake_nvrtc_runtime.cpp"],

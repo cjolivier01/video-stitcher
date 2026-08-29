@@ -26,6 +26,14 @@ struct CudaDeviceInfo {
   std::array<std::uint8_t, 16> uuid{};
 };
 
+/// CUDA virtual architecture supported by one physical device.
+struct CudaComputeCapability {
+  /// Compute capability major version.
+  int major = 0;
+  /// Compute capability minor version.
+  int minor = 0;
+};
+
 struct CudaMemoryInfo {
   std::size_t free_bytes = 0;
   std::size_t total_bytes = 0;
@@ -122,13 +130,20 @@ class CudaBackend {
 public:
   [[nodiscard]] static bool is_available();
   [[nodiscard]] static std::string availability_error();
+  /// Diagnoses an exact CUDA driver library without retaining it.
+  [[nodiscard]] static std::string availability_error(std::string_view library_path);
   [[nodiscard]] static CudaBackend create();
+  /// Loads an exact CUDA driver library path, primarily for explicit deployments and tests.
+  [[nodiscard]] static CudaBackend load(std::string_view library_path);
   /// Returns a backend view that reports explicit operations to `trace_sink`.
   [[nodiscard]] CudaBackend with_trace_sink(std::shared_ptr<CudaBackendTraceSink> trace_sink) const;
 
   [[nodiscard]] int device_count() const;
   [[nodiscard]] CudaDeviceInfo device_info(int ordinal = 0) const;
+  [[nodiscard]] CudaComputeCapability compute_capability(int ordinal = 0) const;
   void ensure_primary_context(int ordinal = 0) const;
+  /// Returns the process-local identity of the retained primary context.
+  [[nodiscard]] std::uintptr_t primary_context_id(int ordinal = 0) const;
   [[nodiscard]] CudaMemoryInfo memory_info() const;
   [[nodiscard]] CudaDeviceBuffer allocate(std::size_t bytes) const;
   /// Allocates 2D storage with a driver-selected pitch valid for `cuMemcpy2D`.
@@ -141,10 +156,11 @@ public:
   void copy_device_to_device_2d(const Cuda2DCopy& copy) const;
   void copy_device_to_host_2d(const CudaDeviceToHost2DCopy& copy) const;
   /// Loads one PTX module that can resolve and share ownership across multiple kernels.
-  [[nodiscard]] CudaModule load_module_from_ptx(std::string_view ptx) const;
+  [[nodiscard]] CudaModule load_module_from_ptx(std::string_view ptx, int device_ordinal = 0) const;
   /// Compatibility helper that loads one PTX module and resolves one kernel from it.
   [[nodiscard]] CudaKernel load_kernel_from_ptx(std::string_view ptx,
-                                                std::string_view function_name) const;
+                                                std::string_view function_name,
+                                                int device_ordinal = 0) const;
   void synchronize() const;
 
 private:

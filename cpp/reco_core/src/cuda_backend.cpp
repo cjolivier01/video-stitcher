@@ -41,6 +41,9 @@ constexpr unsigned int kMemHandleType = 1;
 #endif
 constexpr unsigned int kMemAccessFlagsProtReadWrite = 3;
 constexpr unsigned int kMemAllocGranularityMinimum = 0;
+constexpr int kDeviceAttributeComputeCapabilityMajor = 75;
+constexpr int kDeviceAttributeComputeCapabilityMinor = 76;
+constexpr std::size_t kMaximumDriverLibraryPathBytes = 32U * 1024U;
 
 struct CUuuid {
   std::uint8_t bytes[16];
@@ -85,14 +88,14 @@ struct CudaMemcpy2D {
 
 class DynamicLibrary {
 public:
-  explicit DynamicLibrary(const char* name) {
+  explicit DynamicLibrary(std::string name) : name_(std::move(name)) {
 #if defined(_WIN32)
-    handle_ = LoadLibraryA(name);
+    handle_ = LoadLibraryA(name_.c_str());
 #else
-    handle_ = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+    handle_ = dlopen(name_.c_str(), RTLD_NOW | RTLD_LOCAL);
 #endif
     if (handle_ == nullptr) {
-      throw std::runtime_error(std::string("failed to load ") + name);
+      throw std::runtime_error("failed to load " + name_);
     }
   }
 
@@ -124,8 +127,17 @@ public:
   }
 
 private:
+  std::string name_;
   void* handle_ = nullptr;
 };
+
+std::string default_cuda_driver_name() {
+#if defined(_WIN32)
+  return "nvcuda.dll";
+#else
+  return "libcuda.so.1";
+#endif
+}
 
 [[noreturn]] void throw_cuda(const char* function, CUresult result) {
   throw std::runtime_error(std::string(function) + " returned CUDA error " +
@@ -222,15 +234,12 @@ CudaShareableHandle invalid_shareable_handle() {
 } // namespace
 
 struct CudaBackend::Impl {
-  explicit Impl()
-#if defined(_WIN32)
-      : driver("nvcuda.dll") {
-#else
-      : driver("libcuda.so.1") {
-#endif
+  explicit Impl(std::string driver_path) : driver(std::move(driver_path)) {
     cu_init = driver.symbol<decltype(cu_init)>("cuInit");
     cu_device_get_count = driver.symbol<decltype(cu_device_get_count)>("cuDeviceGetCount");
     cu_device_get = driver.symbol<decltype(cu_device_get)>("cuDeviceGet");
+    cu_device_get_attribute =
+        driver.symbol<decltype(cu_device_get_attribute)>("cuDeviceGetAttribute");
     cu_device_get_name = driver.symbol<decltype(cu_device_get_name)>("cuDeviceGetName");
     cu_device_get_uuid = driver.symbol<decltype(cu_device_get_uuid)>("cuDeviceGetUuid");
     cu_device_primary_ctx_retain =
@@ -322,6 +331,7 @@ struct CudaBackend::Impl {
   CUresult (*cu_init)(unsigned int) = nullptr;
   CUresult (*cu_device_get_count)(int*) = nullptr;
   CUresult (*cu_device_get)(CUdevice*, int) = nullptr;
+  CUresult (*cu_device_get_attribute)(int*, int, CUdevice) = nullptr;
   CUresult (*cu_device_get_name)(char*, int, CUdevice) = nullptr;
   CUresult (*cu_device_get_uuid)(CUuuid*, CUdevice) = nullptr;
   CUresult (*cu_device_primary_ctx_retain)(CUcontext*, CUdevice) = nullptr;
@@ -612,9 +622,29 @@ std::string CudaBackend::availability_error() {
   }
 }
 
+std::string CudaBackend::availability_error(std::string_view library_path) {
+  try {
+    const auto backend = load(library_path);
+    if (backend.device_count() <= 0) {
+      return "CUDA driver loaded but no CUDA devices were reported";
+    }
+    return {};
+  } catch (const std::exception& error) {
+    return error.what();
+  }
+}
+
 CudaBackend CudaBackend::create() {
-  static const std::shared_ptr<Impl> impl = std::make_shared<Impl>();
+  static const std::shared_ptr<Impl> impl = std::make_shared<Impl>(default_cuda_driver_name());
   return CudaBackend(impl);
+}
+
+CudaBackend CudaBackend::load(std::string_view library_path) {
+  validate_no_nul(library_path, "driver library path");
+  if (library_path.size() > kMaximumDriverLibraryPathBytes) {
+    throw std::invalid_argument("CUDA driver library path exceeds 32768 bytes");
+  }
+  return CudaBackend(std::make_shared<Impl>(std::string(library_path)));
 }
 
 CudaBackend::CudaBackend(std::shared_ptr<Impl> impl,
@@ -650,8 +680,32 @@ CudaDeviceInfo CudaBackend::device_info(int ordinal) const {
   return info;
 }
 
+CudaComputeCapability CudaBackend::compute_capability(int ordinal) const {
+  const CUdevice device = impl_->device(ordinal);
+  CudaComputeCapability capability;
+  check_cuda("cuDeviceGetAttribute (compute capability major)",
+             impl_->cu_device_get_attribute(&capability.major,
+                                            kDeviceAttributeComputeCapabilityMajor, device));
+  check_cuda("cuDeviceGetAttribute (compute capability minor)",
+             impl_->cu_device_get_attribute(&capability.minor,
+                                            kDeviceAttributeComputeCapabilityMinor, device));
+  if (capability.major <= 0 || capability.minor < 0 || capability.minor > 9) {
+    throw std::runtime_error("CUDA driver returned an invalid compute capability");
+  }
+  return capability;
+}
+
 void CudaBackend::ensure_primary_context(int ordinal) const {
   impl_->ensure_primary_context(ordinal);
+}
+
+std::uintptr_t CudaBackend::primary_context_id(int ordinal) const {
+  impl_->ensure_primary_context(ordinal);
+  const auto context = impl_->current_context();
+  if (context == nullptr) {
+    throw std::runtime_error("CUDA primary context identity is null");
+  }
+  return reinterpret_cast<std::uintptr_t>(context);
 }
 
 CudaMemoryInfo CudaBackend::memory_info() const {
@@ -858,9 +912,9 @@ void CudaBackend::copy_device_to_host_2d(const CudaDeviceToHost2DCopy& copy) con
   }
 }
 
-CudaModule CudaBackend::load_module_from_ptx(std::string_view ptx) const {
+CudaModule CudaBackend::load_module_from_ptx(std::string_view ptx, int device_ordinal) const {
   validate_ptx(ptx);
-  impl_->ensure_current_context_for_copy();
+  impl_->ensure_primary_context(device_ordinal);
   const CUcontext context = impl_->current_context();
   if (context == nullptr) {
     throw std::runtime_error("CUDA kernel load did not establish a current context");
@@ -879,11 +933,11 @@ CudaModule CudaBackend::load_module_from_ptx(std::string_view ptx) const {
   }
 }
 
-CudaKernel CudaBackend::load_kernel_from_ptx(std::string_view ptx,
-                                             std::string_view function_name) const {
+CudaKernel CudaBackend::load_kernel_from_ptx(std::string_view ptx, std::string_view function_name,
+                                             int device_ordinal) const {
   validate_ptx(ptx);
   validate_no_nul(function_name, "kernel function name");
-  return load_module_from_ptx(ptx).load_kernel(function_name);
+  return load_module_from_ptx(ptx, device_ordinal).load_kernel(function_name);
 }
 
 void CudaBackend::synchronize() const {
