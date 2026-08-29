@@ -15,6 +15,7 @@
 #include <array>
 #include <cerrno>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -29,6 +30,7 @@
 #include <random>
 #include <sstream>
 #include <system_error>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -373,6 +375,27 @@ struct PinnedFileIdentity {
   return left.st_dev == right.st_dev && left.st_ino == right.st_ino;
 }
 
+[[nodiscard]] std::optional<std::string>
+pinned_identity_alias_error(const struct stat& identity, const PinnedFileIdentity& left_input,
+                            const PinnedFileIdentity& right_input,
+                            const std::vector<PinnedFileIdentity>& lens_profiles) {
+  const auto alias_error = [](std::string_view label) {
+    return "output calibration path identifies the " + std::string(label);
+  };
+  if (same_file_identity(identity, left_input.identity)) {
+    return alias_error(left_input.label);
+  }
+  if (same_file_identity(identity, right_input.identity)) {
+    return alias_error(right_input.label);
+  }
+  for (const auto& profile : lens_profiles) {
+    if (same_file_identity(identity, profile.identity)) {
+      return alias_error(profile.label);
+    }
+  }
+  return std::nullopt;
+}
+
 [[nodiscard]] bool temporary_name_identifies_descriptor(int directory_descriptor,
                                                         std::string_view name,
                                                         int temporary_descriptor) {
@@ -406,19 +429,10 @@ validate_pinned_output_identity(int directory_descriptor, std::string_view desti
                             "cannot inspect output calibration path identity");
   }
 
-  const auto alias_error = [](std::string_view label) {
-    return "output calibration path identifies the " + std::string(label);
-  };
-  if (same_file_identity(destination_identity, left_input.identity)) {
-    return alias_error(left_input.label);
-  }
-  if (same_file_identity(destination_identity, right_input.identity)) {
-    return alias_error(right_input.label);
-  }
-  for (const auto& profile : lens_profiles) {
-    if (same_file_identity(destination_identity, profile.identity)) {
-      return alias_error(profile.label);
-    }
+  if (const auto error =
+          pinned_identity_alias_error(destination_identity, left_input, right_input, lens_profiles);
+      error.has_value()) {
+    return error;
   }
 
   if (S_ISLNK(destination_identity.st_mode)) {
@@ -430,17 +444,27 @@ validate_pinned_output_identity(int directory_descriptor, std::string_view desti
       throw std::system_error(errno, std::system_category(),
                               "cannot inspect output calibration symlink target identity");
     }
-    if (same_file_identity(followed_identity, left_input.identity)) {
-      return alias_error(left_input.label);
-    }
-    if (same_file_identity(followed_identity, right_input.identity)) {
-      return alias_error(right_input.label);
-    }
-    for (const auto& profile : lens_profiles) {
-      if (same_file_identity(followed_identity, profile.identity)) {
-        return alias_error(profile.label);
-      }
-    }
+    return pinned_identity_alias_error(followed_identity, left_input, right_input, lens_profiles);
+  }
+  return std::nullopt;
+}
+
+[[nodiscard]] std::optional<std::string> displaced_output_removal_error(
+    int directory_descriptor, std::string_view name, const PinnedFileIdentity& left_input,
+    const PinnedFileIdentity& right_input, const std::vector<PinnedFileIdentity>& lens_profiles) {
+  struct stat identity{};
+  const std::string filename(name);
+  if (::fstatat(directory_descriptor, filename.c_str(), &identity, AT_SYMLINK_NOFOLLOW) != 0) {
+    throw std::system_error(errno, std::system_category(),
+                            "cannot inspect displaced calibration output");
+  }
+  if (const auto error =
+          pinned_identity_alias_error(identity, left_input, right_input, lens_profiles);
+      error.has_value()) {
+    return error;
+  }
+  if (S_ISDIR(identity.st_mode)) {
+    return "output calibration path identifies a directory";
   }
   return std::nullopt;
 }
@@ -543,13 +567,41 @@ create_descriptor_publication_link_at(int directory_descriptor,
   throw std::system_error(errno, std::system_category(), "cannot inspect calibration output entry");
 }
 
-void lock_output_directory(int directory_descriptor, const std::filesystem::path& directory) {
-  while (::flock(directory_descriptor, LOCK_EX) != 0) {
+[[nodiscard]] UniqueFileDescriptor lock_output_directory(int directory_descriptor,
+                                                         const std::filesystem::path& directory) {
+  constexpr std::string_view lock_name = ".reco-calibration-output.lock";
+  constexpr auto lock_timeout = std::chrono::seconds(2);
+  constexpr auto retry_delay = std::chrono::milliseconds(10);
+  const int raw_lock = ::openat(directory_descriptor, lock_name.data(),
+                                O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+  if (raw_lock < 0) {
+    throw_file_error("cannot open calibration output lock", directory / lock_name, errno);
+  }
+  UniqueFileDescriptor lock(raw_lock);
+  struct stat identity{};
+  if (::fstat(lock.get(), &identity) != 0) {
+    throw_file_error("cannot inspect calibration output lock", directory / lock_name, errno);
+  }
+  if (!S_ISREG(identity.st_mode)) {
+    throw std::runtime_error("calibration output lock is not a regular file: " +
+                             (directory / lock_name).string());
+  }
+  const auto deadline = std::chrono::steady_clock::now() + lock_timeout;
+  while (::flock(lock.get(), LOCK_EX | LOCK_NB) != 0) {
     if (errno == EINTR) {
       continue;
     }
-    throw_file_error("cannot lock calibration output directory", directory, errno);
+    if ((errno == EWOULDBLOCK || errno == EAGAIN) && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(retry_delay);
+      continue;
+    }
+    if (errno == EWOULDBLOCK || errno == EAGAIN) {
+      throw std::runtime_error("timed out locking calibration output directory: " +
+                               directory.string());
+    }
+    throw_file_error("cannot lock calibration output directory", directory / lock_name, errno);
   }
+  return lock;
 }
 
 void exchange_directory_entries_at(int directory_descriptor, std::string_view left,
@@ -730,7 +782,7 @@ void write_calibration_json_atomically_impl(std::string_view json,
   if (!S_ISDIR(directory_identity.st_mode)) {
     throw std::runtime_error("calibration output parent is not a directory: " + parent.string());
   }
-  lock_output_directory(directory_descriptor.get(), parent);
+  auto publication_lock = lock_output_directory(directory_descriptor.get(), parent);
 
   TemporaryOutput temporary;
   bool temporary_exists = false;
@@ -835,6 +887,20 @@ void write_calibration_json_atomically_impl(std::string_view json,
           throw std::runtime_error(
               "refusing to publish calibration output: descriptor-bound output identity changed");
         }
+        if (const auto error =
+                displaced_output_removal_error(directory_descriptor.get(), publication_name,
+                                               left_identity, right_identity, profile_identities);
+            error.has_value()) {
+          const bool rolled_back = exchange_directory_entries_noexcept(
+              directory_descriptor.get(), publication_name, destination_name);
+          publication_exists = temporary_name_identifies_descriptor(
+              directory_descriptor.get(), publication_name, temporary.descriptor.get());
+          if (!rolled_back) {
+            throw std::runtime_error("refusing to publish calibration output: " + *error +
+                                     " and rollback failed");
+          }
+          throw std::runtime_error("refusing to publish calibration output: " + *error);
+        }
         if (::unlinkat(directory_descriptor.get(), publication_name.c_str(), 0) != 0) {
           const int unlink_error = errno;
           (void)exchange_directory_entries_noexcept(directory_descriptor.get(), publication_name,
@@ -878,6 +944,22 @@ void write_calibration_json_atomically_impl(std::string_view json,
         }
         throw std::runtime_error(
             "refusing to publish calibration output: fallback output identity changed");
+      }
+      if (exchanged) {
+        if (const auto error =
+                displaced_output_removal_error(directory_descriptor.get(), temporary.name,
+                                               left_identity, right_identity, profile_identities);
+            error.has_value()) {
+          const bool rolled_back = exchange_directory_entries_noexcept(
+              directory_descriptor.get(), temporary.name, destination_name);
+          temporary_exists = temporary_name_identifies_descriptor(
+              directory_descriptor.get(), temporary.name, temporary.descriptor.get());
+          if (!rolled_back) {
+            throw std::runtime_error("refusing to publish calibration output: " + *error +
+                                     " and rollback failed");
+          }
+          throw std::runtime_error("refusing to publish calibration output: " + *error);
+        }
       }
       if (exchanged && ::unlinkat(directory_descriptor.get(), temporary.name.c_str(), 0) != 0) {
         const int unlink_error = errno;

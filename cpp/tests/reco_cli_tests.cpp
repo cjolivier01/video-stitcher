@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -628,6 +629,58 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
                           [&](const auto& payload) { return final_contents == payload + '\n'; }),
               "concurrent calibration output is one complete writer payload");
 
+#if defined(__linux__)
+  const auto serialized_destination = root.path() / "serialized.json";
+  write_text_file(serialized_destination, "serialized initial output\n");
+  std::atomic<bool> first_commit_entered{false};
+  std::atomic<bool> release_first_commit{false};
+  std::atomic<bool> second_writer_entered{false};
+  std::exception_ptr first_writer_error;
+  std::exception_ptr second_writer_error;
+  std::thread first_writer([&] {
+    try {
+      detail::write_calibration_json_atomically(
+          R"json({"writer":"serialized-first"})json", serialized_destination, left_input,
+          right_input, {}, {}, [&] {
+            first_commit_entered.store(true, std::memory_order_release);
+            while (!release_first_commit.load(std::memory_order_acquire)) {
+              std::this_thread::yield();
+            }
+          });
+    } catch (...) {
+      first_writer_error = std::current_exception();
+    }
+  });
+  for (int attempt = 0; attempt < 100 && !first_commit_entered.load(std::memory_order_acquire);
+       ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  expect_true(first_commit_entered.load(std::memory_order_acquire),
+              "first writer reaches the locked commit boundary");
+  std::thread second_writer([&] {
+    try {
+      detail::write_calibration_json_atomically(
+          R"json({"writer":"serialized-second"})json", serialized_destination, left_input,
+          right_input, [&] { second_writer_entered.store(true, std::memory_order_release); });
+    } catch (...) {
+      second_writer_error = std::current_exception();
+    }
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  expect_true(!second_writer_entered.load(std::memory_order_acquire),
+              "second writer blocks before publication while the lock is held");
+  release_first_commit.store(true, std::memory_order_release);
+  first_writer.join();
+  second_writer.join();
+  expect_true(first_writer_error == nullptr && second_writer_error == nullptr,
+              "serialized writers both complete successfully");
+  expect_true(second_writer_entered.load(std::memory_order_acquire),
+              "second writer proceeds after lock release");
+  expect_eq(read_text_file(serialized_destination),
+            std::string("{\"writer\":\"serialized-second\"}\n"),
+            "lock serialization preserves commit order");
+#endif
+
   const auto blocked_destination = root.path() / "blocked.json";
   std::filesystem::create_directory(blocked_destination);
   write_text_file(blocked_destination / "keep", "keep");
@@ -959,6 +1012,46 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
             std::string("fallback absent attacker replacement\n"),
             "failed new-output fallback restores the substituted temporary entry");
   std::filesystem::remove(fallback_absent_replacement);
+
+  const auto moved_input = root.path() / "commit-moved-left.mp4";
+  const auto moved_input_destination = root.path() / "commit-moved-input-output.json";
+  write_text_file(moved_input, "commit-bound media must survive\n");
+  bool moved_input_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"moved-input"})json", moved_input_destination, moved_input, right_input,
+        {}, {}, [&] { std::filesystem::rename(moved_input, moved_input_destination); });
+  } catch (const std::exception& error) {
+    moved_input_rejected =
+        std::string_view(error.what()).find("left video input") != std::string_view::npos;
+  }
+  expect_true(moved_input_rejected,
+              "commit-bound destination substitution with an input is rejected");
+  expect_eq(read_text_file(moved_input_destination),
+            std::string("commit-bound media must survive\n"),
+            "rollback preserves media moved onto the destination");
+  std::filesystem::rename(moved_input_destination, moved_input);
+
+  const auto moved_commit_profile = root.path() / "commit-moved-profile.json";
+  const auto moved_profile_destination = root.path() / "commit-moved-profile-output.json";
+  write_text_file(moved_commit_profile, "commit-bound profile must survive\n");
+  const std::array<std::filesystem::path, 1> moved_commit_profiles{moved_commit_profile};
+  bool moved_commit_profile_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"moved-profile"})json", moved_profile_destination, left_input, right_input,
+        {}, moved_commit_profiles,
+        [&] { std::filesystem::rename(moved_commit_profile, moved_profile_destination); });
+  } catch (const std::exception& error) {
+    moved_commit_profile_rejected =
+        std::string_view(error.what()).find("left lens profile") != std::string_view::npos;
+  }
+  expect_true(moved_commit_profile_rejected,
+              "commit-bound destination substitution with a lens profile is rejected");
+  expect_eq(read_text_file(moved_profile_destination),
+            std::string("commit-bound profile must survive\n"),
+            "rollback preserves a lens profile moved onto the destination");
+  std::filesystem::rename(moved_profile_destination, moved_commit_profile);
 
   const auto original_parent = root.path() / "original-parent";
   const auto redirected_parent = root.path() / "redirected-parent";

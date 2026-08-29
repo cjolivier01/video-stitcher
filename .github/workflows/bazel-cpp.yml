@@ -124,6 +124,7 @@ jobs:
       - name: Test process containment with TSan
         run: >-
           bazel test --config=tsan
+          //cpp/tests:reco_cli_tests
           //cpp/tests:reco_calibrate_supervisor_tests
           //cpp/tests:reco_io_gpu_video_probe_tests
           //cpp/tests:reco_io_gpu_video_probe_fallback_tests
