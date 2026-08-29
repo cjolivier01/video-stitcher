@@ -366,9 +366,20 @@ void result_envelope_covers_maximum_valid_gpu_output() {
             kCalibrationWorkerFrameHeaderBytes + kCalibrationWorkerResultMetadataBytes +
                 kMaximumCalibrationWorkerCorrespondences * kCalibrationWorkerMatchedPointBytes,
             "success frame ceiling includes metadata and every valid correspondence");
-  expect_eq(maximum_calibration_worker_success_frame_bytes(kMaximumCalibrationWorkerResultFrames),
+  expect_eq(maximum_calibration_worker_success_frame_bytes(kMaximumCalibrationWorkerResultFrames,
+                                                           kMaxGpuAkazeFeatures),
             kMaximumCalibrationWorkerSuccessFrameBytes,
             "request-specific frame ceiling reaches the global ceiling at 256 frames");
+  expect_eq(
+      maximum_calibration_worker_success_frame_bytes(2, 8),
+      kCalibrationWorkerFrameHeaderBytes + kCalibrationWorkerFixedResultMetadataBytes +
+          2U * (kCalibrationWorkerPerFrameMetadataBytes + 8U * kCalibrationWorkerMatchedPointBytes),
+      "request-specific frame ceiling binds frames and keypoints");
+  expect_error([] { (void)maximum_calibration_worker_success_frame_bytes(2, 0); }, "invalid",
+               "request-specific frame ceiling rejects zero keypoints");
+  expect_error(
+      [] { (void)maximum_calibration_worker_success_frame_bytes(2, kMaxGpuAkazeFeatures + 1U); },
+      "invalid", "request-specific frame ceiling rejects excess keypoints");
 
   auto maximum_counts = compact_result_fixture();
   const auto summary_fixture = maximum_counts.per_frame.front();

@@ -508,9 +508,19 @@ void worker_failures_crashes_and_bad_frames_are_contained() {
   }
   {
     Scenario scenario("request-oversized");
-    expect_execution_error([&] { (void)run_gpu_calibration(request_fixture(), ready_backends()); },
+    auto request = request_fixture();
+    request.config.akaze.max_keypoints = 8;
+    expect_execution_error([&] { (void)run_gpu_calibration(request, ready_backends()); },
                            "requested frame limit",
-                           "request-specific oversized response rejected before allocation");
+                           "low-keypoint oversized response rejected before allocation");
+  }
+  {
+    Scenario scenario("success");
+    auto request = request_fixture();
+    request.config.akaze.max_keypoints = 8;
+    expect_execution_error([&] { (void)run_gpu_calibration(request, ready_backends()); },
+                           "requested keypoint limit",
+                           "compact forged response cannot exceed the requested keypoint cap");
   }
 }
 

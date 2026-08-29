@@ -40,7 +40,9 @@
 #include <windows.h>
 #elif defined(__linux__)
 #include <fcntl.h>
+#include <linux/fs.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #else
 #include <sys/stat.h>
@@ -471,10 +473,41 @@ create_exclusive_temporary_at(int directory_descriptor, const std::filesystem::p
                            destination.string());
 }
 
-[[nodiscard]] std::string create_descriptor_publication_link_at(
-    int directory_descriptor, const std::filesystem::path& destination, int temporary_descriptor) {
+enum class DescriptorLinkStatus { Linked, AlreadyExists, Unsupported };
+
+[[nodiscard]] bool descriptor_link_is_unsupported(int error) {
+  return error == EPERM || error == EACCES || error == EOPNOTSUPP || error == ENOSYS ||
+         error == EXDEV || error == EMLINK || error == EINVAL || error == ENOENT;
+}
+
+[[nodiscard]] DescriptorLinkStatus link_descriptor_at(int directory_descriptor,
+                                                      std::string_view name,
+                                                      int temporary_descriptor,
+                                                      bool force_rename_fallback) {
+  if (force_rename_fallback) {
+    return DescriptorLinkStatus::Unsupported;
+  }
   const auto descriptor_path = std::filesystem::path("/proc") / std::to_string(::getpid()) / "fd" /
                                std::to_string(temporary_descriptor);
+  const std::string filename(name);
+  if (::linkat(AT_FDCWD, descriptor_path.c_str(), directory_descriptor, filename.c_str(),
+               AT_SYMLINK_FOLLOW) == 0) {
+    return DescriptorLinkStatus::Linked;
+  }
+  if (errno == EEXIST) {
+    return DescriptorLinkStatus::AlreadyExists;
+  }
+  if (descriptor_link_is_unsupported(errno)) {
+    return DescriptorLinkStatus::Unsupported;
+  }
+  throw std::system_error(errno, std::system_category(),
+                          "cannot bind temporary calibration output");
+}
+
+[[nodiscard]] std::optional<std::string>
+create_descriptor_publication_link_at(int directory_descriptor,
+                                      const std::filesystem::path& destination,
+                                      int temporary_descriptor, bool force_rename_fallback) {
   std::random_device random;
   constexpr char hex[] = "0123456789abcdef";
   for (int attempt = 0; attempt < 128; ++attempt) {
@@ -484,16 +517,63 @@ create_exclusive_temporary_at(int directory_descriptor, const std::filesystem::p
     }
     const auto name =
         destination.filename().string() + ".publish." + std::string(token.begin(), token.end());
-    if (::linkat(AT_FDCWD, descriptor_path.c_str(), directory_descriptor, name.c_str(),
-                 AT_SYMLINK_FOLLOW) == 0) {
-      return name;
+    const auto status =
+        link_descriptor_at(directory_descriptor, name, temporary_descriptor, force_rename_fallback);
+    if (status == DescriptorLinkStatus::Linked) {
+      return std::optional<std::string>(name);
     }
-    if (errno != EEXIST) {
-      throw_file_error("cannot bind temporary calibration output", destination, errno);
+    if (status == DescriptorLinkStatus::Unsupported) {
+      return std::nullopt;
     }
   }
   throw std::runtime_error("cannot bind unique temporary calibration output for " +
                            destination.string());
+}
+
+[[nodiscard]] bool directory_entry_exists_at(int directory_descriptor, std::string_view name) {
+  struct stat identity{};
+  const std::string filename(name);
+  if (::fstatat(directory_descriptor, filename.c_str(), &identity, AT_SYMLINK_NOFOLLOW) == 0) {
+    return true;
+  }
+  if (errno == ENOENT) {
+    return false;
+  }
+  throw std::system_error(errno, std::system_category(), "cannot inspect calibration output entry");
+}
+
+void exchange_directory_entries_at(int directory_descriptor, std::string_view left,
+                                   std::string_view right,
+                                   const std::filesystem::path& destination) {
+  const std::string left_name(left);
+  const std::string right_name(right);
+  if (::syscall(SYS_renameat2, directory_descriptor, left_name.c_str(), directory_descriptor,
+                right_name.c_str(), RENAME_EXCHANGE) != 0) {
+    throw_file_error("failed to exchange calibration output", destination, errno);
+  }
+}
+
+[[nodiscard]] bool exchange_directory_entries_noexcept(int directory_descriptor,
+                                                       const std::string& left,
+                                                       const std::string& right) noexcept {
+  return ::syscall(SYS_renameat2, directory_descriptor, left.c_str(), directory_descriptor,
+                   right.c_str(), RENAME_EXCHANGE) == 0;
+}
+
+[[nodiscard]] bool rename_directory_entry_noreplace_at(int directory_descriptor,
+                                                       std::string_view source,
+                                                       std::string_view destination_name,
+                                                       const std::filesystem::path& destination) {
+  const std::string source_name(source);
+  const std::string target_name(destination_name);
+  if (::syscall(SYS_renameat2, directory_descriptor, source_name.c_str(), directory_descriptor,
+                target_name.c_str(), RENAME_NOREPLACE) == 0) {
+    return true;
+  }
+  if (errno == EEXIST) {
+    return false;
+  }
+  throw_file_error("failed to publish calibration output", destination, errno);
 }
 
 void write_all(int descriptor, std::string_view contents, const std::filesystem::path& temporary) {
@@ -559,10 +639,12 @@ void write_calibration_json_atomically_impl(std::string_view json,
                                             const std::filesystem::path& right_input,
                                             const std::function<void()>& before_publish,
                                             std::span<const std::filesystem::path> lens_profiles,
-                                            const std::function<void()>& before_commit) {
+                                            const std::function<void()>& before_commit,
+                                            bool force_rename_fallback) {
   std::string contents(json);
   contents.push_back('\n');
 #if defined(_WIN32)
+  (void)force_rename_fallback;
   HANDLE handle = INVALID_HANDLE_VALUE;
   std::filesystem::path temporary;
   bool temporary_exists = false;
@@ -636,6 +718,7 @@ void write_calibration_json_atomically_impl(std::string_view json,
   bool temporary_exists = false;
   std::string publication_name;
   bool publication_exists = false;
+  bool commit_hook_ran = false;
   try {
     temporary = create_exclusive_temporary_at(directory_descriptor.get(), destination);
     temporary_exists = true;
@@ -659,24 +742,128 @@ void write_calibration_json_atomically_impl(std::string_view json,
         error.has_value()) {
       throw std::runtime_error("refusing to publish calibration output: " + *error);
     }
-    publication_name = create_descriptor_publication_link_at(
-        directory_descriptor.get(), destination, temporary.descriptor.get());
-    publication_exists = true;
-    if (before_commit) {
-      before_commit();
+
+    const auto run_commit_hook = [&] {
+      if (!commit_hook_ran && before_commit) {
+        before_commit();
+      }
+      commit_hook_ran = true;
+    };
+    bool published = false;
+    bool use_rename_fallback = force_rename_fallback;
+    bool destination_exists =
+        directory_entry_exists_at(directory_descriptor.get(), destination_name);
+
+    if (!destination_exists && !use_rename_fallback) {
+      const auto retention = create_descriptor_publication_link_at(
+          directory_descriptor.get(), destination, temporary.descriptor.get(), false);
+      if (!retention.has_value()) {
+        use_rename_fallback = true;
+      } else {
+        publication_name = *retention;
+        publication_exists = true;
+        run_commit_hook();
+        const auto status = link_descriptor_at(directory_descriptor.get(), destination_name,
+                                               temporary.descriptor.get(), false);
+        if (status == DescriptorLinkStatus::Linked) {
+          published = temporary_name_identifies_descriptor(
+              directory_descriptor.get(), destination_name, temporary.descriptor.get());
+          if (!published) {
+            throw std::runtime_error(
+                "refusing to publish calibration output: published output identity changed");
+          }
+          if (temporary_name_identifies_descriptor(directory_descriptor.get(), publication_name,
+                                                   temporary.descriptor.get())) {
+            if (::unlinkat(directory_descriptor.get(), publication_name.c_str(), 0) != 0) {
+              throw_file_error("failed to remove calibration output retention link", destination,
+                               errno);
+            }
+          }
+          publication_exists = false;
+        } else if (status == DescriptorLinkStatus::AlreadyExists) {
+          destination_exists = true;
+        } else {
+          use_rename_fallback = true;
+        }
+      }
     }
-    if (!temporary_name_identifies_descriptor(directory_descriptor.get(), publication_name,
-                                              temporary.descriptor.get())) {
-      publication_exists = false;
-      throw std::runtime_error(
-          "refusing to publish calibration output: descriptor-bound output identity changed");
+
+    if (!published && !use_rename_fallback) {
+      if (publication_name.empty()) {
+        const auto publication = create_descriptor_publication_link_at(
+            directory_descriptor.get(), destination, temporary.descriptor.get(), false);
+        if (!publication.has_value()) {
+          use_rename_fallback = true;
+        } else {
+          publication_name = *publication;
+          publication_exists = true;
+        }
+      }
+      if (!use_rename_fallback) {
+        run_commit_hook();
+        exchange_directory_entries_at(directory_descriptor.get(), publication_name,
+                                      destination_name, destination);
+        if (!temporary_name_identifies_descriptor(directory_descriptor.get(), destination_name,
+                                                  temporary.descriptor.get())) {
+          const bool rolled_back = exchange_directory_entries_noexcept(
+              directory_descriptor.get(), publication_name, destination_name);
+          publication_exists = temporary_name_identifies_descriptor(
+              directory_descriptor.get(), publication_name, temporary.descriptor.get());
+          if (!rolled_back) {
+            throw std::runtime_error(
+                "refusing to publish calibration output: output identity changed and rollback "
+                "failed");
+          }
+          throw std::runtime_error(
+              "refusing to publish calibration output: descriptor-bound output identity changed");
+        }
+        if (::unlinkat(directory_descriptor.get(), publication_name.c_str(), 0) != 0) {
+          const int unlink_error = errno;
+          (void)exchange_directory_entries_noexcept(directory_descriptor.get(), publication_name,
+                                                    destination_name);
+          throw_file_error("failed to remove replaced calibration output", destination,
+                           unlink_error);
+        }
+        publication_exists = false;
+        published = true;
+      }
     }
-    if (::renameat(directory_descriptor.get(), publication_name.c_str(), directory_descriptor.get(),
-                   destination_name.c_str()) != 0) {
-      throw_file_error("failed to replace calibration output", destination, errno);
+
+    if (!published && use_rename_fallback) {
+      run_commit_hook();
+      bool exchanged = destination_exists;
+      if (exchanged) {
+        exchange_directory_entries_at(directory_descriptor.get(), temporary.name, destination_name,
+                                      destination);
+      } else if (!rename_directory_entry_noreplace_at(directory_descriptor.get(), temporary.name,
+                                                      destination_name, destination)) {
+        exchanged = true;
+        exchange_directory_entries_at(directory_descriptor.get(), temporary.name, destination_name,
+                                      destination);
+      }
+      if (!temporary_name_identifies_descriptor(directory_descriptor.get(), destination_name,
+                                                temporary.descriptor.get())) {
+        if (exchanged) {
+          (void)exchange_directory_entries_noexcept(directory_descriptor.get(), temporary.name,
+                                                    destination_name);
+        }
+        temporary_exists = temporary_name_identifies_descriptor(
+            directory_descriptor.get(), temporary.name, temporary.descriptor.get());
+        throw std::runtime_error(
+            "refusing to publish calibration output: fallback output identity changed");
+      }
+      if (exchanged && ::unlinkat(directory_descriptor.get(), temporary.name.c_str(), 0) != 0) {
+        const int unlink_error = errno;
+        (void)exchange_directory_entries_noexcept(directory_descriptor.get(), temporary.name,
+                                                  destination_name);
+        throw_file_error("failed to remove replaced calibration output", destination, unlink_error);
+      }
+      temporary_exists = false;
+      published = true;
     }
-    publication_exists = false;
-    if (temporary_name_identifies_descriptor(directory_descriptor.get(), temporary.name,
+
+    if (temporary_exists &&
+        temporary_name_identifies_descriptor(directory_descriptor.get(), temporary.name,
                                              temporary.descriptor.get())) {
       if (::unlinkat(directory_descriptor.get(), temporary.name.c_str(), 0) != 0) {
         throw_file_error("failed to remove temporary calibration output", temporary_path, errno);
@@ -699,6 +886,7 @@ void write_calibration_json_atomically_impl(std::string_view json,
     throw;
   }
 #else
+  (void)force_rename_fallback;
   int descriptor = -1;
   std::filesystem::path temporary;
   bool temporary_exists = false;
@@ -1768,9 +1956,10 @@ void write_calibration_json_atomically(std::string_view json,
                                        const std::filesystem::path& right_input,
                                        const std::function<void()>& before_publish,
                                        std::span<const std::filesystem::path> lens_profiles,
-                                       const std::function<void()>& before_commit) {
+                                       const std::function<void()>& before_commit,
+                                       bool force_rename_fallback) {
   write_calibration_json_atomically_impl(json, destination, left_input, right_input, before_publish,
-                                         lens_profiles, before_commit);
+                                         lens_profiles, before_commit, force_rename_fallback);
 }
 
 } // namespace detail

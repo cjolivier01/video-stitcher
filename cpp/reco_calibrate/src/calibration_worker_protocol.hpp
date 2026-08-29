@@ -69,7 +69,8 @@ struct DecodedCalibrationWorkerHeader {
 [[nodiscard]] DecodedCalibrationWorkerHeader
 decode_calibration_worker_header(const CalibrationWorkerFrameHeader& header);
 [[nodiscard]] std::size_t
-maximum_calibration_worker_success_frame_bytes(std::size_t maximum_frames);
+maximum_calibration_worker_success_frame_bytes(std::size_t maximum_frames,
+                                               std::size_t maximum_keypoints);
 [[nodiscard]] std::string encode_calibration_worker_request(const GpuCalibrationRequest& request);
 [[nodiscard]] GpuCalibrationRequest decode_calibration_worker_request(std::string_view frame);
 [[nodiscard]] std::string encode_calibration_worker_success(const CalibrationResult& result);

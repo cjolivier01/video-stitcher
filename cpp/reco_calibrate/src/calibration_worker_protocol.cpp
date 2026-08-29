@@ -449,12 +449,14 @@ decode_calibration_worker_header(const CalibrationWorkerFrameHeader& header) {
   return {.message = message, .payload_size = payload_size};
 }
 
-std::size_t maximum_calibration_worker_success_frame_bytes(std::size_t maximum_frames) {
-  if (maximum_frames == 0 || maximum_frames > kMaximumCalibrationWorkerResultFrames) {
+std::size_t maximum_calibration_worker_success_frame_bytes(std::size_t maximum_frames,
+                                                           std::size_t maximum_keypoints) {
+  if (maximum_frames == 0 || maximum_frames > kMaximumCalibrationWorkerResultFrames ||
+      maximum_keypoints == 0 || maximum_keypoints > kMaxGpuAkazeFeatures) {
     throw CalibrationExecutionError("calibration worker success frame limit is invalid");
   }
-  constexpr auto per_frame_bytes = kCalibrationWorkerPerFrameMetadataBytes +
-                                   kMaxGpuAkazeFeatures * kCalibrationWorkerMatchedPointBytes;
+  const auto per_frame_bytes = kCalibrationWorkerPerFrameMetadataBytes +
+                               maximum_keypoints * kCalibrationWorkerMatchedPointBytes;
   return kCalibrationWorkerFrameHeaderBytes + kCalibrationWorkerFixedResultMetadataBytes +
          maximum_frames * per_frame_bytes;
 }

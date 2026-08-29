@@ -410,7 +410,8 @@ int main(int argc, char** argv) {
         0,
         0};
     const auto oversized_payload = static_cast<std::uint32_t>(
-        maximum_calibration_worker_success_frame_bytes(request.config.num_frames) -
+        maximum_calibration_worker_success_frame_bytes(request.config.num_frames,
+                                                       request.config.akaze.max_keypoints) -
         kCalibrationWorkerFrameHeaderBytes + 1U);
     header[8] = static_cast<char>(oversized_payload >> 24U);
     header[9] = static_cast<char>(oversized_payload >> 16U);

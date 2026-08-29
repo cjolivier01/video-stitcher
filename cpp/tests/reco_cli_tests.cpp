@@ -848,6 +848,84 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
             "descriptor-bound publication does not rename or unlink the replacement path");
   std::filesystem::remove(postcheck_replacement);
 
+  const auto publication_race_destination = root.path() / "publication-race.json";
+  write_text_file(publication_race_destination, "original publication target\n");
+  std::filesystem::path publication_replacement;
+  bool publication_identity_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"publication-race"})json", publication_race_destination, left_input,
+        right_input, {}, {}, [&] {
+          for (const auto& entry : std::filesystem::directory_iterator(root.path())) {
+            if (entry.path().filename().string().starts_with("publication-race.json.publish.")) {
+              publication_replacement = entry.path();
+              std::filesystem::remove(publication_replacement);
+              write_text_file(publication_replacement, "publication attacker replacement\n");
+              return;
+            }
+          }
+          throw std::runtime_error("descriptor publication fixture was not found");
+        });
+  } catch (const std::exception& error) {
+    publication_identity_rejected =
+        std::string_view(error.what()).find("descriptor-bound output identity changed") !=
+        std::string_view::npos;
+  }
+  expect_true(publication_identity_rejected,
+              "atomic exchange rejects a replaced descriptor publication entry");
+  expect_eq(read_text_file(publication_race_destination),
+            std::string("original publication target\n"),
+            "failed descriptor publication exchange restores the original output");
+  expect_eq(read_text_file(publication_replacement),
+            std::string("publication attacker replacement\n"),
+            "failed descriptor publication does not unlink the replacement entry");
+  std::filesystem::remove(publication_replacement);
+
+  const auto fallback_destination = root.path() / "fallback.json";
+  detail::write_calibration_json_atomically(R"json({"writer":"fallback-new"})json",
+                                            fallback_destination, left_input, right_input, {}, {},
+                                            {}, true);
+  expect_eq(read_text_file(fallback_destination), std::string("{\"writer\":\"fallback-new\"}\n"),
+            "hard-link-disabled fallback publishes a new output");
+  detail::write_calibration_json_atomically(R"json({"writer":"fallback-replace"})json",
+                                            fallback_destination, left_input, right_input, {}, {},
+                                            {}, true);
+  expect_eq(read_text_file(fallback_destination),
+            std::string("{\"writer\":\"fallback-replace\"}\n"),
+            "hard-link-disabled fallback atomically replaces an output");
+
+  std::filesystem::path fallback_replacement;
+  bool fallback_identity_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"fallback-race"})json", fallback_destination, left_input, right_input, {},
+        {},
+        [&] {
+          for (const auto& entry : std::filesystem::directory_iterator(root.path())) {
+            if (entry.path().filename().string().starts_with("fallback.json.tmp.")) {
+              fallback_replacement = entry.path();
+              std::filesystem::remove(fallback_replacement);
+              write_text_file(fallback_replacement, "fallback attacker replacement\n");
+              return;
+            }
+          }
+          throw std::runtime_error("fallback publication fixture was not found");
+        },
+        true);
+  } catch (const std::exception& error) {
+    fallback_identity_rejected =
+        std::string_view(error.what()).find("fallback output identity changed") !=
+        std::string_view::npos;
+  }
+  expect_true(fallback_identity_rejected,
+              "hard-link-disabled fallback reports substituted content as failure");
+  expect_eq(read_text_file(fallback_destination),
+            std::string("{\"writer\":\"fallback-replace\"}\n"),
+            "failed hard-link-disabled exchange restores the original output");
+  expect_eq(read_text_file(fallback_replacement), std::string("fallback attacker replacement\n"),
+            "failed fallback exchange does not unlink the replacement entry");
+  std::filesystem::remove(fallback_replacement);
+
   const auto original_parent = root.path() / "original-parent";
   const auto redirected_parent = root.path() / "redirected-parent";
   const auto parent_symlink = root.path() / "output-parent";

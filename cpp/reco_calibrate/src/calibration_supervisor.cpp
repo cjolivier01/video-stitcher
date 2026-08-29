@@ -3554,7 +3554,8 @@ supervise_worker(int caller_socket, const std::string& executable, int executabl
     }
     auto response =
         read_frame(channel.get(), worker.process(), worker_deadline,
-                   maximum_calibration_worker_success_frame_bytes(request.config.num_frames),
+                   maximum_calibration_worker_success_frame_bytes(
+                       request.config.num_frames, request.config.akaze.max_keypoints),
                    caller_socket, request.calibration_host_memory_limit_bytes, &scratch_monitor);
     wait_for_process_monitored(worker.process(), worker_deadline,
                                request.calibration_host_memory_limit_bytes, &scratch_monitor);
@@ -3753,9 +3754,9 @@ CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest& re
     }
     auto worker_authority = receive_worker_authority(channel.get(), guardian, deadline);
     (void)worker_authority;
-    auto response =
-        read_frame(channel.get(), guardian, deadline,
-                   maximum_calibration_worker_success_frame_bytes(request.config.num_frames));
+    auto response = read_frame(channel.get(), guardian, deadline,
+                               maximum_calibration_worker_success_frame_bytes(
+                                   request.config.num_frames, request.config.akaze.max_keypoints));
     guardian.wait_until(deadline);
     (void)guardian.reap();
     certify_channel_eof(channel.get());
@@ -3767,6 +3768,21 @@ CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest& re
         result.per_frame.size() > request.config.num_frames) {
       throw CalibrationExecutionError(
           "calibration worker returned more frame summaries than requested");
+    }
+    const auto requested_keypoints = static_cast<std::size_t>(request.config.akaze.max_keypoints);
+    if (result.total_matches > request.config.num_frames * requested_keypoints) {
+      throw CalibrationExecutionError("calibration worker exceeded the requested keypoint limit");
+    }
+    for (const auto& summary : result.per_frame) {
+      if (summary.keypoints_left > requested_keypoints ||
+          summary.keypoints_right > requested_keypoints ||
+          summary.min_descriptors > requested_keypoints ||
+          summary.post_ratio_test > requested_keypoints ||
+          summary.post_spatial_filter > requested_keypoints ||
+          summary.post_ransac > requested_keypoints ||
+          summary.points.size() > requested_keypoints) {
+        throw CalibrationExecutionError("calibration worker exceeded the requested keypoint limit");
+      }
     }
     if (result.left_lens_profile.has_value()) {
       result.left_lens_profile->path = request.left.lens_profile;
