@@ -183,6 +183,45 @@ void production_source_retains_mapped_sample() {
             "idempotent EOS does not perform a third pull on either source");
 }
 
+void persistent_stereo_session_pairs_gstreamer_sources() {
+  set_scenario("frame-eos");
+  const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
+  std::filesystem::remove(event_path);
+
+  auto left_config = valid_config();
+  auto right_config = valid_config();
+  right_config.path = "/data/right.mp4";
+  GpuStereoDecodeSession session(
+      open_gstreamer_gpu_file_decode_source(std::move(left_config), NvbufSurfaceAbi::DeepStream9_1),
+      open_gstreamer_gpu_file_decode_source(std::move(right_config),
+                                            NvbufSurfaceAbi::DeepStream9_1),
+      {.queue_capacity = 1});
+
+  auto paired = session.read();
+  expect_true(paired.status == GpuStereoDecodeStatus::FramePair,
+              "persistent GStreamer stereo decode returns a frame pair");
+  expect_true(paired.frames.has_value(), "persistent GStreamer pair contains both frames");
+  if (paired.frames.has_value()) {
+    expect_eq(paired.frames->left.frame_index, 0U, "persistent left frame index");
+    expect_eq(paired.frames->right.frame_index, 0U, "persistent right frame index");
+    expect_true(paired.frames->left.owner != paired.frames->right.owner,
+                "persistent pair retains each decoder owner independently");
+  }
+  auto events = read_events(event_path);
+  expect_eq(count_event(events, "map"), 2U, "persistent stereo sources each map one NVMM frame");
+  expect_eq(count_event(events, "unmap"), 0U,
+            "persistent paired frames retain both mappings while owned");
+
+  paired.frames.reset();
+  expect_true(session.read().status == GpuStereoDecodeStatus::EndOfStream,
+              "persistent GStreamer stereo decode reports EOS after its pair");
+  events = read_events(event_path);
+  expect_eq(count_event(events, "unmap"), 2U,
+            "persistent pair release unmaps both decoder buffers");
+  expect_eq(count_event(events, "state-null"), 2U,
+            "persistent stereo EOS stops both GStreamer pipelines");
+}
+
 void orientation_tags_are_preserved() {
   set_scenario("orientation-180");
   auto source =
@@ -735,6 +774,7 @@ int main() {
   set_environment("RECO_FAKE_GST_EVENT_PATH", event_path.string());
 
   production_source_retains_mapped_sample();
+  persistent_stereo_session_pairs_gstreamer_sources();
   orientation_tags_are_preserved();
   indexed_cadence_drives_frame_indices();
   indexed_decode_seeks_to_absolute_start_frame();
