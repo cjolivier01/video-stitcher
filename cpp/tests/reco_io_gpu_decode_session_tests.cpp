@@ -1,5 +1,6 @@
 #include "reco/io/gpu_decode.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -117,6 +118,11 @@ struct FakeSourceState {
     return stop_calls;
   }
 
+  [[nodiscard]] std::size_t owners_at_first_stop() const {
+    std::lock_guard lock(mutex);
+    return live_owners_at_first_stop;
+  }
+
   [[nodiscard]] std::shared_ptr<void> owner_for(std::uint64_t frame_index) const {
     std::lock_guard lock(mutex);
     for (const auto& [index, owner] : owners) {
@@ -131,6 +137,7 @@ struct FakeSourceState {
   std::condition_variable condition;
   std::size_t read_calls = 0;
   std::size_t stop_calls = 0;
+  std::size_t live_owners_at_first_stop = 0;
   bool stopped = false;
   std::vector<std::pair<std::uint64_t, std::weak_ptr<void>>> owners;
 };
@@ -205,6 +212,11 @@ public:
 
   void request_stop() noexcept override {
     std::lock_guard lock(state_->mutex);
+    if (state_->stop_calls == 0) {
+      state_->live_owners_at_first_stop = static_cast<std::size_t>(
+          std::count_if(state_->owners.begin(), state_->owners.end(),
+                        [](const auto& entry) { return !entry.second.expired(); }));
+    }
     ++state_->stop_calls;
     state_->stopped = true;
     state_->condition.notify_all();
@@ -309,6 +321,10 @@ void retained_owner_queues_are_bounded() {
             "right queue never retains beyond capacity");
 
   session.request_stop();
+  expect_eq(left_state->owners_at_first_stop(), 0U,
+            "left queued owners are released before source interruption");
+  expect_eq(right_state->owners_at_first_stop(), 0U,
+            "right queued owners are released before source interruption");
   expect_true(wait_until([&] {
                 return left_tracker->alive.load(std::memory_order_acquire) == 0 &&
                        right_tracker->alive.load(std::memory_order_acquire) == 0;
