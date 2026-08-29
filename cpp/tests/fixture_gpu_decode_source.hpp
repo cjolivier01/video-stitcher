@@ -28,6 +28,7 @@ public:
   [[nodiscard]] const reco::io::GpuFileDecodeConfig& config() const override { return config_; }
   [[nodiscard]] std::string_view pipeline() const override { return pipeline_; }
   [[nodiscard]] bool gpu_resident() const override { return true; }
+  void request_stop() noexcept override {}
 
   [[nodiscard]] reco::io::GpuDecodeReadResult read() override {
     if (next_ >= frames_.size()) {

@@ -103,6 +103,7 @@ public:
   [[nodiscard]] const GpuFileDecodeConfig& config() const override { return config_; }
   [[nodiscard]] std::string_view pipeline() const override { return pipeline_; }
   [[nodiscard]] bool gpu_resident() const override { return gpu_resident_; }
+  void request_stop() noexcept override {}
   [[nodiscard]] GpuDecodeReadResult read() override {
     ++read_count_;
     if (next_ == frames_.size()) {
@@ -140,6 +141,7 @@ public:
   [[nodiscard]] const GpuFileDecodeConfig& config() const override { return config_; }
   [[nodiscard]] std::string_view pipeline() const override { return "fixture"; }
   [[nodiscard]] bool gpu_resident() const override { return true; }
+  void request_stop() noexcept override {}
   [[nodiscard]] GpuDecodeReadResult read() override {
     return {.status = GpuDecodeFrameStatus::Frame, .frame = std::nullopt};
   }
