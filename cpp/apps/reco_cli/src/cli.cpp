@@ -41,6 +41,7 @@
 #elif defined(__linux__)
 #include <fcntl.h>
 #include <linux/fs.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -542,6 +543,15 @@ create_descriptor_publication_link_at(int directory_descriptor,
   throw std::system_error(errno, std::system_category(), "cannot inspect calibration output entry");
 }
 
+void lock_output_directory(int directory_descriptor, const std::filesystem::path& directory) {
+  while (::flock(directory_descriptor, LOCK_EX) != 0) {
+    if (errno == EINTR) {
+      continue;
+    }
+    throw_file_error("cannot lock calibration output directory", directory, errno);
+  }
+}
+
 void exchange_directory_entries_at(int directory_descriptor, std::string_view left,
                                    std::string_view right,
                                    const std::filesystem::path& destination) {
@@ -720,6 +730,7 @@ void write_calibration_json_atomically_impl(std::string_view json,
   if (!S_ISDIR(directory_identity.st_mode)) {
     throw std::runtime_error("calibration output parent is not a directory: " + parent.string());
   }
+  lock_output_directory(directory_descriptor.get(), parent);
 
   TemporaryOutput temporary;
   bool temporary_exists = false;
