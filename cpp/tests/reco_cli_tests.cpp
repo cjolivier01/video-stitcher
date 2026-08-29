@@ -926,6 +926,40 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
             "failed fallback exchange does not unlink the replacement entry");
   std::filesystem::remove(fallback_replacement);
 
+  const auto fallback_absent_destination = root.path() / "fallback-absent.json";
+  std::filesystem::path fallback_absent_replacement;
+  bool fallback_absent_identity_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"fallback-absent-race"})json", fallback_absent_destination, left_input,
+        right_input, {}, {},
+        [&] {
+          for (const auto& entry : std::filesystem::directory_iterator(root.path())) {
+            if (entry.path().filename().string().starts_with("fallback-absent.json.tmp.")) {
+              fallback_absent_replacement = entry.path();
+              std::filesystem::remove(fallback_absent_replacement);
+              write_text_file(fallback_absent_replacement,
+                              "fallback absent attacker replacement\n");
+              return;
+            }
+          }
+          throw std::runtime_error("absent fallback publication fixture was not found");
+        },
+        true);
+  } catch (const std::exception& error) {
+    fallback_absent_identity_rejected =
+        std::string_view(error.what()).find("fallback output identity changed") !=
+        std::string_view::npos;
+  }
+  expect_true(fallback_absent_identity_rejected,
+              "hard-link-disabled fallback rejects a substituted new output");
+  expect_true(!std::filesystem::exists(fallback_absent_destination),
+              "failed hard-link-disabled new-output publication restores absence");
+  expect_eq(read_text_file(fallback_absent_replacement),
+            std::string("fallback absent attacker replacement\n"),
+            "failed new-output fallback restores the substituted temporary entry");
+  std::filesystem::remove(fallback_absent_replacement);
+
   const auto original_parent = root.path() / "original-parent";
   const auto redirected_parent = root.path() / "redirected-parent";
   const auto parent_symlink = root.path() / "output-parent";

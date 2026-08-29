@@ -576,6 +576,13 @@ void exchange_directory_entries_at(int directory_descriptor, std::string_view le
   throw_file_error("failed to publish calibration output", destination, errno);
 }
 
+[[nodiscard]] bool
+rename_directory_entry_noreplace_noexcept(int directory_descriptor, const std::string& source,
+                                          const std::string& destination_name) noexcept {
+  return ::syscall(SYS_renameat2, directory_descriptor, source.c_str(), directory_descriptor,
+                   destination_name.c_str(), RENAME_NOREPLACE) == 0;
+}
+
 void write_all(int descriptor, std::string_view contents, const std::filesystem::path& temporary) {
   std::size_t offset = 0;
   while (offset < contents.size()) {
@@ -843,12 +850,21 @@ void write_calibration_json_atomically_impl(std::string_view json,
       }
       if (!temporary_name_identifies_descriptor(directory_descriptor.get(), destination_name,
                                                 temporary.descriptor.get())) {
+        bool rolled_back = false;
         if (exchanged) {
-          (void)exchange_directory_entries_noexcept(directory_descriptor.get(), temporary.name,
-                                                    destination_name);
+          rolled_back = exchange_directory_entries_noexcept(directory_descriptor.get(),
+                                                            temporary.name, destination_name);
+        } else {
+          rolled_back = rename_directory_entry_noreplace_noexcept(directory_descriptor.get(),
+                                                                  destination_name, temporary.name);
         }
         temporary_exists = temporary_name_identifies_descriptor(
             directory_descriptor.get(), temporary.name, temporary.descriptor.get());
+        if (!rolled_back) {
+          throw std::runtime_error(
+              "refusing to publish calibration output: fallback output identity changed and "
+              "rollback failed");
+        }
         throw std::runtime_error(
             "refusing to publish calibration output: fallback output identity changed");
       }
