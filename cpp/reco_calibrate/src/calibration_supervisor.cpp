@@ -1837,13 +1837,20 @@ void read_exact(int socket, const OwnedProcess& process, char* destination, std:
 }
 
 [[nodiscard]] std::string read_frame(int socket, const OwnedProcess& process,
-                                     Clock::time_point deadline, int abort_socket = -1,
+                                     Clock::time_point deadline,
+                                     std::size_t maximum_success_frame_bytes, int abort_socket = -1,
                                      std::uint64_t resident_limit = 0,
                                      ScratchQuotaMonitor* scratch_monitor = nullptr) {
   CalibrationWorkerFrameHeader header{};
   read_exact(socket, process, header.data(), header.size(), deadline, abort_socket, resident_limit,
              scratch_monitor);
   const auto decoded = decode_calibration_worker_header(header);
+  if (decoded.message == CalibrationWorkerMessage::Success &&
+      (maximum_success_frame_bytes < header.size() ||
+       decoded.payload_size > maximum_success_frame_bytes - header.size())) {
+    throw CalibrationExecutionError(
+        "calibration worker payload size exceeds the requested frame limit");
+  }
   std::string response(header.data(), header.size());
   const auto payload_offset = response.size();
   response.resize(payload_offset + decoded.payload_size);
@@ -3545,8 +3552,10 @@ supervise_worker(int caller_socket, const std::string& executable, int executabl
     if (::shutdown(channel.get(), SHUT_WR) != 0) {
       throw CalibrationExecutionError("cannot finish the calibration worker request");
     }
-    auto response = read_frame(channel.get(), worker.process(), worker_deadline, caller_socket,
-                               request.calibration_host_memory_limit_bytes, &scratch_monitor);
+    auto response =
+        read_frame(channel.get(), worker.process(), worker_deadline,
+                   maximum_calibration_worker_success_frame_bytes(request.config.num_frames),
+                   caller_socket, request.calibration_host_memory_limit_bytes, &scratch_monitor);
     wait_for_process_monitored(worker.process(), worker_deadline,
                                request.calibration_host_memory_limit_bytes, &scratch_monitor);
     scratch_monitor.enforce(worker.process(), true);
@@ -3744,7 +3753,9 @@ CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest& re
     }
     auto worker_authority = receive_worker_authority(channel.get(), guardian, deadline);
     (void)worker_authority;
-    auto response = read_frame(channel.get(), guardian, deadline);
+    auto response =
+        read_frame(channel.get(), guardian, deadline,
+                   maximum_calibration_worker_success_frame_bytes(request.config.num_frames));
     guardian.wait_until(deadline);
     (void)guardian.reap();
     certify_channel_eof(channel.get());
@@ -3752,6 +3763,11 @@ CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest& re
       throw CalibrationExecutionError("calibration worker exceeded its cgroup host memory limit");
     }
     auto result = decode_calibration_worker_response(response);
+    if (result.frames_used > request.config.num_frames ||
+        result.per_frame.size() > request.config.num_frames) {
+      throw CalibrationExecutionError(
+          "calibration worker returned more frame summaries than requested");
+    }
     if (result.left_lens_profile.has_value()) {
       result.left_lens_profile->path = request.left.lens_profile;
     }

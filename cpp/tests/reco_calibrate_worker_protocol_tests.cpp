@@ -151,6 +151,7 @@ CalibrationResult result_fixture() {
       {.left = {-1.25, 2.5}, .right = {3.75, -4.5}, .left_pixel_nx = 0.25, .right_pixel_nx = 0.75},
       MatchedPoint::from_planes({0.1, 0.2}, {0.3, 0.4}),
   };
+  frame.points.resize(20, frame.points.back());
   frame.keypoints_left = 100;
   frame.keypoints_right = 90;
   frame.min_descriptors = 90;
@@ -245,6 +246,7 @@ CalibrationResult compact_result_fixture() {
   summary.post_ratio_test = 53;
   summary.post_spatial_filter = 31;
   summary.post_ransac = 17;
+  summary.points.resize(summary.post_ransac, summary.points.back());
   result.total_matches = 17;
   result.calibration.field_roi.reset();
   result.left_lens_profile.reset();
@@ -364,6 +366,9 @@ void result_envelope_covers_maximum_valid_gpu_output() {
             kCalibrationWorkerFrameHeaderBytes + kCalibrationWorkerResultMetadataBytes +
                 kMaximumCalibrationWorkerCorrespondences * kCalibrationWorkerMatchedPointBytes,
             "success frame ceiling includes metadata and every valid correspondence");
+  expect_eq(maximum_calibration_worker_success_frame_bytes(kMaximumCalibrationWorkerResultFrames),
+            kMaximumCalibrationWorkerSuccessFrameBytes,
+            "request-specific frame ceiling reaches the global ceiling at 256 frames");
 
   auto maximum_counts = compact_result_fixture();
   const auto summary_fixture = maximum_counts.per_frame.front();
@@ -374,11 +379,11 @@ void result_envelope_covers_maximum_valid_gpu_output() {
     summary.min_descriptors = kMaxGpuAkazeFeatures;
     summary.post_ratio_test = kMaxGpuAkazeFeatures;
     summary.post_spatial_filter = kMaxGpuAkazeFeatures;
-    summary.post_ransac = kMaxGpuAkazeFeatures;
-    summary.points.clear();
+    summary.post_ransac = 1;
+    summary.points.resize(1);
   }
   maximum_counts.frames_used = kMaximumCalibrationWorkerResultFrames;
-  maximum_counts.total_matches = kMaximumCalibrationWorkerCorrespondences;
+  maximum_counts.total_matches = kMaximumCalibrationWorkerResultFrames;
   maximum_counts.calibration.field_roi = reco::core::FieldRoi{
       .left = std::vector<std::array<double, 2>>(kMaximumCalibrationWorkerRoiPoints, {0.5, 0.5}),
       .right = std::vector<std::array<double, 2>>(kMaximumCalibrationWorkerRoiPoints, {0.5, 0.5})};
@@ -392,8 +397,9 @@ void result_envelope_covers_maximum_valid_gpu_output() {
   maximum_counts.quality = CalibrationQuality{};
   const auto maximum_metadata = encode_calibration_worker_success(maximum_counts);
   expect_eq(maximum_metadata.size(),
-            kCalibrationWorkerFrameHeaderBytes + kCalibrationWorkerResultMetadataBytes,
-            "result metadata envelope exactly accounts for every bounded field");
+            kCalibrationWorkerFrameHeaderBytes + kCalibrationWorkerResultMetadataBytes +
+                kMaximumCalibrationWorkerResultFrames * kCalibrationWorkerMatchedPointBytes,
+            "result envelope exactly accounts for bounded metadata and serialized points");
   expect_true(maximum_metadata.size() <= kMaximumCalibrationWorkerSuccessFrameBytes,
               "maximum valid frame and feature counts serialize within the response envelope");
 }
@@ -418,6 +424,11 @@ void correspondence_limits_and_numeric_validation_are_strict() {
   expect_error([&] { (void)encode_calibration_worker_success(inconsistent); }, "inconsistent",
                "point count cannot exceed the RANSAC count on encode");
 
+  auto missing = compact_result_fixture();
+  missing.per_frame.front().points.pop_back();
+  expect_error([&] { (void)encode_calibration_worker_success(missing); }, "inconsistent",
+               "every reported RANSAC match must carry a correspondence on encode");
+
   auto non_finite = compact_result_fixture();
   non_finite.per_frame.front().points.front().right_pixel_nx =
       std::numeric_limits<double>::infinity();
@@ -436,6 +447,9 @@ void correspondence_limits_and_numeric_validation_are_strict() {
                  "inconsistent", "point count cannot exceed the RANSAC count on decode");
 
     auto truncated_points = encode_calibration_worker_success(valid);
+    expect_eq(replace_u64(truncated_points, valid.per_frame.front().post_ransac,
+                          valid.per_frame.front().post_ransac + 1U, 1U),
+              1U, "truncated correspondence RANSAC-count mutation");
     replace_u32_at(truncated_points, *post_ransac + sizeof(std::uint64_t),
                    static_cast<std::uint32_t>(valid.per_frame.front().points.size() + 1U));
     expect_error([&] { (void)decode_calibration_worker_response(truncated_points); }, "truncated",
@@ -451,6 +465,7 @@ void correspondence_limits_and_numeric_validation_are_strict() {
   carrier_summary.post_ratio_test = maximum_count;
   carrier_summary.post_spatial_filter = maximum_count;
   carrier_summary.post_ransac = maximum_count;
+  carrier_summary.points.assign(maximum_count, carrier_summary.points.front());
   count_carrier.total_matches = maximum_count;
   auto oversized_count = encode_calibration_worker_success(count_carrier);
   const auto oversized_anchor = find_u64(oversized_count, maximum_count, 6U);
@@ -585,6 +600,7 @@ void result_match_summation_overflow_is_rejected_on_encode_and_decode() {
   first.post_ratio_test = 7;
   first.post_spatial_filter = 7;
   first.post_ransac = 7;
+  first.points.resize(first.post_ransac);
   auto second = first;
   second.keypoints_left = 11;
   second.keypoints_right = 8;
@@ -592,6 +608,7 @@ void result_match_summation_overflow_is_rejected_on_encode_and_decode() {
   second.post_ratio_test = 8;
   second.post_spatial_filter = 8;
   second.post_ransac = 8;
+  second.points.resize(second.post_ransac, second.points.back());
   result.per_frame = {first, second};
   result.frames_used = 2;
   result.total_matches = 15;

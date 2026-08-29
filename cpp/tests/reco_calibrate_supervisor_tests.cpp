@@ -293,14 +293,14 @@ void wait_for_process_removal(pid_t process, std::string_view message) {
   expect_true(!process_exists(process), message);
 }
 
-void success_returns_only_the_compact_result() {
+void success_returns_the_bounded_result() {
   Scenario scenario("success");
   const auto result = run_gpu_calibration(request_fixture(), ready_backends());
   expect_eq(result.total_matches, 12U, "supervisor transfers result totals");
   expect_eq(result.frames_used, 1U, "supervisor transfers used frame count");
   expect_eq(result.per_frame.size(), 1U, "supervisor transfers one frame summary");
-  expect_true(result.per_frame[0].points.empty(),
-              "supervisor never transfers raw feature correspondences");
+  expect_eq(result.per_frame[0].points.size(), 12U,
+            "supervisor transfers each reported correspondence");
 }
 
 void retained_input_descriptors_reach_the_sandboxed_worker() {
@@ -466,6 +466,7 @@ void delayed_worker_request_io_obeys_the_deadline() {
   {
     Scenario scenario("large-response");
     auto request = request_fixture();
+    request.config.num_frames = 256;
     request.left.path = std::string(12U * 1024U - 4U, 'l') + ".mp4";
     request.right.path = std::string(12U * 1024U - 4U, 'r') + ".mp4";
     request.calibration_timeout_ns = 2'000'000'000ULL;
@@ -475,6 +476,13 @@ void delayed_worker_request_io_obeys_the_deadline() {
     expect_eq(result.per_frame.size(), 256U, "supervisor drains a backpressured maximum result");
   }
   (void)::unsetenv("RECO_FAKE_CALIBRATION_PRE_REQUEST_DELAY_MS");
+
+  {
+    Scenario scenario("large-response");
+    expect_execution_error([&] { (void)run_gpu_calibration(request_fixture(), ready_backends()); },
+                           "more frame summaries than requested",
+                           "compact excess frame summaries are rejected after decode");
+  }
 }
 
 void worker_failures_crashes_and_bad_frames_are_contained() {
@@ -497,6 +505,12 @@ void worker_failures_crashes_and_bad_frames_are_contained() {
     Scenario scenario("oversized");
     expect_execution_error([&] { (void)run_gpu_calibration(request_fixture(), ready_backends()); },
                            "payload size", "oversized response rejected before allocation");
+  }
+  {
+    Scenario scenario("request-oversized");
+    expect_execution_error([&] { (void)run_gpu_calibration(request_fixture(), ready_backends()); },
+                           "requested frame limit",
+                           "request-specific oversized response rejected before allocation");
   }
 }
 
@@ -1166,7 +1180,7 @@ int main() {
   invalid_worker_paths_fail_before_launch();
 #if defined(__linux__)
   try {
-    success_returns_only_the_compact_result();
+    success_returns_the_bounded_result();
   } catch (const CalibrationExecutionError& error) {
     if (std::string_view(error.what()).find("delegated cgroup-v2") != std::string_view::npos) {
       const char* required = std::getenv("RECO_REQUIRE_CALIBRATION_CONTAINMENT_TEST");

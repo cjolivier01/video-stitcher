@@ -16,9 +16,11 @@
 #include <cerrno>
 #include <charconv>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -41,6 +43,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #else
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -190,8 +193,9 @@ std::filesystem::path create_exclusive_temporary(const std::filesystem::path& de
     auto filename = destination.filename();
     filename += ".tmp." + std::string(token.begin(), token.end());
     auto temporary = destination.parent_path() / filename;
-    handle = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
-                         FILE_ATTRIBUTE_NORMAL, nullptr);
+    handle =
+        CreateFileW(temporary.c_str(), GENERIC_WRITE | DELETE, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                    nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle != INVALID_HANDLE_VALUE) {
       return temporary;
     }
@@ -219,6 +223,43 @@ void write_all(HANDLE handle, std::string_view contents, const std::filesystem::
     }
     offset += written;
   }
+}
+
+void rename_open_file(HANDLE handle, const std::filesystem::path& destination) {
+  const auto absolute_destination = std::filesystem::absolute(destination).wstring();
+  const auto filename_bytes = absolute_destination.size() * sizeof(wchar_t);
+  const auto info_bytes = offsetof(FILE_RENAME_INFO, FileName) + filename_bytes;
+  std::vector<std::max_align_t> storage((info_bytes + sizeof(std::max_align_t) - 1U) /
+                                        sizeof(std::max_align_t));
+  auto* info = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
+  info->ReplaceIfExists = TRUE;
+  info->RootDirectory = nullptr;
+  info->FileNameLength = static_cast<DWORD>(filename_bytes);
+  std::memcpy(info->FileName, absolute_destination.data(), filename_bytes);
+
+  constexpr DWORD retry_delay_ms = 10;
+  constexpr int maximum_replace_attempts = 200;
+  DWORD replace_error = ERROR_SUCCESS;
+  for (int attempt = 0; attempt < maximum_replace_attempts; ++attempt) {
+    if (SetFileInformationByHandle(handle, FileRenameInfo, info, static_cast<DWORD>(info_bytes)) !=
+        0) {
+      return;
+    }
+    replace_error = GetLastError();
+    if (replace_error != ERROR_SHARING_VIOLATION && replace_error != ERROR_ACCESS_DENIED) {
+      break;
+    }
+    if (attempt + 1 < maximum_replace_attempts) {
+      Sleep(retry_delay_ms);
+    }
+  }
+  throw_file_error("failed to replace calibration output", destination,
+                   static_cast<int>(replace_error));
+}
+
+void discard_open_file(HANDLE handle) noexcept {
+  FILE_DISPOSITION_INFO disposition{.DeleteFile = TRUE};
+  (void)SetFileInformationByHandle(handle, FileDispositionInfo, &disposition, sizeof(disposition));
 }
 #elif defined(__linux__)
 class UniqueFileDescriptor {
@@ -430,6 +471,31 @@ create_exclusive_temporary_at(int directory_descriptor, const std::filesystem::p
                            destination.string());
 }
 
+[[nodiscard]] std::string create_descriptor_publication_link_at(
+    int directory_descriptor, const std::filesystem::path& destination, int temporary_descriptor) {
+  const auto descriptor_path = std::filesystem::path("/proc") / std::to_string(::getpid()) / "fd" /
+                               std::to_string(temporary_descriptor);
+  std::random_device random;
+  constexpr char hex[] = "0123456789abcdef";
+  for (int attempt = 0; attempt < 128; ++attempt) {
+    std::array<char, 32> token{};
+    for (auto& digit : token) {
+      digit = hex[random() & 0x0fU];
+    }
+    const auto name =
+        destination.filename().string() + ".publish." + std::string(token.begin(), token.end());
+    if (::linkat(AT_FDCWD, descriptor_path.c_str(), directory_descriptor, name.c_str(),
+                 AT_SYMLINK_FOLLOW) == 0) {
+      return name;
+    }
+    if (errno != EEXIST) {
+      throw_file_error("cannot bind temporary calibration output", destination, errno);
+    }
+  }
+  throw std::runtime_error("cannot bind unique temporary calibration output for " +
+                           destination.string());
+}
+
 void write_all(int descriptor, std::string_view contents, const std::filesystem::path& temporary) {
   std::size_t offset = 0;
   while (offset < contents.size()) {
@@ -447,6 +513,15 @@ void write_all(int descriptor, std::string_view contents, const std::filesystem:
   }
 }
 #else
+[[nodiscard]] bool path_identifies_descriptor(const std::filesystem::path& path, int descriptor) {
+  struct stat descriptor_identity{};
+  struct stat path_identity{};
+  return ::fstat(descriptor, &descriptor_identity) == 0 &&
+         ::lstat(path.c_str(), &path_identity) == 0 && S_ISREG(path_identity.st_mode) &&
+         descriptor_identity.st_dev == path_identity.st_dev &&
+         descriptor_identity.st_ino == path_identity.st_ino;
+}
+
 std::filesystem::path create_exclusive_temporary(const std::filesystem::path& destination,
                                                  int& descriptor) {
   auto temporary = destination.parent_path() / (destination.filename().string() + ".tmp.XXXXXX");
@@ -483,7 +558,8 @@ void write_calibration_json_atomically_impl(std::string_view json,
                                             const std::filesystem::path& left_input,
                                             const std::filesystem::path& right_input,
                                             const std::function<void()>& before_publish,
-                                            std::span<const std::filesystem::path> lens_profiles) {
+                                            std::span<const std::filesystem::path> lens_profiles,
+                                            const std::function<void()>& before_commit) {
   std::string contents(json);
   contents.push_back('\n');
 #if defined(_WIN32)
@@ -498,12 +574,6 @@ void write_calibration_json_atomically_impl(std::string_view json,
       throw_file_error("failed to flush temporary calibration output", temporary,
                        static_cast<int>(GetLastError()));
     }
-    if (CloseHandle(handle) == 0) {
-      handle = INVALID_HANDLE_VALUE;
-      throw_file_error("failed to close temporary calibration output", temporary,
-                       static_cast<int>(GetLastError()));
-    }
-    handle = INVALID_HANDLE_VALUE;
     if (before_publish) {
       before_publish();
     }
@@ -512,33 +582,23 @@ void write_calibration_json_atomically_impl(std::string_view json,
         error.has_value()) {
       throw std::runtime_error("refusing to publish calibration output: " + *error);
     }
-    constexpr DWORD retry_delay_ms = 10;
-    constexpr int maximum_replace_attempts = 200;
-    DWORD replace_error = ERROR_SUCCESS;
-    for (int attempt = 0; attempt < maximum_replace_attempts; ++attempt) {
-      if (MoveFileExW(temporary.c_str(), destination.c_str(),
-                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0) {
-        replace_error = ERROR_SUCCESS;
-        break;
-      }
-      replace_error = GetLastError();
-      if (replace_error != ERROR_SHARING_VIOLATION && replace_error != ERROR_ACCESS_DENIED) {
-        break;
-      }
-      if (attempt + 1 < maximum_replace_attempts) {
-        Sleep(retry_delay_ms);
-      }
+    if (before_commit) {
+      before_commit();
     }
-    if (replace_error != ERROR_SUCCESS) {
-      throw_file_error("failed to replace calibration output", destination,
-                       static_cast<int>(replace_error));
-    }
+    rename_open_file(handle, destination);
     temporary_exists = false;
+    if (CloseHandle(handle) == 0) {
+      handle = INVALID_HANDLE_VALUE;
+      throw_file_error("failed to close calibration output", destination,
+                       static_cast<int>(GetLastError()));
+    }
+    handle = INVALID_HANDLE_VALUE;
   } catch (...) {
     if (handle != INVALID_HANDLE_VALUE) {
+      discard_open_file(handle);
       CloseHandle(handle);
-    }
-    if (temporary_exists) {
+      temporary_exists = false;
+    } else if (temporary_exists) {
       std::error_code ignored;
       std::filesystem::remove(temporary, ignored);
     }
@@ -574,6 +634,8 @@ void write_calibration_json_atomically_impl(std::string_view json,
 
   TemporaryOutput temporary;
   bool temporary_exists = false;
+  std::string publication_name;
+  bool publication_exists = false;
   try {
     temporary = create_exclusive_temporary_at(directory_descriptor.get(), destination);
     temporary_exists = true;
@@ -597,9 +659,28 @@ void write_calibration_json_atomically_impl(std::string_view json,
         error.has_value()) {
       throw std::runtime_error("refusing to publish calibration output: " + *error);
     }
-    if (::renameat(directory_descriptor.get(), temporary.name.c_str(), directory_descriptor.get(),
+    publication_name = create_descriptor_publication_link_at(
+        directory_descriptor.get(), destination, temporary.descriptor.get());
+    publication_exists = true;
+    if (before_commit) {
+      before_commit();
+    }
+    if (!temporary_name_identifies_descriptor(directory_descriptor.get(), publication_name,
+                                              temporary.descriptor.get())) {
+      publication_exists = false;
+      throw std::runtime_error(
+          "refusing to publish calibration output: descriptor-bound output identity changed");
+    }
+    if (::renameat(directory_descriptor.get(), publication_name.c_str(), directory_descriptor.get(),
                    destination_name.c_str()) != 0) {
       throw_file_error("failed to replace calibration output", destination, errno);
+    }
+    publication_exists = false;
+    if (temporary_name_identifies_descriptor(directory_descriptor.get(), temporary.name,
+                                             temporary.descriptor.get())) {
+      if (::unlinkat(directory_descriptor.get(), temporary.name.c_str(), 0) != 0) {
+        throw_file_error("failed to remove temporary calibration output", temporary_path, errno);
+      }
     }
     temporary_exists = false;
     temporary.descriptor.close_checked(destination);
@@ -607,6 +688,9 @@ void write_calibration_json_atomically_impl(std::string_view json,
       throw_file_error("failed to flush calibration output directory", parent, errno);
     }
   } catch (...) {
+    if (publication_exists) {
+      (void)::unlinkat(directory_descriptor.get(), publication_name.c_str(), 0);
+    }
     if (temporary_exists &&
         temporary_name_identifies_descriptor(directory_descriptor.get(), temporary.name,
                                              temporary.descriptor.get())) {
@@ -625,11 +709,6 @@ void write_calibration_json_atomically_impl(std::string_view json,
     if (::fsync(descriptor) != 0) {
       throw_file_error("failed to flush temporary calibration output", temporary, errno);
     }
-    const auto close_result = ::close(descriptor);
-    descriptor = -1;
-    if (close_result != 0) {
-      throw_file_error("failed to close temporary calibration output", temporary, errno);
-    }
     if (before_publish) {
       before_publish();
     }
@@ -638,10 +717,27 @@ void write_calibration_json_atomically_impl(std::string_view json,
         error.has_value()) {
       throw std::runtime_error("refusing to publish calibration output: " + *error);
     }
+    if (before_commit) {
+      before_commit();
+    }
+    if (!path_identifies_descriptor(temporary, descriptor)) {
+      temporary_exists = false;
+      throw std::runtime_error(
+          "refusing to publish calibration output: temporary output identity changed");
+    }
     if (::rename(temporary.c_str(), destination.c_str()) != 0) {
       throw_file_error("failed to replace calibration output", destination, errno);
     }
     temporary_exists = false;
+    if (!path_identifies_descriptor(destination, descriptor)) {
+      throw std::runtime_error(
+          "refusing to publish calibration output: published output identity changed");
+    }
+    const auto close_result = ::close(descriptor);
+    descriptor = -1;
+    if (close_result != 0) {
+      throw_file_error("failed to close calibration output", destination, errno);
+    }
   } catch (...) {
     if (descriptor >= 0) {
       ::close(descriptor);
@@ -1671,9 +1767,10 @@ void write_calibration_json_atomically(std::string_view json,
                                        const std::filesystem::path& left_input,
                                        const std::filesystem::path& right_input,
                                        const std::function<void()>& before_publish,
-                                       std::span<const std::filesystem::path> lens_profiles) {
+                                       std::span<const std::filesystem::path> lens_profiles,
+                                       const std::function<void()>& before_commit) {
   write_calibration_json_atomically_impl(json, destination, left_input, right_input, before_publish,
-                                         lens_profiles);
+                                         lens_profiles, before_commit);
 }
 
 } // namespace detail

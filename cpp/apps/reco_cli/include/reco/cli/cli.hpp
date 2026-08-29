@@ -184,7 +184,8 @@ void write_calibration_json_atomically(std::string_view json,
                                        const std::filesystem::path& left_input,
                                        const std::filesystem::path& right_input,
                                        const std::function<void()>& before_publish = {},
-                                       std::span<const std::filesystem::path> lens_profiles = {});
+                                       std::span<const std::filesystem::path> lens_profiles = {},
+                                       const std::function<void()>& before_commit = {});
 
 } // namespace detail
 

@@ -823,6 +823,31 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
             "cleanup does not unlink a replacement temporary entry");
   std::filesystem::remove(replacement_temporary);
 
+  const auto postcheck_race_destination = root.path() / "postcheck-race.json";
+  std::filesystem::path postcheck_replacement;
+  bool postcheck_hook_ran = false;
+  detail::write_calibration_json_atomically(
+      R"json({"writer":"descriptor-bound"})json", postcheck_race_destination, left_input,
+      right_input, {}, {}, [&] {
+        for (const auto& entry : std::filesystem::directory_iterator(root.path())) {
+          if (entry.path().filename().string().starts_with("postcheck-race.json.tmp.")) {
+            postcheck_replacement = entry.path();
+            std::filesystem::remove(postcheck_replacement);
+            write_text_file(postcheck_replacement, "post-check attacker replacement\n");
+            postcheck_hook_ran = true;
+            return;
+          }
+        }
+        throw std::runtime_error("post-check publication fixture was not found");
+      });
+  expect_true(postcheck_hook_ran, "temporary replacement runs after identity validation");
+  expect_eq(read_text_file(postcheck_race_destination),
+            std::string("{\"writer\":\"descriptor-bound\"}\n"),
+            "publication remains bound to the opened temporary file");
+  expect_eq(read_text_file(postcheck_replacement), std::string("post-check attacker replacement\n"),
+            "descriptor-bound publication does not rename or unlink the replacement path");
+  std::filesystem::remove(postcheck_replacement);
+
   const auto original_parent = root.path() / "original-parent";
   const auto redirected_parent = root.path() / "redirected-parent";
   const auto parent_symlink = root.path() / "output-parent";
@@ -851,7 +876,8 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
   for (const auto& entry : std::filesystem::directory_iterator(root.path())) {
     const auto filename = entry.path().filename().string();
     if (filename.starts_with("match.json.tmp.") || filename.starts_with("blocked.json.tmp.") ||
-        filename.starts_with("raced-match.json.tmp.")) {
+        filename.starts_with("raced-match.json.tmp.") ||
+        filename.find(".publish.") != std::string::npos) {
       orphaned_temporary = true;
     }
   }

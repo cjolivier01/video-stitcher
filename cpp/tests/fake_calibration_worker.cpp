@@ -157,6 +157,7 @@ CalibrationResult result() {
                      .post_ratio_test = 40,
                      .post_spatial_filter = 25,
                      .post_ransac = 12};
+  frame.points.assign(frame.post_ransac, MatchedPoint::from_planes({0.1, 0.2}, {0.3, 0.4}));
   CalibrationResult value;
   value.calibration.left = camera();
   value.calibration.right = camera();
@@ -393,6 +394,30 @@ int main(int argc, char** argv) {
     large.total_matches = large.frames_used * large.per_frame.front().post_ransac;
     write_bytes(descriptor, encode_calibration_worker_success(large), deadline);
     return EXIT_SUCCESS;
+  }
+  if (scenario == "request-oversized") {
+    std::array<char, kCalibrationWorkerFrameHeaderBytes> header{
+        'R',
+        'C',
+        'A',
+        'L',
+        static_cast<char>(kCalibrationWorkerProtocolVersion >> 8U),
+        static_cast<char>(kCalibrationWorkerProtocolVersion),
+        0,
+        2,
+        0,
+        0,
+        0,
+        0};
+    const auto oversized_payload = static_cast<std::uint32_t>(
+        maximum_calibration_worker_success_frame_bytes(request.config.num_frames) -
+        kCalibrationWorkerFrameHeaderBytes + 1U);
+    header[8] = static_cast<char>(oversized_payload >> 24U);
+    header[9] = static_cast<char>(oversized_payload >> 16U);
+    header[10] = static_cast<char>(oversized_payload >> 8U);
+    header[11] = static_cast<char>(oversized_payload);
+    write_bytes(descriptor, std::string_view(header.data(), header.size()), deadline);
+    return EXIT_FAILURE;
   }
   if (scenario == "stdout-noise") {
     std::cout << "Opening in BLOCKING MODE\n";

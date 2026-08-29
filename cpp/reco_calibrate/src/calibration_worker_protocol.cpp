@@ -394,7 +394,6 @@ void validate_finite_result(const CalibrationResult& result) {
 }
 
 void validate_result_counts(const CalibrationResult& result) {
-  std::size_t summarized_matches = 0;
   std::size_t correspondence_count = 0;
   for (const auto& summary : result.per_frame) {
     if (summary.keypoints_left > kMaxGpuAkazeFeatures ||
@@ -403,8 +402,7 @@ void validate_result_counts(const CalibrationResult& result) {
         summary.post_ratio_test > summary.min_descriptors ||
         summary.post_spatial_filter > summary.post_ratio_test ||
         summary.post_ransac > summary.post_spatial_filter ||
-        summary.points.size() > summary.post_ransac ||
-        summary.post_ransac > std::numeric_limits<std::size_t>::max() - summarized_matches) {
+        summary.points.size() != summary.post_ransac) {
       throw CalibrationExecutionError("calibration worker returned inconsistent result counts");
     }
     if (summary.points.size() > kMaximumCalibrationWorkerCorrespondences - correspondence_count) {
@@ -413,11 +411,10 @@ void validate_result_counts(const CalibrationResult& result) {
     if (!std::all_of(summary.points.begin(), summary.points.end(), matched_point_is_finite)) {
       throw CalibrationExecutionError("calibration worker returned a non-finite correspondence");
     }
-    summarized_matches += summary.post_ransac;
     correspondence_count += summary.points.size();
   }
   if (result.frames_used != result.per_frame.size() || result.total_matches == 0 ||
-      result.total_matches != summarized_matches) {
+      result.total_matches != correspondence_count) {
     throw CalibrationExecutionError("calibration worker returned inconsistent result counts");
   }
 }
@@ -450,6 +447,16 @@ decode_calibration_worker_header(const CalibrationWorkerFrameHeader& header) {
     throw CalibrationExecutionError("calibration worker payload size is invalid");
   }
   return {.message = message, .payload_size = payload_size};
+}
+
+std::size_t maximum_calibration_worker_success_frame_bytes(std::size_t maximum_frames) {
+  if (maximum_frames == 0 || maximum_frames > kMaximumCalibrationWorkerResultFrames) {
+    throw CalibrationExecutionError("calibration worker success frame limit is invalid");
+  }
+  constexpr auto per_frame_bytes = kCalibrationWorkerPerFrameMetadataBytes +
+                                   kMaxGpuAkazeFeatures * kCalibrationWorkerMatchedPointBytes;
+  return kCalibrationWorkerFrameHeaderBytes + kCalibrationWorkerFixedResultMetadataBytes +
+         maximum_frames * per_frame_bytes;
 }
 
 std::string encode_calibration_worker_request(const GpuCalibrationRequest& request) {
@@ -704,7 +711,7 @@ CalibrationResult decode_calibration_worker_response(std::string_view value) {
     if (point_count > kMaxGpuAkazeFeatures) {
       throw CalibrationExecutionError("calibration worker returned too many correspondences");
     }
-    if (point_count > summary.post_ransac) {
+    if (point_count != summary.post_ransac) {
       throw CalibrationExecutionError("calibration worker returned inconsistent result counts");
     }
     if (point_count > kMaximumCalibrationWorkerCorrespondences - correspondence_count) {
