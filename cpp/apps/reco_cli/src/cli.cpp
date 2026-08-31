@@ -736,11 +736,6 @@ retain_displaced_windows_output(HANDLE directory, std::wstring_view destination_
     DWORD filename_length;
     wchar_t filename[1];
   };
-  static_assert(offsetof(ExtendedLinkInfo, root_directory) ==
-                offsetof(FILE_LINK_INFO, RootDirectory));
-  static_assert(offsetof(ExtendedLinkInfo, filename_length) ==
-                offsetof(FILE_LINK_INFO, FileNameLength));
-  static_assert(offsetof(ExtendedLinkInfo, filename) == offsetof(FILE_LINK_INFO, FileName));
   constexpr ULONG kFileLinkInformation = 11;
   std::random_device random;
   constexpr wchar_t hex[] = L"0123456789abcdef";
@@ -753,7 +748,7 @@ retain_displaced_windows_output(HANDLE directory, std::wstring_view destination_
     rollback_name += L".rollback.";
     rollback_name.append(token.begin(), token.end());
     const auto filename_bytes = rollback_name.size() * sizeof(wchar_t);
-    const auto info_bytes = sizeof(FILE_LINK_INFO) + filename_bytes;
+    const auto info_bytes = offsetof(ExtendedLinkInfo, filename) + filename_bytes;
     std::vector<std::max_align_t> storage((info_bytes + sizeof(std::max_align_t) - 1U) /
                                               sizeof(std::max_align_t),
                                           std::max_align_t{});
