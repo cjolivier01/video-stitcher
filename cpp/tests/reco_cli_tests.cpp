@@ -52,6 +52,21 @@ namespace {
 
 int failures = 0;
 
+template <typename Test> void run_test_case(std::string_view name, Test&& test) {
+#if defined(_WIN32)
+  std::cerr << "RUN: " << name << std::endl;
+#endif
+  try {
+    std::forward<Test>(test)();
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: " << name << " threw: " << error.what() << '\n';
+    ++failures;
+  } catch (...) {
+    std::cerr << "FAIL: " << name << " threw a non-standard exception\n";
+    ++failures;
+  }
+}
+
 void set_environment(std::string_view name, const std::optional<std::string>& value) {
 #if defined(_WIN32)
   _putenv_s(std::string(name).c_str(), value.value_or("").c_str());
@@ -2073,13 +2088,18 @@ int main(int argc, char** argv) {
   (void)argc;
   (void)argv;
 #endif
-  validators_match_rust();
-  stitch_parse_matches_rust_defaults();
-  preview_and_calibrate_parse_matches_rust_defaults();
-  live_command_parse_matches_rust_defaults();
-  parse_errors_are_reported();
-  probe_worker_discovery_handles_path_and_bzlmod_runfiles();
-  calibration_output_replacement_is_exclusive_and_atomic();
-  command_execution_dispatches_available_stages();
+  run_test_case("validators_match_rust", validators_match_rust);
+  run_test_case("stitch_parse_matches_rust_defaults", stitch_parse_matches_rust_defaults);
+  run_test_case("preview_and_calibrate_parse_matches_rust_defaults",
+                preview_and_calibrate_parse_matches_rust_defaults);
+  run_test_case("live_command_parse_matches_rust_defaults",
+                live_command_parse_matches_rust_defaults);
+  run_test_case("parse_errors_are_reported", parse_errors_are_reported);
+  run_test_case("probe_worker_discovery_handles_path_and_bzlmod_runfiles",
+                probe_worker_discovery_handles_path_and_bzlmod_runfiles);
+  run_test_case("calibration_output_replacement_is_exclusive_and_atomic",
+                calibration_output_replacement_is_exclusive_and_atomic);
+  run_test_case("command_execution_dispatches_available_stages",
+                command_execution_dispatches_available_stages);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
