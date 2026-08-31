@@ -1042,6 +1042,13 @@ bool guardian_write(int descriptor, const void* data, std::size_t size) {
   return true;
 }
 
+[[noreturn]] void report_guardian_startup_error(int error) {
+  const auto reported_error = error == 0 ? EIO : error;
+  (void)guardian_write(STDOUT_FILENO, &kGuardianLaunchFailed, 1);
+  (void)guardian_write(STDOUT_FILENO, &reported_error, sizeof(reported_error));
+  guardian_exit(2);
+}
+
 bool guardian_pipe_write(int descriptor, char value) {
   ssize_t written = -1;
   do {
@@ -2258,16 +2265,18 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int control
       ::dup2(control_descriptor, STDOUT_FILENO) < 0 ||
       ::dup2(worker_input_descriptor, kGuardianWorkerInput) < 0 ||
       ::dup2(worker_output_descriptor, kGuardianWorkerOutput) < 0) {
-    guardian_exit(2);
+    report_guardian_startup_error(errno);
   }
   if (!guardian_close_from(kGuardianFirstUnusedDescriptor, maximum_descriptor)) {
-    guardian_exit(2);
+    report_guardian_startup_error(errno);
   }
   struct sigaction child_action{};
   child_action.sa_handler = SIG_DFL;
   (void)sigemptyset(&child_action.sa_mask);
-  if (::sigaction(SIGCHLD, &child_action, nullptr) != 0 ||
-      !guardian_write(STDOUT_FILENO, &kGuardianReady, 1)) {
+  if (::sigaction(SIGCHLD, &child_action, nullptr) != 0) {
+    report_guardian_startup_error(errno);
+  }
+  if (!guardian_write(STDOUT_FILENO, &kGuardianReady, 1)) {
     guardian_exit(2);
   }
 
@@ -2839,22 +2848,26 @@ int detail::run_gpu_video_probe_supervisor(const char* executable,
 int detail::run_gpu_video_probe_guardian(const char* executable,
                                          std::uint64_t pre_worker_report_delay_ns) {
   sigset_t empty_mask{};
-  if (sigemptyset(&empty_mask) != 0 || ::pthread_sigmask(SIG_SETMASK, &empty_mask, nullptr) != 0) {
-    return 2;
+  if (sigemptyset(&empty_mask) != 0) {
+    report_guardian_startup_error(errno);
+  }
+  const auto mask_error = ::pthread_sigmask(SIG_SETMASK, &empty_mask, nullptr);
+  if (mask_error != 0) {
+    report_guardian_startup_error(mask_error);
   }
   if (executable == nullptr || executable[0] == '\0' ||
       pre_worker_report_delay_ns >
           static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
-    return 2;
+    report_guardian_startup_error(EINVAL);
   }
 #if defined(__APPLE__)
   if (apple_proc_listpids() == nullptr || apple_proc_pid_rusage() == nullptr) {
-    return 2;
+    report_guardian_startup_error(ENOSYS);
   }
 #endif
   const auto maximum_descriptor = descriptor_scan_limit();
   if (maximum_descriptor < kGuardianFirstUnusedDescriptor) {
-    return 2;
+    report_guardian_startup_error(EMFILE);
   }
   run_guardian_child(executable, STDIN_FILENO, kGuardianWorkerInput, kGuardianWorkerOutput,
                      maximum_descriptor, std::chrono::nanoseconds(pre_worker_report_delay_ns));
