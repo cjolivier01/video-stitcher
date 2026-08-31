@@ -1,6 +1,12 @@
 #include "reco/core/nvrtc_compiler.hpp"
 
 #include <algorithm>
+#include <condition_variable>
+#include <iterator>
+#include <limits>
+#include <list>
+#include <mutex>
+#include <new>
 #include <sstream>
 #include <utility>
 
@@ -20,6 +26,8 @@ using NvrtcProgram = void*;
 constexpr int kNvrtcSuccess = 0;
 constexpr std::size_t kMaximumLibraryPathBytes = 32U * 1024U;
 constexpr std::size_t kMaximumErrorStringBytes = 1024U;
+constexpr int kMinimumEncodedArchitecture = 10;
+constexpr int kMaximumEncodedArchitecture = 999;
 
 void validate_text(std::string_view value, std::size_t maximum_bytes, const char* label) {
   if (value.empty()) {
@@ -214,6 +222,131 @@ void validate_options(const NvrtcCompileOptions& options) {
   }
 }
 
+struct CompileCacheKey {
+  std::string library_path;
+  NvrtcVersion version;
+  std::string source;
+  std::string source_name;
+  std::vector<std::string> options;
+
+  [[nodiscard]] bool operator==(const CompileCacheKey& other) const {
+    return library_path == other.library_path && version.major == other.version.major &&
+           version.minor == other.version.minor && source == other.source &&
+           source_name == other.source_name && options == other.options;
+  }
+};
+
+std::size_t checked_cache_bytes(const CompileCacheKey& key, const NvrtcCompileResult& result) {
+  std::size_t bytes = sizeof(CompileCacheKey) + sizeof(NvrtcCompileResult) +
+                      key.options.size() * sizeof(std::string);
+  const auto add = [&](std::size_t value) {
+    if (value > std::numeric_limits<std::size_t>::max() - bytes) {
+      throw NvrtcError("NVRTC compile cache accounting overflow");
+    }
+    bytes += value;
+  };
+  add(key.library_path.size());
+  add(key.source.size());
+  add(key.source_name.size());
+  for (const auto& option : key.options) {
+    add(option.size());
+  }
+  add(result.ptx.size());
+  add(result.log.size());
+  return bytes;
+}
+
+class CompileCoordinator {
+public:
+  template <typename Compile>
+  [[nodiscard]] NvrtcCompileResult compile(const CompileCacheKey& key, Compile&& compile_uncached) {
+    std::unique_lock lock(mutex_);
+    for (;;) {
+      if (auto cached = find_locked(key); cached != cache_.end()) {
+        cache_.splice(cache_.begin(), cache_, cached);
+        return cached->result;
+      }
+      if (!compiling_) {
+        compiling_ = true;
+        break;
+      }
+      changed_.wait(lock);
+    }
+    lock.unlock();
+
+    NvrtcCompileResult result;
+    try {
+      result = compile_uncached();
+    } catch (...) {
+      finish_compile();
+      throw;
+    }
+
+    lock.lock();
+    try {
+      retain_locked(key, result);
+    } catch (const std::bad_alloc&) {
+      // A cache allocation failure must not discard an otherwise valid compilation.
+    } catch (...) {
+      compiling_ = false;
+      lock.unlock();
+      changed_.notify_all();
+      throw;
+    }
+    compiling_ = false;
+    lock.unlock();
+    changed_.notify_all();
+    return result;
+  }
+
+private:
+  struct CachedCompile {
+    CompileCacheKey key;
+    NvrtcCompileResult result;
+    std::size_t accounted_bytes = 0;
+  };
+
+  using Cache = std::list<CachedCompile>;
+
+  [[nodiscard]] Cache::iterator find_locked(const CompileCacheKey& key) {
+    return std::find_if(cache_.begin(), cache_.end(),
+                        [&](const CachedCompile& entry) { return entry.key == key; });
+  }
+
+  void retain_locked(const CompileCacheKey& key, const NvrtcCompileResult& result) {
+    const auto entry_bytes = checked_cache_bytes(key, result);
+    if (entry_bytes > kNvrtcCompileCacheMaximumBytes) {
+      return;
+    }
+    while (!cache_.empty() && (cache_.size() >= kNvrtcCompileCacheMaximumEntries ||
+                               entry_bytes > kNvrtcCompileCacheMaximumBytes - cache_bytes_)) {
+      cache_bytes_ -= cache_.back().accounted_bytes;
+      cache_.pop_back();
+    }
+    cache_.push_front(CachedCompile{.key = key, .result = result, .accounted_bytes = entry_bytes});
+    cache_bytes_ += entry_bytes;
+  }
+
+  void finish_compile() noexcept {
+    {
+      std::lock_guard lock(mutex_);
+      compiling_ = false;
+    }
+    changed_.notify_all();
+  }
+
+  std::mutex mutex_;
+  std::condition_variable changed_;
+  Cache cache_;
+  std::size_t cache_bytes_ = 0;
+  bool compiling_ = false;
+};
+
+CompileCoordinator& compile_coordinator() {
+  static CompileCoordinator coordinator;
+  return coordinator;
+}
+
 } // namespace
 
 struct NvrtcCompiler::Impl {
@@ -227,6 +360,10 @@ struct NvrtcCompiler::Impl {
     get_program_log_size = library.symbol<decltype(get_program_log_size)>("nvrtcGetProgramLogSize");
     get_program_log = library.symbol<decltype(get_program_log)>("nvrtcGetProgramLog");
     get_error_string = library.symbol<decltype(get_error_string)>("nvrtcGetErrorString");
+    get_num_supported_architectures =
+        library.symbol<decltype(get_num_supported_architectures)>("nvrtcGetNumSupportedArchs");
+    get_supported_architectures =
+        library.symbol<decltype(get_supported_architectures)>("nvrtcGetSupportedArchs");
 
     int major = 0;
     int minor = 0;
@@ -235,6 +372,7 @@ struct NvrtcCompiler::Impl {
       throw NvrtcError("nvrtcVersion returned an invalid negative version");
     }
     loaded_version = {.major = major, .minor = minor};
+    supported_architecture_values = query_supported_architectures();
   }
 
   [[nodiscard]] NvrtcCompileResult compile(std::string_view source, std::string_view source_name,
@@ -243,8 +381,20 @@ struct NvrtcCompiler::Impl {
     validate_text(source_name, kNvrtcMaximumSourceNameBytes, "source name");
     validate_options(options);
 
-    const std::string source_text(source);
-    const std::string source_name_text(source_name);
+    CompileCacheKey key{
+        .library_path = std::string(library.path()),
+        .version = loaded_version,
+        .source = std::string(source),
+        .source_name = std::string(source_name),
+        .options = options.values,
+    };
+    return compile_coordinator().compile(
+        key, [&] { return compile_uncached(key.source, key.source_name, key.options); });
+  }
+
+  [[nodiscard]] NvrtcCompileResult compile_uncached(const std::string& source_text,
+                                                    const std::string& source_name_text,
+                                                    const std::vector<std::string>& options) const {
     NvrtcProgram program = nullptr;
     const auto create_result = create_program(&program, source_text.c_str(),
                                               source_name_text.c_str(), 0, nullptr, nullptr);
@@ -270,8 +420,8 @@ struct NvrtcCompiler::Impl {
     }
 
     std::vector<const char*> option_values;
-    option_values.reserve(options.values.size());
-    for (const auto& option : options.values) {
+    option_values.reserve(options.size());
+    for (const auto& option : options) {
       option_values.push_back(option.c_str());
     }
     const auto compile_result =
@@ -307,6 +457,33 @@ struct NvrtcCompiler::Impl {
     NvrtcCompileResult result{.ptx = std::move(ptx), .log = std::move(log)};
     check("nvrtcDestroyProgram", guard.close());
     return result;
+  }
+
+  [[nodiscard]] std::vector<int> query_supported_architectures() const {
+    int count = 0;
+    check("nvrtcGetNumSupportedArchs", get_num_supported_architectures(&count));
+    if (count <= 0) {
+      throw NvrtcError("nvrtcGetNumSupportedArchs returned no supported architectures");
+    }
+    if (static_cast<std::size_t>(count) > kNvrtcMaximumSupportedArchitectureCount) {
+      throw NvrtcError("nvrtcGetNumSupportedArchs returned " + std::to_string(count) +
+                       " architectures, exceeding the limit of " +
+                       std::to_string(kNvrtcMaximumSupportedArchitectureCount));
+    }
+
+    std::vector<int> architectures(static_cast<std::size_t>(count));
+    check("nvrtcGetSupportedArchs", get_supported_architectures(architectures.data()));
+    for (const auto architecture : architectures) {
+      if (architecture < kMinimumEncodedArchitecture ||
+          architecture > kMaximumEncodedArchitecture) {
+        throw NvrtcError("nvrtcGetSupportedArchs returned invalid architecture " +
+                         std::to_string(architecture));
+      }
+    }
+    std::sort(architectures.begin(), architectures.end());
+    architectures.erase(std::unique(architectures.begin(), architectures.end()),
+                        architectures.end());
+    return architectures;
   }
 
   void check(const char* function, NvrtcResult result) const {
@@ -351,6 +528,7 @@ struct NvrtcCompiler::Impl {
 
   DynamicLibrary library;
   NvrtcVersion loaded_version;
+  std::vector<int> supported_architecture_values;
   NvrtcResult (*version_function)(int*, int*) = nullptr;
   NvrtcResult (*create_program)(NvrtcProgram*, const char*, const char*, int, const char* const*,
                                 const char* const*) = nullptr;
@@ -361,6 +539,8 @@ struct NvrtcCompiler::Impl {
   NvrtcResult (*get_program_log_size)(NvrtcProgram, std::size_t*) = nullptr;
   NvrtcResult (*get_program_log)(NvrtcProgram, char*) = nullptr;
   const char* (*get_error_string)(NvrtcResult) = nullptr;
+  NvrtcResult (*get_num_supported_architectures)(int*) = nullptr;
+  NvrtcResult (*get_supported_architectures)(int*) = nullptr;
 };
 
 NvrtcCompiler::NvrtcCompiler(std::shared_ptr<Impl> impl) : impl_(std::move(impl)) {}
@@ -415,6 +595,32 @@ std::string NvrtcCompiler::availability_error(std::string_view library_path) {
 NvrtcVersion NvrtcCompiler::version() const { return checked_impl().loaded_version; }
 
 std::string_view NvrtcCompiler::library_path() const { return checked_impl().library.path(); }
+
+std::vector<int> NvrtcCompiler::supported_architectures() const {
+  return checked_impl().supported_architecture_values;
+}
+
+int NvrtcCompiler::select_architecture(int device_architecture) const {
+  if (device_architecture < kMinimumEncodedArchitecture ||
+      device_architecture > kMaximumEncodedArchitecture) {
+    throw std::invalid_argument("CUDA device architecture must be encoded as major * 10 + minor");
+  }
+  const auto& impl = checked_impl();
+  const auto selected =
+      std::upper_bound(impl.supported_architecture_values.begin(),
+                       impl.supported_architecture_values.end(), device_architecture);
+  if (selected == impl.supported_architecture_values.begin()) {
+    std::ostringstream message;
+    message << "NVRTC " << impl.loaded_version.major << '.' << impl.loaded_version.minor
+            << " does not support a virtual architecture compatible with compute_"
+            << device_architecture << "; supported architectures:";
+    for (const auto architecture : impl.supported_architecture_values) {
+      message << " compute_" << architecture;
+    }
+    throw NvrtcError(message.str());
+  }
+  return *std::prev(selected);
+}
 
 NvrtcCompileResult NvrtcCompiler::compile(std::string_view source, std::string_view source_name,
                                           const NvrtcCompileOptions& options) const {

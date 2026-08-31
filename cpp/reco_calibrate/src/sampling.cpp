@@ -1,12 +1,13 @@
 #include "reco/calibrate/sampling.hpp"
 
-#include "nvrtc_compiler.hpp"
+#include "reco/core/nvrtc_compiler.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace reco::calibrate {
@@ -57,9 +58,14 @@ void validate_frame_indices(std::span<const std::uint64_t> frame_indices) {
 
 struct GpuCalibrationFrameReader::Rotate180 {
   explicit Rotate180(reco::core::CudaBackend& backend_in) : backend(backend_in) {
-    detail::NvrtcCompiler compiler;
+    auto compiler = reco::core::NvrtcCompiler::create();
+    const auto capability = backend.compute_capability();
+    const auto architecture =
+        compiler.select_architecture(capability.major * 10 + capability.minor);
+    reco::core::NvrtcCompileOptions options;
+    options.values = {"--std=c++11", "--gpu-architecture=compute_" + std::to_string(architecture)};
     kernel = backend.load_kernel_from_ptx(
-        compiler.compile(kRotate180KernelSource, "reco_calibrate_rotate_luma_180.cu"),
+        compiler.compile(kRotate180KernelSource, "reco_calibrate_rotate_luma_180.cu", options).ptx,
         "rotate_luma_180");
   }
 

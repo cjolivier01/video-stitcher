@@ -24,6 +24,12 @@ inline constexpr std::size_t kNvrtcMaximumTotalOptionBytes = 64U * 1024U;
 inline constexpr std::size_t kNvrtcMaximumLogBytes = 4U * 1024U * 1024U;
 /// Maximum PTX output size that may be read from NVRTC.
 inline constexpr std::size_t kNvrtcMaximumPtxBytes = 64U * 1024U * 1024U;
+/// Maximum number of virtual architectures accepted from one NVRTC runtime.
+inline constexpr std::size_t kNvrtcMaximumSupportedArchitectureCount = 128U;
+/// Maximum number of successful compilations retained process-wide.
+inline constexpr std::size_t kNvrtcCompileCacheMaximumEntries = 8U;
+/// Maximum accounted request and result bytes retained process-wide.
+inline constexpr std::size_t kNvrtcCompileCacheMaximumBytes = 16U * 1024U * 1024U;
 
 /// Error reported by NVRTC discovery or execution.
 class NvrtcError : public std::runtime_error {
@@ -74,7 +80,15 @@ public:
   [[nodiscard]] NvrtcVersion version() const;
   /// Returns the exact loaded library name or path.
   [[nodiscard]] std::string_view library_path() const;
+  /// Returns sorted virtual architecture numbers such as 75 for `compute_75`.
+  [[nodiscard]] std::vector<int> supported_architectures() const;
+  /// Selects the highest supported virtual architecture not newer than the device.
+  [[nodiscard]] int select_architecture(int device_architecture) const;
   /// Compiles CUDA C++ to PTX and returns any compiler diagnostics.
+  ///
+  /// Compilation is serialized process-wide. Successful identical requests are
+  /// single-flighted and retained in a bounded process-wide LRU cache. Failures
+  /// are never cached.
   [[nodiscard]] NvrtcCompileResult
   compile(std::string_view source, std::string_view source_name,
           const NvrtcCompileOptions& options = NvrtcCompileOptions{}) const;

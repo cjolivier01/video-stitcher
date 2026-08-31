@@ -187,6 +187,9 @@ jobs:
           --cache_test_results=no
           --test_env=RECO_REQUIRE_CUDA_TEST=1
           --test_env=RECO_REQUIRE_NPP_TEST=1
+          //cpp/tests:reco_core_nvrtc_tests
+          //cpp/tests:reco_core_cuda_stitch_renderer_tests
+          //cpp/tests:reco_core_cuda_stitch_parity_tests
           //cpp/tests:reco_calibrate_gpu_undistort_tests
           //cpp/tests:reco_calibrate_gpu_sampling_tests
           //cpp/tests:reco_calibrate_gpu_features_tests

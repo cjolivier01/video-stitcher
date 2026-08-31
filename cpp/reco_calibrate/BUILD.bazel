@@ -17,8 +17,6 @@ cc_library(
         "src/gpu_match_kernels.inc",
         "src/gpu_undistort.cpp",
         "src/lens_database.cpp",
-        "src/nvrtc_compiler.cpp",
-        "src/nvrtc_compiler.hpp",
         "src/optimizer.cpp",
         "src/pipeline.cpp",
         "src/ransac.cpp",
