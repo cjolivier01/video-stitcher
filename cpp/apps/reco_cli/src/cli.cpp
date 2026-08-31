@@ -215,6 +215,8 @@ public:
     return *this;
   }
 
+  [[nodiscard]] HANDLE get() const noexcept { return handle_; }
+
 private:
   HANDLE handle_ = INVALID_HANDLE_VALUE;
 };
@@ -222,7 +224,40 @@ private:
 struct PinnedWindowsPath {
   UniqueWindowsHandle target;
   UniqueWindowsHandle directory_entry;
+
+  void verify_unchanged(const std::filesystem::path& path, std::string_view label) const;
 };
+
+[[nodiscard]] bool path_identifies_windows_handle(const std::filesystem::path& path, HANDLE source,
+                                                  bool open_reparse_point) {
+  DWORD flags = FILE_FLAG_BACKUP_SEMANTICS;
+  if (open_reparse_point) {
+    flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+  }
+  const HANDLE current =
+      CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                  flags, nullptr);
+  if (current == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+  UniqueWindowsHandle retained_current(current);
+  BY_HANDLE_FILE_INFORMATION source_identity{};
+  BY_HANDLE_FILE_INFORMATION current_identity{};
+  return GetFileInformationByHandle(source, &source_identity) != 0 &&
+         GetFileInformationByHandle(current, &current_identity) != 0 &&
+         source_identity.dwVolumeSerialNumber == current_identity.dwVolumeSerialNumber &&
+         source_identity.nFileIndexHigh == current_identity.nFileIndexHigh &&
+         source_identity.nFileIndexLow == current_identity.nFileIndexLow;
+}
+
+void PinnedWindowsPath::verify_unchanged(const std::filesystem::path& path,
+                                         std::string_view label) const {
+  if (!path_identifies_windows_handle(path, directory_entry.get(), true) ||
+      !path_identifies_windows_handle(path, target.get(), false)) {
+    throw std::runtime_error(std::string(label) + " path identity changed before publication");
+  }
+}
 
 [[nodiscard]] PinnedWindowsPath pin_windows_path_for_publication(const std::filesystem::path& path,
                                                                  std::string_view label) {
@@ -1057,6 +1092,17 @@ void write_calibration_json_atomically_impl(std::string_view json,
     }
     if (before_commit) {
       before_commit();
+    }
+    left_reservation.verify_unchanged(left_input, "left video input");
+    right_reservation.verify_unchanged(right_input, "right video input");
+    for (std::size_t index = 0; index < profile_reservations.size(); ++index) {
+      profile_reservations[index].verify_unchanged(
+          lens_profiles[index], index == 0 ? "left lens profile" : "right lens profile");
+    }
+    if (const auto error = reco::calibrate::validate_calibration_output_identity(
+            left_input, right_input, destination, lens_profiles);
+        error.has_value()) {
+      throw std::runtime_error("refusing to publish calibration output: " + *error);
     }
     rename_open_file(handle, destination);
     temporary_exists = false;

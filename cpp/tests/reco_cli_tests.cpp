@@ -1279,6 +1279,23 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
   const auto& surviving_input = move_succeeded ? moved_input_destination : moved_input;
   expect_eq(read_text_file(surviving_input), std::string("commit-bound media must survive\n"),
             "cross-platform publication preserves a moved or retained input");
+
+  const auto commit_alias_destination = root.path() / "commit-input-alias-output.json";
+  bool commit_alias_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"input-alias"})json", commit_alias_destination, left_input,
+        right_input, {}, {},
+        [&] { std::filesystem::create_hard_link(left_input, commit_alias_destination); });
+  } catch (const std::exception& error) {
+    commit_alias_rejected =
+        std::string_view(error.what()).find("left video input") != std::string_view::npos;
+  }
+  expect_true(commit_alias_rejected,
+              "commit-bound destination alias of an input is rejected");
+  expect_true(std::filesystem::equivalent(left_input, commit_alias_destination),
+              "rejected commit-bound alias preserves the input identity");
+  std::filesystem::remove(commit_alias_destination);
 #endif
 
   bool orphaned_temporary = false;
