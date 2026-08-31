@@ -792,6 +792,7 @@ publish_windows_output(HANDLE directory, const std::filesystem::path& resolved_d
         }
         return displaced;
       }
+      retained_current = UniqueWindowsHandle{};
     } else if (current_error != ERROR_FILE_NOT_FOUND && current_error != ERROR_PATH_NOT_FOUND) {
       throw_file_error("cannot inspect calibration output before replacement", destination,
                        static_cast<int>(current_error));
