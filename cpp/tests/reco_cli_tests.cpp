@@ -312,6 +312,101 @@ bool wait_windows_process_success(HANDLE process, DWORD timeout_ms) {
   DWORD exit_code = 1;
   return GetExitCodeProcess(process, &exit_code) != 0 && exit_code == 0;
 }
+
+std::optional<std::filesystem::path> find_windows_reco_runfile() {
+  const char* test_srcdir = std::getenv("TEST_SRCDIR");
+  if (test_srcdir != nullptr && *test_srcdir != '\0') {
+    std::error_code error;
+    const std::filesystem::recursive_directory_iterator entries(
+        test_srcdir, std::filesystem::directory_options::skip_permission_denied, error);
+    if (!error) {
+      for (const auto& entry : entries) {
+        if (entry.is_regular_file(error) && !error &&
+            entry.path().filename().native() == L"reco.exe") {
+          return entry.path();
+        }
+        error.clear();
+      }
+    }
+  }
+  const char* manifest_path = std::getenv("RUNFILES_MANIFEST_FILE");
+  if (manifest_path == nullptr || *manifest_path == '\0') {
+    return std::nullopt;
+  }
+  std::ifstream manifest(manifest_path, std::ios::binary);
+  std::string line;
+  constexpr std::string_view suffix = "cpp/apps/reco_cli/reco.exe";
+  while (std::getline(manifest, line)) {
+    const auto separator = line.find(' ');
+    if (separator != std::string::npos &&
+        std::string_view(line.data(), separator).ends_with(suffix)) {
+      return std::filesystem::path(line.substr(separator + 1));
+    }
+  }
+  return std::nullopt;
+}
+
+struct WindowsProcessResult {
+  bool started = false;
+  DWORD exit_code = 1;
+  std::string output;
+};
+
+WindowsProcessResult run_windows_process_capture(const std::filesystem::path& executable,
+                                                 const std::vector<std::wstring>& arguments,
+                                                 const std::filesystem::path& output_path) {
+  SECURITY_ATTRIBUTES inheritable{
+      .nLength = sizeof(SECURITY_ATTRIBUTES),
+      .lpSecurityDescriptor = nullptr,
+      .bInheritHandle = TRUE,
+  };
+  const HANDLE output =
+      CreateFileW(output_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                  &inheritable, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  const HANDLE input = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                   &inheritable, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (output == INVALID_HANDLE_VALUE || input == INVALID_HANDLE_VALUE) {
+    if (output != INVALID_HANDLE_VALUE) {
+      (void)CloseHandle(output);
+    }
+    if (input != INVALID_HANDLE_VALUE) {
+      (void)CloseHandle(input);
+    }
+    return {};
+  }
+  std::wstring command = quote_windows_argument(executable.native());
+  for (const auto& argument : arguments) {
+    command.push_back(L' ');
+    command += quote_windows_argument(argument);
+  }
+  command.push_back(L'\0');
+  STARTUPINFOW startup{
+      .cb = sizeof(STARTUPINFOW),
+      .dwFlags = STARTF_USESTDHANDLES,
+      .hStdInput = input,
+      .hStdOutput = output,
+      .hStdError = output,
+  };
+  PROCESS_INFORMATION process{};
+  WindowsProcessResult result;
+  result.started = CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, TRUE,
+                                  CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process) != 0;
+  (void)CloseHandle(input);
+  if (!result.started) {
+    (void)CloseHandle(output);
+    return result;
+  }
+  (void)CloseHandle(process.hThread);
+  if (WaitForSingleObject(process.hProcess, 30000) != WAIT_OBJECT_0) {
+    (void)TerminateProcess(process.hProcess, 94);
+    (void)WaitForSingleObject(process.hProcess, 5000);
+  }
+  (void)GetExitCodeProcess(process.hProcess, &result.exit_code);
+  (void)CloseHandle(process.hProcess);
+  (void)CloseHandle(output);
+  result.output = read_text_file(output_path);
+  return result;
+}
 #else
 bool read_byte_with_timeout(int descriptor, char& value, std::chrono::milliseconds timeout) {
   pollfd event{.fd = descriptor, .events = POLLIN};
@@ -536,6 +631,35 @@ std::filesystem::path write_valid_calibration_file() {
   std::ofstream output(path, std::ios::binary);
   output << valid_calibration_json();
   return path;
+}
+
+void production_windows_cli_preserves_unicode_paths() {
+#if defined(_WIN32)
+  TemporaryDirectory root;
+  const auto calibration = root.path() / "match.json";
+  write_text_file(calibration, valid_calibration_json());
+  const auto left = root.path() / std::filesystem::path(L"left-Ω-例.mp4");
+  const auto right = root.path() / std::filesystem::path(L"right-例-Ω.mp4");
+  const auto output = root.path() / std::filesystem::path(L"output-Ω-例.mp4");
+  const auto executable = find_windows_reco_runfile();
+  expect_true(executable.has_value(), "production Windows reco.exe runfile is available");
+  if (!executable.has_value()) {
+    return;
+  }
+  const auto result = run_windows_process_capture(*executable,
+                                                  {L"stitch", left.native(), right.native(), L"-c",
+                                                   calibration.native(), L"-o", output.native()},
+                                                  root.path() / "reco-output.txt");
+  expect_true(result.started, "production Windows reco.exe starts through CreateProcessW");
+  expect_eq(result.exit_code, static_cast<DWORD>(2),
+            "production Windows stitch plan remains intentionally blocked");
+  expect_true(result.output.find(wide_to_utf8(left.native())) != std::string::npos,
+              "production Windows CLI preserves the Unicode left path");
+  expect_true(result.output.find(wide_to_utf8(right.native())) != std::string::npos,
+              "production Windows CLI preserves the Unicode right path");
+  expect_true(result.output.find(wide_to_utf8(output.native())) != std::string::npos,
+              "production Windows CLI preserves the Unicode output path");
+#endif
 }
 
 void expect_error(const std::variant<Command, ParseError>& parsed, std::string_view message) {
@@ -981,6 +1105,31 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
 #endif
 
 #if defined(__linux__)
+  for (const bool force_fallback : {false, true}) {
+    const auto throwing_hook_destination =
+        root.path() /
+        (force_fallback ? "throwing-fallback-hook.json" : "throwing-exchange-hook.json");
+    write_text_file(throwing_hook_destination, "throwing hook original output\n");
+    bool throwing_hook_propagated = false;
+    try {
+      detail::write_calibration_json_atomically(
+          R"json({"writer":"throwing-hook"})json", throwing_hook_destination, left_input,
+          right_input, {}, {}, {}, force_fallback,
+          [] { throw std::runtime_error("synthetic after-publication hook failure"); });
+    } catch (const std::exception& error) {
+      throwing_hook_propagated =
+          std::string_view(error.what()).find("synthetic after-publication hook failure") !=
+          std::string_view::npos;
+    }
+    expect_true(throwing_hook_propagated, force_fallback
+                                              ? "throwing fallback hook propagates after rollback"
+                                              : "throwing exchange hook propagates after rollback");
+    expect_eq(read_text_file(throwing_hook_destination),
+              std::string("throwing hook original output\n"),
+              force_fallback ? "throwing fallback hook restores the original output"
+                             : "throwing exchange hook restores the original output");
+  }
+
   const auto serialized_destination = root.path() / "serialized.json";
   write_text_file(serialized_destination, "serialized initial output\n");
   std::atomic<bool> first_commit_entered{false};
@@ -2191,6 +2340,8 @@ int main(int argc, char** argv) {
   run_test_case("live_command_parse_matches_rust_defaults",
                 live_command_parse_matches_rust_defaults);
   run_test_case("parse_errors_are_reported", parse_errors_are_reported);
+  run_test_case("production_windows_cli_preserves_unicode_paths",
+                production_windows_cli_preserves_unicode_paths);
   run_test_case("probe_worker_discovery_handles_path_and_bzlmod_runfiles",
                 probe_worker_discovery_handles_path_and_bzlmod_runfiles);
   run_test_case("calibration_output_replacement_is_exclusive_and_atomic",

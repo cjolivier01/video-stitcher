@@ -521,6 +521,7 @@ cc_test(
     srcs = ["reco_cli_tests.cpp"],
     data = [
         ":libfake_nvbufsurface.so",
+        "//cpp/apps/reco_cli:reco",
         "//cpp/reco_calibrate:reco_calibration_worker",
         "//cpp/reco_io:reco_video_probe_worker",
     ],

@@ -3,9 +3,12 @@
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 #if defined(_WIN32)
@@ -20,6 +23,31 @@
 #endif
 
 namespace {
+
+#if defined(_WIN32)
+std::string wide_to_utf8(std::wstring_view value) {
+  if (value.empty()) {
+    return {};
+  }
+  if (value.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    throw std::length_error("Windows CLI argument is too long");
+  }
+  const auto input_size = static_cast<int>(value.size());
+  const int output_size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(),
+                                              input_size, nullptr, 0, nullptr, nullptr);
+  if (output_size <= 0) {
+    throw std::system_error(static_cast<int>(GetLastError()), std::system_category(),
+                            "cannot convert Windows CLI argument to UTF-8");
+  }
+  std::string result(static_cast<std::size_t>(output_size), '\0');
+  if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(), input_size, result.data(),
+                          output_size, nullptr, nullptr) != output_size) {
+    throw std::system_error(static_cast<int>(GetLastError()), std::system_category(),
+                            "cannot convert Windows CLI argument to UTF-8");
+  }
+  return result;
+}
+#endif
 
 std::optional<std::filesystem::path> current_executable_path() {
 #if defined(_WIN32)
@@ -64,21 +92,34 @@ std::optional<std::filesystem::path> current_executable_path() {
 
 } // namespace
 
+#if defined(_WIN32)
+int wmain(int argc, wchar_t** argv) {
+#else
 int main(int argc, char** argv) {
-  std::vector<std::string> args;
-  args.reserve(static_cast<std::size_t>(argc > 1 ? argc - 1 : 0));
-  for (int i = 1; i < argc; ++i) {
-    args.emplace_back(argv[i]);
-  }
+#endif
+  try {
+    std::vector<std::string> args;
+    args.reserve(static_cast<std::size_t>(argc > 1 ? argc - 1 : 0));
+    for (int i = 1; i < argc; ++i) {
+#if defined(_WIN32)
+      args.push_back(wide_to_utf8(argv[i]));
+#else
+      args.emplace_back(argv[i]);
+#endif
+    }
 
-  auto parsed = reco::cli::parse_args(args);
-  if (const auto* error = std::get_if<reco::cli::ParseError>(&parsed)) {
-    std::cerr << "error: " << error->message << "\n\n" << reco::cli::help_text() << '\n';
+    auto parsed = reco::cli::parse_args(args);
+    if (const auto* error = std::get_if<reco::cli::ParseError>(&parsed)) {
+      std::cerr << "error: " << error->message << "\n\n" << reco::cli::help_text() << '\n';
+      return 2;
+    }
+
+    const auto command = std::get<reco::cli::Command>(std::move(parsed));
+    auto executable = current_executable_path().value_or(argc > 0 ? std::filesystem::path(argv[0])
+                                                                  : std::filesystem::path{});
+    return reco::cli::run_command(command, std::cout, std::cerr, executable);
+  } catch (const std::exception& error) {
+    std::cerr << "error: " << error.what() << '\n';
     return 2;
   }
-
-  const auto command = std::get<reco::cli::Command>(std::move(parsed));
-  auto executable = current_executable_path().value_or(argc > 0 ? std::filesystem::path(argv[0])
-                                                                : std::filesystem::path{});
-  return reco::cli::run_command(command, std::cout, std::cerr, executable);
 }

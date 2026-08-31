@@ -1075,10 +1075,16 @@ create_descriptor_publication_link_at(int directory_descriptor,
   const auto deadline = std::chrono::steady_clock::now() + lock_timeout;
   bool contention_reported = false;
   while (::flock(lock.get(), LOCK_EX | LOCK_NB) != 0) {
-    if (errno == EINTR) {
+    const int lock_error = errno;
+    const bool contended = lock_error == EWOULDBLOCK || lock_error == EAGAIN;
+    if ((lock_error == EINTR || contended) && std::chrono::steady_clock::now() >= deadline) {
+      throw std::runtime_error("timed out locking calibration output directory: " +
+                               directory.string());
+    }
+    if (lock_error == EINTR) {
       continue;
     }
-    if ((errno == EWOULDBLOCK || errno == EAGAIN) && std::chrono::steady_clock::now() < deadline) {
+    if (contended) {
       if (!contention_reported && on_contention) {
         on_contention();
         contention_reported = true;
@@ -1086,11 +1092,7 @@ create_descriptor_publication_link_at(int directory_descriptor,
       std::this_thread::sleep_for(retry_delay);
       continue;
     }
-    if (errno == EWOULDBLOCK || errno == EAGAIN) {
-      throw std::runtime_error("timed out locking calibration output directory: " +
-                               directory.string());
-    }
-    throw_file_error("cannot lock calibration output directory", directory, errno);
+    throw_file_error("cannot lock calibration output directory", directory, lock_error);
   }
   return lock;
 }
@@ -1270,16 +1272,22 @@ lock_posix_output_directory(const std::filesystem::path& destination,
     (void)::close(descriptor);
     throw_file_error("cannot inspect calibration output directory lock", parent, ENOTDIR);
   }
+  const auto deadline = std::chrono::steady_clock::now() + lock_timeout;
   bool contention_reported = false;
   for (;;) {
     if (::flock(descriptor, LOCK_EX | LOCK_NB) == 0) {
       break;
     }
     const int nonblocking_error = errno;
+    const bool contended = nonblocking_error == EWOULDBLOCK || nonblocking_error == EAGAIN;
+    if ((nonblocking_error == EINTR || contended) && std::chrono::steady_clock::now() >= deadline) {
+      (void)::close(descriptor);
+      throw_file_error("timed out locking calibration output directory", parent, ETIMEDOUT);
+    }
     if (nonblocking_error == EINTR) {
       continue;
     }
-    if (nonblocking_error == EWOULDBLOCK || nonblocking_error == EAGAIN) {
+    if (contended) {
       if (!contention_reported && on_contention) {
         try {
           on_contention();
@@ -1289,14 +1297,13 @@ lock_posix_output_directory(const std::filesystem::path& destination,
         }
         contention_reported = true;
       }
-      const auto deadline = std::chrono::steady_clock::now() + lock_timeout;
       while (std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         if (::flock(descriptor, LOCK_EX | LOCK_NB) == 0) {
           return PosixDirectoryLock(descriptor);
         }
-        if (errno != EINTR && errno != EWOULDBLOCK && errno != EAGAIN) {
-          const int retry_error = errno;
+        const int retry_error = errno;
+        if (retry_error != EINTR && retry_error != EWOULDBLOCK && retry_error != EAGAIN) {
           (void)::close(descriptor);
           throw_file_error("cannot lock calibration output directory", parent, retry_error);
         }
@@ -1780,6 +1787,17 @@ void write_calibration_json_atomically_impl(
       }
       after_publish_hook_ran = true;
     };
+    const auto run_after_publish_or_rollback = [&](const auto& rollback) {
+      try {
+        run_after_publish_hook();
+      } catch (...) {
+        if (!rollback()) {
+          throw std::runtime_error(
+              "post-publication hook failed and calibration output rollback failed");
+        }
+        throw;
+      }
+    };
     bool published = false;
     bool use_rename_fallback = force_rename_fallback;
     bool destination_exists =
@@ -1803,12 +1821,13 @@ void write_calibration_json_atomically_impl(
             throw std::runtime_error(
                 "refusing to publish calibration output: published output identity changed");
           }
-          run_after_publish_hook();
-          validate_published_or_rollback([&] {
+          const auto rollback_link_if_unchanged = [&] {
             return temporary_name_identifies_descriptor(
                        directory_descriptor.get(), destination_name, temporary.descriptor.get()) &&
                    ::unlinkat(directory_descriptor.get(), destination_name.c_str(), 0) == 0;
-          });
+          };
+          run_after_publish_or_rollback(rollback_link_if_unchanged);
+          validate_published_or_rollback(rollback_link_if_unchanged);
           if (temporary_name_identifies_descriptor(directory_descriptor.get(), publication_name,
                                                    temporary.descriptor.get())) {
             if (::unlinkat(directory_descriptor.get(), publication_name.c_str(), 0) != 0) {
@@ -1849,7 +1868,6 @@ void write_calibration_json_atomically_impl(
             capture_directory_entry_snapshot(directory_descriptor.get(), destination_name);
         exchange_directory_entries_at(directory_descriptor.get(), publication_name,
                                       destination_name, destination);
-        run_after_publish_hook();
         const auto rollback_exchange_if_unchanged = [&] {
           if (!temporary_name_identifies_descriptor(directory_descriptor.get(), destination_name,
                                                     temporary.descriptor.get()) ||
@@ -1863,6 +1881,7 @@ void write_calibration_json_atomically_impl(
               directory_descriptor.get(), publication_name, temporary.descriptor.get());
           return rolled_back;
         };
+        run_after_publish_or_rollback(rollback_exchange_if_unchanged);
         if (!temporary_name_identifies_descriptor(directory_descriptor.get(), destination_name,
                                                   temporary.descriptor.get()) ||
             !directory_entry_matches_snapshot(directory_descriptor.get(), publication_name,
@@ -1922,7 +1941,6 @@ void write_calibration_json_atomically_impl(
         exchange_directory_entries_at(directory_descriptor.get(), temporary.name, destination_name,
                                       destination);
       }
-      run_after_publish_hook();
       const auto rollback_fallback_if_unchanged = [&] {
         if (!temporary_name_identifies_descriptor(directory_descriptor.get(), destination_name,
                                                   temporary.descriptor.get())) {
@@ -1945,6 +1963,7 @@ void write_calibration_json_atomically_impl(
             directory_descriptor.get(), temporary.name, temporary.descriptor.get());
         return rolled_back;
       };
+      run_after_publish_or_rollback(rollback_fallback_if_unchanged);
       if (!temporary_name_identifies_descriptor(directory_descriptor.get(), destination_name,
                                                 temporary.descriptor.get()) ||
           (exchanged && (!displaced_snapshot.has_value() ||
@@ -2500,7 +2519,8 @@ RuntimePlan build_stitch_plan(const StitchCommand& command,
     return plan;
   }
   plan.steps.push_back("run stitch renderer without CPU frame readback");
-  plan.steps.push_back("encode the stitched output through the GPU-capable video backend");
+  plan.steps.push_back("encode the stitched output through the GPU-capable video backend to " +
+                       command.output);
   if (command.no_zero_copy) {
     plan.blocked_reason =
         "C++ stitch does not support --no-zero-copy because it would force a CPU path";

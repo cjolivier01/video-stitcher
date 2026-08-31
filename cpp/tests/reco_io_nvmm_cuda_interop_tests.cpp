@@ -257,6 +257,14 @@ void surface_array_mapping_retains_and_unmaps_owner() {
   expect_true(params.mapped_addr.cuda_ptr != nullptr, "runtime CUDA mapping remains live");
   expect_nvmm_error([&] { (void)map_nvmm_frame_to_cuda(info, std::make_shared<int>(10)); },
                     "duplicate map with different owner rejected");
+  params.color_format = abi::kColorNv12;
+  auto changed_while_mapped = extract_info(&surface);
+  changed_while_mapped.runtime = runtime;
+  expect_nvmm_error_contains(
+      [&] { (void)map_nvmm_frame_to_cuda(changed_while_mapped, decoder_owner); },
+      "metadata changed", "duplicate mapping with changed surface metadata rejected");
+  changed_while_mapped.runtime.reset();
+  params.color_format = abi::kColorNv12_709;
 
   decoder_owner.reset();
   decoded.owner.reset();

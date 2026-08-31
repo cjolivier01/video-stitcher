@@ -22,5 +22,6 @@ cc_binary(
         "//cpp/reco_calibrate:reco_calibration_worker",
         "//cpp/reco_io:reco_video_probe_worker",
     ],
+    visibility = ["//cpp/tests:__pkg__"],
     deps = [":reco_cli_lib"],
 )
