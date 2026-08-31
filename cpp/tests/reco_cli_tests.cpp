@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -23,7 +24,12 @@
 #include <variant>
 #include <vector>
 
-#if defined(__linux__)
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <unistd.h>
 #endif
@@ -140,6 +146,77 @@ void write_text_file(const std::filesystem::path& path, std::string_view content
 std::string read_text_file(const std::filesystem::path& path) {
   std::ifstream input(path, std::ios::binary);
   return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+}
+
+enum class AtomicReadStatus { Success, RetryableFailure, Missing, UnexpectedFailure };
+
+struct AtomicReadResult {
+  AtomicReadStatus status = AtomicReadStatus::UnexpectedFailure;
+  std::string contents;
+};
+
+AtomicReadResult read_atomic_output(const std::filesystem::path& path) {
+#if defined(_WIN32)
+  const HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (handle == INVALID_HANDLE_VALUE) {
+    const auto error = GetLastError();
+    if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
+      return {.status = AtomicReadStatus::Missing};
+    }
+    if (error == ERROR_SHARING_VIOLATION || error == ERROR_LOCK_VIOLATION ||
+        error == ERROR_ACCESS_DENIED) {
+      return {.status = AtomicReadStatus::RetryableFailure};
+    }
+    return {.status = AtomicReadStatus::UnexpectedFailure};
+  }
+  AtomicReadResult result{.status = AtomicReadStatus::Success};
+  std::array<char, 4096> buffer{};
+  for (;;) {
+    DWORD bytes_read = 0;
+    if (ReadFile(handle, buffer.data(), static_cast<DWORD>(buffer.size()), &bytes_read, nullptr) ==
+        0) {
+      result.status = AtomicReadStatus::UnexpectedFailure;
+      break;
+    }
+    result.contents.append(buffer.data(), bytes_read);
+    if (bytes_read == 0) {
+      break;
+    }
+  }
+  if (CloseHandle(handle) == 0) {
+    result.status = AtomicReadStatus::UnexpectedFailure;
+  }
+  return result;
+#else
+  const int descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (descriptor < 0) {
+    return {.status =
+                errno == ENOENT ? AtomicReadStatus::Missing : AtomicReadStatus::UnexpectedFailure};
+  }
+  AtomicReadResult result{.status = AtomicReadStatus::Success};
+  std::array<char, 4096> buffer{};
+  for (;;) {
+    const auto bytes_read = ::read(descriptor, buffer.data(), buffer.size());
+    if (bytes_read > 0) {
+      result.contents.append(buffer.data(), static_cast<std::size_t>(bytes_read));
+      continue;
+    }
+    if (bytes_read == 0) {
+      break;
+    }
+    if (errno == EINTR) {
+      continue;
+    }
+    result.status = AtomicReadStatus::UnexpectedFailure;
+    break;
+  }
+  if (::close(descriptor) != 0) {
+    result.status = AtomicReadStatus::UnexpectedFailure;
+  }
+  return result;
+#endif
 }
 
 void make_executable(const std::filesystem::path& path) {
@@ -587,17 +664,21 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
   std::atomic<bool> running{true};
   std::atomic<bool> observed_partial_output{false};
   std::atomic<bool> writer_failed{false};
+  std::atomic<std::uint64_t> successful_reads{0};
   std::thread reader([&] {
     while (running.load(std::memory_order_acquire)) {
-      std::ifstream input(destination, std::ios::binary);
-      if (!input) {
+      const auto result = read_atomic_output(destination);
+      if (result.status == AtomicReadStatus::RetryableFailure) {
         std::this_thread::yield();
         continue;
       }
-      const std::string contents{std::istreambuf_iterator<char>(input),
-                                 std::istreambuf_iterator<char>()};
+      if (result.status != AtomicReadStatus::Success) {
+        observed_partial_output.store(true, std::memory_order_release);
+        return;
+      }
+      successful_reads.fetch_add(1, std::memory_order_relaxed);
       const auto complete = std::any_of(payloads.begin(), payloads.end(), [&](const auto& payload) {
-        return contents == payload + '\n';
+        return result.contents == payload + '\n';
       });
       if (!complete) {
         observed_partial_output.store(true, std::memory_order_release);
@@ -606,6 +687,13 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
       std::this_thread::yield();
     }
   });
+  for (int attempt = 0; attempt < 100 && successful_reads.load(std::memory_order_relaxed) == 0 &&
+                        !observed_partial_output.load(std::memory_order_acquire);
+       ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  expect_true(successful_reads.load(std::memory_order_relaxed) > 0,
+              "concurrent reader opens the initial complete calibration output");
 
   std::vector<std::thread> writers;
   for (std::size_t writer = 0; writer < payloads.size(); ++writer) {
@@ -630,6 +718,8 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
               "concurrent calibration writers all succeed");
   expect_true(!observed_partial_output.load(std::memory_order_acquire),
               "concurrent reader never observes partial calibration output");
+  expect_true(successful_reads.load(std::memory_order_relaxed) > 0,
+              "concurrent reader observes at least one complete calibration output");
   const auto final_contents = read_text_file(destination);
   expect_true(std::any_of(payloads.begin(), payloads.end(),
                           [&](const auto& payload) { return final_contents == payload + '\n'; }),
@@ -731,6 +821,22 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
               "calibration output cannot replace its publication lock file");
   expect_true(std::filesystem::is_regular_file(reserved_lock_destination),
               "reserved publication lock remains a regular file");
+
+  const auto reserved_lock_alias = root.path() / "reserved-lock-alias.json";
+  std::filesystem::create_hard_link(reserved_lock_destination, reserved_lock_alias);
+  bool reserved_lock_alias_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(R"json({"writer":"reserved-lock-alias"})json",
+                                              reserved_lock_alias, left_input, right_input);
+  } catch (const std::exception& error) {
+    reserved_lock_alias_rejected =
+        std::string_view(error.what()).find("reserved publication lock entry") !=
+        std::string_view::npos;
+  }
+  expect_true(reserved_lock_alias_rejected,
+              "calibration output cannot replace an alias of its publication lock");
+  expect_true(std::filesystem::equivalent(reserved_lock_destination, reserved_lock_alias),
+              "reserved publication lock alias remains intact");
 
   const auto mutable_input = root.path() / "mutable-left.mp4";
   const auto mutable_output = root.path() / "mutable-match.json";
@@ -1146,6 +1252,33 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
             "publication stays in the pinned output directory");
   expect_true(!std::filesystem::exists(redirected_parent / "match.json"),
               "retargeted output parent cannot redirect publication");
+#else
+  const auto moved_input = root.path() / "commit-moved-left.mp4";
+  const auto moved_input_destination = root.path() / "commit-moved-input-output.json";
+  write_text_file(moved_input, "commit-bound media must survive\n");
+  bool move_succeeded = false;
+  bool moved_input_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"moved-input"})json", moved_input_destination, moved_input, right_input,
+        {}, {}, [&] {
+          std::error_code move_error;
+          std::filesystem::rename(moved_input, moved_input_destination, move_error);
+          move_succeeded = !move_error;
+          if (move_error) {
+            throw std::filesystem::filesystem_error("input move blocked by retained handle",
+                                                    moved_input, moved_input_destination,
+                                                    move_error);
+          }
+        });
+  } catch (const std::exception&) {
+    moved_input_rejected = true;
+  }
+  expect_true(moved_input_rejected,
+              "commit-bound destination substitution with an input is rejected");
+  const auto& surviving_input = move_succeeded ? moved_input_destination : moved_input;
+  expect_eq(read_text_file(surviving_input), std::string("commit-bound media must survive\n"),
+            "cross-platform publication preserves a moved or retained input");
 #endif
 
   bool orphaned_temporary = false;

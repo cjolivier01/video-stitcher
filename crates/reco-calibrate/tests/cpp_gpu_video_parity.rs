@@ -157,6 +157,10 @@ fn decoded_video_calibration_matches_cpp_golden() {
     let gpu = match GpuContext::new_blocking() {
         Ok(gpu) => gpu,
         Err(GpuError::NoAdapter | GpuError::AdapterRequest(_)) => {
+            assert!(
+                std::env::var_os("RECO_REQUIRE_CPP_GPU_VIDEO_PARITY").is_none(),
+                "RECO_REQUIRE_CPP_GPU_VIDEO_PARITY requires an available Rust GPU adapter"
+            );
             eprintln!("Skipping C++ parity reference: no GPU adapter available");
             return;
         }

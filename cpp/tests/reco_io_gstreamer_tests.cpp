@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -17,6 +18,21 @@ using reco::tests::make_fixture_gpu_file_decode_source;
 namespace {
 
 int failures = 0;
+
+#if defined(__linux__)
+std::filesystem::path find_fake_nvbufsurface() {
+  const char* runfiles = std::getenv("TEST_SRCDIR");
+  if (runfiles == nullptr || runfiles[0] == '\0') {
+    throw std::runtime_error("TEST_SRCDIR is not set");
+  }
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(runfiles)) {
+    if (entry.path().filename() == "libfake_nvbufsurface.so") {
+      return entry.path();
+    }
+  }
+  throw std::runtime_error("fake NvBufSurface runtime runfile not found");
+}
+#endif
 
 template <typename T, typename U> void expect_eq(T actual, U expected, std::string_view message) {
   if (actual != expected) {
@@ -420,6 +436,10 @@ void gpu_decode_frame_source_preserves_gpu_residency() {
 } // namespace
 
 int main() {
+#if defined(__linux__)
+  const auto fake_nvbufsurface = find_fake_nvbufsurface();
+  setenv("RECO_NVBUFSURFACE_DYLIB_PATH", fake_nvbufsurface.c_str(), 1);
+#endif
   pipeline_builders_match_rust_policy();
   runtime_probes_are_stable();
   gpu_file_decode_pipeline_preserves_nvmm();

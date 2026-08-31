@@ -1536,10 +1536,20 @@ bool guardian_worker_group_within_memory_limit(pid_t worker_pid) {
   if (proc_pid_rusage == nullptr) {
     return false;
   }
-  std::uint64_t resident_bytes = 0;
+  struct rusage_info_v2 worker_usage{};
+  if (proc_pid_rusage(worker_pid, RUSAGE_INFO_V2,
+                      reinterpret_cast<rusage_info_t*>(&worker_usage)) != 0) {
+    errno = 0;
+    return ::kill(worker_pid, 0) != 0 && errno == ESRCH;
+  }
+  std::uint64_t resident_bytes =
+      std::max(worker_usage.ri_resident_size, worker_usage.ri_phys_footprint);
+  if (resident_bytes > kMaximumWorkerAddressSpaceBytes) {
+    return false;
+  }
   const auto process_count = static_cast<std::size_t>(bytes) / sizeof(pid_t);
   for (std::size_t index = 0; index < process_count; ++index) {
-    if (processes[index] <= 0) {
+    if (processes[index] <= 0 || processes[index] == worker_pid) {
       continue;
     }
     struct rusage_info_v2 usage{};

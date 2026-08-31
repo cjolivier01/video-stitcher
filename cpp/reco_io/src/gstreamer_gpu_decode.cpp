@@ -706,11 +706,13 @@ private:
 
 class GstreamerGpuFileDecodeSource final : public GpuFileDecodeSource {
 public:
-  GstreamerGpuFileDecodeSource(GpuFileDecodeConfig config, NvbufSurfaceAbi abi,
-                               std::shared_ptr<GstreamerApi> api)
+  GstreamerGpuFileDecodeSource(GpuFileDecodeConfig config,
+                               std::shared_ptr<const NvbufSurfaceRuntime> runtime,
+                               NvbufSurfaceAbi abi, std::shared_ptr<GstreamerApi> api)
       : config_(std::move(config)),
-        pipeline_description_(build_gstreamer_gpu_file_decode_pipeline(config_)), abi_(abi),
-        api_(std::move(api)), next_frame_index_(config_.start_frame_index.value_or(0U)) {}
+        pipeline_description_(build_gstreamer_gpu_file_decode_pipeline(config_)),
+        runtime_(std::move(runtime)), abi_(abi), api_(std::move(api)),
+        next_frame_index_(config_.start_frame_index.value_or(0U)) {}
 
   GstreamerGpuFileDecodeSource(const GstreamerGpuFileDecodeSource&) = delete;
   GstreamerGpuFileDecodeSource& operator=(const GstreamerGpuFileDecodeSource&) = delete;
@@ -742,6 +744,12 @@ public:
     if (pipeline_ == nullptr || error != nullptr) {
       throw GpuDecodeError("GStreamer pipeline parse failed: " +
                            take_error(api_, error, "parse returned no pipeline"));
+    }
+    if (runtime_) {
+      if (const auto provenance_error = validate_nvbufsurface_runtime_provenance(runtime_);
+          provenance_error.has_value()) {
+        throw GpuDecodeError("GStreamer NvBufSurface runtime mismatch: " + *provenance_error);
+      }
     }
     sink_ = api_->bin_get_by_name(pipeline_, "sink");
     if (sink_ == nullptr) {
@@ -869,6 +877,7 @@ public:
     NvmmFrameInfo nvmm;
     try {
       nvmm = extract_nvmm_frame_info(owner->mapped_data(), abi_);
+      nvmm.runtime = runtime_;
     } catch (const std::exception& error) {
       throw GpuDecodeError("invalid GStreamer NVMM frame: " + std::string(error.what()));
     }
@@ -1215,6 +1224,7 @@ private:
 
   GpuFileDecodeConfig config_;
   std::string pipeline_description_;
+  std::shared_ptr<const NvbufSurfaceRuntime> runtime_;
   NvbufSurfaceAbi abi_;
   std::shared_ptr<GstreamerApi> api_;
   void* pipeline_ = nullptr;
@@ -1246,10 +1256,33 @@ private:
 
 std::unique_ptr<GpuFileDecodeSource>
 open_gstreamer_gpu_file_decode_source(GpuFileDecodeConfig config, NvbufSurfaceAbi abi) {
+#if defined(__linux__)
+  auto runtime = discover_nvbufsurface_runtime();
+  if (runtime->abi() != abi) {
+    throw GpuDecodeError("requested NvBufSurface ABI does not match the loaded runtime");
+  }
+  return open_gstreamer_gpu_file_decode_source(std::move(config), std::move(runtime));
+#else
   if (const auto error = validate_gpu_file_decode_config(config); error.has_value()) {
     throw std::invalid_argument(*error);
   }
-  switch (abi) {
+  auto source = std::make_unique<GstreamerGpuFileDecodeSource>(std::move(config), nullptr, abi,
+                                                               std::make_shared<GstreamerApi>());
+  source->start();
+  return source;
+#endif
+}
+
+std::unique_ptr<GpuFileDecodeSource>
+open_gstreamer_gpu_file_decode_source(GpuFileDecodeConfig config,
+                                      std::shared_ptr<const NvbufSurfaceRuntime> runtime) {
+  if (const auto error = validate_gpu_file_decode_config(config); error.has_value()) {
+    throw std::invalid_argument(*error);
+  }
+  if (!runtime) {
+    throw std::invalid_argument("NvBufSurface runtime binding is required");
+  }
+  switch (runtime->abi()) {
   case NvbufSurfaceAbi::DeepStream7_1:
   case NvbufSurfaceAbi::DeepStream9_1:
     break;
@@ -1257,8 +1290,9 @@ open_gstreamer_gpu_file_decode_source(GpuFileDecodeConfig config, NvbufSurfaceAb
     throw std::invalid_argument("unsupported NvBufSurface ABI");
   }
 
-  auto source = std::make_unique<GstreamerGpuFileDecodeSource>(std::move(config), abi,
-                                                               std::make_shared<GstreamerApi>());
+  const auto abi = runtime->abi();
+  auto source = std::make_unique<GstreamerGpuFileDecodeSource>(
+      std::move(config), std::move(runtime), abi, std::make_shared<GstreamerApi>());
   source->start();
   return source;
 }

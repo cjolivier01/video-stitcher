@@ -13,6 +13,10 @@
 #include <thread>
 #include <vector>
 
+#if defined(__linux__)
+#include <dlfcn.h>
+#endif
+
 using namespace reco::io;
 namespace abi = reco::io::detail::nvbufsurface_9_1;
 namespace abi7 = reco::io::detail::nvbufsurface_7_1;
@@ -147,6 +151,23 @@ void runtime_abi_discovery_is_fail_closed() {
 
   set_runtime_path("RECO_NVBUFSURFACE_DYLIB_PATH", nvbufsurface);
   set_environment("RECO_FAKE_DEEPSTREAM_VERSION", "9.1");
+  const auto retained_runtime = discover_nvbufsurface_runtime();
+  expect_true(retained_runtime->abi() == NvbufSurfaceAbi::DeepStream9_1,
+              "retained runtime exposes its selected ABI");
+  expect_true(!retained_runtime->library().empty(),
+              "retained runtime identifies its NvBufSurface provider");
+  expect_true(!validate_nvbufsurface_runtime_provenance(retained_runtime).has_value(),
+              "single retained NvBufSurface provider passes provenance validation");
+  void* mixed_runtime = dlopen(nvbufsurface_7_1.c_str(), RTLD_NOW | RTLD_LOCAL);
+  expect_true(mixed_runtime != nullptr, "mixed-runtime provenance fixture loads");
+  if (mixed_runtime != nullptr) {
+    const auto provenance_error = validate_nvbufsurface_runtime_provenance(retained_runtime);
+    expect_true(provenance_error.has_value() &&
+                    provenance_error->find("multiple NvBufSurface runtime providers") !=
+                        std::string::npos,
+                "a second NvBufSurface provider fails provenance validation");
+    (void)dlclose(mixed_runtime);
+  }
 #else
   expect_nvmm_error_contains([] { (void)discover_nvbufsurface_abi(); }, "only supported on Linux",
                              "non-Linux ABI discovery fails closed");

@@ -1,5 +1,6 @@
 #include "reco/io/gstreamer.hpp"
 
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
@@ -228,6 +229,10 @@ RuntimeProbe probe_nvbufsurface_runtime() {
                       .library = {},
                       .error = "NvBufSurface runtime probing is only supported on Linux"};
 #else
+  if (const char* override_path = std::getenv("RECO_NVBUFSURFACE_DYLIB_PATH");
+      override_path != nullptr && override_path[0] != '\0') {
+    return probe_library({override_path});
+  }
   return probe_library({"libnvbufsurface.so"});
 #endif
 }

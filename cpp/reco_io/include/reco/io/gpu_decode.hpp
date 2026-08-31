@@ -111,5 +111,9 @@ build_gstreamer_gpu_file_decode_pipeline(const GpuFileDecodeConfig& config);
 /// Opens an NVDEC/NVMM appsink source using the selected DeepStream surface ABI.
 [[nodiscard]] std::unique_ptr<GpuFileDecodeSource>
 open_gstreamer_gpu_file_decode_source(GpuFileDecodeConfig config, NvbufSurfaceAbi abi);
+/// Opens an NVDEC/NVMM source bound to the retained surface runtime.
+[[nodiscard]] std::unique_ptr<GpuFileDecodeSource>
+open_gstreamer_gpu_file_decode_source(GpuFileDecodeConfig config,
+                                      std::shared_ptr<const NvbufSurfaceRuntime> runtime);
 
 } // namespace reco::io

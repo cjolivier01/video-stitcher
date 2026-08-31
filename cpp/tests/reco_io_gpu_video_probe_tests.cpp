@@ -1398,8 +1398,12 @@ void invalid_inputs_fail(const std::filesystem::path& video_path,
   expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
                      "incompatible with NV12", "odd parser-visible dimensions rejected");
   set_scenario("probe-high-fps");
-  expect_probe_error([&] { (void)probe_video(container_config(video_path), timeout_ns); },
-                     "implausible frame rate", "time-base artifact FPS rejected");
+  expect_probe_error(
+      [&] {
+        (void)reco::io::detail::probe_gpu_video_bounded_in_process_for_test(
+            container_config(video_path), timeout_ns);
+      },
+      "implausible frame rate", "time-base artifact FPS rejected independently of worker startup");
 
   set_scenario("probe-parse-partial-error");
   std::filesystem::remove(event_path);
@@ -2682,6 +2686,11 @@ void windows_path_runtime_discovery(const std::filesystem::path& video_path,
   set_environment("RECO_GSTAPP_DYLIB_PATH", runtime.string());
   set_environment("RECO_GLIB_DYLIB_PATH", runtime.string());
   set_environment("RECO_GOBJECT_DYLIB_PATH", runtime.string());
+#if defined(__linux__)
+  const auto nvbufsurface = resolve_runfile("cpp/tests/libfake_nvbufsurface.so");
+  set_environment("RECO_NVBUFSURFACE_DYLIB_PATH", nvbufsurface.string());
+  set_environment("RECO_NVDS_UTILS_DYLIB_PATH", nvbufsurface.string());
+#endif
   std::filesystem::remove_all(directory);
 #else
   (void)video_path;

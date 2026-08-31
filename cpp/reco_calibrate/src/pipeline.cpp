@@ -783,7 +783,8 @@ CalibrationResult run_gpu_calibration_sources(
 
 CalibrationResult detail::run_gpu_calibration_in_process(const GpuCalibrationRequest& request,
                                                          const CalibrationBackendStatus& backends) {
-  const auto runtime_abi = reco::io::discover_nvbufsurface_abi();
+  const auto nvbufsurface_runtime = reco::io::discover_nvbufsurface_runtime();
+  const auto runtime_abi = nvbufsurface_runtime->abi();
   if (runtime_abi != request.nvbufsurface_abi) {
     throw CalibrationExecutionError(
         "calibration worker NvBufSurface ABI does not match the supervisor runtime");
@@ -839,9 +840,9 @@ CalibrationResult detail::run_gpu_calibration_in_process(const GpuCalibrationReq
     left_config.start_frame_index = left_indices.front();
     right_config.start_frame_index = right_indices.front();
     auto left_source = reco::io::open_gstreamer_gpu_file_decode_source(std::move(left_config),
-                                                                       request.nvbufsurface_abi);
+                                                                       nvbufsurface_runtime);
     auto right_source = reco::io::open_gstreamer_gpu_file_decode_source(std::move(right_config),
-                                                                        request.nvbufsurface_abi);
+                                                                        nvbufsurface_runtime);
     auto result = run_gpu_calibration_sources(backend, *left_source, *right_source, left_indices,
                                               right_indices, left_params, right_params,
                                               request.config, request.manual_sync_offset);

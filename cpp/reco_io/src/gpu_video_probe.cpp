@@ -2536,6 +2536,11 @@ GpuVideoProbe probe_gpu_video_exhaustive_for_test(const GpuFileDecodeConfig& con
   return probe_gpu_video_in_process(config, timeout_ns,
                                     GpuVideoProbePolicy::ExhaustiveIndexedCadence);
 }
+
+GpuVideoProbe probe_gpu_video_bounded_in_process_for_test(const GpuFileDecodeConfig& config,
+                                                          std::uint64_t timeout_ns) {
+  return probe_gpu_video_in_process(config, timeout_ns, GpuVideoProbePolicy::Bounded);
+}
 } // namespace detail
 
 } // namespace reco::io

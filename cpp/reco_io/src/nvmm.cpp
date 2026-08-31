@@ -4,15 +4,18 @@
 #include "reco/io/detail/nvbufsurface_9_1.hpp"
 
 #include <cstdlib>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 #if defined(__linux__)
 #include <dlfcn.h>
+#include <link.h>
 #endif
 
 namespace reco::io {
@@ -90,8 +93,8 @@ core::CudaDevicePtr checked_device_pointer(void* base, std::uint32_t offset) {
 #if defined(__linux__)
 class DynamicLibrary {
 public:
-  explicit DynamicLibrary(const char* path) : path_(path) {
-    handle_ = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+  explicit DynamicLibrary(const char* path, int flags = RTLD_NOW | RTLD_LOCAL) : path_(path) {
+    handle_ = dlopen(path, flags);
     if (handle_ == nullptr) {
       const char* error = dlerror();
       throw NvmmError("failed to load " + path_ +
@@ -130,11 +133,18 @@ private:
 struct NvbufFunctions {
   using Map = int (*)(void*, int);
 
-  explicit NvbufFunctions(const char* path) : library(path) {
+  explicit NvbufFunctions(const char* path) : library(path, RTLD_NOW | RTLD_GLOBAL) {
     map_cuda = library.optional_symbol<Map>("NvBufSurfaceMapCudaBuffer");
     unmap_cuda = library.optional_symbol<Map>("NvBufSurfaceUnMapCudaBuffer");
     map_egl = library.symbol<Map>("NvBufSurfaceMapEglImage");
     unmap_egl = library.symbol<Map>("NvBufSurfaceUnMapEglImage");
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<void*>(map_egl), &info) == 0 || info.dli_fbase == nullptr ||
+        info.dli_fname == nullptr) {
+      throw NvmmError("cannot identify the loaded NvBufSurface runtime object");
+    }
+    provider_base = info.dli_fbase;
+    provider_path = info.dli_fname;
   }
 
   DynamicLibrary library;
@@ -142,6 +152,8 @@ struct NvbufFunctions {
   Map unmap_cuda = nullptr;
   Map map_egl = nullptr;
   Map unmap_egl = nullptr;
+  void* provider_base = nullptr;
+  std::string provider_path;
 };
 
 std::shared_ptr<NvbufFunctions> nvbuf_functions() {
@@ -621,50 +633,119 @@ void* mapped_egl_image(const NvmmFrameInfo& info) {
 
 } // namespace
 
-NvbufSurfaceAbi discover_nvbufsurface_abi() {
+struct NvbufSurfaceRuntime::State {
+#if defined(__linux__)
+  std::shared_ptr<NvbufFunctions> functions;
+  std::unique_ptr<DynamicLibrary> version_library;
+#endif
+  NvbufSurfaceAbi abi = NvbufSurfaceAbi::DeepStream7_1;
+  std::string library;
+};
+
+NvbufSurfaceRuntime::NvbufSurfaceRuntime(std::unique_ptr<State> state) : state_(std::move(state)) {}
+
+NvbufSurfaceRuntime::~NvbufSurfaceRuntime() = default;
+
+NvbufSurfaceAbi NvbufSurfaceRuntime::abi() const noexcept { return state_->abi; }
+
+std::string_view NvbufSurfaceRuntime::library() const noexcept { return state_->library; }
+
+std::shared_ptr<const NvbufSurfaceRuntime> discover_nvbufsurface_runtime() {
 #if defined(__linux__)
   const char* nvbufsurface_path = std::getenv("RECO_NVBUFSURFACE_DYLIB_PATH");
   if (nvbufsurface_path == nullptr || nvbufsurface_path[0] == '\0') {
     nvbufsurface_path = "libnvbufsurface.so";
   }
-  DynamicLibrary nvbufsurface(nvbufsurface_path);
-  using SurfaceMap = int (*)(void*, int);
-  (void)nvbufsurface.symbol<SurfaceMap>("NvBufSurfaceMapEglImage");
-  (void)nvbufsurface.symbol<SurfaceMap>("NvBufSurfaceUnMapEglImage");
-  const auto map_cuda = nvbufsurface.optional_symbol<SurfaceMap>("NvBufSurfaceMapCudaBuffer");
-  const auto unmap_cuda = nvbufsurface.optional_symbol<SurfaceMap>("NvBufSurfaceUnMapCudaBuffer");
+  auto functions = std::make_shared<NvbufFunctions>(nvbufsurface_path);
 
   const char* deepstream_utils_path = std::getenv("RECO_NVDS_UTILS_DYLIB_PATH");
   if (deepstream_utils_path == nullptr || deepstream_utils_path[0] == '\0') {
     deepstream_utils_path = "libnvds_utils.so";
   }
-  DynamicLibrary deepstream_utils(deepstream_utils_path);
+  auto deepstream_utils = std::make_unique<DynamicLibrary>(deepstream_utils_path);
   using DeepStreamVersion = void (*)(unsigned int*, unsigned int*);
-  const auto version = deepstream_utils.symbol<DeepStreamVersion>("nvds_version");
+  const auto version = deepstream_utils->symbol<DeepStreamVersion>("nvds_version");
   unsigned int major = 0;
   unsigned int minor = 0;
   version(&major, &minor);
 
+  NvbufSurfaceAbi abi;
   if (major == 7U && minor == 1U) {
-    if (map_cuda != nullptr || unmap_cuda != nullptr) {
+    if (functions->map_cuda != nullptr || functions->unmap_cuda != nullptr) {
       throw NvmmError(
           "DeepStream 7.1 version metadata does not match the loaded NvBufSurface runtime: "
           "CUDA-buffer mapping symbols are forbidden for the 7.1 ABI");
     }
-    return NvbufSurfaceAbi::DeepStream7_1;
-  }
-  if (major == 9U && minor == 1U) {
-    if (map_cuda == nullptr || unmap_cuda == nullptr) {
+    abi = NvbufSurfaceAbi::DeepStream7_1;
+  } else if (major == 9U && minor == 1U) {
+    if (functions->map_cuda == nullptr || functions->unmap_cuda == nullptr) {
       throw NvmmError(
           "DeepStream 9.1 version metadata does not match the loaded NvBufSurface runtime: "
           "both CUDA-buffer mapping symbols are required for the 9.1 ABI");
     }
-    return NvbufSurfaceAbi::DeepStream9_1;
+    abi = NvbufSurfaceAbi::DeepStream9_1;
+  } else {
+    throw NvmmError("unsupported DeepStream NvBufSurface ABI version " + std::to_string(major) +
+                    "." + std::to_string(minor) + "; supported versions are 7.1 and 9.1");
   }
-  throw NvmmError("unsupported DeepStream NvBufSurface ABI version " + std::to_string(major) + "." +
-                  std::to_string(minor) + "; supported versions are 7.1 and 9.1");
+
+  auto state = std::make_unique<NvbufSurfaceRuntime::State>();
+  state->functions = std::move(functions);
+  state->version_library = std::move(deepstream_utils);
+  state->abi = abi;
+  state->library = state->functions->provider_path;
+  return std::shared_ptr<const NvbufSurfaceRuntime>(new NvbufSurfaceRuntime(std::move(state)));
 #else
   throw NvmmError("DeepStream NvBufSurface ABI discovery is only supported on Linux");
+#endif
+}
+
+NvbufSurfaceAbi discover_nvbufsurface_abi() { return discover_nvbufsurface_runtime()->abi(); }
+
+std::optional<std::string> validate_nvbufsurface_runtime_provenance(
+    const std::shared_ptr<const NvbufSurfaceRuntime>& runtime) {
+#if defined(__linux__)
+  if (!runtime || !runtime->state_ || !runtime->state_->functions) {
+    return "NvBufSurface runtime binding is missing";
+  }
+  struct LoadedObject {
+    std::uintptr_t base = 0;
+    std::string path;
+  };
+  std::vector<LoadedObject> loaded_objects;
+  const auto collect = [](dl_phdr_info* info, std::size_t, void* raw_objects) {
+    if (info->dlpi_name != nullptr && info->dlpi_name[0] != '\0') {
+      static_cast<std::vector<LoadedObject>*>(raw_objects)
+          ->push_back(LoadedObject{.base = static_cast<std::uintptr_t>(info->dlpi_addr),
+                                   .path = info->dlpi_name});
+    }
+    return 0;
+  };
+  (void)dl_iterate_phdr(collect, &loaded_objects);
+
+  const auto expected_base = runtime->state_->functions->provider_base;
+  for (const auto& object : loaded_objects) {
+    void* handle = dlopen(object.path.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+    if (handle == nullptr) {
+      continue;
+    }
+    dlerror();
+    void* symbol = dlsym(handle, "NvBufSurfaceMapEglImage");
+    Dl_info symbol_info{};
+    const bool owns_provider =
+        symbol != nullptr && dladdr(symbol, &symbol_info) != 0 &&
+        symbol_info.dli_fbase != nullptr &&
+        reinterpret_cast<std::uintptr_t>(symbol_info.dli_fbase) == object.base;
+    (void)dlclose(handle);
+    if (owns_provider && symbol_info.dli_fbase != expected_base) {
+      return "multiple NvBufSurface runtime providers are loaded: retained " +
+             runtime->state_->functions->provider_path + " but also found " + object.path;
+    }
+  }
+  return std::nullopt;
+#else
+  (void)runtime;
+  return "NvBufSurface runtime provenance is only supported on Linux";
 #endif
 }
 
@@ -675,6 +756,9 @@ std::optional<std::string> validate_nvmm_frame_info(const NvmmFrameInfo& info) {
   if (info.memory_type != NvmmMemoryType::SurfaceArray &&
       info.memory_type != NvmmMemoryType::CudaDevice) {
     return "unsupported NvBufSurface memory type";
+  }
+  if (info.runtime && info.runtime->abi() != info.abi) {
+    return "NvBufSurface frame ABI does not match its retained runtime";
   }
   if (info.surface_ptr == nullptr) {
     return "NvBufSurface pointer is null";
@@ -782,6 +866,12 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info, std::shared_ptr<
   };
 
 #if defined(__linux__)
+  if (info.runtime) {
+    if (const auto error = validate_nvbufsurface_runtime_provenance(info.runtime);
+        error.has_value()) {
+      throw NvmmError(*error);
+    }
+  }
   auto cuda = cuda_functions();
   DeviceZeroContext context(cuda);
   if (info.memory_type == NvmmMemoryType::CudaDevice) {
@@ -810,7 +900,7 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info, std::shared_ptr<
     return make_frame(existing->y_ptr, existing->uv_ptr, acquire_mapping_lease(existing, registry));
   }
 
-  auto functions = nvbuf_functions();
+  auto functions = info.runtime ? info.runtime->state_->functions : nvbuf_functions();
   if (mapped_cuda_buffer_handle(info) != nullptr || mapped_egl_image(info) != nullptr) {
     throw NvmmError("NvBufSurface already has an external CUDA or EGL mapping");
   }

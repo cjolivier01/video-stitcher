@@ -25,6 +25,9 @@ namespace reco::io::detail {
 
 [[nodiscard]] GpuVideoProbe probe_gpu_video_exhaustive_for_test(const GpuFileDecodeConfig& config,
                                                                 std::uint64_t timeout_ns);
+[[nodiscard]] GpuVideoProbe
+probe_gpu_video_bounded_in_process_for_test(const GpuFileDecodeConfig& config,
+                                            std::uint64_t timeout_ns);
 void hold_probe_worker_memory_reservation_for_test(std::uint64_t hold_ns);
 
 #if !defined(_WIN32)

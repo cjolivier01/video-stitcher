@@ -57,20 +57,20 @@ bool ends_with(std::string_view value, std::string_view suffix) {
   return value.size() >= suffix.size() && value.substr(value.size() - suffix.size()) == suffix;
 }
 
-std::filesystem::path find_fake_runtime_runfile() {
+std::filesystem::path find_fake_runtime_runfile(std::string_view runtime_name) {
   const char* runfiles = std::getenv("TEST_SRCDIR");
   if (runfiles == nullptr || runfiles[0] == '\0') {
     throw std::runtime_error("TEST_SRCDIR is not set");
   }
   for (const auto& entry : std::filesystem::recursive_directory_iterator(runfiles)) {
     const auto filename = entry.path().filename().string();
-    if (filename.find("fake_gstreamer_runtime") != std::string::npos &&
+    if (filename.find(runtime_name) != std::string::npos &&
         (ends_with(filename, ".so") || ends_with(filename, ".dylib") ||
          ends_with(filename, ".dll"))) {
       return entry.path();
     }
   }
-  throw std::runtime_error("fake GStreamer runtime runfile not found");
+  throw std::runtime_error("fake runtime runfile not found");
 }
 
 void set_environment(const char* name, const std::string& value) {
@@ -720,10 +720,15 @@ void runtime_failures_are_reported() {
 
 int main() {
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
-  const auto runtime = find_fake_runtime_runfile();
+  const auto runtime = find_fake_runtime_runfile("fake_gstreamer_runtime");
   set_environment("RECO_GSTREAMER_DYLIB_PATH", runtime.string());
   set_environment("RECO_GSTAPP_DYLIB_PATH", runtime.string());
   set_environment("RECO_GLIB_DYLIB_PATH", runtime.string());
+#if defined(__linux__)
+  const auto nvbufsurface = find_fake_runtime_runfile("fake_nvbufsurface.so");
+  set_environment("RECO_NVBUFSURFACE_DYLIB_PATH", nvbufsurface.string());
+  set_environment("RECO_NVDS_UTILS_DYLIB_PATH", nvbufsurface.string());
+#endif
   const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
   const auto event_path = std::filesystem::temp_directory_path() /
                           ("reco_fake_gstreamer_events_" + std::to_string(unique) + ".txt");
