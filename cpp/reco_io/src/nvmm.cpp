@@ -371,9 +371,10 @@ std::shared_ptr<CudaMappingRegistry> mapping_registry() {
 }
 
 struct CudaMappingState {
-  std::shared_ptr<void> decoder_owner;
   std::shared_ptr<NvbufFunctions> functions;
   std::shared_ptr<CudaFunctions> cuda;
+  std::shared_ptr<const NvbufSurfaceRuntime> runtime;
+  std::shared_ptr<void> decoder_owner;
   void* surface = nullptr;
   CudaGraphicsResource graphics_resource = nullptr;
   core::CudaDevicePtr y_ptr = 0;
@@ -899,6 +900,9 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info, std::shared_ptr<
     if (!same_owner(existing->decoder_owner, owner)) {
       throw NvmmError("NvBufSurface is already CUDA-mapped by a different decoder owner");
     }
+    if (existing->runtime.get() != info.runtime.get()) {
+      throw NvmmError("NvBufSurface is already CUDA-mapped by a different retained runtime");
+    }
     return make_frame(existing->y_ptr, existing->uv_ptr, acquire_mapping_lease(existing, registry));
   }
 
@@ -910,6 +914,7 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info, std::shared_ptr<
       functions->unmap_cuda != nullptr) {
     auto mapping = std::make_shared<CudaMappingState>();
     mapping->decoder_owner = owner;
+    mapping->runtime = info.runtime;
     mapping->functions = functions;
     mapping->cuda = cuda;
     mapping->surface = info.surface_ptr;
@@ -941,6 +946,7 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info, std::shared_ptr<
 
   auto mapping = std::make_shared<CudaMappingState>();
   mapping->decoder_owner = owner;
+  mapping->runtime = info.runtime;
   mapping->functions = functions;
   mapping->cuda = cuda;
   mapping->surface = info.surface_ptr;

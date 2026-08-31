@@ -935,6 +935,51 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
                           [&](const auto& payload) { return final_contents == payload + '\n'; }),
               "concurrent calibration output is one complete writer payload");
 
+#if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
+  const auto timeout_destination = root.path() / "lock-timeout.json";
+  std::atomic<bool> timeout_holder_entered{false};
+  std::atomic<bool> release_timeout_holder{false};
+  std::exception_ptr timeout_holder_error;
+  std::thread timeout_holder([&] {
+    try {
+      detail::write_calibration_json_atomically(
+          R"json({"writer":"timeout-holder"})json", timeout_destination, left_input, right_input,
+          {}, {}, [&] {
+            timeout_holder_entered.store(true, std::memory_order_release);
+            while (!release_timeout_holder.load(std::memory_order_acquire)) {
+              std::this_thread::yield();
+            }
+          });
+    } catch (...) {
+      timeout_holder_error = std::current_exception();
+    }
+  });
+  for (int attempt = 0; attempt < 100 && !timeout_holder_entered.load(std::memory_order_acquire);
+       ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  expect_true(timeout_holder_entered.load(std::memory_order_acquire),
+              "lock timeout holder reaches the publication boundary");
+  bool lock_contention_reported = false;
+  bool lock_timeout_reported = false;
+  if (timeout_holder_entered.load(std::memory_order_acquire)) {
+    try {
+      detail::write_calibration_json_atomically(
+          R"json({"writer":"timeout-waiter"})json", timeout_destination, left_input, right_input,
+          {}, {}, {}, false, {}, [&] { lock_contention_reported = true; },
+          std::chrono::milliseconds(50));
+    } catch (const std::exception& error) {
+      lock_timeout_reported =
+          std::string_view(error.what()).find("timed out locking") != std::string_view::npos;
+    }
+  }
+  expect_true(lock_contention_reported, "lock timeout waiter reports contention");
+  expect_true(lock_timeout_reported, "lock timeout waiter fails closed at its deadline");
+  release_timeout_holder.store(true, std::memory_order_release);
+  timeout_holder.join();
+  expect_true(timeout_holder_error == nullptr, "lock timeout holder completes after release");
+#endif
+
 #if defined(__linux__)
   const auto serialized_destination = root.path() / "serialized.json";
   write_text_file(serialized_destination, "serialized initial output\n");
@@ -1897,7 +1942,9 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
 
   bool orphaned_temporary = false;
   for (const auto& entry : std::filesystem::directory_iterator(root.path())) {
-    const auto filename = entry.path().filename().string();
+    const auto encoded_filename = entry.path().filename().u8string();
+    const std::string filename(reinterpret_cast<const char*>(encoded_filename.data()),
+                               encoded_filename.size());
     if (filename.starts_with("match.json.tmp.") || filename.starts_with("blocked.json.tmp.") ||
         filename.starts_with("raced-match.json.tmp.") ||
         filename.find(".publish.") != std::string::npos) {

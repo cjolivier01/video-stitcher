@@ -225,9 +225,16 @@ void surface_array_mapping_retains_and_unmaps_owner() {
 
   auto params = make_params();
   auto surface = make_surface(params);
-  const auto info = extract_info(&surface);
-  auto decoder_owner = std::make_shared<int>(9);
-  std::weak_ptr<int> decoder_lifetime = decoder_owner;
+  auto info = extract_info(&surface);
+  auto runtime = discover_nvbufsurface_runtime();
+  std::weak_ptr<const NvbufSurfaceRuntime> runtime_lifetime = runtime;
+  info.runtime = runtime;
+  bool runtime_alive_during_decoder_release = false;
+  std::shared_ptr<void> decoder_owner(new int(9), [&](void* value) {
+    runtime_alive_during_decoder_release = !runtime_lifetime.expired();
+    delete static_cast<int*>(value);
+  });
+  std::weak_ptr<void> decoder_lifetime = decoder_owner;
 
   GpuDecodedFrame decoded{.nvmm = info,
                           .visible_width = info.width - 2,
@@ -253,13 +260,20 @@ void surface_array_mapping_retains_and_unmaps_owner() {
 
   decoder_owner.reset();
   decoded.owner.reset();
+  decoded.nvmm.runtime.reset();
+  info.runtime.reset();
+  runtime.reset();
   expect_true(!decoder_lifetime.expired(), "mapping retains decoder buffer owner");
+  expect_true(!runtime_lifetime.expired(), "mapping retains NvBufSurface runtime");
   mapped.owner.reset();
   expect_true(!decoder_lifetime.expired(), "duplicate mapping keeps decoder owner alive");
   expect_true(params.mapped_addr.cuda_ptr != nullptr,
               "duplicate mapping keeps runtime CUDA map live");
   mapped_again.owner.reset();
   expect_true(decoder_lifetime.expired(), "mapping releases decoder owner");
+  expect_true(runtime_alive_during_decoder_release,
+              "mapped runtime outlives decoder-owner destruction");
+  expect_true(runtime_lifetime.expired(), "mapping releases NvBufSurface runtime");
   expect_true(params.mapped_addr.cuda_ptr == nullptr, "mapping owner unmaps CUDA buffer");
 
   params = make_params();

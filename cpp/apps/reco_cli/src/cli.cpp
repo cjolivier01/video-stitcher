@@ -188,8 +188,11 @@ resolve_calibration_worker_impl(const std::filesystem::path& executable_path) {
 
 [[noreturn]] void throw_file_error(std::string_view operation, const std::filesystem::path& path,
                                    int error) {
-  throw std::system_error(error, std::system_category(),
-                          std::string(operation) + " " + path.string());
+  const auto utf8_path = path.u8string();
+  throw std::system_error(
+      error, std::system_category(),
+      std::string(operation) + " " +
+          std::string(reinterpret_cast<const char*>(utf8_path.data()), utf8_path.size()));
 }
 
 #if defined(_WIN32)
@@ -248,6 +251,52 @@ struct NativeWindowsFunctions {
   NtSetInformationFileFunction set_information_file = nullptr;
   RtlNtStatusToDosErrorFunction status_to_error = nullptr;
 };
+
+using ConvertSecurityDescriptorFunction = BOOL(WINAPI*)(LPCWSTR, DWORD, PSECURITY_DESCRIPTOR*,
+                                                        PULONG);
+
+class UniqueLocalMemory {
+public:
+  explicit UniqueLocalMemory(HLOCAL memory) : memory_(memory) {}
+  ~UniqueLocalMemory() {
+    if (memory_ != nullptr) {
+      (void)LocalFree(memory_);
+    }
+  }
+
+  UniqueLocalMemory(const UniqueLocalMemory&) = delete;
+  UniqueLocalMemory& operator=(const UniqueLocalMemory&) = delete;
+
+  [[nodiscard]] HLOCAL get() const noexcept { return memory_; }
+
+private:
+  HLOCAL memory_ = nullptr;
+};
+
+[[nodiscard]] UniqueLocalMemory make_publication_mutex_security_descriptor() {
+  static const ConvertSecurityDescriptorFunction convert = [] {
+    HMODULE advapi = GetModuleHandleW(L"advapi32.dll");
+    if (advapi == nullptr) {
+      advapi = LoadLibraryExW(L"advapi32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }
+    return advapi == nullptr ? nullptr
+                             : reinterpret_cast<ConvertSecurityDescriptorFunction>(GetProcAddress(
+                                   advapi, "ConvertStringSecurityDescriptorToSecurityDescriptorW"));
+  }();
+  if (convert == nullptr) {
+    throw std::runtime_error("cannot load Windows security descriptor APIs");
+  }
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  constexpr DWORD kSddlRevision1 = 1;
+  // Restrict the global mutex to its owner, administrators, and LocalSystem.
+  if (convert(L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)", kSddlRevision1, &descriptor, nullptr) ==
+          0 ||
+      descriptor == nullptr) {
+    throw std::system_error(static_cast<int>(GetLastError()), std::system_category(),
+                            "cannot create Windows publication lock security descriptor");
+  }
+  return UniqueLocalMemory(static_cast<HLOCAL>(descriptor));
+}
 
 [[nodiscard]] const NativeWindowsFunctions& native_windows_functions() {
   static const NativeWindowsFunctions functions = [] {
@@ -338,17 +387,24 @@ private:
 
 [[nodiscard]] WindowsPublicationLock
 lock_windows_output_directory(HANDLE directory, const std::filesystem::path& path,
-                              const std::function<void()>& on_contention) {
+                              const std::function<void()>& on_contention,
+                              std::chrono::milliseconds lock_timeout) {
   BY_HANDLE_FILE_INFORMATION identity{};
   if (GetFileInformationByHandle(directory, &identity) == 0) {
     throw_file_error("cannot inspect calibration output directory lock", path,
                      static_cast<int>(GetLastError()));
   }
-  const auto name = L"Local\\RecoCalibrationPublication-v1-" +
+  const auto name = L"Global\\RecoCalibrationPublication-v1-" +
                     std::to_wstring(identity.dwVolumeSerialNumber) + L"-" +
                     std::to_wstring(identity.nFileIndexHigh) + L"-" +
                     std::to_wstring(identity.nFileIndexLow);
-  const HANDLE mutex = CreateMutexW(nullptr, FALSE, name.c_str());
+  auto security_descriptor = make_publication_mutex_security_descriptor();
+  SECURITY_ATTRIBUTES security_attributes{
+      .nLength = sizeof(SECURITY_ATTRIBUTES),
+      .lpSecurityDescriptor = security_descriptor.get(),
+      .bInheritHandle = FALSE,
+  };
+  const HANDLE mutex = CreateMutexW(&security_attributes, FALSE, name.c_str());
   if (mutex == nullptr) {
     throw_file_error("cannot create calibration output directory lock", path,
                      static_cast<int>(GetLastError()));
@@ -359,8 +415,9 @@ lock_windows_output_directory(HANDLE directory, const std::filesystem::path& pat
     if (on_contention) {
       on_contention();
     }
-    constexpr DWORD kPublicationLockTimeoutMs = 30000;
-    wait_result = WaitForSingleObject(mutex, kPublicationLockTimeoutMs);
+    const auto bounded_timeout =
+        std::clamp<std::int64_t>(lock_timeout.count(), 1, static_cast<std::int64_t>(INFINITE) - 1);
+    wait_result = WaitForSingleObject(mutex, static_cast<DWORD>(bounded_timeout));
   }
   if (wait_result == WAIT_TIMEOUT) {
     throw_file_error("timed out locking calibration output directory", path, ERROR_TIMEOUT);
@@ -997,10 +1054,10 @@ create_descriptor_publication_link_at(int directory_descriptor,
   throw std::system_error(errno, std::system_category(), "cannot inspect calibration output entry");
 }
 
-[[nodiscard]] UniqueFileDescriptor
-lock_output_directory(int directory_descriptor, const std::filesystem::path& directory,
-                      const std::function<void()>& on_contention) {
-  constexpr auto lock_timeout = std::chrono::seconds(2);
+[[nodiscard]] UniqueFileDescriptor lock_output_directory(int directory_descriptor,
+                                                         const std::filesystem::path& directory,
+                                                         const std::function<void()>& on_contention,
+                                                         std::chrono::milliseconds lock_timeout) {
   constexpr auto retry_delay = std::chrono::milliseconds(10);
   const int raw_lock =
       ::openat(directory_descriptor, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
@@ -1195,7 +1252,8 @@ private:
 
 [[nodiscard]] PosixDirectoryLock
 lock_posix_output_directory(const std::filesystem::path& destination,
-                            const std::function<void()>& on_contention) {
+                            const std::function<void()>& on_contention,
+                            std::chrono::milliseconds lock_timeout) {
   const auto parent =
       destination.has_parent_path() ? destination.parent_path() : std::filesystem::path(".");
   const int descriptor = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -1231,16 +1289,20 @@ lock_posix_output_directory(const std::filesystem::path& destination,
         }
         contention_reported = true;
       }
-      for (;;) {
-        if (::flock(descriptor, LOCK_EX) == 0) {
+      const auto deadline = std::chrono::steady_clock::now() + lock_timeout;
+      while (std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (::flock(descriptor, LOCK_EX | LOCK_NB) == 0) {
           return PosixDirectoryLock(descriptor);
         }
-        if (errno != EINTR) {
-          const int error = errno;
+        if (errno != EINTR && errno != EWOULDBLOCK && errno != EAGAIN) {
+          const int retry_error = errno;
           (void)::close(descriptor);
-          throw_file_error("cannot lock calibration output directory", parent, error);
+          throw_file_error("cannot lock calibration output directory", parent, retry_error);
         }
       }
+      (void)::close(descriptor);
+      throw_file_error("timed out locking calibration output directory", parent, ETIMEDOUT);
     }
     (void)::close(descriptor);
     throw_file_error("cannot lock calibration output directory", parent, nonblocking_error);
@@ -1535,7 +1597,8 @@ void write_calibration_json_atomically_impl(
     const std::function<void()>& before_publish,
     std::span<const std::filesystem::path> lens_profiles,
     const std::function<void()>& before_commit, bool force_rename_fallback,
-    const std::function<void()>& after_publish, const std::function<void()>& on_lock_contention) {
+    const std::function<void()>& after_publish, const std::function<void()>& on_lock_contention,
+    std::chrono::milliseconds lock_timeout) {
   std::string contents(json);
   contents.push_back('\n');
 #if defined(_WIN32)
@@ -1553,10 +1616,8 @@ void write_calibration_json_atomically_impl(
     profile_reservations.push_back(pin_windows_path_for_publication(
         lens_profiles[index], index == 0 ? "left lens profile" : "right lens profile"));
   }
-  static std::mutex publication_mutex;
-  std::lock_guard publication_lock(publication_mutex);
   [[maybe_unused]] auto interprocess_publication_lock = lock_windows_output_directory(
-      output_directory.handle.get(), output_directory.path, on_lock_contention);
+      output_directory.handle.get(), output_directory.path, on_lock_contention, lock_timeout);
   HANDLE handle = INVALID_HANDLE_VALUE;
   std::filesystem::path temporary;
   bool temporary_exists = false;
@@ -1652,7 +1713,7 @@ void write_calibration_json_atomically_impl(
     throw std::runtime_error("calibration output parent is not a directory: " + parent.string());
   }
   auto publication_lock =
-      lock_output_directory(directory_descriptor.get(), parent, on_lock_contention);
+      lock_output_directory(directory_descriptor.get(), parent, on_lock_contention, lock_timeout);
 
   TemporaryOutput temporary;
   bool temporary_exists = false;
@@ -1948,6 +2009,7 @@ void write_calibration_json_atomically_impl(
 #if !defined(__APPLE__)
   (void)after_publish;
   (void)on_lock_contention;
+  (void)lock_timeout;
 #endif
   const auto left_identity = pin_posix_path_for_publication(left_input, "left video input");
   const auto right_identity = pin_posix_path_for_publication(right_input, "right video input");
@@ -1957,8 +2019,10 @@ void write_calibration_json_atomically_impl(
     profile_identities.push_back(pin_posix_path_for_publication(
         lens_profiles[index], index == 0 ? "left lens profile" : "right lens profile"));
   }
+#if !defined(__APPLE__)
   static std::mutex publication_mutex;
   std::lock_guard publication_lock(publication_mutex);
+#endif
 #if defined(__APPLE__)
   const auto parent =
       destination.has_parent_path() ? destination.parent_path() : std::filesystem::path(".");
@@ -1966,7 +2030,8 @@ void write_calibration_json_atomically_impl(
   if (destination_name.empty() || destination_name == "." || destination_name == "..") {
     throw std::runtime_error("calibration output path must name a file: " + destination.string());
   }
-  auto output_directory = lock_posix_output_directory(destination, on_lock_contention);
+  auto output_directory =
+      lock_posix_output_directory(destination, on_lock_contention, lock_timeout);
   std::string temporary_name;
 #endif
   int descriptor = -1;
@@ -3211,10 +3276,11 @@ void write_calibration_json_atomically(
     const std::function<void()>& before_publish,
     std::span<const std::filesystem::path> lens_profiles,
     const std::function<void()>& before_commit, bool force_rename_fallback,
-    const std::function<void()>& after_publish, const std::function<void()>& on_lock_contention) {
+    const std::function<void()>& after_publish, const std::function<void()>& on_lock_contention,
+    std::chrono::milliseconds lock_timeout) {
   write_calibration_json_atomically_impl(json, destination, left_input, right_input, before_publish,
                                          lens_profiles, before_commit, force_rename_fallback,
-                                         after_publish, on_lock_contention);
+                                         after_publish, on_lock_contention, lock_timeout);
 }
 
 } // namespace detail
