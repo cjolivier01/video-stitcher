@@ -982,8 +982,18 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
   expect_true(!temporary_symlink_error, "temporary symlink fixture is available");
 #endif
 
-  detail::write_calibration_json_atomically(R"json({"writer":"symlink-test"})json", destination,
-                                            left_input, right_input);
+  try {
+    detail::write_calibration_json_atomically(R"json({"writer":"symlink-test"})json", destination,
+                                              left_input, right_input);
+  } catch (const std::exception& error) {
+#if defined(_WIN32)
+    throw std::runtime_error(
+        std::string(output_symlink_error ? "regular-file fallback: " : "destination symlink: ") +
+        error.what());
+#else
+    throw;
+#endif
+  }
   expect_eq(read_text_file(destination), std::string("{\"writer\":\"symlink-test\"}\n"),
             "calibration output replaces destination atomically");
   expect_eq(read_text_file(victim), std::string("victim must not change\n"),

@@ -666,13 +666,13 @@ void rename_open_file(HANDLE handle, HANDLE directory, std::wstring_view destina
       break;
     }
     if (replace_error != ERROR_SHARING_VIOLATION && replace_error != ERROR_ACCESS_DENIED) {
-      throw_file_error("failed to replace calibration output", destination,
+      throw_file_error("failed to rename calibration output", destination,
                        static_cast<int>(replace_error));
     }
     if (attempt + 1 < maximum_replace_attempts) {
       Sleep(retry_delay_ms);
     } else {
-      throw_file_error("failed to replace calibration output", destination,
+      throw_file_error("failed to rename calibration output", destination,
                        static_cast<int>(replace_error));
     }
   }
@@ -692,7 +692,7 @@ void rename_open_file(HANDLE handle, HANDLE directory, std::wstring_view destina
       (destination_attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
   if (!extended_rename_unsupported || destination_is_reparse_point) {
     throw_file_error(
-        "failed to replace calibration output", destination,
+        "failed to rename calibration output", destination,
         static_cast<int>(replace_error == ERROR_SUCCESS ? ERROR_NOT_SUPPORTED : replace_error));
   }
   const BOOLEAN replace_if_exists = replace_existing ? TRUE : FALSE;
@@ -716,7 +716,7 @@ void rename_open_file(HANDLE handle, HANDLE directory, std::wstring_view destina
       Sleep(retry_delay_ms);
     }
   }
-  throw_file_error("failed to replace calibration output", destination,
+  throw_file_error("failed to rename calibration output", destination,
                    static_cast<int>(replace_error));
 }
 
