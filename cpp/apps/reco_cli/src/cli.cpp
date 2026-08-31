@@ -305,18 +305,16 @@ public:
   }
   UniqueWindowsHandle retained_destination(destination_handle);
   FILE_ATTRIBUTE_TAG_INFO attributes{};
-  FILE_ID_INFO source_identity{};
-  FILE_ID_INFO destination_identity{};
+  BY_HANDLE_FILE_INFORMATION source_identity{};
+  BY_HANDLE_FILE_INFORMATION destination_identity{};
   return GetFileInformationByHandleEx(destination_handle, FileAttributeTagInfo, &attributes,
                                       sizeof(attributes)) != 0 &&
          (attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0 &&
-         GetFileInformationByHandleEx(source, FileIdInfo, &source_identity,
-                                      sizeof(source_identity)) != 0 &&
-         GetFileInformationByHandleEx(destination_handle, FileIdInfo, &destination_identity,
-                                      sizeof(destination_identity)) != 0 &&
-         source_identity.VolumeSerialNumber == destination_identity.VolumeSerialNumber &&
-         std::memcmp(source_identity.FileId.Identifier, destination_identity.FileId.Identifier,
-                     sizeof(source_identity.FileId.Identifier)) == 0;
+         GetFileInformationByHandle(source, &source_identity) != 0 &&
+         GetFileInformationByHandle(destination_handle, &destination_identity) != 0 &&
+         source_identity.dwVolumeSerialNumber == destination_identity.dwVolumeSerialNumber &&
+         source_identity.nFileIndexHigh == destination_identity.nFileIndexHigh &&
+         source_identity.nFileIndexLow == destination_identity.nFileIndexLow;
 }
 
 void rename_open_file(HANDLE handle, const std::filesystem::path& destination) {

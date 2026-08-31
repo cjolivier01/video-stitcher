@@ -1281,7 +1281,14 @@ bool guardian_restrict_worker_process_creation() {
   if (error != nullptr && sandbox_free_error != nullptr) {
     sandbox_free_error(error);
   }
-  return result == 0;
+  if (result == 0) {
+    return true;
+  }
+  if (::geteuid() == 0) {
+    return false;
+  }
+  constexpr struct rlimit no_child_processes{.rlim_cur = 0, .rlim_max = 0};
+  return ::setrlimit(RLIMIT_NPROC, &no_child_processes) == 0;
 #else
   return false;
 #endif

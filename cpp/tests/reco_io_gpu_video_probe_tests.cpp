@@ -2686,11 +2686,6 @@ void windows_path_runtime_discovery(const std::filesystem::path& video_path,
   set_environment("RECO_GSTAPP_DYLIB_PATH", runtime.string());
   set_environment("RECO_GLIB_DYLIB_PATH", runtime.string());
   set_environment("RECO_GOBJECT_DYLIB_PATH", runtime.string());
-#if defined(__linux__)
-  const auto nvbufsurface = resolve_runfile("cpp/tests/libfake_nvbufsurface.so");
-  set_environment("RECO_NVBUFSURFACE_DYLIB_PATH", nvbufsurface.string());
-  set_environment("RECO_NVDS_UTILS_DYLIB_PATH", nvbufsurface.string());
-#endif
   std::filesystem::remove_all(directory);
 #else
   (void)video_path;
@@ -2778,6 +2773,11 @@ int main(int argc, char** argv) {
   set_environment("RECO_GSTAPP_DYLIB_PATH", runtime.string());
   set_environment("RECO_GLIB_DYLIB_PATH", runtime.string());
   set_environment("RECO_GOBJECT_DYLIB_PATH", runtime.string());
+#if defined(__linux__)
+  const auto nvbufsurface = resolve_runfile("cpp/tests/libfake_nvbufsurface.so");
+  set_environment("RECO_NVBUFSURFACE_DYLIB_PATH", nvbufsurface.string());
+  set_environment("RECO_NVDS_UTILS_DYLIB_PATH", nvbufsurface.string());
+#endif
 
   const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
   const auto video_path = std::filesystem::temp_directory_path() /
