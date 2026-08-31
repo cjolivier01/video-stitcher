@@ -9,6 +9,7 @@
 #include "reco/calibrate/ransac.hpp"
 #include "reco/calibrate/sampling.hpp"
 #include "reco/core/cuda_backend.hpp"
+#include "reco/core/path.hpp"
 #include "reco/detect/npp_interop.hpp"
 #include "reco/io/gpu_decode.hpp"
 #include "reco/io/gpu_video_probe.hpp"
@@ -365,9 +366,9 @@ std::pair<reco::core::CameraParams, reco::core::CameraParams>
 load_calibration_profiles(const detail::StableLensProfileFile& left_profile,
                           const detail::StableLensProfileFile* right_profile) {
   try {
-    auto left = load_lens_from_file(left_profile.retained_path().string());
+    auto left = load_lens_from_file(reco::core::path_to_utf8(left_profile.retained_path()));
     auto right = right_profile != nullptr
-                     ? load_lens_from_file(right_profile->retained_path().string())
+                     ? load_lens_from_file(reco::core::path_to_utf8(right_profile->retained_path()))
                      : left;
     return {std::move(left), std::move(right)};
   } catch (const std::exception& error) {
@@ -380,10 +381,12 @@ class StableCalibrationProfiles {
 public:
   explicit StableCalibrationProfiles(const GpuCalibrationRequest& request) {
     if (request.left.lens_profile.has_value()) {
-      left_.emplace(*request.left.lens_profile, request.left.lens_profile_expected_identity);
+      left_.emplace(reco::core::path_from_utf8(*request.left.lens_profile),
+                    request.left.lens_profile_expected_identity);
     }
     if (request.right.lens_profile.has_value()) {
-      right_.emplace(*request.right.lens_profile, request.right.lens_profile_expected_identity);
+      right_.emplace(reco::core::path_from_utf8(*request.right.lens_profile),
+                     request.right.lens_profile_expected_identity);
     }
   }
 
@@ -412,10 +415,10 @@ private:
 std::vector<std::filesystem::path> lens_profile_paths(const GpuCalibrationRequest& request) {
   std::vector<std::filesystem::path> profiles;
   if (request.left.lens_profile.has_value()) {
-    profiles.emplace_back(*request.left.lens_profile);
+    profiles.push_back(reco::core::path_from_utf8(*request.left.lens_profile));
   }
   if (request.right.lens_profile.has_value()) {
-    profiles.emplace_back(*request.right.lens_profile);
+    profiles.push_back(reco::core::path_from_utf8(*request.right.lens_profile));
   }
   return profiles;
 }
@@ -584,16 +587,17 @@ std::optional<std::string> validate_gpu_calibration_request(const GpuCalibration
   }
   if ((request.left.retained_path.has_value() &&
        (request.left.retained_path->empty() ||
-        !std::filesystem::path(*request.left.retained_path).is_absolute())) ||
+        !reco::core::path_from_utf8(*request.left.retained_path).is_absolute())) ||
       (request.right.retained_path.has_value() &&
        (request.right.retained_path->empty() ||
-        !std::filesystem::path(*request.right.retained_path).is_absolute()))) {
+        !reco::core::path_from_utf8(*request.right.retained_path).is_absolute()))) {
     return "retained calibration video paths must be non-empty and absolute";
   }
   const auto profiles = lens_profile_paths(request);
-  if (const auto error = validate_calibration_output_identity(calibration_open_path(request.left),
-                                                              calibration_open_path(request.right),
-                                                              request.output, profiles);
+  if (const auto error = validate_calibration_output_identity(
+          reco::core::path_from_utf8(calibration_open_path(request.left)),
+          reco::core::path_from_utf8(calibration_open_path(request.right)),
+          reco::core::path_from_utf8(request.output), profiles);
       error.has_value()) {
     return *error;
   }
@@ -632,14 +636,15 @@ std::optional<std::string> validate_gpu_calibration_request(const GpuCalibration
   if (request.right.lens_profile.has_value() && !request.left.lens_profile.has_value()) {
     return "right lens profile requires a left lens profile";
   }
-  if (!request.probe_worker.empty() && !std::filesystem::path(request.probe_worker).is_absolute()) {
+  if (!request.probe_worker.empty() &&
+      !reco::core::path_from_utf8(request.probe_worker).is_absolute()) {
     return "GPU video probe worker path must be absolute";
   }
   if (invalid_protocol_path(request.probe_worker)) {
     return "GPU video probe worker path must not contain NUL bytes or exceed 16384 bytes";
   }
   if (!request.calibration_worker_path.empty() &&
-      !std::filesystem::path(request.calibration_worker_path).is_absolute()) {
+      !reco::core::path_from_utf8(request.calibration_worker_path).is_absolute()) {
     return "GPU calibration worker path must be absolute";
   }
   if (invalid_protocol_path(request.calibration_worker_path)) {
@@ -797,12 +802,13 @@ CalibrationResult detail::run_gpu_calibration_in_process(const GpuCalibrationReq
   try {
     auto left_config = calibration_decode_config(request.left.path);
     auto right_config = calibration_decode_config(request.right.path);
-    StableMediaFile left_media(calibration_open_path(request.left), request.left.expected_identity);
-    StableMediaFile right_media(calibration_open_path(request.right),
+    StableMediaFile left_media(reco::core::path_from_utf8(calibration_open_path(request.left)),
+                               request.left.expected_identity);
+    StableMediaFile right_media(reco::core::path_from_utf8(calibration_open_path(request.right)),
                                 request.right.expected_identity);
     StableCalibrationProfiles profiles(request);
-    left_config.path = left_media.decode_path().string();
-    right_config.path = right_media.decode_path().string();
+    left_config.path = reco::core::path_to_utf8(left_media.decode_path());
+    right_config.path = reco::core::path_to_utf8(right_media.decode_path());
     const auto left_probe = reco::io::detail::probe_gpu_video_in_process(
         left_config, request.probe_timeout_ns,
         reco::io::detail::GpuVideoProbePolicy::ExhaustiveIndexedCadence);

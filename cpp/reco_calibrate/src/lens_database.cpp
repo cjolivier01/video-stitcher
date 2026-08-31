@@ -1,4 +1,5 @@
 #include "reco/calibrate/lens_database.hpp"
+#include "reco/core/path.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -535,7 +536,7 @@ reco::core::CameraParams load_lens_from_json(const std::string& json_text,
 }
 
 reco::core::CameraParams load_lens_from_file(const std::string& path) {
-  std::ifstream file(path);
+  std::ifstream file(reco::core::path_from_utf8(path));
   if (!file) {
     throw LensLoadError(LensLoadErrorKind::Io, path);
   }

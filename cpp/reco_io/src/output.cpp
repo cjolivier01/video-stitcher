@@ -1,4 +1,5 @@
 #include "reco/io/output.hpp"
+#include "reco/core/path.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -103,7 +104,7 @@ Format format_for_output(std::string_view path_or_url) {
     return Format::Mkv;
   }
 
-  const auto ext = lowercase(std::filesystem::path(std::string(path_or_url)).extension().string());
+  const auto ext = lowercase(reco::core::path_from_utf8(path_or_url).extension().string());
   if (ext == ".mkv") {
     return Format::Mkv;
   }

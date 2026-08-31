@@ -1,4 +1,5 @@
 #include "reco/io/gpu_decode.hpp"
+#include "reco/core/path.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -76,7 +77,7 @@ std::string_view gpu_decode_container_demuxer(GpuDecodeContainer container) {
 }
 
 GpuDecodeCodec gpu_decode_codec_for_path(std::string_view path) {
-  const auto ext = lowercase(std::filesystem::path(std::string(path)).extension().string());
+  const auto ext = lowercase(reco::core::path_from_utf8(path).extension().string());
   if (ext == ".h265" || ext == ".hevc" || ext == ".265") {
     return GpuDecodeCodec::Hevc;
   }
@@ -84,12 +85,12 @@ GpuDecodeCodec gpu_decode_codec_for_path(std::string_view path) {
 }
 
 bool gpu_decode_path_is_elementary_stream(std::string_view path) {
-  const auto ext = lowercase(std::filesystem::path(std::string(path)).extension().string());
+  const auto ext = lowercase(reco::core::path_from_utf8(path).extension().string());
   return ext == ".h264" || ext == ".264" || ext == ".h265" || ext == ".hevc" || ext == ".265";
 }
 
 std::optional<GpuDecodeContainer> gpu_decode_container_for_path(std::string_view path) {
-  const auto ext = lowercase(std::filesystem::path(std::string(path)).extension().string());
+  const auto ext = lowercase(reco::core::path_from_utf8(path).extension().string());
   if (ext == ".mp4" || ext == ".mov" || ext == ".m4v") {
     return GpuDecodeContainer::QuickTime;
   }

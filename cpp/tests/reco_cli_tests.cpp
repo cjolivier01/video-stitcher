@@ -1,6 +1,7 @@
 #include "reco/cli/cli.hpp"
 
 #include "reco/calibrate/pipeline.hpp"
+#include "reco/core/path.hpp"
 
 #include <algorithm>
 #include <array>
@@ -636,7 +637,7 @@ std::filesystem::path write_valid_calibration_file() {
 void production_windows_cli_preserves_unicode_paths() {
 #if defined(_WIN32)
   TemporaryDirectory root;
-  const auto calibration = root.path() / "match.json";
+  const auto calibration = root.path() / std::filesystem::path(L"match-Ω-例.json");
   write_text_file(calibration, valid_calibration_json());
   const auto left = root.path() / std::filesystem::path(L"left-Ω-例.mp4");
   const auto right = root.path() / std::filesystem::path(L"right-例-Ω.mp4");
@@ -653,9 +654,9 @@ void production_windows_cli_preserves_unicode_paths() {
   expect_true(result.started, "production Windows reco.exe starts through CreateProcessW");
   expect_eq(result.exit_code, static_cast<DWORD>(2),
             "production Windows stitch plan remains intentionally blocked");
-  expect_true(result.output.find(wide_to_utf8(left.native())) != std::string::npos,
+  expect_true(result.output.find(wide_to_utf8(left.filename().native())) != std::string::npos,
               "production Windows CLI preserves the Unicode left path");
-  expect_true(result.output.find(wide_to_utf8(right.native())) != std::string::npos,
+  expect_true(result.output.find(wide_to_utf8(right.filename().native())) != std::string::npos,
               "production Windows CLI preserves the Unicode right path");
   expect_true(result.output.find(wide_to_utf8(output.native())) != std::string::npos,
               "production Windows CLI preserves the Unicode output path");
@@ -955,6 +956,17 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
   write_text_file(right_input, "right video must not change\n");
   write_text_file(victim, "victim must not change\n");
 
+  const auto unicode_destination =
+      root.path() / reco::core::path_from_utf8("match-\xCE\xA9-\xE4\xBE\x8B.json");
+  const auto unicode_left = root.path() / reco::core::path_from_utf8("left-\xCE\xA9.mp4");
+  const auto unicode_right = root.path() / reco::core::path_from_utf8("right-\xE4\xBE\x8B.mp4");
+  write_text_file(unicode_left, "Unicode left video\n");
+  write_text_file(unicode_right, "Unicode right video\n");
+  detail::write_calibration_json_atomically(R"json({"writer":"unicode-path"})json",
+                                            unicode_destination, unicode_left, unicode_right);
+  expect_eq(read_text_file(unicode_destination), std::string("{\"writer\":\"unicode-path\"}\n"),
+            "calibration publication uses native Unicode filesystem paths");
+
   std::error_code output_symlink_error;
   std::filesystem::create_symlink(victim, destination, output_symlink_error);
   if (output_symlink_error) {
@@ -1099,13 +1111,35 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
   }
   expect_true(lock_contention_reported, "lock timeout waiter reports contention");
   expect_true(lock_timeout_reported, "lock timeout waiter fails closed at its deadline");
+  bool slow_callback_timeout_reported = false;
+  if (timeout_holder_entered.load(std::memory_order_acquire)) {
+    try {
+      detail::write_calibration_json_atomically(
+          R"json({"writer":"slow-timeout-waiter"})json", timeout_destination, left_input,
+          right_input, {}, {}, {}, false, {},
+          [&] {
+            release_timeout_holder.store(true, std::memory_order_release);
+            std::this_thread::sleep_for(std::chrono::milliseconds(75));
+          },
+          std::chrono::milliseconds(25));
+    } catch (const std::exception& error) {
+      slow_callback_timeout_reported =
+          std::string_view(error.what()).find("timed out locking") != std::string_view::npos;
+    }
+  }
+  expect_true(slow_callback_timeout_reported,
+              "lock waiter cannot acquire after a slow callback exhausts its deadline");
   release_timeout_holder.store(true, std::memory_order_release);
   timeout_holder.join();
   expect_true(timeout_holder_error == nullptr, "lock timeout holder completes after release");
 #endif
 
+#if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
+  std::vector<bool> throwing_hook_fallbacks{false};
 #if defined(__linux__)
-  for (const bool force_fallback : {false, true}) {
+  throwing_hook_fallbacks.push_back(true);
+#endif
+  for (const bool force_fallback : throwing_hook_fallbacks) {
     const auto throwing_hook_destination =
         root.path() /
         (force_fallback ? "throwing-fallback-hook.json" : "throwing-exchange-hook.json");
@@ -1128,8 +1162,28 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
               std::string("throwing hook original output\n"),
               force_fallback ? "throwing fallback hook restores the original output"
                              : "throwing exchange hook restores the original output");
-  }
 
+    const auto missing_destination =
+        root.path() / (force_fallback ? "throwing-fallback-new.json" : "throwing-primary-new.json");
+    std::filesystem::remove(missing_destination);
+    throwing_hook_propagated = false;
+    try {
+      detail::write_calibration_json_atomically(
+          R"json({"writer":"throwing-new-hook"})json", missing_destination, left_input, right_input,
+          {}, {}, {}, force_fallback,
+          [] { throw std::runtime_error("synthetic after-publication hook failure"); });
+    } catch (const std::exception& error) {
+      throwing_hook_propagated =
+          std::string_view(error.what()).find("synthetic after-publication hook failure") !=
+          std::string_view::npos;
+    }
+    expect_true(throwing_hook_propagated, "throwing new-output hook propagates after rollback");
+    expect_true(!std::filesystem::exists(missing_destination),
+                "throwing new-output hook removes the published output");
+  }
+#endif
+
+#if defined(__linux__)
   const auto serialized_destination = root.path() / "serialized.json";
   write_text_file(serialized_destination, "serialized initial output\n");
   std::atomic<bool> first_commit_entered{false};
