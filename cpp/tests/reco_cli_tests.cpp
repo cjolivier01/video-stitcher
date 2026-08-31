@@ -14,6 +14,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <random>
 #include <sstream>
@@ -168,6 +169,27 @@ std::string read_text_file(const std::filesystem::path& path) {
 }
 
 #if defined(_WIN32)
+std::string wide_to_utf8(std::wstring_view value) {
+  if (value.empty()) {
+    return {};
+  }
+  if (value.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    throw std::length_error("Windows argument is too long to convert to UTF-8");
+  }
+  const auto input_size = static_cast<int>(value.size());
+  const int output_size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(),
+                                              input_size, nullptr, 0, nullptr, nullptr);
+  if (output_size <= 0) {
+    throw std::runtime_error("cannot convert Windows argument to UTF-8");
+  }
+  std::string result(static_cast<std::size_t>(output_size), '\0');
+  if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(), input_size, result.data(),
+                          output_size, nullptr, nullptr) != output_size) {
+    throw std::runtime_error("cannot convert Windows argument to UTF-8");
+  }
+  return result;
+}
+
 std::wstring quote_windows_argument(std::wstring_view argument) {
   std::wstring quoted(1, L'"');
   std::size_t backslashes = 0;
@@ -246,8 +268,7 @@ int run_windows_publication_writer_child(int argc, wchar_t** argv) {
     return 91;
   }
   try {
-    const std::wstring_view wide_payload(argv[8]);
-    const std::string payload(wide_payload.begin(), wide_payload.end());
+    const std::string payload = wide_to_utf8(argv[8]);
     detail::write_calibration_json_atomically(
         payload, std::filesystem::path(argv[2]), std::filesystem::path(argv[3]),
         std::filesystem::path(argv[4]), {}, {},

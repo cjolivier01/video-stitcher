@@ -350,9 +350,10 @@ lock_windows_output_directory(HANDLE directory, const std::filesystem::path& pat
 pin_windows_output_directory(const std::filesystem::path& destination) {
   const auto parent =
       destination.has_parent_path() ? destination.parent_path() : std::filesystem::path(".");
-  const HANDLE directory = CreateFileW(parent.c_str(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
-                                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                       nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  const HANDLE directory =
+      CreateFileW(parent.c_str(), FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                  FILE_FLAG_BACKUP_SEMANTICS, nullptr);
   if (directory == INVALID_HANDLE_VALUE) {
     throw_file_error("cannot retain calibration output directory", parent,
                      static_cast<int>(GetLastError()));
