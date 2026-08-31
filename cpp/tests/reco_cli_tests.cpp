@@ -2150,7 +2150,8 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
                                encoded_filename.size());
     if (filename.starts_with("match.json.tmp.") || filename.starts_with("blocked.json.tmp.") ||
         filename.starts_with("raced-match.json.tmp.") ||
-        filename.find(".publish.") != std::string::npos) {
+        filename.find(".publish.") != std::string::npos ||
+        filename.find(".quarantine.") != std::string::npos) {
       orphaned_temporary = true;
     }
   }

@@ -591,7 +591,8 @@ public:
 }
 
 void rename_open_file(HANDLE handle, HANDLE directory, std::wstring_view destination_name,
-                      const std::filesystem::path& destination, bool allow_reparse_point = false) {
+                      const std::filesystem::path& destination, bool allow_reparse_point = false,
+                      bool replace_existing = true) {
   const auto filename_bytes = destination_name.size() * sizeof(wchar_t);
   struct ExtendedRenameInfo {
     DWORD flags;
@@ -614,7 +615,7 @@ void rename_open_file(HANDLE handle, HANDLE directory, std::wstring_view destina
   std::vector<std::max_align_t> storage(
       (info_bytes + sizeof(std::max_align_t) - 1U) / sizeof(std::max_align_t), std::max_align_t{});
   auto* raw = reinterpret_cast<std::byte*>(storage.data());
-  const DWORD flags = kReplaceIfExists | kPosixSemantics;
+  const DWORD flags = (replace_existing ? kReplaceIfExists : 0U) | kPosixSemantics;
   const HANDLE root_directory = directory;
   const auto filename_length = static_cast<DWORD>(filename_bytes);
   std::memcpy(raw + offsetof(ExtendedRenameInfo, flags), &flags, sizeof(flags));
@@ -675,7 +676,7 @@ void rename_open_file(HANDLE handle, HANDLE directory, std::wstring_view destina
         "failed to replace calibration output", destination,
         static_cast<int>(replace_error == ERROR_SUCCESS ? ERROR_NOT_SUPPORTED : replace_error));
   }
-  const BOOLEAN replace_if_exists = TRUE;
+  const BOOLEAN replace_if_exists = replace_existing ? TRUE : FALSE;
   std::memcpy(raw + offsetof(FILE_RENAME_INFO, ReplaceIfExists), &replace_if_exists,
               sizeof(replace_if_exists));
   for (int attempt = 0; attempt < maximum_replace_attempts; ++attempt) {
@@ -730,13 +731,6 @@ retain_displaced_windows_output(HANDLE directory, std::wstring_view destination_
   }
   UniqueWindowsHandle retained_existing(existing);
 
-  struct ExtendedLinkInfo {
-    BOOLEAN replace_if_exists;
-    HANDLE root_directory;
-    DWORD filename_length;
-    wchar_t filename[1];
-  };
-  constexpr ULONG kFileLinkInformation = 11;
   std::random_device random;
   constexpr wchar_t hex[] = L"0123456789abcdef";
   for (int attempt = 0; attempt < 128; ++attempt) {
@@ -747,46 +741,19 @@ retain_displaced_windows_output(HANDLE directory, std::wstring_view destination_
     std::wstring rollback_name(destination_name);
     rollback_name += L".rollback.";
     rollback_name.append(token.begin(), token.end());
-    const auto filename_bytes = rollback_name.size() * sizeof(wchar_t);
-    const auto info_bytes = offsetof(ExtendedLinkInfo, filename) + filename_bytes;
-    std::vector<std::max_align_t> storage((info_bytes + sizeof(std::max_align_t) - 1U) /
-                                              sizeof(std::max_align_t),
-                                          std::max_align_t{});
-    auto* raw = reinterpret_cast<std::byte*>(storage.data());
-    const BOOLEAN replace_if_exists = FALSE;
-    const HANDLE root_directory = directory;
-    const auto filename_length = static_cast<DWORD>(filename_bytes);
-    std::memcpy(raw + offsetof(ExtendedLinkInfo, replace_if_exists), &replace_if_exists,
-                sizeof(replace_if_exists));
-    std::memcpy(raw + offsetof(ExtendedLinkInfo, root_directory), &root_directory,
-                sizeof(root_directory));
-    std::memcpy(raw + offsetof(ExtendedLinkInfo, filename_length), &filename_length,
-                sizeof(filename_length));
-    std::memcpy(raw + offsetof(ExtendedLinkInfo, filename), rollback_name.data(), filename_bytes);
-    const DWORD link_error = set_windows_file_information(
-        existing, storage.data(), static_cast<ULONG>(info_bytes), kFileLinkInformation);
-    if (link_error == ERROR_FILE_EXISTS || link_error == ERROR_ALREADY_EXISTS) {
-      continue;
-    }
-    if (link_error != ERROR_SUCCESS) {
-      throw_file_error("cannot retain displaced calibration output", destination,
-                       static_cast<int>(link_error));
-    }
-
-    DWORD rollback_error = ERROR_SUCCESS;
-    const HANDLE rollback = open_windows_file_relative(directory, rollback_name, access, sharing,
-                                                       FILE_OPEN, options, rollback_error);
-    if (rollback == INVALID_HANDLE_VALUE) {
-      throw_file_error("cannot open retained displaced calibration output", destination,
-                       static_cast<int>(rollback_error));
+    try {
+      rename_open_file(existing, directory, rollback_name, destination, true, false);
+    } catch (const std::system_error& error) {
+      if (error.code().value() == ERROR_FILE_EXISTS ||
+          error.code().value() == ERROR_ALREADY_EXISTS) {
+        continue;
+      }
+      throw;
     }
     WindowsDisplacedOutput displaced{.name = std::move(rollback_name),
-                                     .handle = UniqueWindowsHandle(rollback)};
-    if (!relative_path_identifies_windows_handle(directory, destination_name, existing, true) ||
-        !relative_path_identifies_windows_handle(directory, displaced.name, displaced.handle.get(),
-                                                 true) ||
-        !relative_path_identifies_windows_handle(directory, displaced.name, existing, true)) {
-      (void)discard_open_file(displaced.handle.get());
+                                     .handle = std::move(retained_existing)};
+    if (!relative_path_identifies_windows_handle(directory, displaced.name, displaced.handle.get(),
+                                                 true)) {
       throw std::runtime_error(
           "calibration output identity changed while retaining rollback state");
     }
@@ -989,13 +956,8 @@ struct DirectoryEntrySnapshot {
 
 [[nodiscard]] bool unlink_directory_entry_if_unchanged(int directory_descriptor,
                                                        std::string_view name,
-                                                       const DirectoryEntrySnapshot& snapshot) {
-  if (!directory_entry_matches_snapshot(directory_descriptor, name, snapshot)) {
-    return false;
-  }
-  const std::string filename(name);
-  return ::unlinkat(directory_descriptor, filename.c_str(), 0) == 0;
-}
+                                                       const DirectoryEntrySnapshot& snapshot,
+                                                       const std::filesystem::path& destination);
 
 [[nodiscard]] std::optional<std::string>
 validate_pinned_output_identity(int directory_descriptor, std::string_view destination_name,
@@ -1231,13 +1193,6 @@ void exchange_directory_entries_at(int directory_descriptor, std::string_view le
   }
 }
 
-[[nodiscard]] bool exchange_directory_entries_noexcept(int directory_descriptor,
-                                                       const std::string& left,
-                                                       const std::string& right) noexcept {
-  return ::syscall(SYS_renameat2, directory_descriptor, left.c_str(), directory_descriptor,
-                   right.c_str(), RENAME_EXCHANGE) == 0;
-}
-
 [[nodiscard]] bool rename_directory_entry_noreplace_at(int directory_descriptor,
                                                        std::string_view source,
                                                        std::string_view destination_name,
@@ -1255,10 +1210,177 @@ void exchange_directory_entries_at(int directory_descriptor, std::string_view le
 }
 
 [[nodiscard]] bool
-rename_directory_entry_noreplace_noexcept(int directory_descriptor, const std::string& source,
-                                          const std::string& destination_name) noexcept {
-  return ::syscall(SYS_renameat2, directory_descriptor, source.c_str(), directory_descriptor,
-                   destination_name.c_str(), RENAME_NOREPLACE) == 0;
+move_directory_entry_noreplace_noexcept(int source_directory, std::string_view source,
+                                        int destination_directory,
+                                        std::string_view destination_name) noexcept {
+  const std::string source_name(source);
+  const std::string target_name(destination_name);
+  return ::syscall(SYS_renameat2, source_directory, source_name.c_str(), destination_directory,
+                   target_name.c_str(), RENAME_NOREPLACE) == 0;
+}
+
+class ProtectedPosixQuarantine {
+public:
+  ProtectedPosixQuarantine(int parent, const std::filesystem::path& destination) : parent_(parent) {
+    std::random_device random;
+    constexpr char hex[] = "0123456789abcdef";
+    for (int attempt = 0; attempt < 128; ++attempt) {
+      std::array<char, 32> token{};
+      for (auto& digit : token) {
+        digit = hex[random() & 0x0fU];
+      }
+      name_ = destination.filename().string() + ".quarantine." +
+              std::string(token.begin(), token.end());
+      if (::mkdirat(parent_, name_.c_str(), 0700) != 0) {
+        if (errno == EEXIST) {
+          continue;
+        }
+        throw_file_error("cannot create calibration output quarantine", destination, errno);
+      }
+      const int descriptor =
+          ::openat(parent_, name_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+      if (descriptor < 0) {
+        const int open_error = errno;
+        (void)::unlinkat(parent_, name_.c_str(), AT_REMOVEDIR);
+        throw_file_error("cannot open calibration output quarantine", destination, open_error);
+      }
+      directory_ = UniqueFileDescriptor(descriptor);
+      struct stat identity{};
+      if (::fstat(directory_.get(), &identity) != 0 || !S_ISDIR(identity.st_mode) ||
+          identity.st_uid != ::geteuid() || (identity.st_mode & 0077) != 0) {
+        directory_ = UniqueFileDescriptor();
+        (void)::unlinkat(parent_, name_.c_str(), AT_REMOVEDIR);
+        throw std::runtime_error("calibration output quarantine is not private");
+      }
+      return;
+    }
+    throw std::runtime_error("cannot create unique calibration output quarantine for " +
+                             destination.string());
+  }
+
+  ~ProtectedPosixQuarantine() {
+    directory_ = UniqueFileDescriptor();
+    if (!name_.empty()) {
+      (void)::unlinkat(parent_, name_.c_str(), AT_REMOVEDIR);
+    }
+  }
+
+  ProtectedPosixQuarantine(const ProtectedPosixQuarantine&) = delete;
+  ProtectedPosixQuarantine& operator=(const ProtectedPosixQuarantine&) = delete;
+
+  [[nodiscard]] int get() const { return directory_.get(); }
+
+private:
+  int parent_ = -1;
+  std::string name_;
+  UniqueFileDescriptor directory_;
+};
+
+[[nodiscard]] bool unlink_directory_entry_if_unchanged(int directory_descriptor,
+                                                       std::string_view name,
+                                                       const DirectoryEntrySnapshot& snapshot,
+                                                       const std::filesystem::path& destination) {
+  ProtectedPosixQuarantine quarantine(directory_descriptor, destination);
+  constexpr std::string_view retained_name = "displaced";
+  if (!move_directory_entry_noreplace_noexcept(directory_descriptor, name, quarantine.get(),
+                                               retained_name)) {
+    return false;
+  }
+  if (!directory_entry_matches_snapshot(quarantine.get(), retained_name, snapshot)) {
+    (void)move_directory_entry_noreplace_noexcept(quarantine.get(), retained_name,
+                                                  directory_descriptor, name);
+    return false;
+  }
+  return ::unlinkat(quarantine.get(), retained_name.data(), 0) == 0;
+}
+
+[[nodiscard]] bool
+rollback_new_directory_entry_safely(int directory_descriptor, std::string_view published_name,
+                                    std::string_view retained_name, int published_descriptor,
+                                    const std::filesystem::path& destination) noexcept {
+  try {
+    ProtectedPosixQuarantine quarantine(directory_descriptor, destination);
+    constexpr std::string_view quarantined_name = "published";
+    if (!move_directory_entry_noreplace_noexcept(directory_descriptor, published_name,
+                                                 quarantine.get(), quarantined_name)) {
+      return false;
+    }
+    if (!temporary_name_identifies_descriptor(quarantine.get(), quarantined_name,
+                                              published_descriptor)) {
+      (void)move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_name,
+                                                    directory_descriptor, published_name);
+      return false;
+    }
+    return move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_name,
+                                                   directory_descriptor, retained_name);
+  } catch (...) {
+    return false;
+  }
+}
+
+[[nodiscard]] bool rollback_exchanged_directory_entries_safely(
+    int directory_descriptor, std::string_view published_name, int published_descriptor,
+    std::string_view displaced_name, const DirectoryEntrySnapshot& displaced_snapshot,
+    const std::filesystem::path& destination) noexcept {
+  try {
+    ProtectedPosixQuarantine quarantine(directory_descriptor, destination);
+    constexpr std::string_view quarantined_published = "published";
+    constexpr std::string_view quarantined_displaced = "displaced";
+    if (!move_directory_entry_noreplace_noexcept(directory_descriptor, published_name,
+                                                 quarantine.get(), quarantined_published)) {
+      return false;
+    }
+    if (!move_directory_entry_noreplace_noexcept(directory_descriptor, displaced_name,
+                                                 quarantine.get(), quarantined_displaced)) {
+      (void)move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_published,
+                                                    directory_descriptor, published_name);
+      return false;
+    }
+    const bool identities_match =
+        temporary_name_identifies_descriptor(quarantine.get(), quarantined_published,
+                                             published_descriptor) &&
+        directory_entry_matches_snapshot(quarantine.get(), quarantined_displaced,
+                                         displaced_snapshot);
+    if (!identities_match) {
+      (void)move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_displaced,
+                                                    directory_descriptor, displaced_name);
+      (void)move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_published,
+                                                    directory_descriptor, published_name);
+      return false;
+    }
+    if (!move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_displaced,
+                                                 directory_descriptor, published_name)) {
+      return false;
+    }
+    if (!move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_published,
+                                                 directory_descriptor, displaced_name)) {
+      return false;
+    }
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+[[nodiscard]] bool
+unlink_descriptor_entry_safely(int directory_descriptor, std::string_view name, int descriptor,
+                               const std::filesystem::path& destination) noexcept {
+  try {
+    ProtectedPosixQuarantine quarantine(directory_descriptor, destination);
+    constexpr std::string_view retained_name = "temporary";
+    if (!move_directory_entry_noreplace_noexcept(directory_descriptor, name, quarantine.get(),
+                                                 retained_name)) {
+      return false;
+    }
+    if (!temporary_name_identifies_descriptor(quarantine.get(), retained_name, descriptor)) {
+      (void)move_directory_entry_noreplace_noexcept(quarantine.get(), retained_name,
+                                                    directory_descriptor, name);
+      return false;
+    }
+    return ::unlinkat(quarantine.get(), retained_name.data(), 0) == 0;
+  } catch (...) {
+    return false;
+  }
 }
 
 void write_all(int descriptor, std::string_view contents, const std::filesystem::path& temporary) {
@@ -1614,12 +1736,181 @@ posix_directory_entry_matches_snapshot(int directory_descriptor, std::string_vie
 
 [[nodiscard]] bool
 unlink_posix_directory_entry_if_unchanged(int directory_descriptor, std::string_view name,
-                                          const PosixDirectoryEntrySnapshot& snapshot) {
-  if (!posix_directory_entry_matches_snapshot(directory_descriptor, name, snapshot)) {
+                                          const PosixDirectoryEntrySnapshot& snapshot,
+                                          const std::filesystem::path& destination);
+
+[[nodiscard]] bool
+move_posix_directory_entry_noreplace_noexcept(int source_directory, std::string_view source,
+                                              int destination_directory,
+                                              std::string_view destination_name) noexcept {
+  const std::string source_name(source);
+  const std::string target_name(destination_name);
+  return ::renameatx_np(source_directory, source_name.c_str(), destination_directory,
+                        target_name.c_str(), RENAME_EXCL) == 0;
+}
+
+class ProtectedDarwinQuarantine {
+public:
+  ProtectedDarwinQuarantine(int parent, const std::filesystem::path& destination)
+      : parent_(parent) {
+    std::random_device random;
+    constexpr char hex[] = "0123456789abcdef";
+    for (int attempt = 0; attempt < 128; ++attempt) {
+      std::array<char, 32> token{};
+      for (auto& digit : token) {
+        digit = hex[random() & 0x0fU];
+      }
+      name_ = destination.filename().string() + ".quarantine." +
+              std::string(token.begin(), token.end());
+      if (::mkdirat(parent_, name_.c_str(), 0700) != 0) {
+        if (errno == EEXIST) {
+          continue;
+        }
+        throw_file_error("cannot create calibration output quarantine", destination, errno);
+      }
+      descriptor_ =
+          ::openat(parent_, name_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+      if (descriptor_ < 0) {
+        const int open_error = errno;
+        (void)::unlinkat(parent_, name_.c_str(), AT_REMOVEDIR);
+        throw_file_error("cannot open calibration output quarantine", destination, open_error);
+      }
+      struct stat identity{};
+      if (::fstat(descriptor_, &identity) != 0 || !S_ISDIR(identity.st_mode) ||
+          identity.st_uid != ::geteuid() || (identity.st_mode & 0077) != 0) {
+        (void)::close(descriptor_);
+        descriptor_ = -1;
+        (void)::unlinkat(parent_, name_.c_str(), AT_REMOVEDIR);
+        throw std::runtime_error("calibration output quarantine is not private");
+      }
+      return;
+    }
+    throw std::runtime_error("cannot create unique calibration output quarantine for " +
+                             destination.string());
+  }
+
+  ~ProtectedDarwinQuarantine() {
+    if (descriptor_ >= 0) {
+      (void)::close(descriptor_);
+    }
+    if (!name_.empty()) {
+      (void)::unlinkat(parent_, name_.c_str(), AT_REMOVEDIR);
+    }
+  }
+
+  ProtectedDarwinQuarantine(const ProtectedDarwinQuarantine&) = delete;
+  ProtectedDarwinQuarantine& operator=(const ProtectedDarwinQuarantine&) = delete;
+
+  [[nodiscard]] int get() const { return descriptor_; }
+
+private:
+  int parent_ = -1;
+  std::string name_;
+  int descriptor_ = -1;
+};
+
+[[nodiscard]] bool
+unlink_posix_directory_entry_if_unchanged(int directory_descriptor, std::string_view name,
+                                          const PosixDirectoryEntrySnapshot& snapshot,
+                                          const std::filesystem::path& destination) {
+  ProtectedDarwinQuarantine quarantine(directory_descriptor, destination);
+  constexpr std::string_view retained_name = "displaced";
+  if (!move_posix_directory_entry_noreplace_noexcept(directory_descriptor, name, quarantine.get(),
+                                                     retained_name)) {
     return false;
   }
-  const std::string filename(name);
-  return ::unlinkat(directory_descriptor, filename.c_str(), 0) == 0;
+  if (!posix_directory_entry_matches_snapshot(quarantine.get(), retained_name, snapshot)) {
+    (void)move_posix_directory_entry_noreplace_noexcept(quarantine.get(), retained_name,
+                                                        directory_descriptor, name);
+    return false;
+  }
+  return ::unlinkat(quarantine.get(), retained_name.data(), 0) == 0;
+}
+
+[[nodiscard]] bool
+rollback_new_posix_directory_entry_safely(int directory_descriptor, std::string_view published_name,
+                                          std::string_view retained_name, int published_descriptor,
+                                          const std::filesystem::path& destination) noexcept {
+  try {
+    ProtectedDarwinQuarantine quarantine(directory_descriptor, destination);
+    constexpr std::string_view quarantined_name = "published";
+    if (!move_posix_directory_entry_noreplace_noexcept(directory_descriptor, published_name,
+                                                       quarantine.get(), quarantined_name)) {
+      return false;
+    }
+    if (!path_identifies_descriptor_at(quarantine.get(), quarantined_name, published_descriptor)) {
+      (void)move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_name,
+                                                          directory_descriptor, published_name);
+      return false;
+    }
+    return move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_name,
+                                                         directory_descriptor, retained_name);
+  } catch (...) {
+    return false;
+  }
+}
+
+[[nodiscard]] bool rollback_exchanged_posix_directory_entries_safely(
+    int directory_descriptor, std::string_view published_name, int published_descriptor,
+    std::string_view displaced_name, const PosixDirectoryEntrySnapshot& displaced_snapshot,
+    const std::filesystem::path& destination) noexcept {
+  try {
+    ProtectedDarwinQuarantine quarantine(directory_descriptor, destination);
+    constexpr std::string_view quarantined_published = "published";
+    constexpr std::string_view quarantined_displaced = "displaced";
+    if (!move_posix_directory_entry_noreplace_noexcept(directory_descriptor, published_name,
+                                                       quarantine.get(), quarantined_published)) {
+      return false;
+    }
+    if (!move_posix_directory_entry_noreplace_noexcept(directory_descriptor, displaced_name,
+                                                       quarantine.get(), quarantined_displaced)) {
+      (void)move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_published,
+                                                          directory_descriptor, published_name);
+      return false;
+    }
+    const bool identities_match =
+        path_identifies_descriptor_at(quarantine.get(), quarantined_published,
+                                      published_descriptor) &&
+        posix_directory_entry_matches_snapshot(quarantine.get(), quarantined_displaced,
+                                               displaced_snapshot);
+    if (!identities_match) {
+      (void)move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_displaced,
+                                                          directory_descriptor, displaced_name);
+      (void)move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_published,
+                                                          directory_descriptor, published_name);
+      return false;
+    }
+    if (!move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_displaced,
+                                                       directory_descriptor, published_name)) {
+      return false;
+    }
+    return move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_published,
+                                                         directory_descriptor, displaced_name);
+  } catch (...) {
+    return false;
+  }
+}
+
+[[nodiscard]] bool
+unlink_posix_descriptor_entry_safely(int directory_descriptor, std::string_view name,
+                                     int descriptor,
+                                     const std::filesystem::path& destination) noexcept {
+  try {
+    ProtectedDarwinQuarantine quarantine(directory_descriptor, destination);
+    constexpr std::string_view retained_name = "temporary";
+    if (!move_posix_directory_entry_noreplace_noexcept(directory_descriptor, name, quarantine.get(),
+                                                       retained_name)) {
+      return false;
+    }
+    if (!path_identifies_descriptor_at(quarantine.get(), retained_name, descriptor)) {
+      (void)move_posix_directory_entry_noreplace_noexcept(quarantine.get(), retained_name,
+                                                          directory_descriptor, name);
+      return false;
+    }
+    return ::unlinkat(quarantine.get(), retained_name.data(), 0) == 0;
+  } catch (...) {
+    return false;
+  }
 }
 
 [[nodiscard]] std::string create_exclusive_temporary_at(int directory_descriptor,
@@ -1781,38 +2072,34 @@ void write_calibration_json_atomically_impl(
     }
     displaced_output = retain_displaced_windows_output(output_directory.handle.get(),
                                                        destination_name, destination);
-    rename_open_file(handle, output_directory.handle.get(), destination_name, destination);
+    rename_open_file(handle, output_directory.handle.get(), destination_name, destination, false,
+                     false);
     temporary_exists = false;
     destination_published = true;
     const auto rollback_publication = [&]() noexcept {
-      if (!destination_published || !published_path_identifies_handle(output_directory.handle.get(),
-                                                                      destination_name, handle)) {
+      if (!destination_published) {
         return false;
       }
       try {
+        const auto temporary_name = temporary.filename().wstring();
+        rename_open_file(handle, output_directory.handle.get(), temporary_name, temporary, false,
+                         false);
+        temporary_exists = relative_path_identifies_windows_handle(output_directory.handle.get(),
+                                                                   temporary_name, handle, false);
+        destination_published = false;
+        if (!temporary_exists) {
+          return false;
+        }
         if (displaced_output.has_value()) {
-          if (!relative_path_identifies_windows_handle(output_directory.handle.get(),
-                                                       displaced_output->name,
-                                                       displaced_output->handle.get(), true)) {
-            return false;
-          }
           rename_open_file(displaced_output->handle.get(), output_directory.handle.get(),
-                           destination_name, destination, true);
+                           destination_name, destination, true, false);
           if (!relative_path_identifies_windows_handle(output_directory.handle.get(),
                                                        destination_name,
                                                        displaced_output->handle.get(), true)) {
             return false;
           }
-        } else {
-          const auto temporary_name = temporary.filename().wstring();
-          rename_open_file(handle, output_directory.handle.get(), temporary_name, temporary);
-          temporary_exists = relative_path_identifies_windows_handle(output_directory.handle.get(),
-                                                                     temporary_name, handle, false);
-          if (!temporary_exists) {
-            return false;
-          }
+          displaced_output.reset();
         }
-        destination_published = false;
         return true;
       } catch (...) {
         return false;
@@ -1853,19 +2140,18 @@ void write_calibration_json_atomically_impl(
                        static_cast<int>(GetLastError()));
     }
     handle = INVALID_HANDLE_VALUE;
-  } catch (const WindowsPublicationIdentityError&) {
-    if (handle != INVALID_HANDLE_VALUE) {
-      (void)CloseHandle(handle);
-      handle = INVALID_HANDLE_VALUE;
-    }
-    temporary_exists = false;
-    throw;
   } catch (...) {
-    if (!destination_published && displaced_output.has_value() &&
-        relative_path_identifies_windows_handle(output_directory.handle.get(),
-                                                displaced_output->name,
-                                                displaced_output->handle.get(), true)) {
-      (void)discard_open_file(displaced_output->handle.get());
+    if (!destination_published && displaced_output.has_value()) {
+      try {
+        rename_open_file(displaced_output->handle.get(), output_directory.handle.get(),
+                         destination_name, destination, true, false);
+        if (relative_path_identifies_windows_handle(output_directory.handle.get(), destination_name,
+                                                    displaced_output->handle.get(), true)) {
+          displaced_output.reset();
+        }
+      } catch (...) {
+        // A concurrent replacement owns the destination; retain the displaced output by name.
+      }
     }
     if (handle != INVALID_HANDLE_VALUE) {
       if (!destination_published) {
@@ -2010,17 +2296,17 @@ void write_calibration_json_atomically_impl(
                 "refusing to publish calibration output: published output identity changed");
           }
           const auto rollback_link_if_unchanged = [&] {
-            return temporary_name_identifies_descriptor(
-                       directory_descriptor.get(), destination_name, temporary.descriptor.get()) &&
-                   ::unlinkat(directory_descriptor.get(), destination_name.c_str(), 0) == 0;
+            return unlink_descriptor_entry_safely(directory_descriptor.get(), destination_name,
+                                                  temporary.descriptor.get(), destination);
           };
           run_after_publish_or_rollback(rollback_link_if_unchanged);
           validate_published_or_rollback(rollback_link_if_unchanged);
           if (temporary_name_identifies_descriptor(directory_descriptor.get(), publication_name,
                                                    temporary.descriptor.get())) {
-            if (::unlinkat(directory_descriptor.get(), publication_name.c_str(), 0) != 0) {
+            if (!unlink_descriptor_entry_safely(directory_descriptor.get(), publication_name,
+                                                temporary.descriptor.get(), destination)) {
               throw_file_error("failed to remove calibration output retention link", destination,
-                               errno);
+                               EBUSY);
             }
           }
           publication_exists = false;
@@ -2057,14 +2343,9 @@ void write_calibration_json_atomically_impl(
         exchange_directory_entries_at(directory_descriptor.get(), publication_name,
                                       destination_name, destination);
         const auto rollback_exchange_if_unchanged = [&] {
-          if (!temporary_name_identifies_descriptor(directory_descriptor.get(), destination_name,
-                                                    temporary.descriptor.get()) ||
-              !directory_entry_matches_snapshot(directory_descriptor.get(), publication_name,
-                                                displaced_snapshot)) {
-            return false;
-          }
-          const bool rolled_back = exchange_directory_entries_noexcept(
-              directory_descriptor.get(), publication_name, destination_name);
+          const bool rolled_back = rollback_exchanged_directory_entries_safely(
+              directory_descriptor.get(), destination_name, temporary.descriptor.get(),
+              publication_name, displaced_snapshot, destination);
           publication_exists = temporary_name_identifies_descriptor(
               directory_descriptor.get(), publication_name, temporary.descriptor.get());
           return rolled_back;
@@ -2093,7 +2374,7 @@ void write_calibration_json_atomically_impl(
         }
         validate_published_or_rollback([&] { return rollback_exchange_if_unchanged(); });
         if (!unlink_directory_entry_if_unchanged(directory_descriptor.get(), publication_name,
-                                                 displaced_snapshot)) {
+                                                 displaced_snapshot, destination)) {
           const bool rolled_back = rollback_exchange_if_unchanged();
           throw std::runtime_error(
               rolled_back
@@ -2130,22 +2411,18 @@ void write_calibration_json_atomically_impl(
                                       destination);
       }
       const auto rollback_fallback_if_unchanged = [&] {
-        if (!temporary_name_identifies_descriptor(directory_descriptor.get(), destination_name,
-                                                  temporary.descriptor.get())) {
-          return false;
-        }
         bool rolled_back = false;
         if (exchanged) {
-          if (!displaced_snapshot.has_value() ||
-              !directory_entry_matches_snapshot(directory_descriptor.get(), temporary.name,
-                                                *displaced_snapshot)) {
+          if (!displaced_snapshot.has_value()) {
             return false;
           }
-          rolled_back = exchange_directory_entries_noexcept(directory_descriptor.get(),
-                                                            temporary.name, destination_name);
+          rolled_back = rollback_exchanged_directory_entries_safely(
+              directory_descriptor.get(), destination_name, temporary.descriptor.get(),
+              temporary.name, *displaced_snapshot, destination);
         } else {
-          rolled_back = rename_directory_entry_noreplace_noexcept(directory_descriptor.get(),
-                                                                  destination_name, temporary.name);
+          rolled_back = rollback_new_directory_entry_safely(
+              directory_descriptor.get(), destination_name, temporary.name,
+              temporary.descriptor.get(), destination);
         }
         temporary_exists = temporary_name_identifies_descriptor(
             directory_descriptor.get(), temporary.name, temporary.descriptor.get());
@@ -2175,8 +2452,9 @@ void write_calibration_json_atomically_impl(
         }
       }
       validate_published_or_rollback([&] { return rollback_fallback_if_unchanged(); });
-      if (exchanged && !unlink_directory_entry_if_unchanged(directory_descriptor.get(),
-                                                            temporary.name, *displaced_snapshot)) {
+      if (exchanged &&
+          !unlink_directory_entry_if_unchanged(directory_descriptor.get(), temporary.name,
+                                               *displaced_snapshot, destination)) {
         const bool rolled_back = rollback_fallback_if_unchanged();
         throw std::runtime_error(
             rolled_back ? "failed to remove unchanged displaced calibration output"
@@ -2186,12 +2464,9 @@ void write_calibration_json_atomically_impl(
       published = true;
     }
 
-    if (temporary_exists &&
-        temporary_name_identifies_descriptor(directory_descriptor.get(), temporary.name,
-                                             temporary.descriptor.get())) {
-      if (::unlinkat(directory_descriptor.get(), temporary.name.c_str(), 0) != 0) {
-        throw_file_error("failed to remove temporary calibration output", temporary_path, errno);
-      }
+    if (temporary_exists) {
+      (void)unlink_descriptor_entry_safely(directory_descriptor.get(), temporary.name,
+                                           temporary.descriptor.get(), destination);
     }
     temporary_exists = false;
     temporary.descriptor.close_checked(destination);
@@ -2199,15 +2474,13 @@ void write_calibration_json_atomically_impl(
       throw_file_error("failed to flush calibration output directory", parent, errno);
     }
   } catch (...) {
-    if (publication_exists &&
-        temporary_name_identifies_descriptor(directory_descriptor.get(), publication_name,
-                                             temporary.descriptor.get())) {
-      (void)::unlinkat(directory_descriptor.get(), publication_name.c_str(), 0);
+    if (publication_exists) {
+      (void)unlink_descriptor_entry_safely(directory_descriptor.get(), publication_name,
+                                           temporary.descriptor.get(), destination);
     }
-    if (temporary_exists &&
-        temporary_name_identifies_descriptor(directory_descriptor.get(), temporary.name,
-                                             temporary.descriptor.get())) {
-      (void)::unlinkat(directory_descriptor.get(), temporary.name.c_str(), 0);
+    if (temporary_exists) {
+      (void)unlink_descriptor_entry_safely(directory_descriptor.get(), temporary.name,
+                                           temporary.descriptor.get(), destination);
     }
     throw;
   }
@@ -2304,12 +2577,8 @@ void write_calibration_json_atomically_impl(
                        destination_name.c_str(), RENAME_EXCL) == 0) {
       temporary_exists = false;
       const auto rollback_new_output = [&] {
-        if (!path_identifies_descriptor_at(output_directory.get(), destination_name, descriptor)) {
-          return false;
-        }
-        const bool rolled_back =
-            ::renameatx_np(output_directory.get(), destination_name.c_str(), output_directory.get(),
-                           temporary_name.c_str(), RENAME_EXCL) == 0;
+        const bool rolled_back = rollback_new_posix_directory_entry_safely(
+            output_directory.get(), destination_name, temporary_name, descriptor, destination);
         temporary_exists = rolled_back && path_identifies_descriptor_at(output_directory.get(),
                                                                         temporary_name, descriptor);
         return rolled_back;
@@ -2357,14 +2626,9 @@ void write_calibration_json_atomically_impl(
       }
       destination_exchanged = true;
       const auto rollback_exchange_if_unchanged = [&] {
-        if (!path_identifies_descriptor_at(output_directory.get(), destination_name, descriptor) ||
-            !posix_directory_entry_matches_snapshot(output_directory.get(), temporary_name,
-                                                    *displaced_output_snapshot)) {
-          return false;
-        }
-        const bool rolled_back =
-            ::renameatx_np(output_directory.get(), temporary_name.c_str(), output_directory.get(),
-                           destination_name.c_str(), RENAME_SWAP) == 0;
+        const bool rolled_back = rollback_exchanged_posix_directory_entries_safely(
+            output_directory.get(), destination_name, descriptor, temporary_name,
+            *displaced_output_snapshot, destination);
         destination_exchanged = !rolled_back;
         temporary_exists = rolled_back && path_identifies_descriptor_at(output_directory.get(),
                                                                         temporary_name, descriptor);
@@ -2412,7 +2676,7 @@ void write_calibration_json_atomically_impl(
         throw;
       }
       if (!unlink_posix_directory_entry_if_unchanged(output_directory.get(), temporary_name,
-                                                     *displaced_output_snapshot)) {
+                                                     *displaced_output_snapshot, destination)) {
         const bool rolled_back = rollback_exchange_if_unchanged();
         throw std::runtime_error(
             rolled_back ? "failed to remove unchanged displaced calibration output"
@@ -2452,19 +2716,17 @@ void write_calibration_json_atomically_impl(
 #if defined(__APPLE__)
     if (destination_exchanged) {
       if (displaced_output_snapshot.has_value() &&
-          path_identifies_descriptor_at(output_directory.get(), destination_name, descriptor) &&
-          posix_directory_entry_matches_snapshot(output_directory.get(), temporary_name,
-                                                 *displaced_output_snapshot) &&
-          ::renameatx_np(output_directory.get(), temporary_name.c_str(), output_directory.get(),
-                         destination_name.c_str(), RENAME_SWAP) == 0) {
+          rollback_exchanged_posix_directory_entries_safely(
+              output_directory.get(), destination_name, descriptor, temporary_name,
+              *displaced_output_snapshot, destination)) {
         destination_exchanged = false;
         temporary_exists =
             path_identifies_descriptor_at(output_directory.get(), temporary_name, descriptor);
       }
     }
-    if (temporary_exists &&
-        path_identifies_descriptor_at(output_directory.get(), temporary_name, descriptor)) {
-      (void)::unlinkat(output_directory.get(), temporary_name.c_str(), 0);
+    if (temporary_exists) {
+      (void)unlink_posix_descriptor_entry_safely(output_directory.get(), temporary_name, descriptor,
+                                                 destination);
     }
 #else
     if (destination_link_exists && path_identifies_descriptor(destination, descriptor)) {
