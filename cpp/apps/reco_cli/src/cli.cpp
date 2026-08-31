@@ -1822,16 +1822,20 @@ void write_calibration_json_atomically_impl(
       if (after_publish) {
         after_publish();
       }
-      if (!published_path_identifies_handle(output_directory.handle.get(), destination_name,
-                                            handle)) {
-        throw std::runtime_error("published calibration output identity changed after publication");
-      }
     } catch (...) {
       if (!rollback_publication()) {
         throw std::runtime_error(
-            "post-publication validation failed and calibration output rollback failed");
+            "post-publication hook failed and calibration output rollback failed");
       }
       throw;
+    }
+    if (!published_path_identifies_handle(output_directory.handle.get(), destination_name,
+                                          handle)) {
+      const bool rolled_back = rollback_publication();
+      throw std::runtime_error(
+          rolled_back ? "published calibration output identity changed after publication"
+                      : "published calibration output identity changed after publication and "
+                        "calibration output rollback failed");
     }
     if (displaced_output.has_value()) {
       if (!discard_open_file(displaced_output->handle.get())) {
