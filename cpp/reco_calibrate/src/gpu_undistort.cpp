@@ -1,6 +1,6 @@
 #include "reco/calibrate/gpu_undistort.hpp"
 
-#include "nvrtc_compiler.hpp"
+#include "reco/core/nvrtc_compiler.hpp"
 
 #include <algorithm>
 #include <array>
@@ -182,9 +182,14 @@ struct GpuCalibrationUndistorter::Impl {
       : backend(backend_in), config(std::move(config_in)) {
     validate_config(config);
     backend.ensure_primary_context();
-    detail::NvrtcCompiler compiler;
-    const std::string ptx =
-        compiler.compile(kUndistortKernelSource, "reco_calibrate_gpu_undistort.cu");
+    auto compiler = reco::core::NvrtcCompiler::create();
+    const auto capability = backend.compute_capability();
+    const auto architecture =
+        compiler.select_architecture(capability.major * 10 + capability.minor);
+    reco::core::NvrtcCompileOptions options;
+    options.values = {"--std=c++11", "--gpu-architecture=compute_" + std::to_string(architecture)};
+    const auto ptx =
+        compiler.compile(kUndistortKernelSource, "reco_calibrate_gpu_undistort.cu", options).ptx;
     kernel = backend.load_kernel_from_ptx(ptx, "undistort_y_plane");
   }
 

@@ -218,16 +218,19 @@ struct FakeNvrtcControl {
     reset_fn = library.symbol<void (*)()>("recoFakeNvrtcReset");
     create_count_fn = library.symbol<int (*)()>("recoFakeNvrtcCreateCount");
     destroy_count_fn = library.symbol<int (*)()>("recoFakeNvrtcDestroyCount");
+    last_architecture_fn = library.symbol<int (*)()>("recoFakeNvrtcLastArchitecture");
   }
 
   void reset() const { reset_fn(); }
   int create_count() const { return create_count_fn(); }
   int destroy_count() const { return destroy_count_fn(); }
+  int last_architecture() const { return last_architecture_fn(); }
 
   DynamicControl library;
   void (*reset_fn)() = nullptr;
   int (*create_count_fn)() = nullptr;
   int (*destroy_count_fn)() = nullptr;
+  int (*last_architecture_fn)() = nullptr;
 };
 
 MatchCalibration calibration() {
@@ -283,6 +286,8 @@ void compiles_once_and_synchronizes_each_render(const std::filesystem::path& cud
   auto renderer = create_renderer(config(), cuda_runtime, nvrtc_runtime);
   expect_eq(nvrtc_control.create_count(), 1, "renderer performs one NVRTC compilation");
   expect_eq(nvrtc_control.destroy_count(), 1, "renderer releases the NVRTC program");
+  expect_eq(nvrtc_control.last_architecture(), 86,
+            "renderer selects the highest NVRTC target supported by the device");
   expect_eq(renderer.device_ordinal(), 0, "renderer device ordinal");
   expect_eq(renderer.output_width(), 4U, "renderer output width");
   expect_eq(renderer.output_height(), 2U, "renderer output height");

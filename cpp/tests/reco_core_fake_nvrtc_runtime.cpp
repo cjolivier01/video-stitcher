@@ -1,8 +1,12 @@
 #include <atomic>
+#include <charconv>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <thread>
 
 #if defined(_WIN32)
 #define RECO_FAKE_NVRTC_EXPORT extern "C" __declspec(dllexport)
@@ -21,6 +25,7 @@ constexpr NvrtcResult kCompilationError = 6;
 constexpr NvrtcResult kInternalError = 11;
 constexpr std::size_t kOversizedLogBytes = 5U * 1024U * 1024U;
 constexpr std::size_t kOversizedPtxBytes = 65U * 1024U * 1024U;
+constexpr std::size_t kLargeCachePtxBytes = 6U * 1024U * 1024U;
 
 struct Program {
   std::string source;
@@ -34,6 +39,10 @@ std::atomic<int> destroy_count{0};
 std::atomic<int> destroy_attempt_count{0};
 std::atomic<int> log_read_count{0};
 std::atomic<int> ptx_read_count{0};
+std::atomic<int> compile_count{0};
+std::atomic<int> active_compile_count{0};
+std::atomic<int> maximum_active_compile_count{0};
+std::atomic<int> last_architecture{-1};
 
 std::string_view scenario() {
   const char* value = std::getenv("RECO_FAKE_NVRTC_SCENARIO");
@@ -41,6 +50,32 @@ std::string_view scenario() {
 }
 
 Program* program_cast(NvrtcProgram program) { return static_cast<Program*>(program); }
+
+void record_maximum_active(int active) {
+  auto maximum = maximum_active_compile_count.load();
+  while (active > maximum && !maximum_active_compile_count.compare_exchange_weak(maximum, active)) {
+  }
+}
+
+void record_architecture(int option_count, const char* const* options) {
+  constexpr std::string_view kPrefix = "--gpu-architecture=compute_";
+  for (int index = 0; index < option_count; ++index) {
+    if (options[index] == nullptr) {
+      continue;
+    }
+    const std::string_view option(options[index]);
+    if (!option.starts_with(kPrefix)) {
+      continue;
+    }
+    int architecture = -1;
+    const auto digits = option.substr(kPrefix.size());
+    const auto conversion =
+        std::from_chars(digits.data(), digits.data() + digits.size(), architecture);
+    if (conversion.ec == std::errc{} && conversion.ptr == digits.data() + digits.size()) {
+      last_architecture = architecture;
+    }
+  }
+}
 
 } // namespace
 
@@ -50,12 +85,21 @@ RECO_FAKE_NVRTC_EXPORT void recoFakeNvrtcReset() {
   destroy_attempt_count = 0;
   log_read_count = 0;
   ptx_read_count = 0;
+  compile_count = 0;
+  active_compile_count = 0;
+  maximum_active_compile_count = 0;
+  last_architecture = -1;
 }
 
 RECO_FAKE_NVRTC_EXPORT int recoFakeNvrtcCreateCount() { return create_count.load(); }
 RECO_FAKE_NVRTC_EXPORT int recoFakeNvrtcDestroyCount() { return destroy_count.load(); }
 RECO_FAKE_NVRTC_EXPORT int recoFakeNvrtcLogReadCount() { return log_read_count.load(); }
 RECO_FAKE_NVRTC_EXPORT int recoFakeNvrtcPtxReadCount() { return ptx_read_count.load(); }
+RECO_FAKE_NVRTC_EXPORT int recoFakeNvrtcCompileCount() { return compile_count.load(); }
+RECO_FAKE_NVRTC_EXPORT int recoFakeNvrtcMaximumActiveCompileCount() {
+  return maximum_active_compile_count.load();
+}
+RECO_FAKE_NVRTC_EXPORT int recoFakeNvrtcLastArchitecture() { return last_architecture.load(); }
 
 RECO_FAKE_NVRTC_EXPORT NvrtcResult nvrtcVersion(int* major, int* minor) {
   if (scenario() == "version-error") {
@@ -68,6 +112,42 @@ RECO_FAKE_NVRTC_EXPORT NvrtcResult nvrtcVersion(int* major, int* minor) {
   *minor = 8;
   return kSuccess;
 }
+
+RECO_FAKE_NVRTC_EXPORT NvrtcResult nvrtcGetNumSupportedArchs(int* count) {
+  if (count == nullptr) {
+    return kInvalidInput;
+  }
+  if (scenario() == "architecture-count-error") {
+    return kInternalError;
+  }
+  if (scenario() == "architecture-count-zero") {
+    *count = 0;
+    return kSuccess;
+  }
+  if (scenario() == "architecture-count-oversized") {
+    *count = 129;
+    return kSuccess;
+  }
+  *count = 6;
+  return kSuccess;
+}
+
+#if !defined(RECO_FAKE_NVRTC_INCOMPLETE_ARCHS)
+RECO_FAKE_NVRTC_EXPORT NvrtcResult nvrtcGetSupportedArchs(int* architectures) {
+  if (architectures == nullptr) {
+    return kInvalidInput;
+  }
+  if (scenario() == "architecture-list-error") {
+    return kInternalError;
+  }
+  const int values[] = {90, 52, 86, 75, 80, 86};
+  std::memcpy(architectures, values, sizeof(values));
+  if (scenario() == "architecture-invalid") {
+    architectures[2] = -1;
+  }
+  return kSuccess;
+}
+#endif
 
 RECO_FAKE_NVRTC_EXPORT NvrtcResult nvrtcCreateProgram(NvrtcProgram* output, const char* source,
                                                       const char* source_name, int header_count,
@@ -82,6 +162,9 @@ RECO_FAKE_NVRTC_EXPORT NvrtcResult nvrtcCreateProgram(NvrtcProgram* output, cons
   program->log = "fake warning\n";
   program->ptx =
       ".version 7.0\n.target sm_75\n.address_size 64\n.visible .entry fake_kernel() { ret; }\n";
+  if (scenario() == "large-cache-ptx") {
+    program->ptx.assign(kLargeCachePtxBytes, 'x');
+  }
   *output = program;
   if (scenario() == "create-error") {
     return kInvalidInput;
@@ -111,6 +194,16 @@ RECO_FAKE_NVRTC_EXPORT NvrtcResult nvrtcCompileProgram(NvrtcProgram input, int o
   auto* program = program_cast(input);
   if (program == nullptr || option_count < 0 || (option_count != 0 && options == nullptr)) {
     return kInvalidInput;
+  }
+  ++compile_count;
+  const auto active = ++active_compile_count;
+  record_maximum_active(active);
+  struct ActiveCompileGuard {
+    ~ActiveCompileGuard() { --active_compile_count; }
+  } active_guard;
+  record_architecture(option_count, options);
+  if (scenario() == "slow-success") {
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
   }
   if (scenario() == "verify-request") {
     constexpr std::string_view kExpectedSource = "extern \"C\" __global__ void fake_kernel() {}";

@@ -1,6 +1,6 @@
 #include "reco/calibrate/gpu_features.hpp"
 
-#include "nvrtc_compiler.hpp"
+#include "reco/core/nvrtc_compiler.hpp"
 
 #include <algorithm>
 #include <array>
@@ -636,10 +636,17 @@ struct GpuFeatureSet::Impl {
 struct GpuAkazePipeline::Impl {
   explicit Impl(reco::core::CudaBackend& backend_in) : backend(backend_in) {
     backend.ensure_primary_context();
-    detail::NvrtcCompiler compiler;
-    const auto akaze_ptx = compiler.compile(kGpuAkazeKernelSource, "reco_calibrate_gpu_akaze.cu",
-                                            {.disable_fmad = true});
-    akaze_module = backend.load_module_from_ptx(akaze_ptx);
+    auto compiler = reco::core::NvrtcCompiler::create();
+    const auto capability = backend.compute_capability();
+    const auto architecture =
+        compiler.select_architecture(capability.major * 10 + capability.minor);
+    reco::core::NvrtcCompileOptions akaze_options;
+    akaze_options.values = {"--std=c++11",
+                            "--gpu-architecture=compute_" + std::to_string(architecture),
+                            "--fmad=false"};
+    const auto akaze =
+        compiler.compile(kGpuAkazeKernelSource, "reco_calibrate_gpu_akaze.cu", akaze_options);
+    akaze_module = backend.load_module_from_ptx(akaze.ptx);
     y_to_float = akaze_module.load_kernel("akaze_y_to_float");
     triangle_vertical_y = akaze_module.load_kernel("akaze_triangle_vertical_y");
     triangle_horizontal = akaze_module.load_kernel("akaze_triangle_horizontal");
@@ -665,8 +672,12 @@ struct GpuAkazePipeline::Impl {
     emit_features = akaze_module.load_kernel("akaze_emit_features");
     describe_features = akaze_module.load_kernel("akaze_describe_features");
 
-    const auto match_ptx = compiler.compile(kGpuMatchKernelSource, "reco_calibrate_gpu_match.cu");
-    match_module = backend.load_module_from_ptx(match_ptx);
+    reco::core::NvrtcCompileOptions match_options;
+    match_options.values = {"--std=c++11",
+                            "--gpu-architecture=compute_" + std::to_string(architecture)};
+    const auto match =
+        compiler.compile(kGpuMatchKernelSource, "reco_calibrate_gpu_match.cu", match_options);
+    match_module = backend.load_module_from_ptx(match.ptx);
     match_one_way = match_module.load_kernel("match_one_way");
     match_crosscheck = match_module.load_kernel("match_crosscheck_flags");
     match_scan_block = match_module.load_kernel("match_scan_block");

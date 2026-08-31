@@ -521,11 +521,12 @@ CudaStereoStitchRenderer CudaStereoStitchRenderer::create(CudaStitchRendererConf
                                                           NvrtcCompiler compiler) {
   validate_config(config, backend);
   const auto capability = backend.compute_capability(config.device_ordinal);
+  const auto device_architecture = capability.major * 10 + capability.minor;
+  const auto target_architecture = compiler.select_architecture(device_architecture);
   const auto context_id = backend.primary_context_id(config.device_ordinal);
   NvrtcCompileOptions options;
-  options.values = {"--std=c++17", "--gpu-architecture=compute_" +
-                                       std::to_string(capability.major) +
-                                       std::to_string(capability.minor)};
+  options.values = {"--std=c++17",
+                    "--gpu-architecture=compute_" + std::to_string(target_architecture)};
   const auto compiled = compiler.compile(kCudaSource, "reco_cuda_stitch_renderer.cu", options);
   auto module = backend.load_module_from_ptx(compiled.ptx, config.device_ordinal);
   auto kernel = module.load_kernel(kKernelName);

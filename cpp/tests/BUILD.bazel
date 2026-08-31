@@ -116,11 +116,20 @@ cc_binary(
     local_defines = ["RECO_FAKE_NVRTC_INCOMPLETE"],
 )
 
+cc_binary(
+    name = "libreco_core_fake_nvrtc_incomplete_arch_runtime.so",
+    testonly = True,
+    srcs = ["reco_core_fake_nvrtc_runtime.cpp"],
+    linkshared = True,
+    local_defines = ["RECO_FAKE_NVRTC_INCOMPLETE_ARCHS"],
+)
+
 cc_test(
     name = "reco_core_nvrtc_tests",
     size = "large",
     srcs = ["reco_core_nvrtc_tests.cpp"],
     data = [
+        ":libreco_core_fake_nvrtc_incomplete_arch_runtime.so",
         ":libreco_core_fake_nvrtc_incomplete_runtime.so",
         ":libreco_core_fake_nvrtc_runtime.so",
     ],
