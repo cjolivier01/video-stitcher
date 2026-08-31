@@ -2088,6 +2088,12 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
                      kTimingReorderLookahead) < timing_scan.sample_count;
   const auto preliminary_frame_rate = infer_constant_frame_rate(
       timing_scan, timing_scan.reached_eos, timing_scan.reached_eos, !timing_scan.reached_eos);
+  if (preliminary_frame_rate.has_value() &&
+      static_cast<long double>(preliminary_frame_rate->numerator) /
+              preliminary_frame_rate->denominator >
+          kMaximumSaneFps) {
+    throw GpuVideoProbeError("video parser returned an implausible frame rate");
+  }
   const bool caps_rate_conflict_needs_more_evidence =
       preliminary_frame_rate.has_value() && caps_frame_rate_is_plausible &&
       !frame_rates_are_identical(

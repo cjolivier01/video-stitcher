@@ -583,7 +583,11 @@ int main(int argc, char** argv) {
       terminate_and_reap(descendant);
       return 8;
     }
+#if defined(__APPLE__)
+    if (errno != EAGAIN) {
+#else
     if (errno != EPERM) {
+#endif
       return 9;
     }
     bool thread_ran = false;

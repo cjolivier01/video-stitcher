@@ -1024,6 +1024,8 @@ void write_calibration_json_atomically_impl(std::string_view json,
     profile_reservations.push_back(pin_windows_path_for_publication(
         lens_profiles[index], index == 0 ? "left lens profile" : "right lens profile"));
   }
+  static std::mutex publication_mutex;
+  std::lock_guard publication_lock(publication_mutex);
   HANDLE handle = INVALID_HANDLE_VALUE;
   std::filesystem::path temporary;
   bool temporary_exists = false;
