@@ -1,5 +1,6 @@
 #pragma once
 
+#include "reco/core/cuda_frame.hpp"
 #include "reco/io/nvmm.hpp"
 
 #include <cstdint>
@@ -166,6 +167,29 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
+/// Move-only owner of an NVMM CUDA mapping and its validated NV12 render view.
+class CudaNv12FrameLease final {
+public:
+  CudaNv12FrameLease(CudaNv12FrameLease&&) noexcept = default;
+  CudaNv12FrameLease& operator=(CudaNv12FrameLease&&) noexcept = default;
+  CudaNv12FrameLease(const CudaNv12FrameLease&) = delete;
+  CudaNv12FrameLease& operator=(const CudaNv12FrameLease&) = delete;
+
+  /// Driver-validated NV12 view usable by CUDA renderers while this lease remains alive.
+  [[nodiscard]] const core::CudaNv12FrameView& view() const noexcept { return view_; }
+  /// Underlying mapping metadata and retained decoder/runtime owners.
+  [[nodiscard]] const NvmmCudaFrame& mapping() const noexcept { return mapping_; }
+
+private:
+  CudaNv12FrameLease(NvmmCudaFrame mapping, core::CudaNv12FrameView view)
+      : mapping_(std::move(mapping)), view_(std::move(view)) {}
+
+  NvmmCudaFrame mapping_;
+  core::CudaNv12FrameView view_;
+
+  friend CudaNv12FrameLease map_gpu_decoded_frame_to_cuda_lease(const GpuDecodedFrame& frame);
+};
+
 [[nodiscard]] std::string_view gpu_decode_codec_name(GpuDecodeCodec codec);
 [[nodiscard]] std::string_view gpu_decode_container_demuxer(GpuDecodeContainer container);
 [[nodiscard]] GpuDecodeCodec gpu_decode_codec_for_path(std::string_view path);
@@ -178,6 +202,8 @@ validate_gpu_file_decode_config(const GpuFileDecodeConfig& config);
 validate_gpu_stereo_decode_config(const GpuStereoDecodeConfig& config);
 [[nodiscard]] std::optional<std::string> validate_gpu_decoded_frame(const GpuDecodedFrame& frame);
 [[nodiscard]] NvmmCudaFrame map_gpu_decoded_frame_to_cuda(const GpuDecodedFrame& frame);
+/// Maps one decoded frame and derives a render view exclusively from CUDA-verified provenance.
+[[nodiscard]] CudaNv12FrameLease map_gpu_decoded_frame_to_cuda_lease(const GpuDecodedFrame& frame);
 [[nodiscard]] std::string
 build_gstreamer_gpu_file_decode_pipeline(const GpuFileDecodeConfig& config);
 [[nodiscard]] GpuDecodeReadResult make_gpu_decode_eos();
