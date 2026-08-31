@@ -602,10 +602,8 @@ NvmmFrameInfo extract_frame_info(const void* mapped_data, NvbufSurfaceAbi select
       .height = params.height,
       .y_offset = planes.offset[0],
       .y_pitch = planes.pitch[0],
-      .y_size = planes.psize[0],
       .uv_offset = planes.offset[1],
       .uv_pitch = planes.pitch[1],
-      .uv_size = planes.psize[1],
       .total_size = params.data_size,
       .surface_ptr = const_cast<void*>(mapped_data),
       .abi = selected_abi,
@@ -616,6 +614,8 @@ NvmmFrameInfo extract_frame_info(const void* mapped_data, NvbufSurfaceAbi select
                                            reinterpret_cast<std::uintptr_t>(params.data_ptr)),
       .color_matrix = color_matrix,
       .color_range = color_range,
+      .y_size = planes.psize[0],
+      .uv_size = planes.psize[1],
   };
   if (const auto error = validate_nvmm_frame_info(info); error.has_value()) {
     throw NvmmError(*error);

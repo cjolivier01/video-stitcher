@@ -132,10 +132,8 @@ struct NvmmFrameInfo {
   std::uint32_t height = 0;
   std::uint32_t y_offset = 0;
   std::uint32_t y_pitch = 0;
-  std::uint32_t y_size = 0;
   std::uint32_t uv_offset = 0;
   std::uint32_t uv_pitch = 0;
-  std::uint32_t uv_size = 0;
   std::uint32_t total_size = 0;
   void* surface_ptr = nullptr;
   NvbufSurfaceAbi abi = NvbufSurfaceAbi::DeepStream7_1;
@@ -145,6 +143,9 @@ struct NvmmFrameInfo {
   Nv12ColorMatrix color_matrix = Nv12ColorMatrix::Bt601;
   Nv12ColorRange color_range = Nv12ColorRange::Limited;
   std::shared_ptr<const NvbufSurfaceRuntime> runtime;
+  // Appended to preserve the public aggregate's legacy positional prefix.
+  std::uint32_t y_size = 0;
+  std::uint32_t uv_size = 0;
 };
 
 struct NvmmCudaFrame {
