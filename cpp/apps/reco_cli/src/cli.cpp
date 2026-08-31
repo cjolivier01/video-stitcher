@@ -2227,20 +2227,67 @@ void write_calibration_json_atomically_impl(
           const auto resolved_destination = output_directory.resolved_path / destination_name;
           const auto resolved_displaced = output_directory.resolved_path / displaced_output->name;
           const auto resolved_temporary = output_directory.resolved_path / temporary_name;
+          if (!published_path_identifies_handle(output_directory.handle.get(), destination_name,
+                                                handle) ||
+              !relative_path_identifies_windows_handle(output_directory.handle.get(),
+                                                       displaced_output->name,
+                                                       displaced_output->handle.get(), true)) {
+            return false;
+          }
+          BY_HANDLE_FILE_INFORMATION published_identity{};
+          BY_HANDLE_FILE_INFORMATION displaced_identity{};
+          if (GetFileInformationByHandle(handle, &published_identity) == 0 ||
+              GetFileInformationByHandle(displaced_output->handle.get(), &displaced_identity) ==
+                  0) {
+            return false;
+          }
+          const HANDLE displaced_handle = displaced_output->handle.release();
+          if (CloseHandle(handle) == 0) {
+            displaced_output->handle = UniqueWindowsHandle(displaced_handle);
+            handle = INVALID_HANDLE_VALUE;
+            return false;
+          }
+          handle = INVALID_HANDLE_VALUE;
+          if (CloseHandle(displaced_handle) == 0) {
+            return false;
+          }
           if (ReplaceFileW(resolved_destination.c_str(), resolved_displaced.c_str(),
                            resolved_temporary.c_str(), REPLACEFILE_WRITE_THROUGH, nullptr,
                            nullptr) == 0) {
             return false;
           }
           destination_published = false;
-          temporary_exists = relative_path_identifies_windows_handle(output_directory.handle.get(),
-                                                                     temporary_name, handle, false);
-          if (!relative_path_identifies_windows_handle(output_directory.handle.get(),
-                                                       destination_name,
-                                                       displaced_output->handle.get(), true) ||
-              !temporary_exists) {
+          constexpr ACCESS_MASK access = DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+          constexpr ULONG sharing = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+          constexpr ULONG options =
+              FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT;
+          DWORD temporary_error = ERROR_SUCCESS;
+          const HANDLE restored_temporary =
+              open_windows_file_relative(output_directory.handle.get(), temporary_name, access,
+                                         sharing, FILE_OPEN, options, temporary_error);
+          DWORD destination_error = ERROR_SUCCESS;
+          const HANDLE restored_destination =
+              open_windows_file_relative(output_directory.handle.get(), destination_name, access,
+                                         sharing, FILE_OPEN, options, destination_error);
+          UniqueWindowsHandle retained_temporary(restored_temporary);
+          UniqueWindowsHandle retained_destination(restored_destination);
+          BY_HANDLE_FILE_INFORMATION restored_temporary_identity{};
+          BY_HANDLE_FILE_INFORMATION restored_destination_identity{};
+          if (restored_temporary == INVALID_HANDLE_VALUE ||
+              restored_destination == INVALID_HANDLE_VALUE ||
+              GetFileInformationByHandle(restored_temporary, &restored_temporary_identity) == 0 ||
+              GetFileInformationByHandle(restored_destination, &restored_destination_identity) ==
+                  0 ||
+              !same_windows_file_identity(published_identity, restored_temporary_identity) ||
+              !same_windows_file_identity(displaced_identity, restored_destination_identity) ||
+              !relative_path_identifies_windows_handle(output_directory.handle.get(),
+                                                       temporary_name, restored_temporary, false) ||
+              !relative_path_identifies_windows_handle(
+                  output_directory.handle.get(), destination_name, restored_destination, true)) {
             return false;
           }
+          handle = retained_temporary.release();
+          temporary_exists = true;
           displaced_output.reset();
         } else {
           rename_open_file(handle, output_directory.handle.get(), temporary_name, temporary, false,

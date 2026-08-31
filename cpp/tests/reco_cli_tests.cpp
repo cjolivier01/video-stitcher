@@ -1021,6 +1021,7 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
   std::atomic<bool> observed_partial_output{false};
   std::atomic<bool> writer_failed{false};
   std::atomic<std::uint64_t> successful_reads{0};
+  AtomicReadResult failed_read;
   std::thread reader([&] {
     while (running.load(std::memory_order_acquire)) {
       const auto result = read_atomic_output(destination);
@@ -1029,6 +1030,7 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
         continue;
       }
       if (result.status != AtomicReadStatus::Success) {
+        failed_read = result;
         observed_partial_output.store(true, std::memory_order_release);
         return;
       }
@@ -1037,6 +1039,7 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
         return result.contents == payload + '\n';
       });
       if (!complete) {
+        failed_read = result;
         observed_partial_output.store(true, std::memory_order_release);
         return;
       }
@@ -1069,6 +1072,12 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
   }
   running.store(false, std::memory_order_release);
   reader.join();
+
+  if (observed_partial_output.load(std::memory_order_acquire)) {
+    std::cerr << "atomic reader failure status=" << static_cast<int>(failed_read.status)
+              << " bytes=" << failed_read.contents.size() << " contents=" << failed_read.contents
+              << '\n';
+  }
 
   expect_true(!writer_failed.load(std::memory_order_acquire),
               "concurrent calibration writers all succeed");
