@@ -148,15 +148,12 @@ void production_source_retains_mapped_sample() {
 
   source.reset();
   events = read_events(event_path);
-  expect_eq(count_event(events, "state-null"), 1U, "source shutdown stops pipeline");
-  expect_eq(count_event(events, "remove-display-probe"), 1U,
-            "source shutdown removes the geometry callback");
-  expect_eq(count_event(events, "destroy-display-probe-data"), 1U,
-            "GStreamer owns and destroys the geometry callback state");
-  expect_eq(count_event(events, "remove-output-probe"), 1U,
-            "source shutdown removes the output metadata callback");
-  expect_eq(count_event(events, "destroy-output-probe-data"), 1U,
-            "GStreamer owns and destroys the output callback state");
+  expect_eq(count_event(events, "state-null"), 0U,
+            "source shutdown defers pipeline stop while a frame is retained");
+  expect_eq(count_event(events, "remove-display-probe"), 0U,
+            "source shutdown retains the geometry callback with the pipeline");
+  expect_eq(count_event(events, "remove-output-probe"), 0U,
+            "source shutdown retains the output callback with the pipeline");
   expect_eq(count_event(events, "probe-leaked"), 0U,
             "geometry callback does not outlive its source");
   expect_eq(count_event(events, "unmap"), 0U,
@@ -166,9 +163,21 @@ void production_source_retains_mapped_sample() {
   events = read_events(event_path);
   expect_eq(count_event(events, "unmap"), 1U, "last frame owner unmaps GstBuffer");
   expect_eq(count_event(events, "sample-unref"), 1U, "last frame owner releases GstSample");
+  expect_eq(count_event(events, "state-null"), 1U,
+            "last frame release stops the deferred pipeline");
+  expect_eq(count_event(events, "remove-display-probe"), 1U,
+            "deferred shutdown removes the geometry callback");
+  expect_eq(count_event(events, "destroy-display-probe-data"), 1U,
+            "GStreamer owns and destroys the geometry callback state");
+  expect_eq(count_event(events, "remove-output-probe"), 1U,
+            "deferred shutdown removes the output metadata callback");
+  expect_eq(count_event(events, "destroy-output-probe-data"), 1U,
+            "GStreamer owns and destroys the output callback state");
   const auto unmap = std::find(events.begin(), events.end(), "unmap");
   const auto unref = std::find(events.begin(), events.end(), "sample-unref");
+  const auto state_null = std::find(events.begin(), events.end(), "state-null");
   expect_true(unmap < unref, "buffer is unmapped before sample release");
+  expect_true(unref < state_null, "sample is released before deferred pipeline teardown");
 
   source = open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
   auto frame = source->read();
@@ -191,13 +200,14 @@ void persistent_stereo_session_pairs_gstreamer_sources() {
   auto left_config = valid_config();
   auto right_config = valid_config();
   right_config.path = "/data/right.mp4";
-  GpuStereoDecodeSession session(
+  GpuStereoDecodeConfig session_config{.queue_capacity = 1};
+  auto session = std::make_unique<GpuStereoDecodeSession>(
       open_gstreamer_gpu_file_decode_source(std::move(left_config), NvbufSurfaceAbi::DeepStream9_1),
       open_gstreamer_gpu_file_decode_source(std::move(right_config),
                                             NvbufSurfaceAbi::DeepStream9_1),
-      {.queue_capacity = 1});
+      session_config);
 
-  auto paired = session.read();
+  auto paired = session->read();
   expect_true(paired.status == GpuStereoDecodeStatus::FramePair,
               "persistent GStreamer stereo decode returns a frame pair");
   expect_true(paired.frames.has_value(), "persistent GStreamer pair contains both frames");
@@ -212,14 +222,21 @@ void persistent_stereo_session_pairs_gstreamer_sources() {
   expect_eq(count_event(events, "unmap"), 0U,
             "persistent paired frames retain both mappings while owned");
 
-  paired.frames.reset();
-  expect_true(session.read().status == GpuStereoDecodeStatus::EndOfStream,
+  expect_true(session->read().status == GpuStereoDecodeStatus::EndOfStream,
               "persistent GStreamer stereo decode reports EOS after its pair");
+  events = read_events(event_path);
+  expect_eq(count_event(events, "unmap"), 0U,
+            "persistent pair remains mapped while retained across EOS");
+  session.reset();
+  events = read_events(event_path);
+  expect_eq(count_event(events, "state-null"), 0U,
+            "session destruction does not block on or stop retained frame owners");
+  paired.frames.reset();
   events = read_events(event_path);
   expect_eq(count_event(events, "unmap"), 2U,
             "persistent pair release unmaps both decoder buffers");
   expect_eq(count_event(events, "state-null"), 2U,
-            "persistent stereo EOS stops both GStreamer pipelines");
+            "persistent frame release stops both deferred GStreamer pipelines");
 }
 
 void orientation_tags_are_preserved() {

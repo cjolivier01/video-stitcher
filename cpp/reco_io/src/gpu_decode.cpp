@@ -195,6 +195,19 @@ NvmmCudaFrame map_gpu_decoded_frame_to_cuda(const GpuDecodedFrame& frame) {
   return mapped;
 }
 
+CudaNv12FrameLease map_gpu_decoded_frame_to_cuda_lease(const GpuDecodedFrame& frame) {
+  auto mapped = map_gpu_decoded_frame_to_cuda(frame);
+  core::CudaPitchedPlaneView y_plane(
+      mapped.y_ptr, mapped.y_accessible_bytes, mapped.y_pitch, mapped.width, mapped.height,
+      static_cast<core::CudaContextId>(mapped.context_id), mapped.device_ordinal);
+  core::CudaPitchedPlaneView uv_plane(
+      mapped.uv_ptr, mapped.uv_accessible_bytes, mapped.uv_pitch, mapped.width, mapped.height / 2U,
+      static_cast<core::CudaContextId>(mapped.context_id), mapped.device_ordinal);
+  core::CudaNv12FrameView view(std::move(y_plane), std::move(uv_plane), mapped.width, mapped.height,
+                               mapped.color_matrix, mapped.color_range);
+  return CudaNv12FrameLease(std::move(mapped), std::move(view));
+}
+
 std::string build_gstreamer_gpu_file_decode_pipeline(const GpuFileDecodeConfig& config) {
   if (const auto error = validate_gpu_file_decode_config(config); error.has_value()) {
     throw std::invalid_argument(*error);

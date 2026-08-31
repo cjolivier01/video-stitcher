@@ -370,10 +370,140 @@ std::pair<std::uint32_t, std::uint32_t> visible_dimensions(const std::shared_ptr
   return {static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height)};
 }
 
+class GstreamerPipelineResources {
+public:
+  explicit GstreamerPipelineResources(std::shared_ptr<GstreamerApi> api) : api_(std::move(api)) {}
+
+  GstreamerPipelineResources(const GstreamerPipelineResources&) = delete;
+  GstreamerPipelineResources& operator=(const GstreamerPipelineResources&) = delete;
+
+  void close() noexcept {
+    if (closed_) {
+      return;
+    }
+    closed_ = true;
+    if (pipeline != nullptr) {
+      (void)api_->element_set_state(pipeline, kGstStateNull);
+    }
+    if (bus != nullptr) {
+      api_->object_unref(bus);
+      bus = nullptr;
+    }
+    if (output_info_pad != nullptr) {
+      if (output_info_probe_id != 0) {
+        api_->pad_remove_probe(output_info_pad, output_info_probe_id);
+        output_info_probe_id = 0;
+      }
+      api_->object_unref(output_info_pad);
+      output_info_pad = nullptr;
+    }
+    if (output_info != nullptr) {
+      api_->object_unref(output_info);
+      output_info = nullptr;
+    }
+    if (display_info_pad != nullptr) {
+      if (display_info_probe_id != 0) {
+        api_->pad_remove_probe(display_info_pad, display_info_probe_id);
+        display_info_probe_id = 0;
+      }
+      api_->object_unref(display_info_pad);
+      display_info_pad = nullptr;
+    }
+    if (display_info != nullptr) {
+      api_->object_unref(display_info);
+      display_info = nullptr;
+    }
+    if (sink != nullptr) {
+      api_->object_unref(sink);
+      sink = nullptr;
+    }
+    if (pipeline != nullptr) {
+      api_->object_unref(pipeline);
+      pipeline = nullptr;
+    }
+  }
+
+  void* pipeline = nullptr;
+  void* sink = nullptr;
+  void* display_info = nullptr;
+  void* display_info_pad = nullptr;
+  unsigned long display_info_probe_id = 0;
+  void* output_info = nullptr;
+  void* output_info_pad = nullptr;
+  unsigned long output_info_probe_id = 0;
+  void* bus = nullptr;
+
+private:
+  std::shared_ptr<GstreamerApi> api_;
+  bool closed_ = false;
+};
+
+class GstreamerPipelineLifetime {
+public:
+  explicit GstreamerPipelineLifetime(std::shared_ptr<GstreamerPipelineResources> resources)
+      : resources_(std::move(resources)) {}
+
+  GstreamerPipelineLifetime(const GstreamerPipelineLifetime&) = delete;
+  GstreamerPipelineLifetime& operator=(const GstreamerPipelineLifetime&) = delete;
+
+  void acquire_frame() {
+    std::lock_guard lock(mutex_);
+    if (source_released_ || closing_) {
+      throw GpuDecodeError("GStreamer pipeline is closing before frame ownership transfer");
+    }
+    ++frame_leases_;
+  }
+
+  void release_frame() noexcept {
+    std::shared_ptr<GstreamerPipelineResources> close_resources;
+    {
+      std::lock_guard lock(mutex_);
+      if (frame_leases_ == 0) {
+        return;
+      }
+      --frame_leases_;
+      close_resources = take_resources_if_ready();
+    }
+    if (close_resources) {
+      close_resources->close();
+    }
+  }
+
+  void release_source() noexcept {
+    std::shared_ptr<GstreamerPipelineResources> close_resources;
+    {
+      std::lock_guard lock(mutex_);
+      source_released_ = true;
+      close_resources = take_resources_if_ready();
+    }
+    if (close_resources) {
+      close_resources->close();
+    }
+  }
+
+private:
+  std::shared_ptr<GstreamerPipelineResources> take_resources_if_ready() noexcept {
+    if (!source_released_ || frame_leases_ != 0 || closing_) {
+      return {};
+    }
+    closing_ = true;
+    return std::move(resources_);
+  }
+
+  std::mutex mutex_;
+  std::shared_ptr<GstreamerPipelineResources> resources_;
+  std::size_t frame_leases_ = 0;
+  bool source_released_ = false;
+  bool closing_ = false;
+};
+
 class GstSampleOwner {
 public:
-  GstSampleOwner(std::shared_ptr<GstreamerApi> api, void* sample)
-      : api_(std::move(api)), sample_(sample) {}
+  GstSampleOwner(std::shared_ptr<GstreamerApi> api,
+                 std::shared_ptr<GstreamerPipelineLifetime> pipeline_lifetime, void* sample)
+      : api_(std::move(api)), pipeline_lifetime_(std::move(pipeline_lifetime)), sample_(sample) {
+    pipeline_lifetime_->acquire_frame();
+  }
 
   GstSampleOwner(const GstSampleOwner&) = delete;
   GstSampleOwner& operator=(const GstSampleOwner&) = delete;
@@ -385,6 +515,7 @@ public:
     if (sample_ != nullptr) {
       api_->sample_unref(sample_);
     }
+    pipeline_lifetime_->release_frame();
   }
 
   void map_buffer(void* buffer) {
@@ -403,6 +534,7 @@ public:
 
 private:
   std::shared_ptr<GstreamerApi> api_;
+  std::shared_ptr<GstreamerPipelineLifetime> pipeline_lifetime_;
   void* sample_ = nullptr;
   void* buffer_ = nullptr;
   GstMapInfoAbi map_{};
@@ -712,6 +844,8 @@ public:
       : config_(std::move(config)),
         pipeline_description_(build_gstreamer_gpu_file_decode_pipeline(config_)),
         runtime_(std::move(runtime)), abi_(abi), api_(std::move(api)),
+        resources_(std::make_shared<GstreamerPipelineResources>(api_)),
+        pipeline_lifetime_(std::make_shared<GstreamerPipelineLifetime>(resources_)),
         next_frame_index_(config_.start_frame_index.value_or(0U)) {}
 
   GstreamerGpuFileDecodeSource(const GstreamerGpuFileDecodeSource&) = delete;
@@ -741,6 +875,7 @@ public:
     }
 
     pipeline_ = api_->parse_launch(pipeline_description_.c_str(), &error);
+    resources_->pipeline = pipeline_;
     if (pipeline_ == nullptr || error != nullptr) {
       throw GpuDecodeError("GStreamer pipeline parse failed: " +
                            take_error(api_, error, "parse returned no pipeline"));
@@ -752,15 +887,18 @@ public:
       }
     }
     sink_ = api_->bin_get_by_name(pipeline_, "sink");
+    resources_->sink = sink_;
     if (sink_ == nullptr) {
       throw GpuDecodeError("GStreamer pipeline does not contain appsink 'sink'");
     }
     display_info_ = api_->bin_get_by_name(pipeline_, "display_info");
+    resources_->display_info = display_info_;
     if (display_info_ == nullptr) {
       throw GpuDecodeError(
           "GStreamer pipeline does not contain pre-decoder identity 'display_info'");
     }
     display_info_pad_ = api_->element_get_static_pad(display_info_, "src");
+    resources_->display_info_pad = display_info_pad_;
     if (display_info_pad_ == nullptr) {
       throw GpuDecodeError("GStreamer pre-decoder identity does not provide a source pad");
     }
@@ -770,16 +908,19 @@ public:
     display_info_probe_id_ = api_->pad_add_probe(
         display_info_pad_, kGstPadProbeTypeBuffer, &GeometryProbeState::on_predecoder_buffer,
         predecoder_callback_data.get(), &GeometryProbeState::destroy_callback_data);
+    resources_->display_info_probe_id = display_info_probe_id_;
     if (display_info_probe_id_ == 0) {
       geometry_probe_state_.reset();
       throw GpuDecodeError("failed to install GStreamer pre-decoder geometry probe");
     }
     (void)predecoder_callback_data.release();
     output_info_ = api_->bin_get_by_name(pipeline_, "output_info");
+    resources_->output_info = output_info_;
     if (output_info_ == nullptr) {
       throw GpuDecodeError("GStreamer pipeline does not contain output identity 'output_info'");
     }
     output_info_pad_ = api_->element_get_static_pad(output_info_, "src");
+    resources_->output_info_pad = output_info_pad_;
     if (output_info_pad_ == nullptr) {
       throw GpuDecodeError("GStreamer output identity does not provide a source pad");
     }
@@ -788,11 +929,13 @@ public:
     output_info_probe_id_ = api_->pad_add_probe(
         output_info_pad_, kGstPadProbeTypeBuffer, &GeometryProbeState::on_output_buffer,
         output_callback_data.get(), &GeometryProbeState::destroy_callback_data);
+    resources_->output_info_probe_id = output_info_probe_id_;
     if (output_info_probe_id_ == 0) {
       throw GpuDecodeError("failed to install GStreamer output geometry probe");
     }
     (void)output_callback_data.release();
     bus_ = api_->element_get_bus(pipeline_);
+    resources_->bus = bus_;
     if (bus_ == nullptr) {
       throw GpuDecodeError("GStreamer pipeline does not provide a message bus");
     }
@@ -813,9 +956,6 @@ public:
     bool expected = false;
     if (!stop_requested_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
       return;
-    }
-    if (pipeline_ != nullptr) {
-      (void)api_->element_set_state(pipeline_, kGstStateNull);
     }
   }
 
@@ -889,7 +1029,7 @@ public:
       }
     }
 
-    auto owner = std::make_shared<GstSampleOwner>(api_, sample);
+    auto owner = std::make_shared<GstSampleOwner>(api_, pipeline_lifetime_, sample);
     drain_pipeline_messages();
     throw_if_geometry_probe_failed();
     void* buffer = api_->sample_get_buffer(sample);
@@ -1203,54 +1343,15 @@ private:
     return index;
   }
 
-  void close() noexcept {
-    if (pipeline_ != nullptr) {
-      (void)api_->element_set_state(pipeline_, kGstStateNull);
-    }
-    if (bus_ != nullptr) {
-      api_->object_unref(bus_);
-      bus_ = nullptr;
-    }
-    if (output_info_pad_ != nullptr) {
-      if (output_info_probe_id_ != 0) {
-        api_->pad_remove_probe(output_info_pad_, output_info_probe_id_);
-        output_info_probe_id_ = 0;
-      }
-      api_->object_unref(output_info_pad_);
-      output_info_pad_ = nullptr;
-    }
-    if (output_info_ != nullptr) {
-      api_->object_unref(output_info_);
-      output_info_ = nullptr;
-    }
-    if (display_info_pad_ != nullptr) {
-      if (display_info_probe_id_ != 0) {
-        api_->pad_remove_probe(display_info_pad_, display_info_probe_id_);
-        display_info_probe_id_ = 0;
-      }
-      api_->object_unref(display_info_pad_);
-      display_info_pad_ = nullptr;
-    }
-    if (display_info_ != nullptr) {
-      api_->object_unref(display_info_);
-      display_info_ = nullptr;
-    }
-    geometry_probe_state_.reset();
-    if (sink_ != nullptr) {
-      api_->object_unref(sink_);
-      sink_ = nullptr;
-    }
-    if (pipeline_ != nullptr) {
-      api_->object_unref(pipeline_);
-      pipeline_ = nullptr;
-    }
-  }
+  void close() noexcept { pipeline_lifetime_->release_source(); }
 
   GpuFileDecodeConfig config_;
   std::string pipeline_description_;
   std::shared_ptr<const NvbufSurfaceRuntime> runtime_;
   NvbufSurfaceAbi abi_;
   std::shared_ptr<GstreamerApi> api_;
+  std::shared_ptr<GstreamerPipelineResources> resources_;
+  std::shared_ptr<GstreamerPipelineLifetime> pipeline_lifetime_;
   void* pipeline_ = nullptr;
   void* sink_ = nullptr;
   void* display_info_ = nullptr;

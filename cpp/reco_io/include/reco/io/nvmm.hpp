@@ -132,8 +132,10 @@ struct NvmmFrameInfo {
   std::uint32_t height = 0;
   std::uint32_t y_offset = 0;
   std::uint32_t y_pitch = 0;
+  std::uint32_t y_size = 0;
   std::uint32_t uv_offset = 0;
   std::uint32_t uv_pitch = 0;
+  std::uint32_t uv_size = 0;
   std::uint32_t total_size = 0;
   void* surface_ptr = nullptr;
   NvbufSurfaceAbi abi = NvbufSurfaceAbi::DeepStream7_1;
@@ -150,11 +152,29 @@ struct NvmmCudaFrame {
   core::CudaDevicePtr uv_ptr = 0;
   std::size_t y_pitch = 0;
   std::size_t uv_pitch = 0;
+  /// Bytes accessible from the Y pointer within its driver-reported mapping and plane allocation.
+  std::size_t y_accessible_bytes = 0;
+  /// Bytes accessible from the UV pointer within its driver-reported mapping and plane allocation.
+  std::size_t uv_accessible_bytes = 0;
+  /// Base address of the CUDA mapping containing the Y plane.
+  core::CudaDevicePtr y_mapping_base = 0;
+  /// Base address of the CUDA mapping containing the UV plane.
+  core::CudaDevicePtr uv_mapping_base = 0;
+  /// Driver-reported byte size of the CUDA mapping containing the Y plane.
+  std::size_t y_mapping_bytes = 0;
+  /// Driver-reported byte size of the CUDA mapping containing the UV plane.
+  std::size_t uv_mapping_bytes = 0;
   std::uint32_t width = 0;
   std::uint32_t height = 0;
   std::uint32_t gpu_id = 0;
+  /// Process-local identity of the CUDA context proven by the driver for both planes.
+  std::uintptr_t context_id = 0;
+  /// CUDA device ordinal proven by the driver for both planes.
+  int device_ordinal = -1;
   Nv12ColorMatrix color_matrix = Nv12ColorMatrix::Bt601;
   Nv12ColorRange color_range = Nv12ColorRange::Limited;
+  /// Exact NvBufSurface provider retained through mapping cleanup.
+  std::shared_ptr<const NvbufSurfaceRuntime> runtime;
   std::shared_ptr<void> owner;
 };
 

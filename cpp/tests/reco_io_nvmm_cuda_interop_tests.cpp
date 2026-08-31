@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #if defined(__linux__)
@@ -22,6 +23,9 @@ namespace abi = reco::io::detail::nvbufsurface_9_1;
 namespace abi7 = reco::io::detail::nvbufsurface_7_1;
 
 namespace {
+
+static_assert(!std::is_copy_constructible_v<CudaNv12FrameLease>);
+static_assert(std::is_nothrow_move_constructible_v<CudaNv12FrameLease>);
 
 int failures = 0;
 
@@ -249,12 +253,31 @@ void surface_array_mapping_retains_and_unmaps_owner() {
   expect_eq(mapped.uv_ptr, 0x40000000U + 1280U * 720U, "mapped UV pointer");
   expect_eq(mapped.y_pitch, 1280U, "mapped Y pitch");
   expect_eq(mapped.uv_pitch, 1280U, "mapped UV pitch");
+  expect_eq(mapped.y_accessible_bytes, 1280U * 720U,
+            "mapped Y capacity comes from plane and driver bounds");
+  expect_eq(mapped.uv_accessible_bytes, 1280U * 360U,
+            "mapped UV capacity comes from plane and driver bounds");
+  expect_eq(mapped.y_mapping_base, 0x40000000U, "mapped Y allocation base");
+  expect_eq(mapped.y_mapping_bytes, 1280U * 1080U, "mapped Y allocation size");
+  expect_eq(mapped.context_id, static_cast<std::uintptr_t>(0xC0DA),
+            "mapped CUDA context is driver-derived");
+  expect_eq(mapped.device_ordinal, 0, "mapped CUDA device is driver-derived");
   expect_eq(mapped.width, 1278U, "mapped CUDA view uses visible width");
   expect_eq(mapped.gpu_id, 0U, "mapped GPU id");
   expect_eq(mapped_again.y_ptr, mapped.y_ptr, "duplicate map shares CUDA mapping");
   expect_true(mapped.color_matrix == Nv12ColorMatrix::Bt709, "BT.709 metadata preserved");
   expect_true(mapped.color_range == Nv12ColorRange::Limited, "limited range preserved");
   expect_true(params.mapped_addr.cuda_ptr != nullptr, "runtime CUDA mapping remains live");
+  {
+    auto lease = map_gpu_decoded_frame_to_cuda_lease(decoded);
+    expect_eq(lease.view().width(), 1278U, "CUDA frame lease preserves visible width");
+    expect_eq(lease.view().height(), 720U, "CUDA frame lease preserves visible height");
+    expect_eq(lease.view().context_id(), static_cast<reco::core::CudaContextId>(0xC0DA),
+              "CUDA frame lease uses verified context");
+    expect_eq(lease.view().y_plane().accessible_bytes(), 1280U * 720U,
+              "CUDA frame lease uses verified Y capacity");
+    expect_true(lease.mapping().owner != nullptr, "CUDA frame lease retains mapping owner");
+  }
   expect_nvmm_error([&] { (void)map_nvmm_frame_to_cuda(info, std::make_shared<int>(10)); },
                     "duplicate map with different owner rejected");
   params.color_format = abi::kColorNv12;
