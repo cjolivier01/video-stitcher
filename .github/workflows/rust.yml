@@ -77,6 +77,8 @@ jobs:
         run: cargo test --workspace
       - name: Run tests (with profiling)
         run: cargo test --workspace --features profiling
+      - name: Run stacked video round-trip tests
+        run: cargo test -p reco-io --features stacked-output --test stacked_video_roundtrip
 
   # ===========================================================================
   # doc — full workspace docs, all features enabled, warnings-as-errors.

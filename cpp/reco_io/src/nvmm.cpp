@@ -476,8 +476,9 @@ std::shared_ptr<void> acquire_mapping_lease(const std::shared_ptr<CudaMappingSta
 }
 
 struct DirectCudaOwner {
-  std::shared_ptr<void> decoder_owner;
+  std::shared_ptr<const NvbufSurfaceRuntime> runtime;
   std::shared_ptr<CudaFunctions> cuda;
+  std::shared_ptr<void> decoder_owner;
 };
 
 bool same_owner(const std::shared_ptr<void>& lhs, const std::shared_ptr<void>& rhs) {
@@ -883,6 +884,7 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info, std::shared_ptr<
     auto direct_owner = std::make_shared<DirectCudaOwner>();
     direct_owner->decoder_owner = std::move(owner);
     direct_owner->cuda = std::move(cuda);
+    direct_owner->runtime = info.runtime;
     return make_frame(y_ptr, uv_ptr, direct_owner);
   }
 

@@ -388,12 +388,27 @@ void cuda_device_mapping_retains_context_and_owner() {
   params.data_ptr = reinterpret_cast<void*>(0x40000000);
   auto surface = make_surface(params);
   surface.mem_type = abi::kMemCudaDevice;
-  const auto info = extract_info(&surface);
-  auto decoder_owner = std::make_shared<int>(5);
+  auto info = extract_info(&surface);
+  auto runtime = discover_nvbufsurface_runtime();
+  std::weak_ptr<const NvbufSurfaceRuntime> runtime_lifetime = runtime;
+  info.runtime = runtime;
+  bool runtime_alive_during_decoder_release = false;
+  std::shared_ptr<void> decoder_owner(new int(5), [&](void* value) {
+    runtime_alive_during_decoder_release = !runtime_lifetime.expired();
+    delete static_cast<int*>(value);
+  });
   auto mapped = map_nvmm_frame_to_cuda(info, decoder_owner);
+  runtime.reset();
+  info.runtime.reset();
+  decoder_owner.reset();
   expect_eq(mapped.y_ptr, 0x40000000U, "direct CUDA Y pointer");
   expect_eq(mapped.uv_ptr, 0x40000000U + 1280U * 720U, "direct CUDA UV pointer");
   expect_true(mapped.owner.use_count() == 1, "direct CUDA view owns context wrapper");
+  expect_true(!runtime_lifetime.expired(), "direct CUDA view retains NvBufSurface runtime");
+  mapped.owner.reset();
+  expect_true(runtime_alive_during_decoder_release,
+              "direct CUDA runtime outlives decoder-owner destruction");
+  expect_true(runtime_lifetime.expired(), "direct CUDA view releases NvBufSurface runtime");
 
   params = make_params();
   params.data_ptr = reinterpret_cast<void*>(9);

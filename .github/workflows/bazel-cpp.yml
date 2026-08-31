@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
@@ -142,7 +143,9 @@ jobs:
   # This job requires a runner whose service cgroup delegates the memory and pids controllers.
   calibration-containment-self-hosted-conditional:
     name: Bazel C++ calibration containment (self-hosted)
-    if: vars.RECO_CONTAINMENT_RUNNER_ENABLED == 'true'
+    if: >-
+      vars.RECO_CONTAINMENT_RUNNER_ENABLED == 'true' &&
+      github.event_name != 'pull_request'
     runs-on: [self-hosted, linux, x64, delegated-cgroup-v2]
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -158,10 +161,12 @@ jobs:
           --test_output=errors
           //cpp/tests:reco_calibrate_supervisor_tests
 
-  # This job is intentionally conditional until the repository has a self-hosted NVIDIA runner.
+  # Persistent hardware runners only execute trusted main pushes and manual dispatches.
   gpu-calibration-hardware-conditional:
     name: Bazel C++ GPU calibration (hardware-conditional)
-    if: vars.RECO_GPU_RUNNER_ENABLED == 'true'
+    if: >-
+      vars.RECO_GPU_RUNNER_ENABLED == 'true' &&
+      github.event_name != 'pull_request'
     runs-on: [self-hosted, linux, x64, nvidia-gpu, delegated-cgroup-v2]
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3

@@ -178,8 +178,8 @@ resolve_video_probe_worker(const std::filesystem::path& executable_path);
 resolve_calibration_worker(const std::filesystem::path& executable_path);
 
 /// Publishes serialized calibration JSON after rechecking that it cannot replace an input or
-/// selected lens profile. The final flag exists for tests that exercise filesystems without
-/// descriptor hard-link support.
+/// selected lens profile. The trailing controls are deterministic race hooks for publication
+/// tests; production callers leave them at their defaults.
 void write_calibration_json_atomically(std::string_view json,
                                        const std::filesystem::path& destination,
                                        const std::filesystem::path& left_input,
@@ -187,7 +187,9 @@ void write_calibration_json_atomically(std::string_view json,
                                        const std::function<void()>& before_publish = {},
                                        std::span<const std::filesystem::path> lens_profiles = {},
                                        const std::function<void()>& before_commit = {},
-                                       bool force_rename_fallback = false);
+                                       bool force_rename_fallback = false,
+                                       const std::function<void()>& after_publish = {},
+                                       const std::function<void()>& on_lock_contention = {});
 
 } // namespace detail
 

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -31,6 +32,9 @@
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -147,6 +151,176 @@ std::string read_text_file(const std::filesystem::path& path) {
   std::ifstream input(path, std::ios::binary);
   return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
 }
+
+#if defined(_WIN32)
+std::wstring quote_windows_argument(std::wstring_view argument) {
+  std::wstring quoted(1, L'"');
+  std::size_t backslashes = 0;
+  for (const wchar_t character : argument) {
+    if (character == L'\\') {
+      ++backslashes;
+      continue;
+    }
+    if (character == L'"') {
+      quoted.append(backslashes * 2 + 1, L'\\');
+      quoted.push_back(character);
+      backslashes = 0;
+      continue;
+    }
+    quoted.append(backslashes, L'\\');
+    backslashes = 0;
+    quoted.push_back(character);
+  }
+  quoted.append(backslashes * 2, L'\\');
+  quoted.push_back(L'"');
+  return quoted;
+}
+
+HANDLE start_windows_publication_writer(const std::filesystem::path& destination,
+                                        const std::filesystem::path& left_input,
+                                        const std::filesystem::path& right_input,
+                                        std::wstring_view ready_event,
+                                        std::wstring_view release_event,
+                                        std::wstring_view contention_event,
+                                        std::wstring_view payload) {
+  std::wstring executable(32768, L'\0');
+  const DWORD executable_size =
+      GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+  if (executable_size == 0 || executable_size >= executable.size()) {
+    return nullptr;
+  }
+  executable.resize(executable_size);
+  std::wstring command = quote_windows_argument(executable);
+  for (const auto argument :
+       {std::wstring_view(L"--reco-publication-writer-child"),
+        std::wstring_view(destination.native()), std::wstring_view(left_input.native()),
+        std::wstring_view(right_input.native()), ready_event, release_event, contention_event,
+        payload}) {
+    command.push_back(L' ');
+    command += quote_windows_argument(argument);
+  }
+  command.push_back(L'\0');
+  STARTUPINFOW startup{.cb = sizeof(startup)};
+  PROCESS_INFORMATION process{};
+  if (CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                     nullptr, &startup, &process) == 0) {
+    return nullptr;
+  }
+  (void)CloseHandle(process.hThread);
+  return process.hProcess;
+}
+
+int run_windows_publication_writer_child(int argc, wchar_t** argv) {
+  if (argc != 9) {
+    return 90;
+  }
+  const HANDLE ready_event = OpenEventW(EVENT_MODIFY_STATE, FALSE, argv[5]);
+  const HANDLE release_event = OpenEventW(SYNCHRONIZE, FALSE, argv[6]);
+  const HANDLE contention_event =
+      std::wstring_view(argv[7]) == L"-" ? nullptr : OpenEventW(EVENT_MODIFY_STATE, FALSE, argv[7]);
+  if (ready_event == nullptr || release_event == nullptr) {
+    if (ready_event != nullptr) {
+      (void)CloseHandle(ready_event);
+    }
+    if (release_event != nullptr) {
+      (void)CloseHandle(release_event);
+    }
+    if (contention_event != nullptr) {
+      (void)CloseHandle(contention_event);
+    }
+    return 91;
+  }
+  try {
+    const std::wstring_view wide_payload(argv[8]);
+    const std::string payload(wide_payload.begin(), wide_payload.end());
+    detail::write_calibration_json_atomically(
+        payload, std::filesystem::path(argv[2]), std::filesystem::path(argv[3]),
+        std::filesystem::path(argv[4]), {}, {},
+        [&] {
+          if (SetEvent(ready_event) == 0 ||
+              WaitForSingleObject(release_event, 10000) != WAIT_OBJECT_0) {
+            throw std::runtime_error("publication writer synchronization failed");
+          }
+        },
+        false, {},
+        [&] {
+          if (contention_event != nullptr && SetEvent(contention_event) == 0) {
+            throw std::runtime_error("cannot signal publication lock contention");
+          }
+        });
+  } catch (...) {
+    (void)CloseHandle(ready_event);
+    (void)CloseHandle(release_event);
+    if (contention_event != nullptr) {
+      (void)CloseHandle(contention_event);
+    }
+    return 92;
+  }
+  (void)CloseHandle(ready_event);
+  (void)CloseHandle(release_event);
+  if (contention_event != nullptr) {
+    (void)CloseHandle(contention_event);
+  }
+  return 0;
+}
+
+bool wait_windows_process_success(HANDLE process, DWORD timeout_ms) {
+  if (process == nullptr) {
+    return false;
+  }
+  if (WaitForSingleObject(process, timeout_ms) != WAIT_OBJECT_0) {
+    (void)TerminateProcess(process, 93);
+    (void)WaitForSingleObject(process, 5000);
+    return false;
+  }
+  DWORD exit_code = 1;
+  return GetExitCodeProcess(process, &exit_code) != 0 && exit_code == 0;
+}
+#else
+bool read_byte_with_timeout(int descriptor, char& value, std::chrono::milliseconds timeout) {
+  pollfd event{.fd = descriptor, .events = POLLIN};
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  for (;;) {
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now());
+    if (remaining <= std::chrono::milliseconds::zero()) {
+      return false;
+    }
+    const int result = ::poll(&event, 1, static_cast<int>(remaining.count()));
+    if (result > 0) {
+      return (event.revents & POLLIN) != 0 && ::read(descriptor, &value, 1) == 1;
+    }
+    if (result == 0) {
+      return false;
+    }
+    if (errno != EINTR) {
+      return false;
+    }
+  }
+}
+
+bool wait_child_success_with_timeout(pid_t process, std::chrono::milliseconds timeout) {
+  if (process <= 0) {
+    return false;
+  }
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  int status = 0;
+  while (std::chrono::steady_clock::now() < deadline) {
+    const pid_t result = ::waitpid(process, &status, WNOHANG);
+    if (result == process) {
+      return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    }
+    if (result < 0 && errno != EINTR) {
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  (void)::kill(process, SIGKILL);
+  while (::waitpid(process, &status, 0) < 0 && errno == EINTR) {
+  }
+  return false;
+}
+#endif
 
 enum class AtomicReadStatus { Success, RetryableFailure, Missing, UnexpectedFailure };
 
@@ -777,6 +951,106 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
             "lock serialization preserves commit order");
 #endif
 
+#if !defined(_WIN32)
+  const auto process_destination = root.path() / "process-serialized.json";
+  write_text_file(process_destination, "process serialization initial output\n");
+  int first_ready[2]{};
+  int release_first[2]{};
+  int second_contended[2]{};
+  int second_entered[2]{};
+  const bool pipes_ready = ::pipe(first_ready) == 0 && ::pipe(release_first) == 0 &&
+                           ::pipe(second_contended) == 0 && ::pipe(second_entered) == 0;
+  expect_true(pipes_ready, "interprocess serialization pipes are available");
+  if (pipes_ready) {
+    const pid_t first_writer = ::fork();
+    if (first_writer == 0) {
+      (void)::close(first_ready[0]);
+      (void)::close(release_first[1]);
+      (void)::close(second_contended[0]);
+      (void)::close(second_contended[1]);
+      (void)::close(second_entered[0]);
+      (void)::close(second_entered[1]);
+      try {
+        detail::write_calibration_json_atomically(
+            R"json({"writer":"process-first"})json", process_destination, left_input, right_input,
+            {}, {}, [&] {
+              const char ready = 'r';
+              if (::write(first_ready[1], &ready, 1) != 1) {
+                throw std::runtime_error("cannot signal first writer readiness");
+              }
+              char release = 0;
+              if (::read(release_first[0], &release, 1) != 1) {
+                throw std::runtime_error("cannot release first writer");
+              }
+            });
+        ::_exit(0);
+      } catch (...) {
+        ::_exit(2);
+      }
+    }
+    expect_true(first_writer > 0, "first interprocess writer starts");
+    (void)::close(first_ready[1]);
+    char ready = 0;
+    expect_true(first_writer > 0 &&
+                    read_byte_with_timeout(first_ready[0], ready, std::chrono::seconds(5)),
+                "first interprocess writer reaches the locked boundary");
+
+    const pid_t second_writer = ::fork();
+    if (second_writer == 0) {
+      (void)::close(first_ready[0]);
+      (void)::close(first_ready[1]);
+      (void)::close(release_first[0]);
+      (void)::close(release_first[1]);
+      (void)::close(second_contended[0]);
+      (void)::close(second_entered[0]);
+      try {
+        detail::write_calibration_json_atomically(
+            R"json({"writer":"process-second"})json", process_destination, left_input, right_input,
+            [&] {
+              const char entered = 'e';
+              if (::write(second_entered[1], &entered, 1) != 1) {
+                throw std::runtime_error("cannot signal second writer entry");
+              }
+            },
+            {}, {}, false, {},
+            [&] {
+              const char contended = 'c';
+              if (::write(second_contended[1], &contended, 1) != 1) {
+                throw std::runtime_error("cannot signal directory-lock contention");
+              }
+            });
+        ::_exit(0);
+      } catch (...) {
+        ::_exit(3);
+      }
+    }
+    expect_true(second_writer > 0, "second interprocess writer starts");
+    (void)::close(second_contended[1]);
+    (void)::close(second_entered[1]);
+    char contended = 0;
+    expect_true(second_writer > 0 &&
+                    read_byte_with_timeout(second_contended[0], contended, std::chrono::seconds(5)),
+                "second process observes directory-lock contention");
+    const char release = 'x';
+    expect_true(::write(release_first[1], &release, 1) == 1,
+                "first interprocess writer is released");
+    expect_true(wait_child_success_with_timeout(first_writer, std::chrono::seconds(5)),
+                "first interprocess writer succeeds");
+    char entered = 0;
+    expect_true(read_byte_with_timeout(second_entered[0], entered, std::chrono::seconds(5)),
+                "second process enters after directory-lock release");
+    expect_true(wait_child_success_with_timeout(second_writer, std::chrono::seconds(5)),
+                "second interprocess writer succeeds");
+    expect_eq(read_text_file(process_destination), std::string("{\"writer\":\"process-second\"}\n"),
+              "interprocess lock preserves writer commit order");
+    (void)::close(first_ready[0]);
+    (void)::close(release_first[0]);
+    (void)::close(release_first[1]);
+    (void)::close(second_contended[0]);
+    (void)::close(second_entered[0]);
+  }
+#endif
+
   const auto blocked_destination = root.path() / "blocked.json";
   std::filesystem::create_directory(blocked_destination);
   write_text_file(blocked_destination / "keep", "keep");
@@ -807,36 +1081,11 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
             "publication recheck preserves aliased input contents");
 
 #if defined(__linux__)
-  const auto reserved_lock_destination = root.path() / ".reco-calibration-output.lock";
-  bool reserved_lock_rejected = false;
-  try {
-    detail::write_calibration_json_atomically(R"json({"writer":"reserved-lock"})json",
-                                              reserved_lock_destination, left_input, right_input);
-  } catch (const std::exception& error) {
-    reserved_lock_rejected =
-        std::string_view(error.what()).find("reserved publication lock name") !=
-        std::string_view::npos;
-  }
-  expect_true(reserved_lock_rejected,
-              "calibration output cannot replace its publication lock file");
-  expect_true(std::filesystem::is_regular_file(reserved_lock_destination),
-              "reserved publication lock remains a regular file");
-
-  const auto reserved_lock_alias = root.path() / "reserved-lock-alias.json";
-  std::filesystem::create_hard_link(reserved_lock_destination, reserved_lock_alias);
-  bool reserved_lock_alias_rejected = false;
-  try {
-    detail::write_calibration_json_atomically(R"json({"writer":"reserved-lock-alias"})json",
-                                              reserved_lock_alias, left_input, right_input);
-  } catch (const std::exception& error) {
-    reserved_lock_alias_rejected =
-        std::string_view(error.what()).find("reserved publication lock entry") !=
-        std::string_view::npos;
-  }
-  expect_true(reserved_lock_alias_rejected,
-              "calibration output cannot replace an alias of its publication lock");
-  expect_true(std::filesystem::equivalent(reserved_lock_destination, reserved_lock_alias),
-              "reserved publication lock alias remains intact");
+  const auto legacy_lock_name = root.path() / ".reco-calibration-output.lock";
+  detail::write_calibration_json_atomically(R"json({"writer":"directory-lock"})json",
+                                            legacy_lock_name, left_input, right_input);
+  expect_eq(read_text_file(legacy_lock_name), std::string("{\"writer\":\"directory-lock\"}\n"),
+            "directory-inode locking does not reserve a replaceable lock-file name");
 
   const auto mutable_input = root.path() / "mutable-left.mp4";
   const auto mutable_output = root.path() / "mutable-match.json";
@@ -872,6 +1121,43 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
               "publication rejects in-place profile mutation after calibration");
   expect_true(!std::filesystem::exists(mutable_profile_output),
               "rejected profile mutation is not published");
+
+  const auto commit_mutable_input = root.path() / "commit-mutable-left.mp4";
+  const auto commit_mutable_output = root.path() / "commit-mutable-match.json";
+  write_text_file(commit_mutable_input, "commit media identity\n");
+  bool commit_mutable_input_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"commit-mutable-input"})json", commit_mutable_output, commit_mutable_input,
+        right_input, {}, {},
+        [&] { write_text_file(commit_mutable_input, "changed media identity\n"); });
+  } catch (const std::exception& error) {
+    commit_mutable_input_rejected =
+        std::string_view(error.what()).find("left video input") != std::string_view::npos;
+  }
+  expect_true(commit_mutable_input_rejected,
+              "commit-boundary revalidation rejects an in-place media mutation");
+  expect_true(!std::filesystem::exists(commit_mutable_output),
+              "commit-boundary media mutation is not published");
+
+  const auto commit_mutable_profile = root.path() / "commit-mutable-profile.json";
+  const auto commit_mutable_profile_output = root.path() / "commit-mutable-profile-match.json";
+  write_text_file(commit_mutable_profile, "commit profile identity\n");
+  const std::array<std::filesystem::path, 1> commit_mutable_profiles{commit_mutable_profile};
+  bool commit_mutable_profile_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"commit-mutable-profile"})json", commit_mutable_profile_output, left_input,
+        right_input, {}, commit_mutable_profiles,
+        [&] { write_text_file(commit_mutable_profile, "changed profile identity\n"); });
+  } catch (const std::exception& error) {
+    commit_mutable_profile_rejected =
+        std::string_view(error.what()).find("left lens profile") != std::string_view::npos;
+  }
+  expect_true(commit_mutable_profile_rejected,
+              "commit-boundary revalidation rejects an in-place lens-profile mutation");
+  expect_true(!std::filesystem::exists(commit_mutable_profile_output),
+              "commit-boundary profile mutation is not published");
 
   const auto symlink_alias = root.path() / "symlink-alias.json";
   std::filesystem::create_symlink(left_input, symlink_alias);
@@ -1060,6 +1346,78 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
             std::string("publication attacker replacement\n"),
             "failed descriptor publication does not unlink the replacement entry");
   std::filesystem::remove(publication_replacement);
+
+  const auto post_exchange_destination = root.path() / "post-exchange-race.json";
+  write_text_file(post_exchange_destination, "post-exchange original output\n");
+  std::filesystem::path post_exchange_replacement;
+  bool post_exchange_rejected = false;
+  bool post_exchange_hook_ran = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"post-exchange-race"})json", post_exchange_destination, left_input,
+        right_input, {}, {}, {}, false, [&] {
+          post_exchange_hook_ran = true;
+          for (const auto& entry : std::filesystem::directory_iterator(root.path())) {
+            if (entry.path() != post_exchange_destination &&
+                std::filesystem::is_regular_file(entry.path()) &&
+                read_text_file(entry.path()) == "post-exchange original output\n") {
+              post_exchange_replacement = entry.path();
+              std::filesystem::remove(post_exchange_replacement);
+              write_text_file(post_exchange_replacement, "post-exchange attacker replacement\n");
+              return;
+            }
+          }
+          throw std::runtime_error("post-exchange publication fixture was not found");
+        });
+  } catch (const std::exception& error) {
+    post_exchange_rejected =
+        std::string_view(error.what()).find("rollback refused") != std::string_view::npos;
+  }
+  expect_true(post_exchange_hook_ran, "post-exchange displaced-entry race hook runs");
+  expect_true(post_exchange_rejected,
+              "post-exchange displaced-entry substitution refuses unsafe cleanup");
+  expect_eq(read_text_file(post_exchange_replacement),
+            std::string("post-exchange attacker replacement\n"),
+            "post-exchange cleanup preserves a substituted displaced entry");
+  expect_eq(read_text_file(post_exchange_destination),
+            std::string("{\"writer\":\"post-exchange-race\"}\n"),
+            "post-exchange cleanup failure does not move an unverified entry over the output");
+  std::filesystem::remove(post_exchange_replacement);
+
+  const auto fallback_post_exchange_destination = root.path() / "fallback-post-exchange-race.json";
+  write_text_file(fallback_post_exchange_destination, "fallback post-exchange original output\n");
+  std::filesystem::path fallback_displaced_output;
+  bool fallback_post_exchange_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"fallback-post-exchange-race"})json", fallback_post_exchange_destination,
+        left_input, right_input, {}, {}, {}, true, [&] {
+          for (const auto& entry : std::filesystem::directory_iterator(root.path())) {
+            if (entry.path().filename().string().starts_with(
+                    "fallback-post-exchange-race.json.tmp.")) {
+              fallback_displaced_output = entry.path();
+              break;
+            }
+          }
+          if (fallback_displaced_output.empty()) {
+            throw std::runtime_error("fallback post-exchange fixture was not found");
+          }
+          std::filesystem::remove(fallback_post_exchange_destination);
+          std::filesystem::create_hard_link(left_input, fallback_post_exchange_destination);
+        });
+  } catch (const std::exception& error) {
+    fallback_post_exchange_rejected =
+        std::string_view(error.what()).find("rollback refused") != std::string_view::npos;
+  }
+  expect_true(fallback_post_exchange_rejected,
+              "fallback post-exchange destination substitution refuses unsafe rollback");
+  expect_true(std::filesystem::equivalent(left_input, fallback_post_exchange_destination),
+              "unsafe fallback rollback does not move an input alias");
+  expect_eq(read_text_file(fallback_displaced_output),
+            std::string("fallback post-exchange original output\n"),
+            "unsafe fallback rollback preserves the displaced output");
+  std::filesystem::remove(fallback_post_exchange_destination);
+  std::filesystem::remove(fallback_displaced_output);
 
   const auto fallback_destination = root.path() / "fallback.json";
   detail::write_calibration_json_atomically(R"json({"writer":"fallback-new"})json",
@@ -1253,6 +1611,97 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
   expect_true(!std::filesystem::exists(redirected_parent / "match.json"),
               "retargeted output parent cannot redirect publication");
 #else
+#if defined(__APPLE__)
+  const auto timestamp_mutable_input = root.path() / "timestamp-mutable-left.mp4";
+  const auto timestamp_mutable_output = root.path() / "timestamp-mutable-match.json";
+  write_text_file(timestamp_mutable_input, "aaaaaaaa\n");
+  bool timestamp_mutation_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"timestamp-mutation"})json", timestamp_mutable_output,
+        timestamp_mutable_input, right_input,
+        [&] { write_text_file(timestamp_mutable_input, "bbbbbbbb\n"); });
+  } catch (const std::exception& error) {
+    timestamp_mutation_rejected =
+        std::string_view(error.what()).find("left video input") != std::string_view::npos;
+  }
+  expect_true(timestamp_mutation_rejected,
+              "Darwin publication rejects same-size in-place media mutation");
+  expect_true(!std::filesystem::exists(timestamp_mutable_output),
+              "Darwin timestamp mutation is not published");
+
+  const auto timestamp_mutable_profile = root.path() / "timestamp-mutable-profile.json";
+  const auto timestamp_mutable_profile_output =
+      root.path() / "timestamp-mutable-profile-match.json";
+  write_text_file(timestamp_mutable_profile, "cccccccc\n");
+  const std::array<std::filesystem::path, 1> timestamp_profiles{timestamp_mutable_profile};
+  bool timestamp_profile_mutation_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"timestamp-profile-mutation"})json", timestamp_mutable_profile_output,
+        left_input, right_input, [&] { write_text_file(timestamp_mutable_profile, "dddddddd\n"); },
+        timestamp_profiles);
+  } catch (const std::exception& error) {
+    timestamp_profile_mutation_rejected =
+        std::string_view(error.what()).find("left lens profile") != std::string_view::npos;
+  }
+  expect_true(timestamp_profile_mutation_rejected,
+              "Darwin publication rejects same-size in-place lens-profile mutation");
+  expect_true(!std::filesystem::exists(timestamp_mutable_profile_output),
+              "Darwin profile timestamp mutation is not published");
+
+  const auto darwin_original_parent = root.path() / "darwin-original-parent";
+  const auto darwin_redirected_parent = root.path() / "darwin-redirected-parent";
+  const auto darwin_parent_symlink = root.path() / "darwin-output-parent";
+  std::filesystem::create_directory(darwin_original_parent);
+  std::filesystem::create_directory(darwin_redirected_parent);
+  std::filesystem::create_symlink(darwin_original_parent, darwin_parent_symlink);
+  const auto darwin_redirected_destination = darwin_parent_symlink / "match.json";
+  detail::write_calibration_json_atomically(
+      R"json({"writer":"darwin-pinned-parent"})json", darwin_redirected_destination, left_input,
+      right_input, [&] {
+        std::filesystem::remove(darwin_parent_symlink);
+        std::filesystem::create_symlink(darwin_redirected_parent, darwin_parent_symlink);
+      });
+  expect_eq(read_text_file(darwin_original_parent / "match.json"),
+            std::string("{\"writer\":\"darwin-pinned-parent\"}\n"),
+            "Darwin publication stays in the pinned output directory");
+  expect_true(!std::filesystem::exists(darwin_redirected_parent / "match.json"),
+              "Darwin retargeted parent cannot redirect publication");
+
+  const auto darwin_cleanup_destination = root.path() / "darwin-cleanup-race.json";
+  write_text_file(darwin_cleanup_destination, "Darwin cleanup original output\n");
+  std::filesystem::path darwin_cleanup_replacement;
+  bool darwin_cleanup_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"darwin-cleanup-race"})json", darwin_cleanup_destination, left_input,
+        right_input, {}, {}, {}, false, [&] {
+          for (const auto& entry : std::filesystem::directory_iterator(root.path())) {
+            if (entry.path().filename().string().starts_with("darwin-cleanup-race.json.tmp.")) {
+              darwin_cleanup_replacement = entry.path();
+              std::filesystem::remove(darwin_cleanup_replacement);
+              write_text_file(darwin_cleanup_replacement, "Darwin cleanup attacker replacement\n");
+              return;
+            }
+          }
+          throw std::runtime_error("Darwin cleanup race fixture was not found");
+        });
+  } catch (const std::exception& error) {
+    darwin_cleanup_rejected =
+        std::string_view(error.what()).find("rollback refused") != std::string_view::npos;
+  }
+  expect_true(darwin_cleanup_rejected,
+              "Darwin displaced-entry substitution refuses cleanup and rollback");
+  expect_eq(read_text_file(darwin_cleanup_replacement),
+            std::string("Darwin cleanup attacker replacement\n"),
+            "Darwin cleanup preserves a substituted displaced entry");
+  expect_eq(read_text_file(darwin_cleanup_destination),
+            std::string("{\"writer\":\"darwin-cleanup-race\"}\n"),
+            "Darwin unsafe cleanup does not move an unverified entry over the output");
+  std::filesystem::remove(darwin_cleanup_replacement);
+#endif
+
   const auto moved_input = root.path() / "commit-moved-left.mp4";
   const auto moved_input_destination = root.path() / "commit-moved-input-output.json";
   write_text_file(moved_input, "commit-bound media must survive\n");
@@ -1280,19 +1729,103 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
   expect_eq(read_text_file(surviving_input), std::string("commit-bound media must survive\n"),
             "cross-platform publication preserves a moved or retained input");
 
+#if defined(_WIN32)
+  const auto unicode_process_parent =
+      root.path() / std::filesystem::path(L"windows-publication-\u03a9-\u4f8b");
+  std::filesystem::create_directory(unicode_process_parent);
+  const auto process_destination = unicode_process_parent / "windows-process-serialized.json";
+  write_text_file(process_destination, "windows process serialization initial output\n");
+  const auto event_prefix = L"Local\\RecoCliPublicationTest-" +
+                            std::to_wstring(GetCurrentProcessId()) + L"-" +
+                            std::to_wstring(std::random_device{}());
+  const auto first_ready_name = event_prefix + L"-first-ready";
+  const auto first_release_name = event_prefix + L"-first-release";
+  const auto second_ready_name = event_prefix + L"-second-ready";
+  const auto second_release_name = event_prefix + L"-second-release";
+  const auto second_contention_name = event_prefix + L"-second-contention";
+  const HANDLE first_ready_event = CreateEventW(nullptr, TRUE, FALSE, first_ready_name.c_str());
+  const HANDLE first_release_event = CreateEventW(nullptr, TRUE, FALSE, first_release_name.c_str());
+  const HANDLE second_ready_event = CreateEventW(nullptr, TRUE, FALSE, second_ready_name.c_str());
+  const HANDLE second_release_event =
+      CreateEventW(nullptr, TRUE, FALSE, second_release_name.c_str());
+  const HANDLE second_contention_event =
+      CreateEventW(nullptr, TRUE, FALSE, second_contention_name.c_str());
+  const bool events_ready = first_ready_event != nullptr && first_release_event != nullptr &&
+                            second_ready_event != nullptr && second_release_event != nullptr &&
+                            second_contention_event != nullptr;
+  expect_true(events_ready, "Windows interprocess publication events are available");
+  if (events_ready) {
+    const HANDLE first_writer = start_windows_publication_writer(
+        process_destination, left_input, right_input, first_ready_name, first_release_name, L"-",
+        LR"json({"writer":"windows-process-first"})json");
+    expect_true(first_writer != nullptr, "first Windows interprocess writer starts");
+    expect_true(first_writer != nullptr &&
+                    WaitForSingleObject(first_ready_event, 10000) == WAIT_OBJECT_0,
+                "first Windows writer reaches the locked commit boundary");
+    const HANDLE second_writer = start_windows_publication_writer(
+        process_destination, left_input, right_input, second_ready_name, second_release_name,
+        second_contention_name, LR"json({"writer":"windows-process-second"})json");
+    expect_true(second_writer != nullptr, "second Windows interprocess writer starts");
+    expect_true(second_writer != nullptr &&
+                    WaitForSingleObject(second_contention_event, 10000) == WAIT_OBJECT_0,
+                "second Windows process observes directory-lock contention");
+    expect_true(SetEvent(first_release_event) != 0, "first Windows writer is released");
+    expect_true(wait_windows_process_success(first_writer, 10000), "first Windows writer succeeds");
+    expect_true(second_writer != nullptr &&
+                    WaitForSingleObject(second_ready_event, 10000) == WAIT_OBJECT_0,
+                "second Windows process enters after directory-lock release");
+    expect_true(SetEvent(second_release_event) != 0, "second Windows writer is released");
+    expect_true(wait_windows_process_success(second_writer, 10000),
+                "second Windows writer succeeds");
+    expect_eq(read_text_file(process_destination),
+              std::string("{\"writer\":\"windows-process-second\"}\n"),
+              "Windows interprocess lock preserves writer commit order");
+    if (first_writer != nullptr) {
+      (void)CloseHandle(first_writer);
+    }
+    if (second_writer != nullptr) {
+      (void)CloseHandle(second_writer);
+    }
+  }
+  for (const HANDLE event : {first_ready_event, first_release_event, second_ready_event,
+                             second_release_event, second_contention_event}) {
+    if (event != nullptr) {
+      (void)CloseHandle(event);
+    }
+  }
+
+  const auto active_parent = root.path() / "active-output-parent";
+  const auto retained_parent = root.path() / "retained-output-parent";
+  std::filesystem::create_directory(active_parent);
+  const auto parent_race_destination = active_parent / "match.json";
+  bool parent_race_hook_ran = false;
+  detail::write_calibration_json_atomically(R"json({"writer":"windows-pinned-parent"})json",
+                                            parent_race_destination, left_input, right_input, [&] {
+                                              std::filesystem::rename(active_parent,
+                                                                      retained_parent);
+                                              std::filesystem::create_directory(active_parent);
+                                              parent_race_hook_ran = true;
+                                            });
+  expect_true(parent_race_hook_ran,
+              "Windows output parent replacement happens at the publication boundary");
+  expect_eq(read_text_file(retained_parent / "match.json"),
+            std::string("{\"writer\":\"windows-pinned-parent\"}\n"),
+            "Windows publication stays relative to the retained directory handle");
+  expect_true(!std::filesystem::exists(active_parent / "match.json"),
+              "Windows replacement parent cannot redirect publication");
+#endif
+
   const auto commit_alias_destination = root.path() / "commit-input-alias-output.json";
   bool commit_alias_rejected = false;
   try {
     detail::write_calibration_json_atomically(
-        R"json({"writer":"input-alias"})json", commit_alias_destination, left_input,
-        right_input, {}, {},
-        [&] { std::filesystem::create_hard_link(left_input, commit_alias_destination); });
+        R"json({"writer":"input-alias"})json", commit_alias_destination, left_input, right_input,
+        {}, {}, [&] { std::filesystem::create_hard_link(left_input, commit_alias_destination); });
   } catch (const std::exception& error) {
     commit_alias_rejected =
         std::string_view(error.what()).find("left video input") != std::string_view::npos;
   }
-  expect_true(commit_alias_rejected,
-              "commit-bound destination alias of an input is rejected");
+  expect_true(commit_alias_rejected, "commit-bound destination alias of an input is rejected");
   expect_true(std::filesystem::equivalent(left_input, commit_alias_destination),
               "rejected commit-bound alias preserves the input identity");
   std::filesystem::remove(commit_alias_destination);
@@ -1530,7 +2063,16 @@ void command_execution_dispatches_available_stages() {
 
 } // namespace
 
-int main() {
+#if defined(_WIN32)
+int wmain(int argc, wchar_t** argv) {
+  if (argc >= 2 && std::wstring_view(argv[1]) == L"--reco-publication-writer-child") {
+    return run_windows_publication_writer_child(argc, argv);
+  }
+#else
+int main(int argc, char** argv) {
+  (void)argc;
+  (void)argv;
+#endif
   validators_match_rust();
   stitch_parse_matches_rust_defaults();
   preview_and_calibrate_parse_matches_rust_defaults();
