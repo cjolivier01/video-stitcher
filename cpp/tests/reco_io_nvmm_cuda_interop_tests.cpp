@@ -304,8 +304,11 @@ void surface_array_mapping_retains_and_unmaps_owner() {
   expect_true(decoder_lifetime.expired(), "mapping releases decoder owner");
   expect_true(runtime_alive_during_decoder_release,
               "mapped runtime outlives decoder-owner destruction");
-  expect_true(runtime_lifetime.expired(), "mapping releases NvBufSurface runtime");
   expect_true(params.mapped_addr.cuda_ptr == nullptr, "mapping owner unmaps CUDA buffer");
+  expect_true(!runtime_lifetime.expired(), "CUDA frame retains its explicit runtime handle");
+  mapped.runtime.reset();
+  mapped_again.runtime.reset();
+  expect_true(runtime_lifetime.expired(), "CUDA frames release NvBufSurface runtime");
 
   params = make_params();
   surface = make_surface(params);
@@ -453,7 +456,9 @@ void cuda_device_mapping_retains_context_and_owner() {
   mapped.owner.reset();
   expect_true(runtime_alive_during_decoder_release,
               "direct CUDA runtime outlives decoder-owner destruction");
-  expect_true(runtime_lifetime.expired(), "direct CUDA view releases NvBufSurface runtime");
+  expect_true(!runtime_lifetime.expired(), "direct CUDA frame retains its explicit runtime handle");
+  mapped.runtime.reset();
+  expect_true(runtime_lifetime.expired(), "direct CUDA frame releases NvBufSurface runtime");
 
   params = make_params();
   params.data_ptr = reinterpret_cast<void*>(9);
