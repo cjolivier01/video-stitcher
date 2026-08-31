@@ -759,6 +759,43 @@ publish_windows_output(HANDLE directory, const std::filesystem::path& resolved_d
     rollback_name += L".rollback.";
     rollback_name.append(token.begin(), token.end());
     const auto resolved_rollback = resolved_directory / std::filesystem::path(rollback_name);
+    DWORD current_error = ERROR_SUCCESS;
+    const HANDLE current = open_windows_file_relative(directory, destination_name, access, sharing,
+                                                      FILE_OPEN, options, current_error);
+    UniqueWindowsHandle retained_current(current);
+    if (current != INVALID_HANDLE_VALUE) {
+      FILE_ATTRIBUTE_TAG_INFO attributes{};
+      if (GetFileInformationByHandleEx(current, FileAttributeTagInfo, &attributes,
+                                       sizeof(attributes)) == 0) {
+        throw_file_error("cannot inspect calibration output reparse state", destination,
+                         static_cast<int>(GetLastError()));
+      }
+      if ((attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        rename_open_file(current, directory, rollback_name, destination, true, false);
+        try {
+          rename_open_file(temporary_handle, directory, destination_name, destination, false,
+                           false);
+        } catch (...) {
+          try {
+            rename_open_file(current, directory, destination_name, destination, true, false);
+          } catch (...) {
+          }
+          throw;
+        }
+        WindowsDisplacedOutput displaced{.name = std::move(rollback_name),
+                                         .handle = std::move(retained_current)};
+        if (!published_path_identifies_handle(directory, destination_name, temporary_handle) ||
+            !relative_path_identifies_windows_handle(directory, displaced.name,
+                                                     displaced.handle.get(), true)) {
+          throw WindowsPublicationIdentityError(
+              "reparse-point calibration output replacement changed publication identity");
+        }
+        return displaced;
+      }
+    } else if (current_error != ERROR_FILE_NOT_FOUND && current_error != ERROR_PATH_NOT_FOUND) {
+      throw_file_error("cannot inspect calibration output before replacement", destination,
+                       static_cast<int>(current_error));
+    }
     if (ReplaceFileW(resolved_destination.c_str(), resolved_temporary.c_str(),
                      resolved_rollback.c_str(), REPLACEFILE_WRITE_THROUGH, nullptr, nullptr) != 0) {
       DWORD rollback_error = ERROR_SUCCESS;
