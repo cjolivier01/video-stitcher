@@ -1183,17 +1183,10 @@ long descriptor_scan_limit() {
 
 bool guardian_limit_worker_address_space() {
 #if defined(__APPLE__)
-  // Darwin aliases RLIMIT_AS to RLIMIT_RSS, so retain the footprint watchdog
-  // and also apply the enforceable data-segment ceiling used by malloc.
-  struct rlimit current{};
-  if (::getrlimit(RLIMIT_DATA, &current) != 0) {
-    return false;
-  }
-  const auto requested = static_cast<rlim_t>(kMaximumWorkerAddressSpaceBytes);
-  const auto existing = current.rlim_cur == RLIM_INFINITY ? requested : current.rlim_cur;
-  const auto limit = std::min(existing, requested);
-  const struct rlimit bounded{.rlim_cur = limit, .rlim_max = limit};
-  return limit != 0 && ::setrlimit(RLIMIT_DATA, &bounded) == 0;
+  // Darwin rejects RLIMIT_DATA values below the process's existing VM map,
+  // which is commonly larger than this worker budget before exec. The
+  // process-group physical-footprint watchdog below remains enforceable.
+  return true;
 #elif defined(RECO_PROBE_WIDE_ADDRESS_SANITIZER)
   // Wide-address sanitizers reserve terabytes of shadow virtual memory before main.
   return true;
@@ -1531,9 +1524,12 @@ bool guardian_worker_group_within_memory_limit(pid_t worker_pid) {
   if (proc_listpids == nullptr) {
     return false;
   }
+  errno = 0;
   const auto bytes = proc_listpids(PROC_PGRP_ONLY, static_cast<std::uint32_t>(worker_pid),
                                    processes.data(), static_cast<int>(sizeof(processes)));
-  if (bytes < 0 || static_cast<std::size_t>(bytes) >= sizeof(processes)) {
+  const auto list_error = errno;
+  if (bytes < 0 || (bytes == 0 && list_error != 0) ||
+      static_cast<std::size_t>(bytes) >= sizeof(processes)) {
     return false;
   }
   const auto proc_pid_rusage = apple_proc_pid_rusage();
@@ -1570,9 +1566,12 @@ bool guardian_worker_group_has_other_members(pid_t worker_pid) {
   if (proc_listpids == nullptr) {
     return true;
   }
+  errno = 0;
   const auto bytes = proc_listpids(PROC_PGRP_ONLY, static_cast<std::uint32_t>(worker_pid),
                                    processes.data(), static_cast<int>(sizeof(processes)));
-  if (bytes < 0 || static_cast<std::size_t>(bytes) >= sizeof(processes)) {
+  const auto list_error = errno;
+  if (bytes < 0 || (bytes == 0 && list_error != 0) ||
+      static_cast<std::size_t>(bytes) >= sizeof(processes)) {
     return true;
   }
   const auto process_count = static_cast<std::size_t>(bytes) / sizeof(pid_t);
@@ -2297,24 +2296,28 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int control
   }
   asan_options += "detect_leaks=0";
   if (::setenv("ASAN_OPTIONS", asan_options.c_str(), 1) != 0) {
-    guardian_exit(2);
+    report_guardian_startup_error(errno);
   }
 #endif
-  if (!guardian_limit_worker_address_space() || ::setenv("GST_REGISTRY_FORK", "no", 1) != 0 ||
+  if (!guardian_limit_worker_address_space()) {
+    report_guardian_startup_error(errno);
+  }
+  if (::setenv("GST_REGISTRY_FORK", "no", 1) != 0 ||
       ::setenv("RECO_VIDEO_PROBE_PROCESS_ROLE", "worker", 1) != 0) {
-    guardian_exit(2);
+    report_guardian_startup_error(errno);
   }
   int start_gate[2] = {-1, -1};
   int lifetime_gate[2] = {-1, -1};
   int watchdog_gate[2] = {-1, -1};
   if (::pipe(start_gate) != 0 || ::pipe(lifetime_gate) != 0 || ::pipe(watchdog_gate) != 0) {
+    const auto pipe_error = errno;
     (void)::close(start_gate[0]);
     (void)::close(start_gate[1]);
     (void)::close(lifetime_gate[0]);
     (void)::close(lifetime_gate[1]);
     (void)::close(watchdog_gate[0]);
     (void)::close(watchdog_gate[1]);
-    guardian_exit(2);
+    report_guardian_startup_error(pipe_error);
   }
   const auto guardian_pid = ::getpid();
   const auto worker_pid = ::fork();
@@ -2362,21 +2365,23 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int control
   }
   (void)::close(start_gate[0]);
   if (worker_pid < 0) {
+    const auto fork_error = errno;
     (void)::close(start_gate[1]);
     (void)::close(lifetime_gate[0]);
     (void)::close(lifetime_gate[1]);
     (void)::close(watchdog_gate[0]);
     (void)::close(watchdog_gate[1]);
-    guardian_exit(2);
+    report_guardian_startup_error(fork_error);
   }
   if (::setpgid(worker_pid, worker_pid) != 0) {
+    const auto group_error = errno;
     (void)::close(start_gate[1]);
     (void)::close(lifetime_gate[0]);
     (void)::close(lifetime_gate[1]);
     (void)::close(watchdog_gate[0]);
     (void)::close(watchdog_gate[1]);
     guardian_terminate_worker(worker_pid);
-    guardian_exit(2);
+    report_guardian_startup_error(group_error);
   }
   (void)::close(kGuardianWorkerInput);
   (void)::close(kGuardianWorkerOutput);
@@ -2410,22 +2415,25 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int control
   }
   (void)::close(lifetime_gate[0]);
   (void)::close(watchdog_gate[0]);
-  if (watchdog_pid < 0 || ::setpgid(watchdog_pid, worker_pid) != 0 ||
-      !guardian_pipe_write(watchdog_gate[1], kGuardianRelease)) {
+  const auto watchdog_group_error =
+      watchdog_pid < 0 || ::setpgid(watchdog_pid, worker_pid) != 0 ? errno : 0;
+  if (watchdog_group_error != 0 || !guardian_pipe_write(watchdog_gate[1], kGuardianRelease)) {
+    const auto startup_error = watchdog_group_error != 0 ? watchdog_group_error : EIO;
     (void)::close(start_gate[1]);
     (void)::close(lifetime_gate[1]);
     (void)::close(watchdog_gate[1]);
     guardian_terminate_worker(worker_pid, watchdog_pid);
-    guardian_exit(2);
+    report_guardian_startup_error(startup_error);
   }
   (void)::close(watchdog_gate[1]);
   const auto encoded_worker_pid = static_cast<std::uint64_t>(worker_pid);
   if (!guardian_sleep(pre_worker_report_delay) ||
       !guardian_pipe_write_process_id(kGuardianWorkerAuthority, worker_pid)) {
+    const auto report_error = errno == 0 ? EIO : errno;
     (void)::close(start_gate[1]);
     (void)::close(lifetime_gate[1]);
     guardian_terminate_worker(worker_pid, watchdog_pid);
-    guardian_exit(2);
+    report_guardian_startup_error(report_error);
   }
   const bool authority_reported = true;
   if (!guardian_write(STDOUT_FILENO, &kGuardianStarted, 1) ||
@@ -2718,19 +2726,25 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   guard_input.reset();
   guard_output.reset();
   char lifecycle = '\0';
-  read_exact(guardian.control(), &lifecycle, 1, deadline);
-  if (lifecycle == kGuardianLaunchFailed) {
+  const auto throw_guardian_startup_error = [&] {
     int launch_error = 0;
     read_exact(guardian.control(), reinterpret_cast<char*>(&launch_error), sizeof(launch_error),
                deadline);
     throw GpuVideoProbeError("failed to start video probe worker guardian: " +
                              std::string(std::strerror(launch_error)));
+  };
+  read_exact(guardian.control(), &lifecycle, 1, deadline);
+  if (lifecycle == kGuardianLaunchFailed) {
+    throw_guardian_startup_error();
   }
   if (lifecycle != kGuardianReady) {
     throw GpuVideoProbeError("video probe guardian failed its readiness handshake");
   }
   write_all(guardian.control(), std::string_view(&kGuardianLaunch, 1), deadline);
   read_exact(guardian.control(), &lifecycle, 1, deadline);
+  if (lifecycle == kGuardianLaunchFailed) {
+    throw_guardian_startup_error();
+  }
   if (lifecycle != kGuardianStarted) {
     throw GpuVideoProbeError("video probe guardian failed its worker launch handshake");
   }
