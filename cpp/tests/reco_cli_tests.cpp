@@ -1849,6 +1849,29 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
             "Windows publication stays relative to the retained directory handle");
   expect_true(!std::filesystem::exists(active_parent / "match.json"),
               "Windows replacement parent cannot redirect publication");
+
+  const auto windows_post_publish_destination = root.path() / "windows-post-publish-race.json";
+  bool windows_post_publish_hook_ran = false;
+  bool windows_post_publish_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"windows-post-publish-race"})json", windows_post_publish_destination,
+        left_input, right_input, {}, {}, {}, false, [&] {
+          windows_post_publish_hook_ran = true;
+          std::filesystem::remove(windows_post_publish_destination);
+          write_text_file(windows_post_publish_destination,
+                          "Windows post-publication replacement\n");
+        });
+  } catch (const std::exception& error) {
+    windows_post_publish_rejected =
+        std::string_view(error.what()).find("identity changed after publication") !=
+        std::string_view::npos;
+  }
+  expect_true(windows_post_publish_hook_ran, "Windows post-publication race hook runs");
+  expect_true(windows_post_publish_rejected, "Windows post-publication substitution is rejected");
+  expect_eq(read_text_file(windows_post_publish_destination),
+            std::string("Windows post-publication replacement\n"),
+            "Windows post-publication rejection preserves the substituted entry");
 #endif
 
   const auto commit_alias_destination = root.path() / "commit-input-alias-output.json";

@@ -344,7 +344,7 @@ lock_windows_output_directory(HANDLE directory, const std::filesystem::path& pat
     throw_file_error("cannot inspect calibration output directory lock", path,
                      static_cast<int>(GetLastError()));
   }
-  const auto name = L"Global\\RecoCalibrationPublication-v1-" +
+  const auto name = L"Local\\RecoCalibrationPublication-v1-" +
                     std::to_wstring(identity.dwVolumeSerialNumber) + L"-" +
                     std::to_wstring(identity.nFileIndexHigh) + L"-" +
                     std::to_wstring(identity.nFileIndexLow);
@@ -359,7 +359,11 @@ lock_windows_output_directory(HANDLE directory, const std::filesystem::path& pat
     if (on_contention) {
       on_contention();
     }
-    wait_result = WaitForSingleObject(mutex, INFINITE);
+    constexpr DWORD kPublicationLockTimeoutMs = 30000;
+    wait_result = WaitForSingleObject(mutex, kPublicationLockTimeoutMs);
+  }
+  if (wait_result == WAIT_TIMEOUT) {
+    throw_file_error("timed out locking calibration output directory", path, ERROR_TIMEOUT);
   }
   if (wait_result != WAIT_OBJECT_0 && wait_result != WAIT_ABANDONED) {
     throw_file_error("cannot lock calibration output directory", path,
@@ -1536,7 +1540,6 @@ void write_calibration_json_atomically_impl(
   contents.push_back('\n');
 #if defined(_WIN32)
   (void)force_rename_fallback;
-  (void)after_publish;
   const auto destination_name = destination.filename().wstring();
   if (destination_name.empty() || destination_name == L"." || destination_name == L"..") {
     throw std::runtime_error("calibration output path must name a file: " + destination.string());
@@ -1589,6 +1592,14 @@ void write_calibration_json_atomically_impl(
     }
     rename_open_file(handle, output_directory.handle.get(), destination_name, destination);
     temporary_exists = false;
+    if (after_publish) {
+      after_publish();
+    }
+    if (!published_path_identifies_handle(output_directory.handle.get(), destination_name,
+                                          handle)) {
+      throw WindowsPublicationIdentityError(
+          "published calibration output identity changed after publication");
+    }
     if (CloseHandle(handle) == 0) {
       handle = INVALID_HANDLE_VALUE;
       throw_file_error("failed to close calibration output", destination,
