@@ -578,6 +578,12 @@ public:
   using std::runtime_error::runtime_error;
 };
 
+[[nodiscard]] bool same_windows_file_identity(const BY_HANDLE_FILE_INFORMATION& left,
+                                              const BY_HANDLE_FILE_INFORMATION& right) {
+  return left.dwVolumeSerialNumber == right.dwVolumeSerialNumber &&
+         left.nFileIndexHigh == right.nFileIndexHigh && left.nFileIndexLow == right.nFileIndexLow;
+}
+
 [[nodiscard]] bool relative_path_identifies_windows_handle(HANDLE directory, std::wstring_view name,
                                                            HANDLE source,
                                                            bool allow_reparse_point) {
@@ -598,9 +604,7 @@ public:
          (allow_reparse_point || (attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0) &&
          GetFileInformationByHandle(source, &source_identity) != 0 &&
          GetFileInformationByHandle(destination_handle, &destination_identity) != 0 &&
-         source_identity.dwVolumeSerialNumber == destination_identity.dwVolumeSerialNumber &&
-         source_identity.nFileIndexHigh == destination_identity.nFileIndexHigh &&
-         source_identity.nFileIndexLow == destination_identity.nFileIndexLow;
+         same_windows_file_identity(source_identity, destination_identity);
 }
 
 [[nodiscard]] bool published_path_identifies_handle(HANDLE directory,
@@ -734,7 +738,8 @@ struct WindowsDisplacedOutput {
 [[nodiscard]] std::optional<WindowsDisplacedOutput>
 publish_windows_output(HANDLE directory, const std::filesystem::path& resolved_directory,
                        std::wstring_view destination_name, std::wstring_view temporary_name,
-                       HANDLE temporary_handle, const std::filesystem::path& destination) {
+                       HANDLE& temporary_handle, const std::filesystem::path& destination,
+                       bool& destination_published) {
   constexpr ACCESS_MASK access = DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
   constexpr ULONG sharing = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
   constexpr ULONG options =
@@ -775,6 +780,7 @@ publish_windows_output(HANDLE directory, const std::filesystem::path& resolved_d
         try {
           rename_open_file(temporary_handle, directory, destination_name, destination, false,
                            false);
+          destination_published = true;
         } catch (...) {
           try {
             rename_open_file(current, directory, destination_name, destination, true, false);
@@ -797,8 +803,40 @@ publish_windows_output(HANDLE directory, const std::filesystem::path& resolved_d
       throw_file_error("cannot inspect calibration output before replacement", destination,
                        static_cast<int>(current_error));
     }
+    BY_HANDLE_FILE_INFORMATION temporary_identity{};
+    if (!relative_path_identifies_windows_handle(directory, temporary_name, temporary_handle,
+                                                 false) ||
+        GetFileInformationByHandle(temporary_handle, &temporary_identity) == 0) {
+      throw WindowsPublicationIdentityError(
+          "temporary output identity changed before atomic replacement");
+    }
+    if (CloseHandle(temporary_handle) == 0) {
+      temporary_handle = INVALID_HANDLE_VALUE;
+      throw_file_error("failed to close temporary calibration output", destination,
+                       static_cast<int>(GetLastError()));
+    }
+    temporary_handle = INVALID_HANDLE_VALUE;
     if (ReplaceFileW(resolved_destination.c_str(), resolved_temporary.c_str(),
                      resolved_rollback.c_str(), REPLACEFILE_WRITE_THROUGH, nullptr, nullptr) != 0) {
+      destination_published = true;
+      DWORD published_error = ERROR_SUCCESS;
+      const HANDLE published = open_windows_file_relative(
+          directory, destination_name, access, sharing, FILE_OPEN, options, published_error);
+      if (published == INVALID_HANDLE_VALUE) {
+        throw_file_error("cannot reopen published calibration output", destination,
+                         static_cast<int>(published_error));
+      }
+      UniqueWindowsHandle retained_published(published);
+      BY_HANDLE_FILE_INFORMATION published_identity{};
+      FILE_ATTRIBUTE_TAG_INFO published_attributes{};
+      if (GetFileInformationByHandle(published, &published_identity) == 0 ||
+          GetFileInformationByHandleEx(published, FileAttributeTagInfo, &published_attributes,
+                                       sizeof(published_attributes)) == 0 ||
+          (published_attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+          !same_windows_file_identity(temporary_identity, published_identity)) {
+        throw WindowsPublicationIdentityError(
+            "atomic calibration output replacement published a different file identity");
+      }
       DWORD rollback_error = ERROR_SUCCESS;
       const HANDLE rollback = open_windows_file_relative(directory, rollback_name, access, sharing,
                                                          FILE_OPEN, options, rollback_error);
@@ -806,6 +844,7 @@ publish_windows_output(HANDLE directory, const std::filesystem::path& resolved_d
         throw_file_error("cannot open retained displaced calibration output", destination,
                          static_cast<int>(rollback_error));
       }
+      temporary_handle = retained_published.release();
       WindowsDisplacedOutput displaced{.name = std::move(rollback_name),
                                        .handle = UniqueWindowsHandle(rollback)};
       if (!path_identifies_windows_handle(resolved_directory, directory, true) ||
@@ -818,9 +857,27 @@ publish_windows_output(HANDLE directory, const std::filesystem::path& resolved_d
       return displaced;
     }
     const DWORD replace_error = GetLastError();
+    DWORD reopen_error = ERROR_SUCCESS;
+    const HANDLE reopened_temporary = open_windows_file_relative(
+        directory, temporary_name, access, sharing, FILE_OPEN, options, reopen_error);
+    if (reopened_temporary == INVALID_HANDLE_VALUE) {
+      throw_file_error("cannot reopen temporary calibration output after replacement failure",
+                       destination, static_cast<int>(reopen_error));
+    }
+    UniqueWindowsHandle retained_temporary(reopened_temporary);
+    BY_HANDLE_FILE_INFORMATION reopened_identity{};
+    if (GetFileInformationByHandle(reopened_temporary, &reopened_identity) == 0 ||
+        !same_windows_file_identity(temporary_identity, reopened_identity) ||
+        !relative_path_identifies_windows_handle(directory, temporary_name, reopened_temporary,
+                                                 false)) {
+      throw WindowsPublicationIdentityError(
+          "temporary output identity changed after atomic replacement failure");
+    }
+    temporary_handle = retained_temporary.release();
     if (replace_error == ERROR_FILE_NOT_FOUND || replace_error == ERROR_PATH_NOT_FOUND) {
       try {
         rename_open_file(temporary_handle, directory, destination_name, destination, false, false);
+        destination_published = true;
         return std::nullopt;
       } catch (const std::system_error& error) {
         if (error.code().value() != ERROR_FILE_EXISTS &&
@@ -2156,9 +2213,9 @@ void write_calibration_json_atomically_impl(
       throw std::runtime_error("refusing to publish calibration output: " + *error);
     }
     const auto temporary_name = temporary.filename().wstring();
-    displaced_output =
-        publish_windows_output(output_directory.handle.get(), output_directory.resolved_path,
-                               destination_name, temporary_name, handle, destination);
+    displaced_output = publish_windows_output(
+        output_directory.handle.get(), output_directory.resolved_path, destination_name,
+        temporary_name, handle, destination, destination_published);
     temporary_exists = false;
     destination_published = true;
     const auto rollback_publication = [&]() noexcept {
@@ -2255,9 +2312,6 @@ void write_calibration_json_atomically_impl(
       (void)CloseHandle(handle);
       handle = INVALID_HANDLE_VALUE;
       temporary_exists = false;
-    } else if (temporary_exists) {
-      std::error_code ignored;
-      std::filesystem::remove(temporary, ignored);
     }
     throw;
   }
