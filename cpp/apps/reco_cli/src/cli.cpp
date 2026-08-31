@@ -450,7 +450,7 @@ pin_windows_output_directory(const std::filesystem::path& destination) {
       destination.has_parent_path() ? destination.parent_path() : std::filesystem::path(".");
   const HANDLE directory =
       CreateFileW(parent.c_str(), FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
-                  FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                   FILE_FLAG_BACKUP_SEMANTICS, nullptr);
   if (directory == INVALID_HANDLE_VALUE) {
     throw_file_error("cannot retain calibration output directory", parent,
@@ -748,6 +748,9 @@ publish_windows_output(HANDLE directory, const std::filesystem::path& resolved_d
   constexpr int maximum_replace_attempts = 200;
   constexpr DWORD retry_delay_ms = 10;
   for (int attempt = 0; attempt < maximum_replace_attempts; ++attempt) {
+    if (!path_identifies_windows_handle(resolved_directory, directory, true)) {
+      throw std::runtime_error("calibration output directory identity changed before replacement");
+    }
     std::array<wchar_t, 32> token{};
     for (auto& digit : token) {
       digit = hex[random() & 0x0fU];
@@ -767,7 +770,8 @@ publish_windows_output(HANDLE directory, const std::filesystem::path& resolved_d
       }
       WindowsDisplacedOutput displaced{.name = std::move(rollback_name),
                                        .handle = UniqueWindowsHandle(rollback)};
-      if (!published_path_identifies_handle(directory, destination_name, temporary_handle) ||
+      if (!path_identifies_windows_handle(resolved_directory, directory, true) ||
+          !published_path_identifies_handle(directory, destination_name, temporary_handle) ||
           !relative_path_identifies_windows_handle(directory, displaced.name,
                                                    displaced.handle.get(), true)) {
         throw WindowsPublicationIdentityError(
