@@ -745,7 +745,9 @@ publish_windows_output(HANDLE directory, const std::filesystem::path& resolved_d
       resolved_directory / std::filesystem::path(std::wstring(temporary_name));
   std::random_device random;
   constexpr wchar_t hex[] = L"0123456789abcdef";
-  for (int attempt = 0; attempt < 128; ++attempt) {
+  constexpr int maximum_replace_attempts = 200;
+  constexpr DWORD retry_delay_ms = 10;
+  for (int attempt = 0; attempt < maximum_replace_attempts; ++attempt) {
     std::array<wchar_t, 32> token{};
     for (auto& digit : token) {
       digit = hex[random() & 0x0fU];
@@ -790,6 +792,12 @@ publish_windows_output(HANDLE directory, const std::filesystem::path& resolved_d
     }
     if (replace_error == ERROR_FILE_EXISTS || replace_error == ERROR_ALREADY_EXISTS) {
       continue;
+    }
+    if (replace_error == ERROR_SHARING_VIOLATION || replace_error == ERROR_ACCESS_DENIED) {
+      if (attempt + 1 < maximum_replace_attempts) {
+        Sleep(retry_delay_ms);
+        continue;
+      }
     }
     throw_file_error("failed to replace calibration output", destination,
                      static_cast<int>(replace_error));
