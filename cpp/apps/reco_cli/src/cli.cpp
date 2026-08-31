@@ -239,6 +239,7 @@ struct PinnedWindowsPath {
 
 struct PinnedWindowsDirectory {
   std::filesystem::path path;
+  std::filesystem::path resolved_path;
   UniqueWindowsHandle handle;
 };
 
@@ -449,13 +450,31 @@ pin_windows_output_directory(const std::filesystem::path& destination) {
       destination.has_parent_path() ? destination.parent_path() : std::filesystem::path(".");
   const HANDLE directory =
       CreateFileW(parent.c_str(), FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
-                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
                   FILE_FLAG_BACKUP_SEMANTICS, nullptr);
   if (directory == INVALID_HANDLE_VALUE) {
     throw_file_error("cannot retain calibration output directory", parent,
                      static_cast<int>(GetLastError()));
   }
-  return {.path = parent, .handle = UniqueWindowsHandle(directory)};
+  const DWORD required =
+      GetFinalPathNameByHandleW(directory, nullptr, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+  if (required == 0) {
+    const int path_error = static_cast<int>(GetLastError());
+    (void)CloseHandle(directory);
+    throw_file_error("cannot resolve calibration output directory", parent, path_error);
+  }
+  std::wstring resolved(required, L'\0');
+  const DWORD written = GetFinalPathNameByHandleW(directory, resolved.data(), required,
+                                                  FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+  if (written == 0 || written >= required) {
+    const int path_error = static_cast<int>(GetLastError());
+    (void)CloseHandle(directory);
+    throw_file_error("cannot resolve calibration output directory", parent, path_error);
+  }
+  resolved.resize(written);
+  return {.path = parent,
+          .resolved_path = std::filesystem::path(std::move(resolved)),
+          .handle = UniqueWindowsHandle(directory)};
 }
 
 [[nodiscard]] bool path_identifies_windows_handle(const std::filesystem::path& path, HANDLE source,
@@ -713,24 +732,17 @@ struct WindowsDisplacedOutput {
 };
 
 [[nodiscard]] std::optional<WindowsDisplacedOutput>
-retain_displaced_windows_output(HANDLE directory, std::wstring_view destination_name,
-                                const std::filesystem::path& destination) {
+publish_windows_output(HANDLE directory, const std::filesystem::path& resolved_directory,
+                       std::wstring_view destination_name, std::wstring_view temporary_name,
+                       HANDLE temporary_handle, const std::filesystem::path& destination) {
   constexpr ACCESS_MASK access = DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
   constexpr ULONG sharing = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
   constexpr ULONG options =
       FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT;
-  DWORD open_error = ERROR_SUCCESS;
-  const HANDLE existing = open_windows_file_relative(directory, destination_name, access, sharing,
-                                                     FILE_OPEN, options, open_error);
-  if (existing == INVALID_HANDLE_VALUE) {
-    if (open_error == ERROR_FILE_NOT_FOUND || open_error == ERROR_PATH_NOT_FOUND) {
-      return std::nullopt;
-    }
-    throw_file_error("cannot retain displaced calibration output", destination,
-                     static_cast<int>(open_error));
-  }
-  UniqueWindowsHandle retained_existing(existing);
-
+  const auto resolved_destination =
+      resolved_directory / std::filesystem::path(std::wstring(destination_name));
+  const auto resolved_temporary =
+      resolved_directory / std::filesystem::path(std::wstring(temporary_name));
   std::random_device random;
   constexpr wchar_t hex[] = L"0123456789abcdef";
   for (int attempt = 0; attempt < 128; ++attempt) {
@@ -741,25 +753,48 @@ retain_displaced_windows_output(HANDLE directory, std::wstring_view destination_
     std::wstring rollback_name(destination_name);
     rollback_name += L".rollback.";
     rollback_name.append(token.begin(), token.end());
-    try {
-      rename_open_file(existing, directory, rollback_name, destination, true, false);
-    } catch (const std::system_error& error) {
-      if (error.code().value() == ERROR_FILE_EXISTS ||
-          error.code().value() == ERROR_ALREADY_EXISTS) {
+    const auto resolved_rollback = resolved_directory / std::filesystem::path(rollback_name);
+    if (ReplaceFileW(resolved_destination.c_str(), resolved_temporary.c_str(),
+                     resolved_rollback.c_str(), REPLACEFILE_WRITE_THROUGH, nullptr, nullptr) != 0) {
+      DWORD rollback_error = ERROR_SUCCESS;
+      const HANDLE rollback = open_windows_file_relative(directory, rollback_name, access, sharing,
+                                                         FILE_OPEN, options, rollback_error);
+      if (rollback == INVALID_HANDLE_VALUE) {
+        throw_file_error("cannot open retained displaced calibration output", destination,
+                         static_cast<int>(rollback_error));
+      }
+      WindowsDisplacedOutput displaced{.name = std::move(rollback_name),
+                                       .handle = UniqueWindowsHandle(rollback)};
+      if (!published_path_identifies_handle(directory, destination_name, temporary_handle) ||
+          !relative_path_identifies_windows_handle(directory, displaced.name,
+                                                   displaced.handle.get(), true)) {
+        throw WindowsPublicationIdentityError(
+            "atomic calibration output replacement changed publication identity");
+      }
+      return displaced;
+    }
+    const DWORD replace_error = GetLastError();
+    if (replace_error == ERROR_FILE_NOT_FOUND || replace_error == ERROR_PATH_NOT_FOUND) {
+      try {
+        rename_open_file(temporary_handle, directory, destination_name, destination, false, false);
+        return std::nullopt;
+      } catch (const std::system_error& error) {
+        if (error.code().value() != ERROR_FILE_EXISTS &&
+            error.code().value() != ERROR_ALREADY_EXISTS &&
+            error.code().value() != ERROR_ACCESS_DENIED &&
+            error.code().value() != ERROR_SHARING_VIOLATION) {
+          throw;
+        }
         continue;
       }
-      throw;
     }
-    WindowsDisplacedOutput displaced{.name = std::move(rollback_name),
-                                     .handle = std::move(retained_existing)};
-    if (!relative_path_identifies_windows_handle(directory, displaced.name, displaced.handle.get(),
-                                                 true)) {
-      throw std::runtime_error(
-          "calibration output identity changed while retaining rollback state");
+    if (replace_error == ERROR_FILE_EXISTS || replace_error == ERROR_ALREADY_EXISTS) {
+      continue;
     }
-    return displaced;
+    throw_file_error("failed to replace calibration output", destination,
+                     static_cast<int>(replace_error));
   }
-  throw std::runtime_error("cannot retain unique displaced calibration output for " +
+  throw std::runtime_error("cannot create unique displaced calibration output for " +
                            destination.string());
 }
 #elif defined(__linux__)
@@ -2070,10 +2105,10 @@ void write_calibration_json_atomically_impl(
         error.has_value()) {
       throw std::runtime_error("refusing to publish calibration output: " + *error);
     }
-    displaced_output = retain_displaced_windows_output(output_directory.handle.get(),
-                                                       destination_name, destination);
-    rename_open_file(handle, output_directory.handle.get(), destination_name, destination, false,
-                     false);
+    const auto temporary_name = temporary.filename().wstring();
+    displaced_output =
+        publish_windows_output(output_directory.handle.get(), output_directory.resolved_path,
+                               destination_name, temporary_name, handle, destination);
     temporary_exists = false;
     destination_published = true;
     const auto rollback_publication = [&]() noexcept {
@@ -2081,24 +2116,34 @@ void write_calibration_json_atomically_impl(
         return false;
       }
       try {
-        const auto temporary_name = temporary.filename().wstring();
-        rename_open_file(handle, output_directory.handle.get(), temporary_name, temporary, false,
-                         false);
-        temporary_exists = relative_path_identifies_windows_handle(output_directory.handle.get(),
-                                                                   temporary_name, handle, false);
-        destination_published = false;
-        if (!temporary_exists) {
-          return false;
-        }
         if (displaced_output.has_value()) {
-          rename_open_file(displaced_output->handle.get(), output_directory.handle.get(),
-                           destination_name, destination, true, false);
+          const auto resolved_destination = output_directory.resolved_path / destination_name;
+          const auto resolved_displaced = output_directory.resolved_path / displaced_output->name;
+          const auto resolved_temporary = output_directory.resolved_path / temporary_name;
+          if (ReplaceFileW(resolved_destination.c_str(), resolved_displaced.c_str(),
+                           resolved_temporary.c_str(), REPLACEFILE_WRITE_THROUGH, nullptr,
+                           nullptr) == 0) {
+            return false;
+          }
+          destination_published = false;
+          temporary_exists = relative_path_identifies_windows_handle(output_directory.handle.get(),
+                                                                     temporary_name, handle, false);
           if (!relative_path_identifies_windows_handle(output_directory.handle.get(),
                                                        destination_name,
-                                                       displaced_output->handle.get(), true)) {
+                                                       displaced_output->handle.get(), true) ||
+              !temporary_exists) {
             return false;
           }
           displaced_output.reset();
+        } else {
+          rename_open_file(handle, output_directory.handle.get(), temporary_name, temporary, false,
+                           false);
+          temporary_exists = relative_path_identifies_windows_handle(output_directory.handle.get(),
+                                                                     temporary_name, handle, false);
+          destination_published = false;
+          if (!temporary_exists) {
+            return false;
+          }
         }
         return true;
       } catch (...) {
