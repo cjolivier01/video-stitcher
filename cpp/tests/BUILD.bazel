@@ -132,6 +132,7 @@ cc_test(
         ":libfake_gstreamer_runtime.so",
         "//cpp/reco_io:reco_video_probe_worker",
     ],
+    tags = ["no-sandbox"],
     deps = [
         "//cpp/reco_io",
         "//cpp/reco_io:gpu_video_probe_test_support",
@@ -149,6 +150,7 @@ cc_test(
         "//cpp/reco_io:reco_video_probe_worker_fallback",
     ],
     local_defines = ["RECO_PROBE_TEST_FORCE_GUARDIAN_FALLBACKS"],
+    tags = ["no-sandbox"],
     deps = [
         "//cpp/reco_io:gpu_video_probe_fallback_test_support",
         "//cpp/reco_io:reco_io_forced_guardian_fallbacks",

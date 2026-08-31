@@ -2459,7 +2459,12 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int control
         guardian_exit(2);
       }
       (void)::close(kGuardianWorkerAuthority);
-      while (::waitpid(worker_pid, &worker_status, 0) < 0 && errno == EINTR) {
+      pid_t reaped_worker = -1;
+      do {
+        reaped_worker = ::waitpid(worker_pid, &worker_status, 0);
+      } while (reaped_worker < 0 && errno == EINTR);
+      if (reaped_worker != worker_pid) {
+        worker_status = -1;
       }
       break;
     }
@@ -2469,11 +2474,12 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int control
       int watchdog_status = 0;
       while (::waitpid(watchdog_pid, &watchdog_status, 0) < 0 && errno == EINTR) {
       }
+      guardian_wait_for_worker_group_cleanup(worker_pid);
       if (!guardian_pipe_write(kGuardianWorkerAuthority, kWorkerGroupCertified)) {
         guardian_exit(2);
       }
       (void)::close(kGuardianWorkerAuthority);
-      worker_status = 0;
+      worker_status = -1;
       break;
     }
     if (wait_result < 0 && errno != EINTR) {

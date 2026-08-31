@@ -196,7 +196,8 @@ abi::Surface make_surface(abi::SurfaceParams& params) {
 
 void surface_array_mapping_retains_and_unmaps_owner() {
 #if defined(__linux__)
-  set_runtime_path("RECO_NVBUFSURFACE_DYLIB_PATH", find_fake_runtime_runfile("fake_nvbufsurface"));
+  set_runtime_path("RECO_NVBUFSURFACE_DYLIB_PATH",
+                   find_fake_runtime_runfile("fake_nvbufsurface.so"));
   set_runtime_path("RECO_CUDA_DRIVER_DYLIB_PATH", find_fake_runtime_runfile("fake_cuda_driver"));
   expect_true(is_nvmm_cuda_interop_available(), "fake CUDA interop runtime available");
   expect_true(nvmm_cuda_interop_availability_error().empty(), "interop probe has no error");

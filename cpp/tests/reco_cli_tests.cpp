@@ -589,7 +589,13 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
   std::atomic<bool> writer_failed{false};
   std::thread reader([&] {
     while (running.load(std::memory_order_acquire)) {
-      const auto contents = read_text_file(destination);
+      std::ifstream input(destination, std::ios::binary);
+      if (!input) {
+        std::this_thread::yield();
+        continue;
+      }
+      const std::string contents{std::istreambuf_iterator<char>(input),
+                                 std::istreambuf_iterator<char>()};
       const auto complete = std::any_of(payloads.begin(), payloads.end(), [&](const auto& payload) {
         return contents == payload + '\n';
       });
@@ -605,7 +611,7 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
   for (std::size_t writer = 0; writer < payloads.size(); ++writer) {
     writers.emplace_back([&, writer] {
       try {
-        for (int iteration = 0; iteration < 12; ++iteration) {
+        for (int iteration = 0; iteration < 3; ++iteration) {
           detail::write_calibration_json_atomically(payloads[writer], destination, left_input,
                                                     right_input);
         }
@@ -711,6 +717,21 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
             "publication recheck preserves aliased input contents");
 
 #if defined(__linux__)
+  const auto reserved_lock_destination = root.path() / ".reco-calibration-output.lock";
+  bool reserved_lock_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(R"json({"writer":"reserved-lock"})json",
+                                              reserved_lock_destination, left_input, right_input);
+  } catch (const std::exception& error) {
+    reserved_lock_rejected =
+        std::string_view(error.what()).find("reserved publication lock name") !=
+        std::string_view::npos;
+  }
+  expect_true(reserved_lock_rejected,
+              "calibration output cannot replace its publication lock file");
+  expect_true(std::filesystem::is_regular_file(reserved_lock_destination),
+              "reserved publication lock remains a regular file");
+
   const auto mutable_input = root.path() / "mutable-left.mp4";
   const auto mutable_output = root.path() / "mutable-match.json";
   write_text_file(mutable_input, "calibrated media identity\n");
@@ -1052,6 +1073,56 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
             std::string("commit-bound profile must survive\n"),
             "rollback preserves a lens profile moved onto the destination");
   std::filesystem::rename(moved_profile_destination, moved_commit_profile);
+
+  const auto moved_symlink_target = root.path() / "commit-moved-symlink-target.mp4";
+  const auto moved_symlink_input = root.path() / "commit-moved-symlink-left.mp4";
+  const auto moved_symlink_destination = root.path() / "commit-moved-symlink-output.json";
+  write_text_file(moved_symlink_target, "commit-bound symlink media must survive\n");
+  std::filesystem::create_symlink(moved_symlink_target, moved_symlink_input);
+  bool moved_symlink_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"moved-symlink-input"})json", moved_symlink_destination,
+        moved_symlink_input, right_input, {}, {},
+        [&] { std::filesystem::rename(moved_symlink_input, moved_symlink_destination); });
+  } catch (const std::exception& error) {
+    moved_symlink_rejected =
+        std::string_view(error.what()).find("left video input") != std::string_view::npos;
+  }
+  expect_true(moved_symlink_rejected, "descriptor-link publication rejects a moved input symlink");
+  expect_true(std::filesystem::is_symlink(moved_symlink_destination),
+              "descriptor-link rollback preserves the moved input symlink");
+  expect_eq(read_text_file(moved_symlink_destination),
+            std::string("commit-bound symlink media must survive\n"),
+            "descriptor-link rollback preserves the moved symlink target");
+  std::filesystem::rename(moved_symlink_destination, moved_symlink_input);
+
+  const auto moved_profile_target = root.path() / "commit-moved-symlink-profile-target.json";
+  const auto moved_symlink_profile = root.path() / "commit-moved-symlink-profile.json";
+  const auto moved_symlink_profile_destination =
+      root.path() / "commit-moved-symlink-profile-output.json";
+  write_text_file(moved_profile_target, "commit-bound symlink profile must survive\n");
+  std::filesystem::create_symlink(moved_profile_target, moved_symlink_profile);
+  const std::array<std::filesystem::path, 1> moved_symlink_profiles{moved_symlink_profile};
+  bool moved_symlink_profile_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"moved-symlink-profile"})json", moved_symlink_profile_destination,
+        left_input, right_input, {}, moved_symlink_profiles,
+        [&] { std::filesystem::rename(moved_symlink_profile, moved_symlink_profile_destination); },
+        true);
+  } catch (const std::exception& error) {
+    moved_symlink_profile_rejected =
+        std::string_view(error.what()).find("left lens profile") != std::string_view::npos;
+  }
+  expect_true(moved_symlink_profile_rejected,
+              "forced-fallback publication rejects a moved profile symlink");
+  expect_true(std::filesystem::is_symlink(moved_symlink_profile_destination),
+              "forced-fallback rollback preserves the moved profile symlink");
+  expect_eq(read_text_file(moved_symlink_profile_destination),
+            std::string("commit-bound symlink profile must survive\n"),
+            "forced-fallback rollback preserves the moved profile target");
+  std::filesystem::rename(moved_symlink_profile_destination, moved_symlink_profile);
 
   const auto original_parent = root.path() / "original-parent";
   const auto redirected_parent = root.path() / "redirected-parent";

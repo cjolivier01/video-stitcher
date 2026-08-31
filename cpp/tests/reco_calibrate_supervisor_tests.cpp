@@ -1179,7 +1179,8 @@ void invalid_worker_paths_fail_before_launch() {
                          "executable regular file", "missing worker fails closed");
 #else
   expect_execution_error([&] { (void)run_gpu_calibration(request, ready_backends()); },
-                         "only supported on Linux", "unsupported platform fails closed");
+                         "not implemented on this POSIX platform",
+                         "unsupported platform fails closed");
 #endif
 }
 

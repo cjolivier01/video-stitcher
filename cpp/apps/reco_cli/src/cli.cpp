@@ -26,6 +26,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <sstream>
@@ -304,11 +305,14 @@ private:
   int descriptor_ = -1;
 };
 
+constexpr std::string_view kCalibrationOutputLockName = ".reco-calibration-output.lock";
+
 struct PinnedFileIdentity {
   std::string label;
   std::filesystem::path path;
   UniqueFileDescriptor descriptor;
   struct stat identity{};
+  struct stat path_identity{};
 
   [[nodiscard]] std::filesystem::path retained_path() const {
     return std::filesystem::path("/proc") / std::to_string(::getpid()) / "fd" /
@@ -331,8 +335,10 @@ struct PinnedFileIdentity {
   void verify_unchanged() const {
     struct stat descriptor_identity{};
     struct stat named_identity{};
+    struct stat followed_identity{};
     if (::fstat(descriptor.get(), &descriptor_identity) != 0 ||
-        ::stat(path.c_str(), &named_identity) != 0) {
+        ::lstat(path.c_str(), &named_identity) != 0 ||
+        ::stat(path.c_str(), &followed_identity) != 0) {
       throw std::runtime_error("cannot re-inspect " + label + " before publication");
     }
     const auto portable = [](const struct stat& value) {
@@ -348,7 +354,10 @@ struct PinnedFileIdentity {
       };
     };
     if (portable(descriptor_identity) != portable_identity() ||
-        portable(named_identity) != portable_identity()) {
+        portable(followed_identity) != portable_identity() ||
+        named_identity.st_dev != path_identity.st_dev ||
+        named_identity.st_ino != path_identity.st_ino ||
+        named_identity.st_mode != path_identity.st_mode) {
       throw std::runtime_error(label + " changed before calibration output publication");
     }
   }
@@ -364,6 +373,9 @@ struct PinnedFileIdentity {
       .label = std::string(label), .path = path, .descriptor = UniqueFileDescriptor(descriptor)};
   if (::fstat(descriptor, &pinned.identity) != 0) {
     throw_file_error("cannot inspect " + std::string(label), path, errno);
+  }
+  if (::lstat(path.c_str(), &pinned.path_identity) != 0) {
+    throw_file_error("cannot inspect " + std::string(label) + " path", path, errno);
   }
   if (!S_ISREG(pinned.identity.st_mode) || pinned.identity.st_size <= 0) {
     throw std::runtime_error(std::string(label) + " must be a regular file: " + path.string());
@@ -385,11 +397,18 @@ pinned_identity_alias_error(const struct stat& identity, const PinnedFileIdentit
   if (same_file_identity(identity, left_input.identity)) {
     return alias_error(left_input.label);
   }
+  if (same_file_identity(identity, left_input.path_identity)) {
+    return alias_error(left_input.label);
+  }
   if (same_file_identity(identity, right_input.identity)) {
     return alias_error(right_input.label);
   }
+  if (same_file_identity(identity, right_input.path_identity)) {
+    return alias_error(right_input.label);
+  }
   for (const auto& profile : lens_profiles) {
-    if (same_file_identity(identity, profile.identity)) {
+    if (same_file_identity(identity, profile.identity) ||
+        same_file_identity(identity, profile.path_identity)) {
       return alias_error(profile.label);
     }
   }
@@ -465,6 +484,17 @@ validate_pinned_output_identity(int directory_descriptor, std::string_view desti
   }
   if (S_ISDIR(identity.st_mode)) {
     return "output calibration path identifies a directory";
+  }
+  if (S_ISLNK(identity.st_mode)) {
+    struct stat followed_identity{};
+    if (::fstatat(directory_descriptor, filename.c_str(), &followed_identity, 0) != 0) {
+      if (errno == ENOENT || errno == ELOOP) {
+        return std::nullopt;
+      }
+      throw std::system_error(errno, std::system_category(),
+                              "cannot inspect displaced calibration symlink target");
+    }
+    return pinned_identity_alias_error(followed_identity, left_input, right_input, lens_profiles);
   }
   return std::nullopt;
 }
@@ -569,22 +599,23 @@ create_descriptor_publication_link_at(int directory_descriptor,
 
 [[nodiscard]] UniqueFileDescriptor lock_output_directory(int directory_descriptor,
                                                          const std::filesystem::path& directory) {
-  constexpr std::string_view lock_name = ".reco-calibration-output.lock";
   constexpr auto lock_timeout = std::chrono::seconds(2);
   constexpr auto retry_delay = std::chrono::milliseconds(10);
-  const int raw_lock = ::openat(directory_descriptor, lock_name.data(),
+  const int raw_lock = ::openat(directory_descriptor, kCalibrationOutputLockName.data(),
                                 O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
   if (raw_lock < 0) {
-    throw_file_error("cannot open calibration output lock", directory / lock_name, errno);
+    throw_file_error("cannot open calibration output lock", directory / kCalibrationOutputLockName,
+                     errno);
   }
   UniqueFileDescriptor lock(raw_lock);
   struct stat identity{};
   if (::fstat(lock.get(), &identity) != 0) {
-    throw_file_error("cannot inspect calibration output lock", directory / lock_name, errno);
+    throw_file_error("cannot inspect calibration output lock",
+                     directory / kCalibrationOutputLockName, errno);
   }
   if (!S_ISREG(identity.st_mode)) {
     throw std::runtime_error("calibration output lock is not a regular file: " +
-                             (directory / lock_name).string());
+                             (directory / kCalibrationOutputLockName).string());
   }
   const auto deadline = std::chrono::steady_clock::now() + lock_timeout;
   while (::flock(lock.get(), LOCK_EX | LOCK_NB) != 0) {
@@ -599,7 +630,8 @@ create_descriptor_publication_link_at(int directory_descriptor,
       throw std::runtime_error("timed out locking calibration output directory: " +
                                directory.string());
     }
-    throw_file_error("cannot lock calibration output directory", directory / lock_name, errno);
+    throw_file_error("cannot lock calibration output directory",
+                     directory / kCalibrationOutputLockName, errno);
   }
   return lock;
 }
@@ -769,6 +801,10 @@ void write_calibration_json_atomically_impl(std::string_view json,
   const auto destination_name = destination.filename().string();
   if (destination_name.empty() || destination_name == "." || destination_name == "..") {
     throw std::runtime_error("calibration output path must name a file: " + destination.string());
+  }
+  if (destination_name == kCalibrationOutputLockName) {
+    throw std::runtime_error("calibration output path uses the reserved publication lock name: " +
+                             destination.string());
   }
   const int raw_directory_descriptor = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   if (raw_directory_descriptor < 0) {
@@ -996,6 +1032,8 @@ void write_calibration_json_atomically_impl(std::string_view json,
   }
 #else
   (void)force_rename_fallback;
+  static std::mutex publication_mutex;
+  std::lock_guard publication_lock(publication_mutex);
   int descriptor = -1;
   std::filesystem::path temporary;
   bool temporary_exists = false;
