@@ -726,21 +726,32 @@ void rename_open_file(HANDLE handle, HANDLE directory, std::wstring_view destina
 
 [[nodiscard]] DWORD link_open_file(HANDLE handle, HANDLE directory,
                                    std::wstring_view destination_name) {
+  struct NativeLinkInfo {
+    BOOLEAN replace_if_exists;
+    HANDLE root_directory;
+    ULONG filename_length;
+    wchar_t filename[1];
+  };
+  static_assert(offsetof(NativeLinkInfo, root_directory) ==
+                offsetof(FILE_RENAME_INFO, RootDirectory));
+  static_assert(offsetof(NativeLinkInfo, filename_length) ==
+                offsetof(FILE_RENAME_INFO, FileNameLength));
+  static_assert(offsetof(NativeLinkInfo, filename) == offsetof(FILE_RENAME_INFO, FileName));
   const auto filename_bytes = destination_name.size() * sizeof(wchar_t);
-  const auto info_bytes = sizeof(FILE_LINK_INFO) + filename_bytes;
+  const auto info_bytes = offsetof(NativeLinkInfo, filename) + filename_bytes;
   std::vector<std::max_align_t> storage(
       (info_bytes + sizeof(std::max_align_t) - 1U) / sizeof(std::max_align_t), std::max_align_t{});
   auto* raw = reinterpret_cast<std::byte*>(storage.data());
   const BOOLEAN replace_if_exists = FALSE;
   const HANDLE root_directory = directory;
   const auto filename_length = static_cast<DWORD>(filename_bytes);
-  std::memcpy(raw + offsetof(FILE_LINK_INFO, ReplaceIfExists), &replace_if_exists,
+  std::memcpy(raw + offsetof(NativeLinkInfo, replace_if_exists), &replace_if_exists,
               sizeof(replace_if_exists));
-  std::memcpy(raw + offsetof(FILE_LINK_INFO, RootDirectory), &root_directory,
+  std::memcpy(raw + offsetof(NativeLinkInfo, root_directory), &root_directory,
               sizeof(root_directory));
-  std::memcpy(raw + offsetof(FILE_LINK_INFO, FileNameLength), &filename_length,
+  std::memcpy(raw + offsetof(NativeLinkInfo, filename_length), &filename_length,
               sizeof(filename_length));
-  std::memcpy(raw + offsetof(FILE_LINK_INFO, FileName), destination_name.data(), filename_bytes);
+  std::memcpy(raw + offsetof(NativeLinkInfo, filename), destination_name.data(), filename_bytes);
   constexpr ULONG kFileLinkInformation = 11;
   return set_windows_file_information(handle, storage.data(), static_cast<ULONG>(info_bytes),
                                       kFileLinkInformation);
