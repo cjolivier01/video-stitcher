@@ -334,21 +334,30 @@ void rename_open_file(HANDLE handle, const std::filesystem::path& destination) {
   constexpr DWORD kReplaceIfExists = 0x00000001;
   constexpr DWORD kPosixSemantics = 0x00000002;
   constexpr auto kFileRenameInfoEx = static_cast<FILE_INFO_BY_HANDLE_CLASS>(22);
-  const auto info_bytes = offsetof(ExtendedRenameInfo, filename) + filename_bytes;
+  // SetFileInformationByHandle documents a complete FILE_RENAME_INFO followed by the
+  // variable-length name. Copying through filename[1] can trigger MSVC's object-size guard.
+  const auto info_bytes = sizeof(FILE_RENAME_INFO) + filename_bytes;
   std::vector<std::max_align_t> storage((info_bytes + sizeof(std::max_align_t) - 1U) /
-                                        sizeof(std::max_align_t));
-  auto* extended = reinterpret_cast<ExtendedRenameInfo*>(storage.data());
-  extended->flags = kReplaceIfExists | kPosixSemantics;
-  extended->root_directory = nullptr;
-  extended->filename_length = static_cast<DWORD>(filename_bytes);
-  std::memcpy(extended->filename, absolute_destination.data(), filename_bytes);
+                                        sizeof(std::max_align_t),
+                                        std::max_align_t{});
+  auto* raw = reinterpret_cast<std::byte*>(storage.data());
+  const DWORD flags = kReplaceIfExists | kPosixSemantics;
+  const HANDLE root_directory = nullptr;
+  const auto filename_length = static_cast<DWORD>(filename_bytes);
+  std::memcpy(raw + offsetof(ExtendedRenameInfo, flags), &flags, sizeof(flags));
+  std::memcpy(raw + offsetof(ExtendedRenameInfo, root_directory), &root_directory,
+              sizeof(root_directory));
+  std::memcpy(raw + offsetof(ExtendedRenameInfo, filename_length), &filename_length,
+              sizeof(filename_length));
+  std::memcpy(raw + offsetof(ExtendedRenameInfo, filename), absolute_destination.data(),
+              filename_bytes);
 
   constexpr DWORD retry_delay_ms = 10;
   constexpr int maximum_replace_attempts = 200;
   DWORD replace_error = ERROR_SUCCESS;
   bool extended_rename_unsupported = false;
   for (int attempt = 0; attempt < maximum_replace_attempts; ++attempt) {
-    if (SetFileInformationByHandle(handle, kFileRenameInfoEx, extended,
+    if (SetFileInformationByHandle(handle, kFileRenameInfoEx, storage.data(),
                                    static_cast<DWORD>(info_bytes)) != 0) {
       if (!published_path_identifies_handle(destination, handle)) {
         throw WindowsPublicationIdentityError(
@@ -382,11 +391,12 @@ void rename_open_file(HANDLE handle, const std::filesystem::path& destination) {
         "failed to replace calibration output", destination,
         static_cast<int>(replace_error == ERROR_SUCCESS ? ERROR_NOT_SUPPORTED : replace_error));
   }
-  auto* info = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
-  info->ReplaceIfExists = TRUE;
+  const BOOLEAN replace_if_exists = TRUE;
+  std::memcpy(raw + offsetof(FILE_RENAME_INFO, ReplaceIfExists), &replace_if_exists,
+              sizeof(replace_if_exists));
   for (int attempt = 0; attempt < maximum_replace_attempts; ++attempt) {
-    if (SetFileInformationByHandle(handle, FileRenameInfo, info, static_cast<DWORD>(info_bytes)) !=
-        0) {
+    if (SetFileInformationByHandle(handle, FileRenameInfo, storage.data(),
+                                   static_cast<DWORD>(info_bytes)) != 0) {
       if (!published_path_identifies_handle(destination, handle)) {
         throw WindowsPublicationIdentityError(
             "published calibration output does not identify the temporary file");
