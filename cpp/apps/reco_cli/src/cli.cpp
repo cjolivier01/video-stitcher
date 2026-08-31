@@ -239,10 +239,13 @@ struct PinnedWindowsDirectory {
 using NtCreateFileFunction = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
                                               PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG,
                                               ULONG, PVOID, ULONG);
+using NtSetInformationFileFunction = NTSTATUS(NTAPI*)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG,
+                                                      ULONG);
 using RtlNtStatusToDosErrorFunction = ULONG(WINAPI*)(NTSTATUS);
 
 struct NativeWindowsFunctions {
   NtCreateFileFunction create_file = nullptr;
+  NtSetInformationFileFunction set_information_file = nullptr;
   RtlNtStatusToDosErrorFunction status_to_error = nullptr;
 };
 
@@ -255,10 +258,13 @@ struct NativeWindowsFunctions {
     NativeWindowsFunctions loaded{
         .create_file =
             reinterpret_cast<NtCreateFileFunction>(GetProcAddress(ntdll, "NtCreateFile")),
+        .set_information_file = reinterpret_cast<NtSetInformationFileFunction>(
+            GetProcAddress(ntdll, "NtSetInformationFile")),
         .status_to_error = reinterpret_cast<RtlNtStatusToDosErrorFunction>(
             GetProcAddress(ntdll, "RtlNtStatusToDosError")),
     };
-    if (loaded.create_file == nullptr || loaded.status_to_error == nullptr) {
+    if (loaded.create_file == nullptr || loaded.set_information_file == nullptr ||
+        loaded.status_to_error == nullptr) {
       throw std::runtime_error("Windows native relative file APIs are unavailable");
     }
     return loaded;
@@ -293,6 +299,22 @@ struct NativeWindowsFunctions {
   }
   windows_error = ERROR_SUCCESS;
   return handle;
+}
+
+[[nodiscard]] DWORD set_windows_file_information(HANDLE handle, void* information,
+                                                 ULONG information_size, ULONG information_class) {
+  IO_STATUS_BLOCK io_status{};
+  const auto& functions = native_windows_functions();
+  NTSTATUS status = functions.set_information_file(handle, &io_status, information,
+                                                   information_size, information_class);
+  constexpr NTSTATUS kStatusPending = 0x00000103L;
+  if (status == kStatusPending) {
+    if (WaitForSingleObject(handle, INFINITE) != WAIT_OBJECT_0) {
+      return GetLastError();
+    }
+    status = io_status.Status;
+  }
+  return status < 0 ? functions.status_to_error(status) : ERROR_SUCCESS;
 }
 
 class WindowsPublicationLock {
@@ -503,7 +525,8 @@ void rename_open_file(HANDLE handle, HANDLE directory, std::wstring_view destina
   static_assert(offsetof(ExtendedRenameInfo, filename) == offsetof(FILE_RENAME_INFO, FileName));
   constexpr DWORD kReplaceIfExists = 0x00000001;
   constexpr DWORD kPosixSemantics = 0x00000002;
-  constexpr auto kFileRenameInfoEx = static_cast<FILE_INFO_BY_HANDLE_CLASS>(22);
+  constexpr ULONG kFileRenameInformation = 10;
+  constexpr ULONG kFileRenameInformationEx = 65;
   // SetFileInformationByHandle documents a complete FILE_RENAME_INFO followed by the
   // variable-length name. Copying through filename[1] can trigger MSVC's object-size guard.
   const auto info_bytes = sizeof(FILE_RENAME_INFO) + filename_bytes;
@@ -526,15 +549,15 @@ void rename_open_file(HANDLE handle, HANDLE directory, std::wstring_view destina
   DWORD replace_error = ERROR_SUCCESS;
   bool extended_rename_unsupported = false;
   for (int attempt = 0; attempt < maximum_replace_attempts; ++attempt) {
-    if (SetFileInformationByHandle(handle, kFileRenameInfoEx, storage.data(),
-                                   static_cast<DWORD>(info_bytes)) != 0) {
+    replace_error = set_windows_file_information(
+        handle, storage.data(), static_cast<ULONG>(info_bytes), kFileRenameInformationEx);
+    if (replace_error == ERROR_SUCCESS) {
       if (!published_path_identifies_handle(directory, destination_name, handle)) {
         throw WindowsPublicationIdentityError(
             "published calibration output does not identify the temporary file");
       }
       return;
     }
-    replace_error = GetLastError();
     if (replace_error == ERROR_INVALID_FUNCTION || replace_error == ERROR_NOT_SUPPORTED ||
         replace_error == ERROR_INVALID_PARAMETER) {
       extended_rename_unsupported = true;
@@ -574,15 +597,15 @@ void rename_open_file(HANDLE handle, HANDLE directory, std::wstring_view destina
   std::memcpy(raw + offsetof(FILE_RENAME_INFO, ReplaceIfExists), &replace_if_exists,
               sizeof(replace_if_exists));
   for (int attempt = 0; attempt < maximum_replace_attempts; ++attempt) {
-    if (SetFileInformationByHandle(handle, FileRenameInfo, storage.data(),
-                                   static_cast<DWORD>(info_bytes)) != 0) {
+    replace_error = set_windows_file_information(
+        handle, storage.data(), static_cast<ULONG>(info_bytes), kFileRenameInformation);
+    if (replace_error == ERROR_SUCCESS) {
       if (!published_path_identifies_handle(directory, destination_name, handle)) {
         throw WindowsPublicationIdentityError(
             "published calibration output does not identify the temporary file");
       }
       return;
     }
-    replace_error = GetLastError();
     if (replace_error != ERROR_SHARING_VIOLATION && replace_error != ERROR_ACCESS_DENIED) {
       break;
     }
