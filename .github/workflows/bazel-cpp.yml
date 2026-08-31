@@ -22,7 +22,7 @@ jobs:
             test_target: "//cpp/tests:all //cpp/reco_io:gpu_video_probe_protocol_tests"
           - os: macos-latest
             bazel_args: ""
-            test_args: "--test_strategy=local"
+            test_args: "--test_strategy=standalone"
             test_target: "//cpp/tests:all //cpp/reco_io:gpu_video_probe_protocol_tests"
           - os: windows-latest
             bazel_args: "--cxxopt=/std:c++20 --host_cxxopt=/std:c++20"
