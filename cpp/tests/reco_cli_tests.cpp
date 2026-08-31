@@ -1832,23 +1832,28 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
 
   const auto active_parent = root.path() / "active-output-parent";
   const auto retained_parent = root.path() / "retained-output-parent";
-  std::filesystem::create_directory(active_parent);
-  const auto parent_race_destination = active_parent / "match.json";
-  bool parent_race_hook_ran = false;
-  detail::write_calibration_json_atomically(R"json({"writer":"windows-pinned-parent"})json",
-                                            parent_race_destination, left_input, right_input, [&] {
-                                              std::filesystem::rename(active_parent,
-                                                                      retained_parent);
-                                              std::filesystem::create_directory(active_parent);
-                                              parent_race_hook_ran = true;
-                                            });
-  expect_true(parent_race_hook_ran,
-              "Windows output parent replacement happens at the publication boundary");
-  expect_eq(read_text_file(retained_parent / "match.json"),
-            std::string("{\"writer\":\"windows-pinned-parent\"}\n"),
-            "Windows publication stays relative to the retained directory handle");
-  expect_true(!std::filesystem::exists(active_parent / "match.json"),
-              "Windows replacement parent cannot redirect publication");
+  std::filesystem::create_directory(retained_parent);
+  std::error_code parent_symlink_error;
+  std::filesystem::create_directory_symlink(retained_parent, active_parent, parent_symlink_error);
+  expect_true(!parent_symlink_error, "Windows output parent symlink fixture is available");
+  if (!parent_symlink_error) {
+    const auto parent_race_destination = active_parent / "match.json";
+    bool parent_race_hook_ran = false;
+    detail::write_calibration_json_atomically(R"json({"writer":"windows-pinned-parent"})json",
+                                              parent_race_destination, left_input, right_input,
+                                              [&] {
+                                                std::filesystem::remove(active_parent);
+                                                std::filesystem::create_directory(active_parent);
+                                                parent_race_hook_ran = true;
+                                              });
+    expect_true(parent_race_hook_ran,
+                "Windows output parent replacement happens at the publication boundary");
+    expect_eq(read_text_file(retained_parent / "match.json"),
+              std::string("{\"writer\":\"windows-pinned-parent\"}\n"),
+              "Windows publication stays relative to the retained directory handle");
+    expect_true(!std::filesystem::exists(active_parent / "match.json"),
+                "Windows replacement parent cannot redirect publication");
+  }
 
   const auto windows_post_publish_destination = root.path() / "windows-post-publish-race.json";
   bool windows_post_publish_hook_ran = false;
