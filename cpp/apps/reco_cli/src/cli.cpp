@@ -543,7 +543,7 @@ std::filesystem::path create_exclusive_temporary(const std::filesystem::path& de
     DWORD error = ERROR_SUCCESS;
     handle = open_windows_file_relative(
         directory, filename.wstring(), GENERIC_WRITE | DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-        FILE_SHARE_READ | FILE_SHARE_DELETE, FILE_CREATE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_CREATE,
         FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT, error);
     if (handle != INVALID_HANDLE_VALUE) {
       return temporary;
