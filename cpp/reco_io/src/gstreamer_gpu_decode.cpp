@@ -960,6 +960,11 @@ public:
     if (!stop_requested_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
       return;
     }
+    // Wait out the bounded appsink poll before releasing the source's pipeline ownership. Any
+    // returned frame leases keep the resources alive independently until their CUDA work ends.
+    std::lock_guard lock(read_mutex_);
+    ended_ = true;
+    close();
   }
 
   void seek_to_frame(std::uint64_t frame_index) override {

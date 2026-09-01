@@ -262,6 +262,40 @@ void persistent_stereo_session_pairs_gstreamer_sources() {
             "persistent frame release stops both deferred GStreamer pipelines");
 }
 
+void early_stereo_stop_releases_source_pipeline_ownership() {
+  set_scenario("frame-eos");
+  const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
+  std::filesystem::remove(event_path);
+
+  auto left_config = valid_config();
+  auto right_config = valid_config();
+  right_config.path = "/data/right.mp4";
+  auto session = std::make_unique<GpuStereoDecodeSession>(
+      open_gstreamer_gpu_file_decode_source(std::move(left_config), NvbufSurfaceAbi::DeepStream9_1),
+      open_gstreamer_gpu_file_decode_source(std::move(right_config),
+                                            NvbufSurfaceAbi::DeepStream9_1),
+      GpuStereoDecodeConfig{.queue_capacity = 1});
+
+  auto paired = session->read();
+  expect_true(paired.frames.has_value(), "early-stop fixture returns a retained frame pair");
+  session->request_stop();
+  expect_true(session->read().status == GpuStereoDecodeStatus::Stopped,
+              "early-stopped session reports the stopped status");
+
+  auto events = read_events(event_path);
+  expect_eq(count_event(events, "state-null"), 0U,
+            "early stop keeps pipelines alive while returned frames are retained");
+  paired.frames.reset();
+  events = read_events(event_path);
+  expect_eq(count_event(events, "state-null"), 2U,
+            "returned-frame release closes early-stopped pipelines before session destruction");
+
+  session.reset();
+  events = read_events(event_path);
+  expect_eq(count_event(events, "state-null"), 2U,
+            "session destruction does not close early-stopped pipelines twice");
+}
+
 void orientation_tags_are_preserved() {
   set_scenario("orientation-180");
   auto source =
@@ -866,6 +900,7 @@ int run_tests() {
 
   production_source_retains_mapped_sample();
   persistent_stereo_session_pairs_gstreamer_sources();
+  early_stereo_stop_releases_source_pipeline_ownership();
   orientation_tags_are_preserved();
   indexed_cadence_drives_frame_indices();
   indexed_decode_seeks_to_absolute_start_frame();
