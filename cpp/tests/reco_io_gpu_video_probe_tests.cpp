@@ -3427,20 +3427,15 @@ void unrelated_descriptors_are_not_inherited(const std::filesystem::path& video_
 #endif
 }
 
-void signal_handler_fork_cannot_deadlock_the_probe_registry() {
-#if !defined(_WIN32)
+int run_registry_owner_signal_fork_fixture() {
+#if defined(_WIN32)
+  return 0;
+#else
   std::array<int, 2> ready{-1, -1};
   std::array<int, 2> release{-1, -1};
   std::array<int, 2> report{-1, -1};
   if (::pipe(ready.data()) != 0 || ::pipe(release.data()) != 0 || ::pipe(report.data()) != 0) {
-    expect_true(false, "probe signal-fork fixture creates its pipes");
-    for (const auto descriptor :
-         {ready[0], ready[1], release[0], release[1], report[0], report[1]}) {
-      if (descriptor >= 0) {
-        (void)::close(descriptor);
-      }
-    }
-    return;
+    return 10;
   }
   struct sigaction action{};
   struct sigaction previous{};
@@ -3448,67 +3443,130 @@ void signal_handler_fork_cannot_deadlock_the_probe_registry() {
   sigset_t previous_mask{};
   if (sigemptyset(&signal_set) != 0 || sigaddset(&signal_set, SIGUSR1) != 0 ||
       ::pthread_sigmask(SIG_UNBLOCK, &signal_set, &previous_mask) != 0) {
-    expect_true(false, "probe signal-fork fixture unblocks its signal");
-    for (const auto descriptor :
-         {ready[0], ready[1], release[0], release[1], report[0], report[1]}) {
-      (void)::close(descriptor);
-    }
-    return;
+    return 11;
   }
   action.sa_handler = fork_from_signal_handler;
   (void)sigemptyset(&action.sa_mask);
   if (::sigaction(SIGUSR1, &action, &previous) != 0) {
-    expect_true(false, "probe signal-fork handler installs");
     (void)::pthread_sigmask(SIG_SETMASK, &previous_mask, nullptr);
-    for (const auto descriptor :
-         {ready[0], ready[1], release[0], release[1], report[0], report[1]}) {
-      (void)::close(descriptor);
-    }
-    return;
+    return 12;
   }
   signal_fork_report_descriptor = report[1];
   std::exception_ptr holder_error;
   std::thread holder([&] {
     try {
       reco::io::detail::hold_probe_fork_descriptor_registry_for_test(ready[1], release[0]);
+      const char unlocked = 'U';
+      ssize_t written = -1;
+      do {
+        written = ::write(ready[1], &unlocked, 1);
+      } while (written < 0 && errno == EINTR);
+      if (written != 1) {
+        throw std::runtime_error("failed to report the unlocked probe descriptor registry");
+      }
+      char finish = '\0';
+      ssize_t received = -1;
+      do {
+        received = ::read(release[0], &finish, 1);
+      } while (received < 0 && errno == EINTR);
+      if (received != 1 || finish != 'F') {
+        throw std::runtime_error("failed to retain the registry owner after signal delivery");
+      }
     } catch (...) {
       holder_error = std::current_exception();
     }
   });
+  const auto read_marker = [](int descriptor, char expected) {
+    pollfd pending{.fd = descriptor, .events = POLLIN, .revents = 0};
+    if (::poll(&pending, 1, 2000) <= 0) {
+      return false;
+    }
+    char marker = '\0';
+    return ::read(descriptor, &marker, 1) == 1 && marker == expected;
+  };
   char ready_marker = '\0';
-  expect_true(::read(ready[0], &ready_marker, 1) == 1 && ready_marker == 'R',
-              "probe descriptor registry reaches its held state");
-  std::thread releaser([&] {
-    std::this_thread::sleep_for(std::chrono::milliseconds(25));
-    const char release_marker = 'R';
-    (void)::write(release[1], &release_marker, 1);
-  });
-  expect_true(::pthread_kill(::pthread_self(), SIGUSR1) == 0,
-              "probe signal handler forks while another thread owns the registry");
-  holder.join();
-  releaser.join();
-  expect_true(holder_error == nullptr, "probe descriptor registry holder completes");
+  if (::read(ready[0], &ready_marker, 1) != 1 || ready_marker != 'R') {
+    ::_exit(13);
+  }
+  if (::pthread_kill(holder.native_handle(), SIGUSR1) != 0) {
+    ::_exit(14);
+  }
+  const char release_marker = 'R';
+  if (::write(release[1], &release_marker, 1) != 1 || !read_marker(ready[0], 'U')) {
+    ::_exit(15);
+  }
   pollfd pending{.fd = report[0], .events = POLLIN, .revents = 0};
   const auto reported = ::poll(&pending, 1, 2000);
   pid_t fork_child = -1;
   if (reported > 0) {
     (void)::read(report[0], &fork_child, sizeof(fork_child));
   }
-  expect_true(fork_child > 0, "probe signal handler forks after the registry unlocks");
+  const char finish_marker = 'F';
+  (void)::write(release[1], &finish_marker, 1);
+  holder.join();
+  if (holder_error != nullptr || fork_child <= 0) {
+    return 16;
+  }
   if (fork_child > 0) {
     int status = 0;
     while (::waitpid(fork_child, &status, 0) < 0 && errno == EINTR) {
     }
-    expect_true(WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS,
-                "probe signal-handler child exits cleanly");
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != EXIT_SUCCESS) {
+      return 17;
+    }
   }
   signal_fork_report_descriptor = -1;
-  expect_true(::sigaction(SIGUSR1, &previous, nullptr) == 0, "probe signal-fork handler restores");
-  expect_true(::pthread_sigmask(SIG_SETMASK, &previous_mask, nullptr) == 0,
-              "probe signal-fork mask restores");
+  if (::sigaction(SIGUSR1, &previous, nullptr) != 0 ||
+      ::pthread_sigmask(SIG_SETMASK, &previous_mask, nullptr) != 0) {
+    return 18;
+  }
   for (const auto descriptor : {ready[0], ready[1], release[0], release[1], report[0], report[1]}) {
     (void)::close(descriptor);
   }
+  return 0;
+#endif
+}
+
+void signal_handler_fork_cannot_deadlock_the_probe_registry() {
+#if !defined(_WIN32)
+  const auto fixture = ::fork();
+  if (fixture == 0) {
+    const auto executable = test_executable_path.string();
+    ::execl(executable.c_str(), executable.c_str(), "--reco-registry-owner-signal-fork-fixture",
+            static_cast<char*>(nullptr));
+    ::_exit(127);
+  }
+  expect_true(fixture > 0, "probe owner-thread signal-fork fixture starts");
+  if (fixture <= 0) {
+    return;
+  }
+  int status = 0;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  pid_t waited = 0;
+  while ((waited = ::waitpid(fixture, &status, WNOHANG)) == 0 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  if (waited == 0) {
+    (void)::kill(fixture, SIGKILL);
+    do {
+      waited = ::waitpid(fixture, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+  }
+  if (waited < 0) {
+    expect_true(false, "probe owner-thread signal-fork fixture is reaped");
+    return;
+  }
+  if (WIFSIGNALED(status)) {
+    expect_true(false, "probe owner-thread signal-fork fixture does not time out");
+    return;
+  }
+  if (!WIFEXITED(status)) {
+    while ((waited = ::waitpid(fixture, &status, 0)) < 0 && errno == EINTR) {
+    }
+  }
+  expect_true(WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS,
+              "probe registry owner defers signal-handler fork until after unlock");
 #endif
 }
 
@@ -3827,6 +3885,9 @@ int main(int argc, char** argv) {
   }
   if (argc == 2 && std::string_view(argv[1]) == "--reco-posix-probe-caller") {
     return run_posix_probe_caller();
+  }
+  if (argc == 2 && std::string_view(argv[1]) == "--reco-registry-owner-signal-fork-fixture") {
+    return run_registry_owner_signal_fork_fixture();
   }
 #endif
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
