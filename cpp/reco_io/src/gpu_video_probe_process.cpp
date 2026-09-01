@@ -2393,6 +2393,9 @@ bool guardian_worker_group_has_other_members(pid_t worker_pid) {
     int query[] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, process};
     if (::sysctl(query, static_cast<unsigned int>(std::size(query)), &process_info,
                  &process_info_size, nullptr, 0) != 0) {
+      if (errno == ESRCH || errno == ENOENT) {
+        continue;
+      }
       return true;
     }
     if (process_info_size == 0) {

@@ -67,6 +67,7 @@ cc_test(
     ],
     deps = [
         "//cpp/reco_core",
+        "@rules_cc//cc/runfiles",
     ],
 )
 

@@ -1,9 +1,12 @@
 #include "reco/core/cuda_backend.hpp"
 #include "reco/core/windows_runtime_library.hpp"
 
+#include "rules_cc/cc/runfiles/runfiles.h"
+
 #include <atomic>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -88,47 +91,55 @@ template <typename Fn> void expect_runtime_error(Fn&& fn, std::string_view messa
 }
 
 #if defined(_WIN32)
+std::filesystem::path resolve_windows_runtime_runfile(std::string_view path) {
+  const char* workspace = std::getenv("TEST_WORKSPACE");
+  if (workspace == nullptr || workspace[0] == '\0') {
+    throw std::runtime_error("TEST_WORKSPACE is not set");
+  }
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(&error));
+  if (!runfiles) {
+    throw std::runtime_error("failed to initialize Bazel runfiles: " + error);
+  }
+  const auto logical_path = std::string(workspace) + "/" + std::string(path);
+  const auto resolved = std::filesystem::path(runfiles->Rlocation(logical_path));
+  if (resolved.empty() || !std::filesystem::is_regular_file(resolved)) {
+    throw std::runtime_error("Windows runtime runfile not found: " + std::string(path));
+  }
+  return resolved;
+}
+
 std::filesystem::path find_windows_runtime_fixture(std::string_view target_name) {
-  const char* runfiles = std::getenv("TEST_SRCDIR");
-  if (runfiles == nullptr || runfiles[0] == '\0') {
-    throw std::runtime_error("TEST_SRCDIR is not set");
-  }
-  std::error_code error;
-  for (const auto& entry : std::filesystem::recursive_directory_iterator(runfiles, error)) {
-    if (error) {
-      break;
-    }
-    const auto filename = entry.path().filename().string();
-    const auto position = filename.find(target_name);
-    const auto target_end =
-        position == std::string::npos ? position : position + target_name.size();
-    const auto target_matches = position != std::string::npos &&
-                                (target_end == filename.size() || filename[target_end] == '.' ||
-                                 filename[target_end] == '-');
-    if (target_matches && entry.is_regular_file(error) && !error &&
-        (entry.path().extension() == ".dll" || filename.ends_with(".so"))) {
-      return entry.path();
-    }
-  }
-  throw std::runtime_error("Windows runtime DLL fixture not found: " + std::string(target_name));
+  return resolve_windows_runtime_runfile("cpp/tests/lib" + std::string(target_name) + ".so");
 }
 
 std::vector<std::filesystem::path>
 find_windows_runtime_fixtures_containing(std::string_view target_name) {
-  const char* runfiles = std::getenv("TEST_SRCDIR");
-  if (runfiles == nullptr || runfiles[0] == '\0') {
-    throw std::runtime_error("TEST_SRCDIR is not set");
+  const char* manifest = std::getenv("RUNFILES_MANIFEST_FILE");
+  if (manifest == nullptr || manifest[0] == '\0') {
+    throw std::runtime_error("Bazel runfiles manifest is not available");
+  }
+  std::ifstream input(manifest);
+  if (!input) {
+    throw std::runtime_error("failed to open the Bazel runfiles manifest");
   }
   std::vector<std::filesystem::path> fixtures;
-  std::error_code error;
-  for (const auto& entry : std::filesystem::recursive_directory_iterator(runfiles, error)) {
-    if (error) {
-      break;
+  std::string entry;
+  while (std::getline(input, entry)) {
+    const auto separator = entry.find(' ');
+    if (separator == std::string::npos) {
+      continue;
     }
-    const auto filename = entry.path().filename().string();
-    if (filename.find(target_name) != std::string::npos && entry.is_regular_file(error) && !error &&
-        (entry.path().extension() == ".dll" || filename.ends_with(".so"))) {
-      fixtures.push_back(entry.path());
+    const auto logical_path = std::string_view(entry).substr(0, separator);
+    const auto filename = std::filesystem::path(logical_path).filename().string();
+    if (filename.find(target_name) == std::string::npos ||
+        (std::filesystem::path(filename).extension() != ".dll" && !filename.ends_with(".so"))) {
+      continue;
+    }
+    const auto physical_path = std::filesystem::path(entry.substr(separator + 1));
+    if (std::filesystem::is_regular_file(physical_path)) {
+      fixtures.push_back(physical_path);
     }
   }
   if (fixtures.empty()) {
