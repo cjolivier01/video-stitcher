@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -60,6 +61,8 @@ constexpr const char* kProbeCallerMode = "RECO_FAKE_PROBE_CALLER_MODE";
 constexpr const char* kProbeCallerTimeout = "RECO_FAKE_PROBE_CALLER_TIMEOUT_NS";
 constexpr const char* kProbeCallerDelay = "RECO_FAKE_PROBE_CALLER_DELAY_NS";
 constexpr const char* kProbeCallerMarkerPath = "RECO_FAKE_PROBE_CALLER_MARKER_PATH";
+constexpr const char* kProbeCallerInheritedChildPath =
+    "RECO_FAKE_PROBE_CALLER_INHERITED_CHILD_PATH";
 #endif
 
 void expect_true(bool value, std::string_view message) {
@@ -355,6 +358,7 @@ int run_posix_probe_caller() {
   const char* worker_path = std::getenv(kProbeCallerWorkerPath);
   const char* mode_value = std::getenv(kProbeCallerMode);
   const char* marker_path = std::getenv(kProbeCallerMarkerPath);
+  const char* inherited_child_path = std::getenv(kProbeCallerInheritedChildPath);
   std::uint64_t timeout_ns = 0;
   std::uint64_t delay_ns = 0;
   if (video_path == nullptr || video_path[0] == '\0' || worker_path == nullptr ||
@@ -373,7 +377,46 @@ int run_posix_probe_caller() {
       (marker_path == nullptr || marker_path[0] == '\0')) {
     return EXIT_FAILURE;
   }
+  if (inherited_child_path != nullptr && inherited_child_path[0] != '\0' &&
+      (marker_path == nullptr || marker_path[0] == '\0')) {
+    return EXIT_FAILURE;
+  }
 
+  std::atomic<bool> stop_inherited_child = false;
+  std::atomic<pid_t> inherited_child = -1;
+  std::thread inherited_child_thread;
+  if (inherited_child_path != nullptr && inherited_child_path[0] != '\0') {
+    const auto snapshot_marker = std::filesystem::path(marker_path);
+    const auto child_marker = std::filesystem::path(inherited_child_path);
+    inherited_child_thread = std::thread([&, snapshot_marker, child_marker] {
+      while (!stop_inherited_child.load(std::memory_order_acquire) &&
+             ::access(snapshot_marker.c_str(), F_OK) != 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+      if (stop_inherited_child.load(std::memory_order_acquire)) {
+        return;
+      }
+      const auto child = ::fork();
+      if (child == 0) {
+        while (true) {
+          (void)::pause();
+        }
+      }
+      if (child <= 0) {
+        return;
+      }
+      inherited_child.store(child, std::memory_order_release);
+      {
+        std::ofstream marker(child_marker, std::ios::trunc);
+        marker << static_cast<std::uint64_t>(child);
+      }
+      int status = 0;
+      while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {
+      }
+    });
+  }
+
+  int result = EXIT_SUCCESS;
   try {
     const auto config = container_config(std::filesystem::path(video_path));
     const auto worker = std::filesystem::path(worker_path);
@@ -382,7 +425,7 @@ int run_posix_probe_caller() {
     } else if (mode == "pre-worker-report-delay") {
       (void)reco::io::detail::probe_gpu_video_with_pre_worker_report_delay_for_test(
           config, worker, timeout_ns, delay_ns);
-      return 2;
+      result = 2;
     } else if (mode == "pre-supervisor-exec-delay") {
       (void)reco::io::detail::probe_gpu_video_with_pre_supervisor_exec_delay_for_test(
           config, worker, timeout_ns, delay_ns, std::filesystem::path(marker_path));
@@ -391,21 +434,31 @@ int run_posix_probe_caller() {
           config, worker, timeout_ns, delay_ns, std::filesystem::path(marker_path));
     }
   } catch (...) {
-    return EXIT_SUCCESS;
+    result = EXIT_SUCCESS;
   }
-  return EXIT_SUCCESS;
+  stop_inherited_child.store(true, std::memory_order_release);
+  const auto child = inherited_child.load(std::memory_order_acquire);
+  if (child > 0) {
+    (void)::kill(child, SIGKILL);
+  }
+  if (inherited_child_thread.joinable()) {
+    inherited_child_thread.join();
+  }
+  return result;
 }
 
 pid_t fork_exec_probe_caller(const std::filesystem::path& video_path,
                              const std::filesystem::path& worker_path, std::string_view mode,
                              std::uint64_t timeout_ns, std::uint64_t delay_ns = 0,
-                             const std::filesystem::path& marker_path = {}) {
+                             const std::filesystem::path& marker_path = {},
+                             const std::filesystem::path& inherited_child_path = {}) {
   set_environment(kProbeCallerVideoPath, video_path.string());
   set_environment(kProbeCallerWorkerPath, worker_path.string());
   set_environment(kProbeCallerMode, std::string(mode));
   set_environment(kProbeCallerTimeout, std::to_string(timeout_ns));
   set_environment(kProbeCallerDelay, std::to_string(delay_ns));
   set_environment(kProbeCallerMarkerPath, marker_path.string());
+  set_environment(kProbeCallerInheritedChildPath, inherited_child_path.string());
 
   auto executable = test_executable_path.string();
   std::string helper_mode = "--reco-posix-probe-caller";
@@ -422,6 +475,7 @@ pid_t fork_exec_probe_caller(const std::filesystem::path& video_path,
   set_environment(kProbeCallerTimeout, "");
   set_environment(kProbeCallerDelay, "");
   set_environment(kProbeCallerMarkerPath, "");
+  set_environment(kProbeCallerInheritedChildPath, "");
   return caller;
 }
 #endif
@@ -1497,20 +1551,34 @@ void worker_ipc_failures_are_bounded(const std::filesystem::path& video_path) {
 
 void aggregate_worker_memory_budget_is_enforced() {
   constexpr std::uint64_t kExpectedWorkerBytes = 512ULL * 1024ULL * 1024ULL;
+  constexpr std::uint64_t kExpectedSnapshotBytes = 256ULL * 1024ULL * 1024ULL;
   constexpr std::uint64_t kExpectedAggregateBytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
   const auto worker_bytes = reco::io::detail::maximum_probe_worker_address_space_bytes_for_test();
-  const auto aggregate_bytes =
-      reco::io::detail::maximum_aggregate_probe_worker_address_space_bytes_for_test();
+  const auto snapshot_bytes = reco::io::detail::maximum_probe_executable_snapshot_bytes_for_test();
+  const auto reservation_bytes =
+      reco::io::detail::maximum_per_probe_memory_reservation_bytes_for_test();
+  const auto aggregate_bytes = reco::io::detail::maximum_aggregate_probe_memory_bytes_for_test();
   expect_eq(worker_bytes, kExpectedWorkerBytes,
             "probe worker memory reservation matches its limit");
+  expect_eq(snapshot_bytes, kExpectedSnapshotBytes,
+            "probe executable snapshot memory reservation matches its limit");
+#if defined(__linux__)
+  expect_eq(reservation_bytes, kExpectedWorkerBytes + kExpectedSnapshotBytes,
+            "Linux probe admission includes worker and RAM-backed snapshot memory");
+#else
+  expect_eq(reservation_bytes, kExpectedWorkerBytes,
+            "non-Linux probe admission includes its worker memory");
+#endif
   expect_eq(aggregate_bytes, kExpectedAggregateBytes,
-            "aggregate probe worker memory budget leaves caller headroom");
-  if (worker_bytes == 0 || aggregate_bytes == 0 || aggregate_bytes % worker_bytes != 0) {
-    expect_true(false, "aggregate probe worker memory budget is composed of whole reservations");
+            "aggregate probe memory budget leaves caller headroom");
+  if (worker_bytes == 0 || reservation_bytes == 0 || aggregate_bytes < reservation_bytes) {
+    expect_true(false, "aggregate probe memory budget admits at least one whole reservation");
     return;
   }
 
-  const auto reservation_count = static_cast<std::size_t>(aggregate_bytes / worker_bytes);
+  const auto reservation_count = static_cast<std::size_t>(aggregate_bytes / reservation_bytes);
+  const auto expected_reserved_worker_bytes = reservation_count * worker_bytes;
+  const auto expected_reserved_probe_bytes = reservation_count * reservation_bytes;
   std::atomic<std::size_t> ready{0};
   std::atomic<bool> start{false};
   std::atomic<bool> reservation_failed{false};
@@ -1546,16 +1614,21 @@ void aggregate_worker_memory_budget_is_enforced() {
   start.store(true, std::memory_order_release);
 
   const auto saturation_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
-  while (reco::io::detail::reserved_probe_worker_address_space_bytes_for_test() !=
-             aggregate_bytes &&
+  while (reco::io::detail::reserved_probe_memory_bytes_for_test() !=
+             expected_reserved_probe_bytes &&
          std::chrono::steady_clock::now() < saturation_deadline) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
-  expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), aggregate_bytes,
-            "all aggregate probe worker memory reservations are admitted");
+  expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(),
+            expected_reserved_worker_bytes,
+            "all admitted probe worker address-space reservations are tracked");
+  expect_eq(reco::io::detail::reserved_probe_memory_bytes_for_test(), expected_reserved_probe_bytes,
+            "all admitted probe memory reservations are tracked");
+  expect_true(aggregate_bytes - expected_reserved_probe_bytes < reservation_bytes,
+              "aggregate probe memory leaves less than one reservation unallocated");
   expect_probe_error([] { reco::io::detail::hold_probe_worker_memory_reservation_for_test(0); },
-                     "aggregate video probe worker memory budget",
-                     "an additional probe is rejected at the aggregate worker memory boundary");
+                     "aggregate video probe memory budget",
+                     "an additional probe is rejected at the aggregate memory boundary");
 
   for (auto& reservation : reservations) {
     reservation.join();
@@ -1564,6 +1637,115 @@ void aggregate_worker_memory_budget_is_enforced() {
               "every reservation within the aggregate worker memory budget succeeds");
   expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
             "probe worker memory reservations are released after completion");
+  expect_eq(reco::io::detail::reserved_probe_memory_bytes_for_test(), 0ULL,
+            "aggregate probe memory reservations are released after completion");
+}
+
+void maximum_linux_snapshots_are_aggregate_bounded() {
+#if defined(__linux__)
+  const auto snapshot_bytes = reco::io::detail::maximum_probe_executable_snapshot_bytes_for_test();
+  const auto reservation_bytes =
+      reco::io::detail::maximum_per_probe_memory_reservation_bytes_for_test();
+  const auto aggregate_bytes = reco::io::detail::maximum_aggregate_probe_memory_bytes_for_test();
+  const auto reservation_count = static_cast<std::size_t>(aggregate_bytes / reservation_bytes);
+  expect_eq(reservation_count, 2U,
+            "Linux aggregate memory budget admits two maximum-snapshot probes");
+
+  const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("reco_probe_maximum_snapshot_" + std::to_string(unique));
+  const auto worker = root / "maximum-snapshot-worker";
+  std::error_code cleanup_error;
+  std::filesystem::remove_all(root, cleanup_error);
+  std::vector<std::array<int, 2>> ready(reservation_count, {-1, -1});
+  std::vector<std::array<int, 2>> release(reservation_count, {-1, -1});
+  std::vector<std::thread> snapshots;
+  std::atomic<bool> snapshot_failed = false;
+  try {
+    std::filesystem::create_directory(root);
+    std::filesystem::copy_file(fake_probe_worker_path, worker);
+    std::filesystem::permissions(worker,
+                                 std::filesystem::perms::owner_read |
+                                     std::filesystem::perms::owner_write |
+                                     std::filesystem::perms::owner_exec,
+                                 std::filesystem::perm_options::replace);
+    const int worker_descriptor = ::open(worker.c_str(), O_WRONLY | O_CLOEXEC);
+    if (worker_descriptor < 0 ||
+        ::ftruncate(worker_descriptor, static_cast<off_t>(snapshot_bytes)) != 0) {
+      const auto resize_error = errno;
+      if (worker_descriptor >= 0) {
+        (void)::close(worker_descriptor);
+      }
+      throw std::runtime_error("failed to resize maximum snapshot fixture: " +
+                               std::string(std::strerror(resize_error)));
+    }
+    (void)::close(worker_descriptor);
+
+    snapshots.reserve(reservation_count);
+    for (std::size_t index = 0; index < reservation_count; ++index) {
+      if (::pipe(ready[index].data()) != 0 || ::pipe(release[index].data()) != 0) {
+        throw std::runtime_error("failed to create maximum snapshot synchronization pipes");
+      }
+      snapshots.emplace_back([&, index] {
+        try {
+          reco::io::detail::hold_linux_probe_executable_snapshot_for_test(worker, ready[index][1],
+                                                                          release[index][0]);
+        } catch (...) {
+          snapshot_failed.store(true, std::memory_order_release);
+        }
+      });
+    }
+
+    bool every_snapshot_ready = true;
+    for (std::size_t index = 0; index < reservation_count; ++index) {
+      pollfd descriptor{.fd = ready[index][0], .events = POLLIN, .revents = 0};
+      int poll_result = -1;
+      do {
+        poll_result = ::poll(&descriptor, 1, 30'000);
+      } while (poll_result < 0 && errno == EINTR);
+      char ready_byte = '\0';
+      const auto ready_size = poll_result == 1 ? ::read(ready[index][0], &ready_byte, 1) : -1;
+      every_snapshot_ready = every_snapshot_ready && ready_size == 1 && ready_byte == 'R';
+    }
+    expect_true(every_snapshot_ready,
+                "concurrent maximum-size Linux executable snapshots are populated");
+    expect_eq(reco::io::detail::reserved_probe_memory_bytes_for_test(),
+              reservation_count * reservation_bytes,
+              "maximum-size Linux snapshots remain inside aggregate admission");
+    expect_probe_error(
+        [&] { reco::io::detail::hold_linux_probe_executable_snapshot_for_test(worker, -1, -1); },
+        "aggregate video probe memory budget",
+        "another maximum Linux snapshot is rejected before allocating its memfd");
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: maximum Linux snapshot fixture failed: " << error.what() << '\n';
+    ++failures;
+  }
+
+  for (auto& pipe : release) {
+    if (pipe[1] >= 0) {
+      const char release_byte = 'R';
+      (void)::write(pipe[1], &release_byte, 1);
+    }
+  }
+  for (auto& snapshot : snapshots) {
+    if (snapshot.joinable()) {
+      snapshot.join();
+    }
+  }
+  for (auto& pipe : ready) {
+    (void)::close(pipe[0]);
+    (void)::close(pipe[1]);
+  }
+  for (auto& pipe : release) {
+    (void)::close(pipe[0]);
+    (void)::close(pipe[1]);
+  }
+  expect_true(!snapshot_failed.load(std::memory_order_acquire),
+              "maximum Linux snapshot holders complete successfully");
+  expect_eq(reco::io::detail::reserved_probe_memory_bytes_for_test(), 0ULL,
+            "maximum Linux snapshot reservations are released");
+  std::filesystem::remove_all(root, cleanup_error);
+#endif
 }
 
 void inherited_probe_state_is_rejected_after_fork(const std::filesystem::path& video_path) {
@@ -2487,6 +2669,91 @@ void mac_probe_snapshot_preserves_quarantine(const std::filesystem::path& video_
 #endif
 }
 
+void mac_probe_snapshot_cleanup_tracks_owner_process(const std::filesystem::path& video_path) {
+#if defined(__APPLE__)
+  const auto snapshot_marker =
+      video_path.parent_path() / (video_path.filename().string() + ".snapshot-owner-ready");
+  const auto child_marker =
+      video_path.parent_path() / (video_path.filename().string() + ".snapshot-inherited-child");
+  std::filesystem::remove(snapshot_marker);
+  std::filesystem::remove(child_marker);
+  const auto snapshots_before = mac_probe_snapshot_directories();
+  std::vector<std::filesystem::path> caller_snapshots;
+  std::optional<std::uint64_t> inherited_child;
+  pid_t caller = -1;
+  try {
+    set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+    caller =
+        fork_exec_probe_caller(video_path, fake_probe_worker_path, "pre-supervisor-exec-delay",
+                               30'000'000'000ULL, 30'000'000'000ULL, snapshot_marker, child_marker);
+    expect_true(caller > 0, "macOS inherited-socket snapshot caller starts");
+    const auto marker_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    const auto snapshot_ready = wait_for_process_marker(snapshot_marker, marker_deadline);
+    inherited_child = wait_for_process_marker(child_marker, marker_deadline);
+    expect_true(snapshot_ready.has_value(),
+                "macOS inherited-socket fixture creates its executable snapshot");
+    expect_true(inherited_child.has_value(),
+                "macOS inherited-socket fixture forks a child after snapshot creation");
+    for (const auto& snapshot : mac_probe_snapshot_directories()) {
+      if (!std::binary_search(snapshots_before.begin(), snapshots_before.end(), snapshot)) {
+        caller_snapshots.push_back(snapshot);
+      }
+    }
+    expect_true(!caller_snapshots.empty(),
+                "macOS inherited-socket fixture observes the caller snapshot");
+
+    if (caller > 0) {
+      (void)::kill(caller, SIGKILL);
+      int status = 0;
+      while (::waitpid(caller, &status, 0) < 0 && errno == EINTR) {
+      }
+      caller = -1;
+    }
+    const auto child_pid =
+        inherited_child.has_value() &&
+                *inherited_child <= static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max())
+            ? static_cast<pid_t>(*inherited_child)
+            : static_cast<pid_t>(-1);
+    expect_true(child_pid > 0 && ::kill(child_pid, 0) == 0,
+                "fork-only child remains alive with its inherited cleanup socket");
+
+    bool snapshots_removed = caller_snapshots.empty();
+    const auto cleanup_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!snapshots_removed && std::chrono::steady_clock::now() < cleanup_deadline) {
+      snapshots_removed =
+          std::all_of(caller_snapshots.begin(), caller_snapshots.end(), [](const auto& snapshot) {
+            std::error_code exists_error;
+            return !std::filesystem::exists(snapshot, exists_error) && !exists_error;
+          });
+      if (!snapshots_removed) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+    }
+    expect_true(snapshots_removed,
+                "macOS owner death removes snapshots despite an inherited socket endpoint");
+    expect_true(child_pid > 0 && ::kill(child_pid, 0) == 0,
+                "macOS snapshot cleanup does not depend on killing the fork-only child");
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: macOS inherited-socket snapshot fixture failed: " << error.what() << '\n';
+    ++failures;
+  }
+  if (caller > 0) {
+    (void)::kill(caller, SIGKILL);
+    int status = 0;
+    while (::waitpid(caller, &status, 0) < 0 && errno == EINTR) {
+    }
+  }
+  if (inherited_child.has_value() &&
+      *inherited_child <= static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max())) {
+    (void)::kill(static_cast<pid_t>(*inherited_child), SIGKILL);
+  }
+  std::filesystem::remove(snapshot_marker);
+  std::filesystem::remove(child_marker);
+#else
+  (void)video_path;
+#endif
+}
+
 void caller_death_before_worker_main(const std::filesystem::path& video_path) {
 #if defined(_WIN32)
   const auto worker_marker =
@@ -3055,6 +3322,7 @@ int main(int argc, char** argv) {
             "path tests leave no aggregate admission behind");
   worker_ipc_failures_are_bounded(video_path);
   aggregate_worker_memory_budget_is_enforced();
+  maximum_linux_snapshots_are_aggregate_bounded();
   inherited_probe_state_is_rejected_after_fork(video_path);
   deferred_cleanup_retains_worker_memory_reservation(video_path);
   delayed_supervision_cannot_launch_worker(video_path);
@@ -3076,6 +3344,7 @@ int main(int argc, char** argv) {
   caller_death_before_supervisor_main(video_path);
   executable_replacement_cannot_change_the_pinned_probe_image(video_path);
   mac_probe_snapshot_preserves_quarantine(video_path);
+  mac_probe_snapshot_cleanup_tracks_owner_process(video_path);
   caller_death_before_guardian_main(video_path);
   caller_death_before_worker_main(video_path);
   pre_main_loader_stall_respects_timeout(video_path);

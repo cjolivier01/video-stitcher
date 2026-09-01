@@ -49,6 +49,7 @@ constexpr DWORD_PTR kProcThreadAttributeJobList = ProcThreadAttributeValue(13, F
 #include <copyfile.h>
 #include <dlfcn.h>
 #include <libproc.h>
+#include <sys/event.h>
 #include <sys/sysctl.h>
 #include <sys/xattr.h>
 #endif
@@ -94,13 +95,19 @@ constexpr auto kProcessPollInterval = std::chrono::milliseconds(2);
 constexpr auto kMinimumTerminationReserve = std::chrono::milliseconds(50);
 constexpr auto kMaximumTerminationReserve = std::chrono::milliseconds(250);
 constexpr std::uint64_t kMaximumWorkerAddressSpaceBytes = 512ULL * 1024ULL * 1024ULL;
-// Reserve each admitted worker's full allowance and leave process memory for
-// the caller, guardians, IPC, and non-probe application state.
-constexpr std::uint64_t kMaximumAggregateWorkerAddressSpaceBytes =
-    2ULL * 1024ULL * 1024ULL * 1024ULL;
-static_assert(kMaximumAggregateWorkerAddressSpaceBytes % kMaximumWorkerAddressSpaceBytes == 0);
+constexpr std::uint64_t kMaximumProbeExecutableSnapshotBytes = 256ULL * 1024ULL * 1024ULL;
+#if defined(__linux__)
+constexpr std::uint64_t kMaximumPerProbeMemoryReservationBytes =
+    kMaximumWorkerAddressSpaceBytes + kMaximumProbeExecutableSnapshotBytes;
+#else
+constexpr std::uint64_t kMaximumPerProbeMemoryReservationBytes = kMaximumWorkerAddressSpaceBytes;
+#endif
+// Reserve every admitted worker's full allowance, including RAM-backed Linux
+// executable snapshots, and leave memory for the caller and process guardians.
+constexpr std::uint64_t kMaximumAggregateProbeMemoryBytes = 2ULL * 1024ULL * 1024ULL * 1024ULL;
 constexpr std::size_t kMaximumConcurrentProbeWorkers =
-    kMaximumAggregateWorkerAddressSpaceBytes / kMaximumWorkerAddressSpaceBytes;
+    kMaximumAggregateProbeMemoryBytes / kMaximumPerProbeMemoryReservationBytes;
+static_assert(kMaximumConcurrentProbeWorkers > 0);
 
 #if !defined(_WIN32)
 const pid_t probe_process_generation = ::getpid();
@@ -127,6 +134,7 @@ struct ProbeLaunchOptions {
 struct SupervisorSlots {
   std::mutex mutex;
   std::uint64_t reserved_worker_address_space_bytes = 0;
+  std::uint64_t reserved_probe_memory_bytes = 0;
 };
 
 SupervisorSlots& supervisor_slots() {
@@ -140,11 +148,12 @@ public:
     require_probe_process_generation();
     auto& slots = supervisor_slots();
     std::lock_guard lock(slots.mutex);
-    if (slots.reserved_worker_address_space_bytes >
-        kMaximumAggregateWorkerAddressSpaceBytes - kMaximumWorkerAddressSpaceBytes) {
-      throw GpuVideoProbeError("the aggregate video probe worker memory budget is exhausted");
+    if (slots.reserved_probe_memory_bytes >
+        kMaximumAggregateProbeMemoryBytes - kMaximumPerProbeMemoryReservationBytes) {
+      throw GpuVideoProbeError("the aggregate video probe memory budget is exhausted");
     }
     slots.reserved_worker_address_space_bytes += kMaximumWorkerAddressSpaceBytes;
+    slots.reserved_probe_memory_bytes += kMaximumPerProbeMemoryReservationBytes;
   }
   SupervisorSlot(const SupervisorSlot&) = delete;
   SupervisorSlot& operator=(const SupervisorSlot&) = delete;
@@ -152,6 +161,7 @@ public:
     auto& slots = supervisor_slots();
     std::lock_guard lock(slots.mutex);
     slots.reserved_worker_address_space_bytes -= kMaximumWorkerAddressSpaceBytes;
+    slots.reserved_probe_memory_bytes -= kMaximumPerProbeMemoryReservationBytes;
   }
 };
 
@@ -947,9 +957,8 @@ UniqueFd snapshot_linux_probe_executable(int source) {
   throw GpuVideoProbeError("sealed Linux video probe snapshots require memfd_create");
 #else
   struct stat before{};
-  constexpr std::uint64_t maximum_snapshot_bytes = 256ULL * 1024ULL * 1024ULL;
   if (::fstat(source, &before) != 0 || before.st_size <= 0 ||
-      static_cast<std::uint64_t>(before.st_size) > maximum_snapshot_bytes) {
+      static_cast<std::uint64_t>(before.st_size) > kMaximumProbeExecutableSnapshotBytes) {
     throw GpuVideoProbeError("failed to snapshot Linux video probe worker: invalid size");
   }
   constexpr auto base_flags = static_cast<unsigned int>(MFD_CLOEXEC | MFD_ALLOW_SEALING);
@@ -1028,9 +1037,8 @@ public:
   MacProbeExecutableSnapshot(int source, std::chrono::steady_clock::time_point deadline) {
     try {
       struct stat before{};
-      constexpr std::uint64_t maximum_snapshot_bytes = 256ULL * 1024ULL * 1024ULL;
       if (::fstat(source, &before) != 0 || before.st_size <= 0 ||
-          static_cast<std::uint64_t>(before.st_size) > maximum_snapshot_bytes) {
+          static_cast<std::uint64_t>(before.st_size) > kMaximumProbeExecutableSnapshotBytes) {
         throw GpuVideoProbeError(
             "failed to snapshot macOS video probe worker: invalid executable size");
       }
@@ -1138,6 +1146,7 @@ private:
       throw GpuVideoProbeError("failed to suppress macOS snapshot cleanup SIGPIPE: " +
                                std::string(std::strerror(errno)));
     }
+    const auto owner_pid = ::getpid();
     const auto maximum_descriptor = descriptor_scan_limit();
     const auto helper = ::fork();
     const auto fork_error = errno;
@@ -1147,7 +1156,22 @@ private:
           !guardian_close_from(STDOUT_FILENO, maximum_descriptor)) {
         guardian_exit(127);
       }
-      const int setup_error = ::mkdir(root_.c_str(), 0700) == 0 ? 0 : errno;
+      UniqueFd owner_monitor(::kqueue());
+      int setup_error = owner_monitor.get() < 0 ? errno : 0;
+      std::array<struct kevent, 2> changes{};
+      if (setup_error == 0) {
+        EV_SET(&changes[0], static_cast<std::uintptr_t>(STDIN_FILENO), EVFILT_READ,
+               EV_ADD | EV_ENABLE, 0, 0, nullptr);
+        EV_SET(&changes[1], static_cast<std::uintptr_t>(owner_pid), EVFILT_PROC,
+               EV_ADD | EV_ENABLE | EV_ONESHOT, NOTE_EXIT, 0, nullptr);
+        if (::kevent(owner_monitor.get(), changes.data(), static_cast<int>(changes.size()), nullptr,
+                     0, nullptr) != 0) {
+          setup_error = errno;
+        }
+      }
+      if (setup_error == 0 && ::mkdir(root_.c_str(), 0700) != 0) {
+        setup_error = errno;
+      }
       std::size_t offset = 0;
       while (offset < sizeof(setup_error)) {
         ssize_t written = -1;
@@ -1166,14 +1190,30 @@ private:
       if (setup_error != 0) {
         guardian_exit(0);
       }
-      char lifetime = '\0';
-      while (true) {
-        const auto received = ::read(STDIN_FILENO, &lifetime, 1);
-        if (received < 0 && errno == EINTR) {
+      bool owner_exited = false;
+      while (!owner_exited) {
+        std::array<struct kevent, 2> events{};
+        const auto event_count = ::kevent(owner_monitor.get(), nullptr, 0, events.data(),
+                                          static_cast<int>(events.size()), nullptr);
+        if (event_count < 0 && errno == EINTR) {
           continue;
         }
-        if (received <= 0) {
+        if (event_count <= 0) {
           break;
+        }
+        for (int index = 0; index < event_count && !owner_exited; ++index) {
+          if (events[static_cast<std::size_t>(index)].filter == EVFILT_PROC) {
+            owner_exited = true;
+            continue;
+          }
+          if (events[static_cast<std::size_t>(index)].filter == EVFILT_READ) {
+            char lifetime = '\0';
+            ssize_t received = -1;
+            do {
+              received = ::read(STDIN_FILENO, &lifetime, 1);
+            } while (received < 0 && errno == EINTR);
+            owner_exited = received <= 0;
+          }
         }
       }
       (void)::chmod(root_.c_str(), 0700);
@@ -3346,8 +3386,16 @@ std::uint64_t detail::maximum_probe_worker_address_space_bytes_for_test() {
   return kMaximumWorkerAddressSpaceBytes;
 }
 
-std::uint64_t detail::maximum_aggregate_probe_worker_address_space_bytes_for_test() {
-  return kMaximumAggregateWorkerAddressSpaceBytes;
+std::uint64_t detail::maximum_probe_executable_snapshot_bytes_for_test() {
+  return kMaximumProbeExecutableSnapshotBytes;
+}
+
+std::uint64_t detail::maximum_per_probe_memory_reservation_bytes_for_test() {
+  return kMaximumPerProbeMemoryReservationBytes;
+}
+
+std::uint64_t detail::maximum_aggregate_probe_memory_bytes_for_test() {
+  return kMaximumAggregateProbeMemoryBytes;
 }
 
 std::uint64_t detail::reserved_probe_worker_address_space_bytes_for_test() {
@@ -3357,10 +3405,43 @@ std::uint64_t detail::reserved_probe_worker_address_space_bytes_for_test() {
   return slots.reserved_worker_address_space_bytes;
 }
 
+std::uint64_t detail::reserved_probe_memory_bytes_for_test() {
+  require_probe_process_generation();
+  auto& slots = supervisor_slots();
+  std::lock_guard lock(slots.mutex);
+  return slots.reserved_probe_memory_bytes;
+}
+
 void detail::hold_probe_worker_memory_reservation_for_test(std::uint64_t hold_ns) {
   SupervisorSlot slot;
   std::this_thread::sleep_for(std::chrono::nanoseconds(hold_ns));
 }
+
+#if defined(__linux__)
+void detail::hold_linux_probe_executable_snapshot_for_test(const std::filesystem::path& worker_path,
+                                                           int ready_descriptor,
+                                                           int release_descriptor) {
+  SupervisorSlot slot;
+  auto source = open_probe_executable(worker_path);
+  auto snapshot = snapshot_linux_probe_executable(source.get());
+  const char ready = 'R';
+  ssize_t written = -1;
+  do {
+    written = ::write(ready_descriptor, &ready, 1);
+  } while (written < 0 && errno == EINTR);
+  if (written != 1) {
+    throw GpuVideoProbeError("failed to report the held Linux video probe snapshot");
+  }
+  char release = '\0';
+  ssize_t received = -1;
+  do {
+    received = ::read(release_descriptor, &release, 1);
+  } while (received < 0 && errno == EINTR);
+  if (received != 1 || release != 'R') {
+    throw GpuVideoProbeError("failed to release the held Linux video probe snapshot");
+  }
+}
+#endif
 
 #if !defined(_WIN32)
 void detail::hold_probe_worker_admission_lock_for_test(std::uint64_t hold_ns,
