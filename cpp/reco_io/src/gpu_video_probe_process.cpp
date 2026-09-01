@@ -693,16 +693,24 @@ int fork_descriptor_registration_error = 0;
 struct ForkProtectedDescriptorState {
   int value = -1;
 };
-constexpr std::size_t kMaximumForkProtectedDescriptors = kMaximumConcurrentProbeWorkers * 2U;
+constexpr std::size_t kMaximumForkProtectedDescriptors = kMaximumConcurrentProbeWorkers * 4U;
 std::array<ForkProtectedDescriptorState*, kMaximumForkProtectedDescriptors>
     fork_protected_descriptors{};
 thread_local int fork_child_retained_descriptor = -1;
+int prepared_fork_child_retained_descriptor = -1;
 
-void lock_fork_descriptors() { (void)::pthread_mutex_lock(&fork_descriptor_mutex); }
-void unlock_fork_descriptors() { (void)::pthread_mutex_unlock(&fork_descriptor_mutex); }
+void prepare_fork_descriptors() {
+  (void)::pthread_mutex_lock(&fork_descriptor_mutex);
+  prepared_fork_child_retained_descriptor = fork_child_retained_descriptor;
+}
+
+void restore_fork_descriptors_in_parent() {
+  prepared_fork_child_retained_descriptor = -1;
+  (void)::pthread_mutex_unlock(&fork_descriptor_mutex);
+}
 
 void close_fork_protected_descriptors_in_child() {
-  const auto retained = fork_child_retained_descriptor;
+  const auto retained = prepared_fork_child_retained_descriptor;
   for (auto*& state : fork_protected_descriptors) {
     if (state != nullptr) {
       if (state->value >= 0 && state->value != retained) {
@@ -712,13 +720,14 @@ void close_fork_protected_descriptors_in_child() {
       state = nullptr;
     }
   }
-  fork_child_retained_descriptor = -1;
-  unlock_fork_descriptors();
+  prepared_fork_child_retained_descriptor = -1;
+  (void)::pthread_mutex_unlock(&fork_descriptor_mutex);
 }
 
 void register_fork_descriptor_handlers() {
-  fork_descriptor_registration_error = ::pthread_atfork(
-      lock_fork_descriptors, unlock_fork_descriptors, close_fork_protected_descriptors_in_child);
+  fork_descriptor_registration_error =
+      ::pthread_atfork(prepare_fork_descriptors, restore_fork_descriptors_in_parent,
+                       close_fork_protected_descriptors_in_child);
 }
 
 class ForkDescriptorLock {
@@ -783,6 +792,54 @@ public:
     }
     *available = state.get();
     return ForkProtectedFd(std::move(state));
+  }
+
+  static std::array<ForkProtectedFd, 2> create_socket_pair(std::string_view description) {
+    auto first = std::make_unique<ForkProtectedDescriptorState>();
+    auto second = std::make_unique<ForkProtectedDescriptorState>();
+    ForkDescriptorLock lock;
+    int descriptors[2] = {-1, -1};
+    bool close_on_exec = false;
+#if defined(SOCK_CLOEXEC)
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, descriptors) == 0) {
+      close_on_exec = true;
+    } else if (errno != EINVAL && errno != EPROTONOSUPPORT) {
+      throw GpuVideoProbeError("failed to create video probe worker " + std::string(description) +
+                               " socket: " + std::string(std::strerror(errno)));
+    }
+#endif
+    if (descriptors[0] < 0 && ::socketpair(AF_UNIX, SOCK_STREAM, 0, descriptors) != 0) {
+      throw GpuVideoProbeError("failed to create video probe worker " + std::string(description) +
+                               " socket: " + std::string(std::strerror(errno)));
+    }
+    try {
+      if (!close_on_exec) {
+        make_close_on_exec(descriptors[0]);
+        make_close_on_exec(descriptors[1]);
+      }
+      std::array<std::size_t, 2> slots{};
+      std::size_t slot_count = 0;
+      for (std::size_t index = 0;
+           index < fork_protected_descriptors.size() && slot_count < slots.size(); ++index) {
+        if (fork_protected_descriptors[index] == nullptr) {
+          slots[slot_count++] = index;
+        }
+      }
+      if (slot_count != slots.size()) {
+        throw GpuVideoProbeError("the video probe fork-protected descriptor registry is exhausted");
+      }
+      first->value = descriptors[0];
+      second->value = descriptors[1];
+      fork_protected_descriptors[slots[0]] = first.get();
+      fork_protected_descriptors[slots[1]] = second.get();
+      return {ForkProtectedFd(std::move(first)), ForkProtectedFd(std::move(second))};
+    } catch (...) {
+      const auto setup_error = errno;
+      (void)::close(descriptors[0]);
+      (void)::close(descriptors[1]);
+      errno = setup_error;
+      throw;
+    }
   }
 
   [[nodiscard]] int get() const { return state_ == nullptr ? -1 : state_->value; }
@@ -972,7 +1029,7 @@ bool wait_for_process_exit(pid_t pid, int* status, std::chrono::steady_clock::ti
 struct GuardianLaunch {
   pid_t supervisor_pid = -1;
   pid_t watchdog_pid = -1;
-  UniqueFd caller_lifetime;
+  ForkProtectedFd caller_lifetime;
 };
 
 GuardianLaunch spawn_guardian_process(const std::string& executable, int executable_descriptor,
@@ -1433,7 +1490,7 @@ bool worker_process_group_exists(pid_t worker_pid) {
   return ::kill(-worker_pid, 0) == 0 || errno != ESRCH;
 }
 
-bool take_supervisor_certificate(UniqueFd* lifetime) noexcept {
+template <typename Descriptor> bool take_supervisor_certificate(Descriptor* lifetime) noexcept {
   if (lifetime == nullptr || lifetime->get() < 0) {
     return false;
   }
@@ -1455,7 +1512,7 @@ public:
   DeferredProcessReaper& operator=(const DeferredProcessReaper&) = delete;
 
   [[nodiscard]] bool add(pid_t pid, std::shared_ptr<SupervisorSlot>&& reservation,
-                         UniqueFd&& certification = UniqueFd{}) noexcept {
+                         ForkProtectedFd&& certification = ForkProtectedFd{}) noexcept {
     std::lock_guard lock(mutex_);
     for (auto& process : processes_) {
       if (process.pid <= 0 && !process.reservation) {
@@ -1473,7 +1530,7 @@ private:
   struct DeferredProcess {
     pid_t pid = -1;
     std::shared_ptr<SupervisorSlot> reservation;
-    UniqueFd certification;
+    ForkProtectedFd certification;
   };
 
   void run() {
@@ -2317,10 +2374,9 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
     marker = duplicate_for_supervisor(opened_marker.get());
   }
 
-  int lifetime_descriptors[2] = {-1, -1};
-  create_socket_pair(lifetime_descriptors, "guardian lifetime");
-  UniqueFd supervisor_lifetime(lifetime_descriptors[0]);
-  UniqueFd caller_lifetime(lifetime_descriptors[1]);
+  auto lifetime_descriptors = ForkProtectedFd::create_socket_pair("guardian lifetime");
+  auto supervisor_lifetime = std::move(lifetime_descriptors[0]);
+  auto caller_lifetime = std::move(lifetime_descriptors[1]);
   make_nonblocking(supervisor_lifetime.get());
   int watchdog_target_descriptors[2] = {-1, -1};
   int supervisor_arm_descriptors[2] = {-1, -1};
@@ -2394,7 +2450,9 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
   fork_child_retained_descriptor = supervisor_executable.get();
   const auto supervisor_pid = ::fork();
   const auto supervisor_fork_error = errno;
-  fork_child_retained_descriptor = -1;
+  if (supervisor_pid != 0) {
+    fork_child_retained_descriptor = -1;
+  }
   if (supervisor_pid == 0) {
     const auto report_error = [&](int error) {
       const auto write_exact = [](const void* data, std::size_t size) {
@@ -3115,7 +3173,7 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
 
 class GuardianProcess {
 public:
-  GuardianProcess(pid_t pid, pid_t watchdog_pid, UniqueFd control, UniqueFd caller_lifetime,
+  GuardianProcess(pid_t pid, pid_t watchdog_pid, UniqueFd control, ForkProtectedFd caller_lifetime,
                   std::chrono::steady_clock::time_point deadline,
                   std::shared_ptr<SupervisorSlot> reservation)
       : pid_(pid), watchdog_pid_(watchdog_pid), control_(std::move(control)),
@@ -3227,7 +3285,7 @@ private:
   pid_t pid_ = -1;
   pid_t watchdog_pid_ = -1;
   UniqueFd control_;
-  UniqueFd caller_lifetime_;
+  ForkProtectedFd caller_lifetime_;
   std::chrono::steady_clock::time_point deadline_;
   std::shared_ptr<SupervisorSlot> reservation_;
   bool certified_ = false;

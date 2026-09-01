@@ -41,6 +41,7 @@
 #include <linux/sched.h>
 #include <linux/seccomp.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/file.h>
 #include <sys/prctl.h>
 #include <sys/random.h>
@@ -161,6 +162,135 @@ public:
 
 private:
   int descriptor_ = -1;
+};
+
+struct ForkProtectedDescriptorState {
+  int value = -1;
+};
+
+constexpr std::size_t kMaximumForkProtectedDescriptors = 2;
+pthread_mutex_t fork_descriptor_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_once_t fork_descriptor_once = PTHREAD_ONCE_INIT;
+int fork_descriptor_registration_error = 0;
+std::array<ForkProtectedDescriptorState*, kMaximumForkProtectedDescriptors>
+    fork_protected_descriptors{};
+
+void lock_fork_descriptors() { (void)::pthread_mutex_lock(&fork_descriptor_mutex); }
+void unlock_fork_descriptors() { (void)::pthread_mutex_unlock(&fork_descriptor_mutex); }
+
+void close_fork_protected_descriptors_in_child() {
+  for (auto*& state : fork_protected_descriptors) {
+    if (state != nullptr) {
+      if (state->value >= 0) {
+        (void)::close(state->value);
+        state->value = -1;
+      }
+      state = nullptr;
+    }
+  }
+  unlock_fork_descriptors();
+}
+
+void register_fork_descriptor_handlers() {
+  fork_descriptor_registration_error = ::pthread_atfork(
+      lock_fork_descriptors, unlock_fork_descriptors, close_fork_protected_descriptors_in_child);
+}
+
+class ForkDescriptorLock {
+public:
+  ForkDescriptorLock() {
+    const auto once_error =
+        ::pthread_once(&fork_descriptor_once, register_fork_descriptor_handlers);
+    if (once_error != 0 || fork_descriptor_registration_error != 0) {
+      const auto error = once_error != 0 ? once_error : fork_descriptor_registration_error;
+      throw CalibrationExecutionError("cannot coordinate calibration descriptor creation: " +
+                                      std::string(std::strerror(error)));
+    }
+    const auto lock_error = ::pthread_mutex_lock(&fork_descriptor_mutex);
+    if (lock_error != 0) {
+      throw CalibrationExecutionError("cannot lock calibration descriptor creation: " +
+                                      std::string(std::strerror(lock_error)));
+    }
+    locked_ = true;
+  }
+
+  ForkDescriptorLock(const ForkDescriptorLock&) = delete;
+  ForkDescriptorLock& operator=(const ForkDescriptorLock&) = delete;
+  ~ForkDescriptorLock() {
+    if (locked_) {
+      unlock_fork_descriptors();
+    }
+  }
+
+private:
+  bool locked_ = false;
+};
+
+class ForkProtectedFd {
+public:
+  ForkProtectedFd() = default;
+  ForkProtectedFd(const ForkProtectedFd&) = delete;
+  ForkProtectedFd& operator=(const ForkProtectedFd&) = delete;
+  ForkProtectedFd(ForkProtectedFd&&) noexcept = default;
+  ForkProtectedFd& operator=(ForkProtectedFd&& other) noexcept {
+    if (this != &other) {
+      reset();
+      state_ = std::move(other.state_);
+    }
+    return *this;
+  }
+  ~ForkProtectedFd() { reset(); }
+
+  template <typename Creator> static ForkProtectedFd create(Creator&& creator) {
+    auto state = std::make_unique<ForkProtectedDescriptorState>();
+    ForkDescriptorLock lock;
+    state->value = std::forward<Creator>(creator)();
+    if (state->value < 0) {
+      const auto create_error = errno;
+      errno = create_error;
+      return {};
+    }
+    const auto available =
+        std::find(fork_protected_descriptors.begin(), fork_protected_descriptors.end(), nullptr);
+    if (available == fork_protected_descriptors.end()) {
+      (void)::close(state->value);
+      state->value = -1;
+      throw CalibrationExecutionError(
+          "the calibration fork-protected descriptor registry is exhausted");
+    }
+    *available = state.get();
+    return ForkProtectedFd(std::move(state));
+  }
+
+  [[nodiscard]] int get() const { return state_ == nullptr ? -1 : state_->value; }
+  [[nodiscard]] explicit operator bool() const { return get() >= 0; }
+
+  void reset() noexcept {
+    if (state_ == nullptr) {
+      return;
+    }
+    if (::pthread_mutex_lock(&fork_descriptor_mutex) != 0) {
+      (void)state_.release();
+      return;
+    }
+    const auto registered = std::find(fork_protected_descriptors.begin(),
+                                      fork_protected_descriptors.end(), state_.get());
+    if (registered != fork_protected_descriptors.end()) {
+      *registered = nullptr;
+    }
+    if (state_->value >= 0) {
+      (void)::close(state_->value);
+      state_->value = -1;
+    }
+    unlock_fork_descriptors();
+    state_.reset();
+  }
+
+private:
+  explicit ForkProtectedFd(std::unique_ptr<ForkProtectedDescriptorState> state)
+      : state_(std::move(state)) {}
+
+  std::unique_ptr<ForkProtectedDescriptorState> state_;
 };
 
 class CgroupRemovalGuard {
@@ -687,29 +817,39 @@ public:
     }
     const auto path = std::filesystem::path("/tmp") /
                       (std::string(kAdmissionFileName) + "-" + std::to_string(::getuid()));
-    descriptor_.reset(
-        ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, S_IRUSR | S_IWUSR));
+    descriptor_ = ForkProtectedFd::create([&] {
+      const auto descriptor =
+          ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, S_IRUSR | S_IWUSR);
+      if (descriptor < 0) {
+        return descriptor;
+      }
+      struct stat status{};
+      if (::fstat(descriptor, &status) != 0 || !S_ISREG(status.st_mode) ||
+          status.st_uid != ::getuid()) {
+        (void)::close(descriptor);
+        throw CalibrationExecutionError("calibration admission lock has unsafe ownership or type");
+      }
+      if (::flock(descriptor, LOCK_EX | LOCK_NB) != 0) {
+        const auto lock_error = errno;
+        (void)::close(descriptor);
+        if (lock_error == EWOULDBLOCK) {
+          throw CalibrationExecutionError(
+              "another calibration holds the cross-process host-memory admission reservation");
+        }
+        throw CalibrationExecutionError(
+            errno_message("cannot acquire calibration admission lock", lock_error));
+      }
+      return descriptor;
+    });
     if (!descriptor_) {
       throw CalibrationExecutionError(errno_message("cannot open calibration admission lock"));
-    }
-    struct stat status{};
-    if (::fstat(descriptor_.get(), &status) != 0 || !S_ISREG(status.st_mode) ||
-        status.st_uid != ::getuid()) {
-      throw CalibrationExecutionError("calibration admission lock has unsafe ownership or type");
-    }
-    if (::flock(descriptor_.get(), LOCK_EX | LOCK_NB) != 0) {
-      if (errno == EWOULDBLOCK) {
-        throw CalibrationExecutionError(
-            "another calibration holds the cross-process host-memory admission reservation");
-      }
-      throw CalibrationExecutionError(errno_message("cannot acquire calibration admission lock"));
     }
   }
 
   [[nodiscard]] int fd() const { return descriptor_.get(); }
 
 private:
-  UniqueFd descriptor_;
+  ForkProtectedFd descriptor_;
 };
 
 [[nodiscard]] std::optional<std::uint64_t> parse_memory_control(const std::filesystem::path& path) {
@@ -1247,7 +1387,7 @@ private:
 #endif
 }
 
-[[nodiscard]] UniqueFd receive_executable_snapshot(int channel) {
+[[nodiscard]] int receive_executable_snapshot(int channel) {
   char marker = '\0';
   std::array<char, CMSG_SPACE(sizeof(int) * 2U)> control{};
   iovec bytes{.iov_base = &marker, .iov_len = 1};
@@ -1286,7 +1426,7 @@ private:
     }
     throw CalibrationExecutionError("calibration executable snapshot helper returned invalid data");
   }
-  return UniqueFd(snapshot);
+  return snapshot;
 }
 
 class PinnedExecutable {
@@ -1356,7 +1496,8 @@ public:
         throw CalibrationExecutionError("calibration worker snapshot exceeded its deadline");
       }
       if ((events[0].revents & POLLIN) != 0) {
-        descriptor_ = receive_executable_snapshot(parent_transport.get());
+        descriptor_ = ForkProtectedFd::create(
+            [&] { return receive_executable_snapshot(parent_transport.get()); });
         break;
       }
       if ((events[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0 ||
@@ -1390,7 +1531,7 @@ public:
   [[nodiscard]] const std::string& display_path() const { return display_path_; }
 
 private:
-  UniqueFd descriptor_;
+  ForkProtectedFd descriptor_;
   std::string display_path_;
 };
 

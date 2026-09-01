@@ -289,6 +289,22 @@ std::optional<pid_t> wait_for_pid_marker(const std::filesystem::path& path,
   return std::nullopt;
 }
 
+std::vector<std::filesystem::path> process_descriptor_targets(pid_t process) {
+  std::vector<std::filesystem::path> targets;
+  std::error_code error;
+  const auto directory = std::filesystem::path("/proc") / std::to_string(process) / "fd";
+  for (std::filesystem::directory_iterator entries(directory, error), end; !error && entries != end;
+       entries.increment(error)) {
+    auto target = std::filesystem::read_symlink(entries->path(), error);
+    if (!error) {
+      targets.push_back(std::move(target));
+    } else {
+      error.clear();
+    }
+  }
+  return targets;
+}
+
 void wait_for_process_removal(pid_t process, std::string_view message) {
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
   while (process_exists(process) && std::chrono::steady_clock::now() < deadline) {
@@ -1264,6 +1280,73 @@ void active_worker_retains_cross_process_admission() {
   (void)::unsetenv("RECO_FAKE_CALIBRATION_WORKER_PID_PATH");
   std::filesystem::remove(marker);
 }
+
+void fork_only_child_does_not_retain_calibration_ownership() {
+  const auto marker = temporary_path("fork-only-worker.pid");
+  std::filesystem::remove(marker);
+  (void)::setenv("RECO_FAKE_CALIBRATION_WORKER_PID_PATH", marker.c_str(), 1);
+  std::exception_ptr first_error;
+  pid_t inherited_child = -1;
+  {
+    Scenario scenario("timeout");
+    std::thread first([&] {
+      try {
+        (void)run_gpu_calibration(lifecycle_request_fixture(), ready_backends());
+      } catch (...) {
+        first_error = std::current_exception();
+      }
+    });
+    const auto worker = wait_for_pid_marker(marker, std::chrono::milliseconds(1500));
+    expect_true(worker.has_value(), "fork-only fixture observes an active calibration worker");
+    if (worker.has_value()) {
+      inherited_child = ::fork();
+      if (inherited_child == 0) {
+        pollfd delay{.fd = -1, .events = 0, .revents = 0};
+        (void)::poll(&delay, 0, 30'000);
+        std::_Exit(EXIT_SUCCESS);
+      }
+      expect_true(inherited_child > 0, "fork-only calibration child starts");
+    }
+    first.join();
+    expect_true(first_error != nullptr, "fork-only fixture reaches its configured deadline");
+  }
+
+  if (inherited_child > 0) {
+    expect_true(process_exists(inherited_child),
+                "fork-only calibration child remains live after the first call");
+    const auto targets = process_descriptor_targets(inherited_child);
+    expect_true(!targets.empty(), "fork-only calibration child descriptor table is inspectable");
+    const auto retains_worker = std::any_of(targets.begin(), targets.end(), [](const auto& target) {
+      return target.string().find("reco-calibration-worker") != std::string::npos;
+    });
+    const auto retains_admission =
+        std::any_of(targets.begin(), targets.end(), [](const auto& target) {
+          return target.string().find("reco-video-stitcher-calibration.lock") != std::string::npos;
+        });
+    expect_true(!retains_worker, "fork-only child does not retain the sealed worker image");
+    expect_true(!retains_admission, "fork-only child does not retain the admission lock");
+  }
+
+  std::exception_ptr second_error;
+  try {
+    Scenario scenario("success");
+    expect_eq(run_gpu_calibration(request_fixture(), ready_backends()).total_matches, 12U,
+              "a fork-only child cannot block later calibration");
+  } catch (...) {
+    second_error = std::current_exception();
+  }
+  if (inherited_child > 0) {
+    (void)::kill(inherited_child, SIGKILL);
+    int status = 0;
+    while (::waitpid(inherited_child, &status, 0) < 0 && errno == EINTR) {
+    }
+  }
+  (void)::unsetenv("RECO_FAKE_CALIBRATION_WORKER_PID_PATH");
+  std::filesystem::remove(marker);
+  if (second_error != nullptr) {
+    std::rethrow_exception(second_error);
+  }
+}
 #endif
 
 void invalid_worker_paths_fail_before_launch() {
@@ -1333,6 +1416,7 @@ int main() {
            caller_death_before_worker_launch_removes_the_boundary);
   run_case("guardian death cleanup", unexpected_guardian_death_kills_the_worker_boundary);
   run_case("cross-process admission", active_worker_retains_cross_process_admission);
+  run_case("fork-only descriptor cleanup", fork_only_child_does_not_retain_calibration_ownership);
 #else
   expect_execution_error([&] { (void)run_gpu_calibration(request_fixture(), ready_backends()); },
                          "fails closed",

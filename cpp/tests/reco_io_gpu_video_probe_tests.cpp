@@ -407,8 +407,7 @@ int run_posix_probe_caller() {
     return EXIT_FAILURE;
   }
   if (inherited_child_path != nullptr && inherited_child_path[0] != '\0' &&
-      (marker_path == nullptr || marker_path[0] == '\0' || inherited_audit_path == nullptr ||
-       inherited_audit_path[0] == '\0')) {
+      (marker_path == nullptr || marker_path[0] == '\0')) {
     return EXIT_FAILURE;
   }
 
@@ -418,14 +417,16 @@ int run_posix_probe_caller() {
   if (inherited_child_path != nullptr && inherited_child_path[0] != '\0') {
     const auto snapshot_marker = std::filesystem::path(marker_path);
     const auto child_marker = std::filesystem::path(inherited_child_path);
-    const auto audit_marker = std::filesystem::path(inherited_audit_path);
+    const auto audit_marker = inherited_audit_path == nullptr
+                                  ? std::filesystem::path{}
+                                  : std::filesystem::path(inherited_audit_path);
     inherited_child_thread = std::thread([&, snapshot_marker, child_marker, audit_marker] {
       int snapshot_descriptor = -1;
       while (!stop_inherited_child.load(std::memory_order_acquire)) {
         std::ifstream marker(snapshot_marker);
         std::uint64_t process_id = 0;
-        if (marker >> process_id >> snapshot_descriptor && process_id != 0 &&
-            snapshot_descriptor >= 0) {
+        if (marker >> process_id && process_id != 0 &&
+            (audit_marker.empty() || (marker >> snapshot_descriptor && snapshot_descriptor >= 0))) {
           break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -435,14 +436,16 @@ int run_posix_probe_caller() {
       }
       const auto child = ::fork();
       if (child == 0) {
-        errno = 0;
-        const auto descriptor_status = ::fcntl(snapshot_descriptor, F_GETFD);
-        const char retained = descriptor_status >= 0 || errno != EBADF ? '1' : '0';
-        const int audit =
-            ::open(audit_marker.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-        if (audit >= 0) {
-          (void)::write(audit, &retained, 1);
-          (void)::close(audit);
+        if (!audit_marker.empty()) {
+          errno = 0;
+          const auto descriptor_status = ::fcntl(snapshot_descriptor, F_GETFD);
+          const char retained = descriptor_status >= 0 || errno != EBADF ? '1' : '0';
+          const int audit =
+              ::open(audit_marker.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+          if (audit >= 0) {
+            (void)::write(audit, &retained, 1);
+            (void)::close(audit);
+          }
         }
         while (true) {
           (void)::pause();
@@ -2411,16 +2414,28 @@ void caller_death_before_supervisor_main(const std::filesystem::path& video_path
 #endif
   const auto marker_path =
       video_path.parent_path() / (video_path.filename().string() + ".pre-main-supervisor");
+  const auto inherited_child_path =
+      video_path.parent_path() / (video_path.filename().string() + ".pre-main-supervisor-child");
   std::filesystem::remove(marker_path);
+  std::filesystem::remove(inherited_child_path);
   set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", marker_path.string());
   set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "supervisor-pre-main-block");
   const auto caller =
-      fork_exec_probe_caller(video_path, fake_probe_worker_path, "probe", 30'000'000'000ULL);
+      fork_exec_probe_caller(video_path, fake_probe_worker_path, "probe", 30'000'000'000ULL, 0,
+                             marker_path, inherited_child_path);
   expect_true(caller > 0, "POSIX pre-main supervisor caller starts");
   if (caller > 0) {
     const auto supervisor = wait_for_process_marker(marker_path, std::chrono::steady_clock::now() +
                                                                      std::chrono::seconds(2));
     expect_true(supervisor.has_value(), "supervisor reaches its pre-main test block");
+    const auto inherited_child = wait_for_process_marker(
+        inherited_child_path, std::chrono::steady_clock::now() + std::chrono::seconds(2));
+    expect_true(inherited_child.has_value(), "fork-only caller child starts while probe is active");
+    if (inherited_child.has_value()) {
+      errno = 0;
+      expect_true(::kill(static_cast<pid_t>(*inherited_child), 0) == 0,
+                  "fork-only caller child remains live before caller death");
+    }
 #if defined(__APPLE__)
     const auto snapshots_during = mac_probe_snapshot_directories();
     for (const auto& snapshot : snapshots_during) {
@@ -2446,6 +2461,12 @@ void caller_death_before_supervisor_main(const std::filesystem::path& video_path
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     expect_true(exited, "pre-main watchdog reclaims the supervisor when its caller dies");
+    if (inherited_child.has_value()) {
+      errno = 0;
+      expect_true(::kill(static_cast<pid_t>(*inherited_child), 0) == 0,
+                  "pre-main supervisor cleanup does not depend on killing the fork-only child");
+      (void)::kill(static_cast<pid_t>(*inherited_child), SIGKILL);
+    }
     if (supervisor.has_value() && !exited) {
       (void)::kill(static_cast<pid_t>(*supervisor), SIGKILL);
     }
@@ -2469,6 +2490,7 @@ void caller_death_before_supervisor_main(const std::filesystem::path& video_path
   set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", "");
   set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
   std::filesystem::remove(marker_path);
+  std::filesystem::remove(inherited_child_path);
 #else
   (void)video_path;
 #endif
