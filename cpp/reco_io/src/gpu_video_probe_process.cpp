@@ -9,6 +9,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <limits>
@@ -113,6 +114,7 @@ void require_probe_process_generation() {}
 struct ProbeLaunchOptions {
   std::chrono::nanoseconds supervisor_start_delay{};
   std::chrono::nanoseconds pre_worker_spawn_delay{};
+  std::filesystem::path pre_supervisor_exec_marker;
   std::chrono::nanoseconds pre_worker_report_delay{};
   std::chrono::nanoseconds pre_guardian_exec_delay{};
   std::filesystem::path pre_guardian_exec_marker;
@@ -838,24 +840,8 @@ constexpr char kGuardianAcknowledge = 'A';
 void execute_pinned_probe(int descriptor, char* const arguments[],
                           char* const environment[]) noexcept {
 #if defined(__APPLE__)
-  char path[32] = "/dev/fd/";
-  char reversed[16]{};
-  auto value = static_cast<unsigned int>(descriptor);
-  std::size_t digits = 0;
-  do {
-    reversed[digits++] = static_cast<char>('0' + value % 10U);
-    value /= 10U;
-  } while (value != 0U && digits < sizeof(reversed));
-  if (descriptor < 0 || value != 0U || sizeof("/dev/fd/") - 1U + digits >= sizeof(path)) {
-    errno = EBADF;
-    return;
-  }
-  auto offset = sizeof("/dev/fd/") - 1U;
-  while (digits > 0U) {
-    path[offset++] = reversed[--digits];
-  }
-  path[offset] = '\0';
-  ::execve(path, arguments, environment);
+  (void)descriptor;
+  ::execve(arguments[0], arguments, environment);
 #else
   ::fexecve(descriptor, arguments, environment);
 #endif
@@ -942,6 +928,104 @@ UniqueFd open_probe_executable(const std::filesystem::path& path) {
   }
   return executable;
 }
+
+#if defined(__APPLE__)
+class MacProbeExecutableSnapshot final {
+public:
+  explicit MacProbeExecutableSnapshot(int source) {
+    try {
+      struct stat before{};
+      constexpr std::uint64_t maximum_snapshot_bytes = 256ULL * 1024ULL * 1024ULL;
+      if (::fstat(source, &before) != 0 || before.st_size <= 0 ||
+          static_cast<std::uint64_t>(before.st_size) > maximum_snapshot_bytes) {
+        throw GpuVideoProbeError(
+            "failed to snapshot macOS video probe worker: invalid executable size");
+      }
+
+      auto pattern = (std::filesystem::temp_directory_path() / "reco-video-probe-XXXXXX").string();
+      if (::mkdtemp(pattern.data()) == nullptr) {
+        throw GpuVideoProbeError("failed to create macOS video probe snapshot directory: " +
+                                 std::string(std::strerror(errno)));
+      }
+      root_ = std::filesystem::path(pattern);
+      executable_ = root_ / "probe-worker";
+      UniqueFd output(
+          ::open(executable_.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600));
+      if (output.get() < 0) {
+        throw GpuVideoProbeError("failed to create macOS video probe snapshot: " +
+                                 std::string(std::strerror(errno)));
+      }
+
+      std::array<char, 64U * 1024U> buffer{};
+      off_t offset = 0;
+      while (offset < before.st_size) {
+        const auto remaining = static_cast<std::uint64_t>(before.st_size - offset);
+        const auto requested = static_cast<std::size_t>(
+            std::min<std::uint64_t>(remaining, static_cast<std::uint64_t>(buffer.size())));
+        ssize_t received = -1;
+        do {
+          received = ::pread(source, buffer.data(), requested, offset);
+        } while (received < 0 && errno == EINTR);
+        if (received <= 0) {
+          throw GpuVideoProbeError("failed to read macOS video probe executable snapshot");
+        }
+        std::size_t written = 0;
+        while (written < static_cast<std::size_t>(received)) {
+          ssize_t count = -1;
+          do {
+            count = ::write(output.get(), buffer.data() + written,
+                            static_cast<std::size_t>(received) - written);
+          } while (count < 0 && errno == EINTR);
+          if (count <= 0) {
+            throw GpuVideoProbeError("failed to write macOS video probe executable snapshot");
+          }
+          written += static_cast<std::size_t>(count);
+        }
+        offset += received;
+      }
+
+      struct stat after{};
+      if (::fstat(source, &after) != 0 || before.st_dev != after.st_dev ||
+          before.st_ino != after.st_ino || before.st_size != after.st_size ||
+          before.st_mtimespec.tv_sec != after.st_mtimespec.tv_sec ||
+          before.st_mtimespec.tv_nsec != after.st_mtimespec.tv_nsec ||
+          before.st_ctimespec.tv_sec != after.st_ctimespec.tv_sec ||
+          before.st_ctimespec.tv_nsec != after.st_ctimespec.tv_nsec) {
+        throw GpuVideoProbeError("macOS video probe executable changed while it was snapshotted");
+      }
+      if (::fsync(output.get()) != 0 || ::fchmod(output.get(), 0500) != 0 ||
+          ::chmod(root_.c_str(), 0500) != 0) {
+        throw GpuVideoProbeError("failed to seal macOS video probe executable snapshot: " +
+                                 std::string(std::strerror(errno)));
+      }
+    } catch (...) {
+      cleanup();
+      throw;
+    }
+  }
+
+  MacProbeExecutableSnapshot(const MacProbeExecutableSnapshot&) = delete;
+  MacProbeExecutableSnapshot& operator=(const MacProbeExecutableSnapshot&) = delete;
+  ~MacProbeExecutableSnapshot() { cleanup(); }
+
+  [[nodiscard]] const std::filesystem::path& executable() const { return executable_; }
+
+private:
+  void cleanup() noexcept {
+    if (root_.empty()) {
+      return;
+    }
+    (void)::chmod(root_.c_str(), 0700);
+    (void)::unlink(executable_.c_str());
+    (void)::rmdir(root_.c_str());
+    executable_.clear();
+    root_.clear();
+  }
+
+  std::filesystem::path root_;
+  std::filesystem::path executable_;
+};
+#endif
 
 void kill_worker_process_group(pid_t worker_pid) {
   if (worker_pid <= 0) {
@@ -2762,6 +2846,13 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   require_worker_launch_active(deadline);
   (void)deferred_process_reaper();
   auto pinned_executable = open_probe_executable(worker_path);
+#if defined(__APPLE__)
+  MacProbeExecutableSnapshot executable_snapshot(pinned_executable.get());
+  pinned_executable = open_probe_executable(executable_snapshot.executable());
+  const auto executable = executable_snapshot.executable().string();
+#else
+  const auto executable = worker_path.string();
+#endif
   int request_socket[2] = {-1, -1};
   int response_socket[2] = {-1, -1};
   int control_socket[2] = {-1, -1};
@@ -2790,10 +2881,29 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   }
 #endif
 
-  const auto executable = worker_path.string();
   auto guard_control = duplicate_for_guardian(child_control.get());
   auto guard_input = duplicate_for_guardian(child_input.get());
   auto guard_output = duplicate_for_guardian(child_output.get());
+  if (!options.pre_supervisor_exec_marker.empty()) {
+    UniqueFd marker(::open(options.pre_supervisor_exec_marker.c_str(),
+                           O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600));
+    if (marker.get() < 0) {
+      throw GpuVideoProbeError("failed to create video probe supervisor pre-exec marker: " +
+                               std::string(std::strerror(errno)));
+    }
+    const auto process = std::to_string(static_cast<std::uint64_t>(::getpid()));
+    std::size_t offset = 0;
+    while (offset < process.size()) {
+      ssize_t written = -1;
+      do {
+        written = ::write(marker.get(), process.data() + offset, process.size() - offset);
+      } while (written < 0 && errno == EINTR);
+      if (written <= 0) {
+        throw GpuVideoProbeError("failed to write video probe supervisor pre-exec marker");
+      }
+      offset += static_cast<std::size_t>(written);
+    }
+  }
   wait_for_worker_launch_delay(options.pre_worker_spawn_delay, deadline);
   auto guardian_launch = spawn_guardian_process(
       executable, pinned_executable.get(), guard_control.get(), guard_input.get(),
@@ -2993,6 +3103,17 @@ GpuVideoProbe detail::probe_gpu_video_with_pre_worker_spawn_delay_for_test(
       config, worker_path, timeout_ns,
       ProbeLaunchOptions{.pre_worker_spawn_delay =
                              std::chrono::nanoseconds(pre_worker_spawn_delay_ns)});
+}
+
+GpuVideoProbe detail::probe_gpu_video_with_pre_supervisor_exec_delay_for_test(
+    const GpuFileDecodeConfig& config, const std::filesystem::path& worker_path,
+    std::uint64_t timeout_ns, std::uint64_t pre_supervisor_exec_delay_ns,
+    const std::filesystem::path& marker_path) {
+  return probe_gpu_video_with_delays(
+      config, worker_path, timeout_ns,
+      ProbeLaunchOptions{.pre_worker_spawn_delay =
+                             std::chrono::nanoseconds(pre_supervisor_exec_delay_ns),
+                         .pre_supervisor_exec_marker = marker_path});
 }
 
 GpuVideoProbe detail::probe_gpu_video_with_pre_worker_report_delay_for_test(

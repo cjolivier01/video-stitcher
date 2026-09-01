@@ -2270,7 +2270,8 @@ void executable_replacement_cannot_change_the_pinned_probe_image(
                                      std::filesystem::perms::owner_exec,
                                  std::filesystem::perm_options::replace);
 
-    const auto run_race = [&](std::string_view name, bool symlink_retarget) {
+    const auto run_race = [&](std::string_view name, bool symlink_retarget,
+                              bool before_supervisor) {
       const auto selected = root / (std::string(name) + "-selected");
       const auto staged = root / (std::string(name) + "-staged");
       const auto marker = root / (std::string(name) + "-marker");
@@ -2286,8 +2287,13 @@ void executable_replacement_cannot_change_the_pinned_probe_image(
       std::exception_ptr probe_error;
       std::thread probe([&] {
         try {
-          result = reco::io::detail::probe_gpu_video_with_pre_guardian_exec_delay_for_test(
-              container_config(video_path), selected, 5'000'000'000ULL, 1'000'000'000ULL, marker);
+          if (before_supervisor) {
+            result = reco::io::detail::probe_gpu_video_with_pre_supervisor_exec_delay_for_test(
+                container_config(video_path), selected, 5'000'000'000ULL, 1'000'000'000ULL, marker);
+          } else {
+            result = reco::io::detail::probe_gpu_video_with_pre_guardian_exec_delay_for_test(
+                container_config(video_path), selected, 5'000'000'000ULL, 1'000'000'000ULL, marker);
+          }
         } catch (...) {
           probe_error = std::current_exception();
         }
@@ -2321,8 +2327,10 @@ void executable_replacement_cannot_change_the_pinned_probe_image(
 
     set_scenario("probe-ok");
     set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
-    run_race("regular executable replacement", false);
-    run_race("symlink retarget", true);
+    run_race("pre-supervisor regular executable replacement", false, true);
+    run_race("pre-supervisor symlink retarget", true, true);
+    run_race("pre-guardian regular executable replacement", false, false);
+    run_race("pre-guardian symlink retarget", true, false);
   } catch (const std::exception& error) {
     std::cerr << "FAIL: pinned executable race fixture failed: " << error.what() << '\n';
     ++failures;
