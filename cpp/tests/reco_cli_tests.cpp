@@ -1025,7 +1025,8 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
   std::thread reader([&] {
     while (running.load(std::memory_order_acquire)) {
       const auto result = read_atomic_output(destination);
-      // ReplaceFileW can transiently hide the destination while never exposing partial contents.
+      // The Windows no-replace handoff can transiently hide the destination while never exposing
+      // partial contents.
       if (result.status == AtomicReadStatus::RetryableFailure
 #if defined(_WIN32)
           || result.status == AtomicReadStatus::Missing
@@ -2165,8 +2166,8 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
         });
   } catch (const std::exception& error) {
     windows_replace_race_rejected =
-        std::string_view(error.what()).find("identity changed during atomic replacement") !=
-        std::string_view::npos;
+        std::string_view(error.what())
+            .find("identity changed before Windows publication handoff") != std::string_view::npos;
   }
   expect_true(windows_replace_race_hook_ran, "Windows exact-replacement race hook runs");
   expect_true(windows_replace_race_rejected, "Windows exact-replacement race is rejected");
@@ -2176,6 +2177,42 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
   expect_eq(read_text_file(windows_replace_race_retained),
             std::string("Windows replace original output\n"),
             "Windows exact-replacement race preserves the prior output moved by the racer");
+
+  const auto windows_source_race_destination = root.path() / "windows-source-race.json";
+  const auto windows_source_race_retained = root.path() / "windows-source-race-retained.json";
+  write_text_file(windows_source_race_destination, "Windows source original output\n");
+  std::filesystem::path windows_source_race_substitute;
+  bool windows_source_race_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"windows-source-race"})json", windows_source_race_destination, left_input,
+        right_input, {}, {}, {}, false, {}, {}, std::chrono::seconds(2), [&] {
+          for (const auto& entry : std::filesystem::directory_iterator(root.path())) {
+            if (entry.path().filename().string().starts_with("windows-source-race.json.tmp.")) {
+              windows_source_race_substitute = entry.path();
+              std::filesystem::rename(entry.path(), windows_source_race_retained);
+              write_text_file(windows_source_race_substitute,
+                              "Windows source concurrent replacement\n");
+              return;
+            }
+          }
+          throw std::runtime_error("Windows source-race temporary fixture was not found");
+        });
+  } catch (const std::exception& error) {
+    windows_source_race_rejected =
+        std::string_view(error.what())
+            .find("identity changed before Windows publication handoff") != std::string_view::npos;
+  }
+  expect_true(windows_source_race_rejected, "Windows replacement-source race is rejected");
+  expect_eq(read_text_file(windows_source_race_destination),
+            std::string("Windows source original output\n"),
+            "Windows replacement-source race preserves the destination");
+  expect_eq(read_text_file(windows_source_race_retained),
+            std::string("{\"writer\":\"windows-source-race\"}\n"),
+            "Windows replacement-source race preserves the intended output");
+  expect_eq(read_text_file(windows_source_race_substitute),
+            std::string("Windows source concurrent replacement\n"),
+            "Windows replacement-source race preserves the substituted entry");
 
   const auto windows_rollback_race_destination = root.path() / "windows-rollback-race.json";
   const auto windows_rollback_race_published = root.path() / "windows-rollback-race-published.json";
@@ -2216,6 +2253,48 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
   }
   expect_true(windows_rollback_original_retained,
               "Windows rollback race retains the original output by identity");
+
+  const auto windows_rollback_source_destination =
+      root.path() / "windows-rollback-source-race.json";
+  const auto windows_rollback_source_retained =
+      root.path() / "windows-rollback-source-race-retained.json";
+  write_text_file(windows_rollback_source_destination, "Windows rollback-source original output\n");
+  std::filesystem::path windows_rollback_source_substitute;
+  bool windows_rollback_source_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"windows-rollback-source-race"})json", windows_rollback_source_destination,
+        left_input, right_input, {}, {}, {}, false,
+        [] { throw std::runtime_error("synthetic Windows rollback-source race"); }, {},
+        std::chrono::seconds(2), {},
+        [&] {
+          for (const auto& entry : std::filesystem::directory_iterator(root.path())) {
+            if (entry.path().filename().string().starts_with(
+                    "windows-rollback-source-race.json.rollback.")) {
+              windows_rollback_source_substitute = entry.path();
+              std::filesystem::rename(entry.path(), windows_rollback_source_retained);
+              write_text_file(windows_rollback_source_substitute,
+                              "Windows rollback-source concurrent replacement\n");
+              return;
+            }
+          }
+          throw std::runtime_error("Windows rollback-source fixture was not found");
+        });
+  } catch (const std::exception& error) {
+    windows_rollback_source_rejected =
+        std::string_view(error.what()).find("rollback failed") != std::string_view::npos;
+  }
+  expect_true(windows_rollback_source_rejected,
+              "Windows rollback replacement-source race is rejected");
+  expect_eq(read_text_file(windows_rollback_source_destination),
+            std::string("{\"writer\":\"windows-rollback-source-race\"}\n"),
+            "Windows rollback replacement-source race preserves the published output");
+  expect_eq(read_text_file(windows_rollback_source_retained),
+            std::string("Windows rollback-source original output\n"),
+            "Windows rollback replacement-source race preserves the original output");
+  expect_eq(read_text_file(windows_rollback_source_substitute),
+            std::string("Windows rollback-source concurrent replacement\n"),
+            "Windows rollback replacement-source race preserves the substituted entry");
 #endif
 
   const auto commit_alias_destination = root.path() / "commit-input-alias-output.json";

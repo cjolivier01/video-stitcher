@@ -266,6 +266,7 @@ struct AllocationInterval {
   std::size_t releases = 0;
   std::size_t allocated_bytes = 0;
   std::size_t released_bytes = 0;
+  std::size_t copied_plane_releases = 0;
 };
 
 struct AllocationIntervalTrace final : CudaBackendTraceSink {
@@ -276,13 +277,54 @@ struct AllocationIntervalTrace final : CudaBackendTraceSink {
   void device_allocation_released(std::size_t bytes) noexcept override {
     ++current.releases;
     current.released_bytes += bytes;
+    if (copied_plane_bytes != 0 && bytes == copied_plane_bytes) {
+      ++current.copied_plane_releases;
+    }
   }
 
-  void begin_left_read() noexcept { current = {}; }
-  void begin_right_read() { intervals.push_back(current); }
+  void begin_left_read() noexcept {
+    if (phase == Phase::RightToNextLeft) {
+      record(right_to_next_left, right_to_next_left_count, current);
+    }
+    current = {};
+    phase = Phase::LeftToRight;
+  }
+
+  void begin_right_read() noexcept {
+    record(left_to_right, left_to_right_count, current);
+    if (copied_plane_bytes == 0 && current.allocations == 1) {
+      copied_plane_bytes = current.allocated_bytes;
+    }
+    current = {};
+    phase = Phase::RightToNextLeft;
+  }
+
+  void finish() noexcept {
+    if (phase == Phase::RightToNextLeft) {
+      record(right_to_next_left, right_to_next_left_count, current);
+      phase = Phase::Finished;
+    }
+  }
+
+  void record(std::array<AllocationInterval, 8>& intervals, std::size_t& count,
+              const AllocationInterval& interval) noexcept {
+    if (count < intervals.size()) {
+      intervals[count++] = interval;
+    } else {
+      overflow = true;
+    }
+  }
+
+  enum class Phase { None, LeftToRight, RightToNextLeft, Finished };
 
   AllocationInterval current;
-  std::vector<AllocationInterval> intervals;
+  std::array<AllocationInterval, 8> left_to_right{};
+  std::array<AllocationInterval, 8> right_to_next_left{};
+  std::size_t left_to_right_count = 0;
+  std::size_t right_to_next_left_count = 0;
+  std::size_t copied_plane_bytes = 0;
+  Phase phase = Phase::None;
+  bool overflow = false;
 };
 
 struct CudaNvmmOwner {
@@ -587,6 +629,7 @@ void seekable_source_calibration_releases_each_pair(CudaBackend& backend) {
                                           indices, params, params, config);
       },
       "no usable frame pairs", "uniform seeked frames produce no calibration features");
+  allocation_trace->finish();
   expect_eq(left_source.read_count(), indices.size(), "left source returns every selected frame");
   expect_eq(right_source.read_count(), indices.size(), "right source returns every selected frame");
   expect_true(*left_seeks == std::vector<std::uint64_t>({indices[1], indices[2]}),
@@ -596,9 +639,11 @@ void seekable_source_calibration_releases_each_pair(CudaBackend& backend) {
   expect_true(std::all_of(lifetimes.begin(), lifetimes.end(),
                           [](const auto& lifetime) { return lifetime.expired(); }),
               "seeked calibration releases every decoder-owned surface");
-  expect_eq(allocation_trace->intervals.size(), indices.size(),
+  expect_true(!allocation_trace->overflow, "allocation interval trace does not overflow");
+  expect_eq(allocation_trace->left_to_right_count, indices.size(),
             "each calibration pair records its left-copy allocation interval");
-  for (const auto& interval : allocation_trace->intervals) {
+  for (std::size_t index = 0; index < allocation_trace->left_to_right_count; ++index) {
+    const auto& interval = allocation_trace->left_to_right[index];
     expect_eq(interval.allocations, 1U,
               "each left read creates exactly one calibration-owned allocation");
     expect_true(interval.allocated_bytes >= 854U * 64U,
@@ -607,6 +652,15 @@ void seekable_source_calibration_releases_each_pair(CudaBackend& backend) {
               "previous copied pair is released before allocating the next left frame");
     expect_eq(interval.released_bytes, 0U,
               "no prior calibration allocation remains live during the next left read");
+  }
+  expect_eq(allocation_trace->right_to_next_left_count, indices.size(),
+            "each calibration pair records releases through the next pair boundary");
+  for (std::size_t index = 0; index < allocation_trace->right_to_next_left_count; ++index) {
+    const auto& interval = allocation_trace->right_to_next_left[index];
+    expect_true(interval.allocations >= 1,
+                "each right read creates its calibration-owned luma allocation");
+    expect_true(interval.copied_plane_releases >= 2,
+                "both copied luma planes are released before the next pair remains live");
   }
 }
 

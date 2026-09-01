@@ -707,19 +707,26 @@ CudaPitchedAllocation CudaBackend::allocate_pitched(std::size_t width_bytes, std
   }
 
   const std::size_t size = pitch * height;
-  auto impl = impl_;
-  auto trace_sink = trace_sink_;
-  std::function<void(CudaDevicePtr)> deleter = [impl, trace_sink, size](CudaDevicePtr allocation) {
-    impl->ensure_primary_context(0);
-    check_cuda("cuMemFree_v2", impl->cu_mem_free(allocation));
-    if (trace_sink) {
-      trace_sink->device_allocation_released(size);
+  try {
+    auto impl = impl_;
+    auto trace_sink = trace_sink_;
+    std::function<void(CudaDevicePtr)> deleter = [impl, trace_sink,
+                                                  size](CudaDevicePtr allocation) {
+      impl->ensure_primary_context(0);
+      check_cuda("cuMemFree_v2", impl->cu_mem_free(allocation));
+      if (trace_sink) {
+        trace_sink->device_allocation_released(size);
+      }
+    };
+    if (trace_sink_) {
+      trace_sink_->device_allocation_created(size);
     }
-  };
-  if (trace_sink_) {
-    trace_sink_->device_allocation_created(size);
+    return {.buffer = CudaDeviceBuffer(ptr, size, std::move(deleter)), .pitch = pitch};
+  } catch (...) {
+    const auto free_result = impl_->cu_mem_free(ptr);
+    (void)free_result;
+    throw;
   }
-  return {.buffer = CudaDeviceBuffer(ptr, size, std::move(deleter)), .pitch = pitch};
 }
 
 CudaSharedMemory CudaBackend::allocate_shared_memory(std::size_t bytes) const {
