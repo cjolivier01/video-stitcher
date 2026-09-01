@@ -2436,23 +2436,67 @@ void guardian_wait_for_owned_session_cleanup(pid_t supervisor_pid) {
   }
 
   while (true) {
-    std::array<kinfo_proc, 4096> processes{};
-    std::size_t bytes = sizeof(processes);
-    int query[] = {CTL_KERN, KERN_PROC, KERN_PROC_SESSION, session_id};
-    const auto query_result = ::sysctl(query, static_cast<unsigned int>(std::size(query)),
-                                       processes.data(), &bytes, nullptr, 0);
-    const bool uncertain =
-        query_result != 0 || bytes % sizeof(kinfo_proc) != 0 || bytes >= sizeof(processes);
+    std::array<pid_t, 4096> processes{};
+    const auto proc_listpids = apple_proc_listpids();
+    if (proc_listpids == nullptr) {
+      (void)::nanosleep(&kSessionPollPause, nullptr);
+      continue;
+    }
+    errno = 0;
+    const auto bytes =
+        proc_listpids(PROC_ALL_PIDS, 0, processes.data(), static_cast<int>(sizeof(processes)));
+    const auto list_error = errno;
+    bool uncertain = bytes < 0 || (bytes == 0 && list_error != 0) ||
+                     static_cast<std::size_t>(bytes) >= sizeof(processes) ||
+                     bytes % static_cast<int>(sizeof(pid_t)) != 0;
     bool found_member = false;
-    if (query_result == 0) {
-      const auto process_count = std::min(bytes / sizeof(kinfo_proc), processes.size());
+    if (!uncertain) {
+      const auto process_count = static_cast<std::size_t>(bytes) / sizeof(pid_t);
       for (std::size_t index = 0; index < process_count; ++index) {
-        const auto process = processes[index].kp_proc.p_pid;
+        const auto process = processes[index];
+        if (process <= 0 || process == owner_pid || process == supervisor_pid) {
+          continue;
+        }
+        errno = 0;
+        const auto observed_session = ::getsid(process);
+        if (observed_session < 0) {
+          if (errno != ESRCH) {
+            uncertain = true;
+          }
+          continue;
+        }
+        if (observed_session != session_id) {
+          continue;
+        }
+        kinfo_proc process_info{};
+        std::size_t process_info_size = sizeof(process_info);
+        int query[] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, process};
+        if (::sysctl(query, static_cast<unsigned int>(std::size(query)), &process_info,
+                     &process_info_size, nullptr, 0) != 0) {
+          if (errno != ESRCH && errno != ENOENT) {
+            uncertain = true;
+          }
+          continue;
+        }
+        if (process_info_size == 0) {
+          continue;
+        }
+        if (process_info_size != sizeof(process_info) || process_info.kp_proc.p_pid != process) {
+          uncertain = true;
+          continue;
+        }
+        errno = 0;
+        const auto verified_session = ::getsid(process);
+        if (verified_session < 0) {
+          if (errno != ESRCH) {
+            uncertain = true;
+          }
+          continue;
+        }
         // A killed pre-main grandchild can remain an init-owned zombie in the
         // session. It has no address space or execution authority and cannot
         // delay certification of the directly pinned supervisor child.
-        if (process > 0 && process != owner_pid && process != supervisor_pid &&
-            processes[index].kp_proc.p_stat != SZOMB) {
+        if (verified_session == session_id && process_info.kp_proc.p_stat != SZOMB) {
           found_member = true;
         }
       }
