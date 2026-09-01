@@ -4,12 +4,14 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -171,6 +173,14 @@ struct FakePipeline : FakeObject {
   std::uint64_t compressed_input_count = 0;
   bool dequeue_race_emitted = false;
   int state = 1;
+  std::mutex flush_mutex;
+  std::condition_variable flush_changed;
+  bool flush_started = false;
+};
+
+struct FakeEvent {
+  enum class Type { FlushStart };
+  Type type = Type::FlushStart;
 };
 
 constexpr std::uint64_t kFakeCapsMagic = 0x5245434f43415053ULL;
@@ -895,6 +905,27 @@ RECO_FAKE_EXPORT int gst_element_set_state(void* pipeline_pointer, int state) {
     pipeline->has_seek = false;
     ++pipeline->seek_generation;
   }
+  return 1;
+}
+
+RECO_FAKE_EXPORT void* gst_event_new_flush_start() {
+  record("new-flush-start");
+  return new FakeEvent;
+}
+
+RECO_FAKE_EXPORT int gst_element_send_event(void* pipeline_pointer, void* event_pointer) {
+  std::unique_ptr<FakeEvent> event(static_cast<FakeEvent*>(event_pointer));
+  if (pipeline_pointer == nullptr || event == nullptr ||
+      event->type != FakeEvent::Type::FlushStart) {
+    return 0;
+  }
+  auto* pipeline = static_cast<FakePipeline*>(pipeline_pointer);
+  {
+    std::lock_guard lock(pipeline->flush_mutex);
+    pipeline->flush_started = true;
+  }
+  record("send-flush-start");
+  pipeline->flush_changed.notify_all();
   return 1;
 }
 
@@ -1758,6 +1789,18 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
   }
   record("pull");
   const auto current_scenario = scenario();
+  if (current_scenario == "stop-blocked-read") {
+    std::unique_lock lock(sink->pipeline->flush_mutex);
+    if (sink->pipeline->flush_started) {
+      lock.unlock();
+      record("post-flush-drain");
+      return nullptr;
+    }
+    record("pull-blocked");
+    sink->pipeline->flush_changed.wait(lock, [&] { return sink->pipeline->flush_started; });
+    record("pull-unblocked");
+    return nullptr;
+  }
   if (sink->observed_seek_generation != sink->pipeline->seek_generation) {
     sink->observed_seek_generation = sink->pipeline->seek_generation;
     const bool ambiguous_zero_seek =

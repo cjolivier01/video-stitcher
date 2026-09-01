@@ -123,6 +123,18 @@ std::size_t count_event(const std::vector<std::string>& events, std::string_view
   return count;
 }
 
+bool wait_for_event(const std::filesystem::path& path, std::string_view expected,
+                    std::chrono::steady_clock::duration timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (count_event(read_events(path), expected) != 0) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return false;
+}
+
 GpuFileDecodeConfig valid_config() {
   return {.path = "/data/left.mp4",
           .codec = GpuDecodeCodec::H264,
@@ -262,7 +274,7 @@ void persistent_stereo_session_pairs_gstreamer_sources() {
             "persistent frame release stops both deferred GStreamer pipelines");
 }
 
-void early_stereo_stop_releases_source_pipeline_ownership() {
+void early_stereo_stop_flushes_both_pipelines_before_teardown() {
   set_scenario("frame-eos");
   const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
   std::filesystem::remove(event_path);
@@ -283,17 +295,58 @@ void early_stereo_stop_releases_source_pipeline_ownership() {
               "early-stopped session reports the stopped status");
 
   auto events = read_events(event_path);
+  expect_eq(count_event(events, "send-flush-start"), 2U,
+            "early stop flushes both GStreamer pipelines before teardown");
   expect_eq(count_event(events, "state-null"), 0U,
             "early stop keeps pipelines alive while returned frames are retained");
   paired.frames.reset();
   events = read_events(event_path);
-  expect_eq(count_event(events, "state-null"), 2U,
-            "returned-frame release closes early-stopped pipelines before session destruction");
+  expect_eq(count_event(events, "state-null"), 0U,
+            "returned-frame release leaves pipeline teardown to session destruction");
 
   session.reset();
   events = read_events(event_path);
   expect_eq(count_event(events, "state-null"), 2U,
-            "session destruction does not close early-stopped pipelines twice");
+            "session destruction closes both flushed pipelines once");
+}
+
+void stop_flushes_a_blocked_appsink_read_before_teardown() {
+  set_scenario("stop-blocked-read");
+  const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
+  std::filesystem::remove(event_path);
+  auto source =
+      open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+  std::atomic<bool> read_returned{false};
+  std::atomic<bool> read_failed{false};
+  std::thread reader([&] {
+    try {
+      const auto result = source->read();
+      read_returned = result.status == GpuDecodeFrameStatus::EndOfStream;
+    } catch (...) {
+      read_failed = true;
+    }
+  });
+  const bool pull_blocked = wait_for_event(event_path, "pull-blocked", std::chrono::seconds(2));
+  expect_true(pull_blocked, "stop fixture enters its blocking appsink pull");
+
+  const auto started = std::chrono::steady_clock::now();
+  source->request_stop();
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  reader.join();
+
+  expect_true(elapsed < std::chrono::seconds(2),
+              "source stop flushes and joins a blocked appsink pull promptly");
+  expect_true(read_returned.load(), "flushed appsink read returns end-of-stream");
+  expect_true(!read_failed.load(), "flushed appsink read does not fail");
+  const auto events = read_events(event_path);
+  expect_eq(count_event(events, "post-flush-drain"), 1U,
+            "source stop drains queued appsink samples after the blocked pull exits");
+  const auto blocked = std::find(events.begin(), events.end(), "pull-blocked");
+  const auto flushed = std::find(events.begin(), events.end(), "send-flush-start");
+  const auto unblocked = std::find(events.begin(), events.end(), "pull-unblocked");
+  const auto stopped = std::find(events.begin(), events.end(), "state-null");
+  expect_true(blocked < flushed && flushed < unblocked && unblocked < stopped,
+              "flush unblocks the appsink pull before pipeline teardown");
 }
 
 void orientation_tags_are_preserved() {
@@ -900,7 +953,8 @@ int run_tests() {
 
   production_source_retains_mapped_sample();
   persistent_stereo_session_pairs_gstreamer_sources();
-  early_stereo_stop_releases_source_pipeline_ownership();
+  early_stereo_stop_flushes_both_pipelines_before_teardown();
+  stop_flushes_a_blocked_appsink_read_before_teardown();
   orientation_tags_are_preserved();
   indexed_cadence_drives_frame_indices();
   indexed_decode_seeks_to_absolute_start_frame();

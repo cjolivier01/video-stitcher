@@ -199,6 +199,8 @@ public:
   using ElementSetState = int (*)(void*, int);
   using ElementGetState = int (*)(void*, int*, int*, std::uint64_t);
   using ElementSeekSimple = int (*)(void*, int, int, std::int64_t);
+  using ElementSendEvent = int (*)(void*, void*);
+  using EventNewFlushStart = void* (*)();
   using ElementGetBus = void* (*)(void*);
   using ObjectUnref = void (*)(void*);
   using PadGetCurrentCaps = void* (*)(void*);
@@ -262,6 +264,8 @@ public:
     element_set_state = core_library->symbol<ElementSetState>("gst_element_set_state");
     element_get_state = core_library->symbol<ElementGetState>("gst_element_get_state");
     element_seek_simple = core_library->symbol<ElementSeekSimple>("gst_element_seek_simple");
+    element_send_event = core_library->symbol<ElementSendEvent>("gst_element_send_event");
+    event_new_flush_start = core_library->symbol<EventNewFlushStart>("gst_event_new_flush_start");
     element_get_bus = core_library->symbol<ElementGetBus>("gst_element_get_bus");
     object_unref = core_library->symbol<ObjectUnref>("gst_object_unref");
     pad_get_current_caps = core_library->symbol<PadGetCurrentCaps>("gst_pad_get_current_caps");
@@ -310,6 +314,8 @@ public:
   ElementSetState element_set_state = nullptr;
   ElementGetState element_get_state = nullptr;
   ElementSeekSimple element_seek_simple = nullptr;
+  ElementSendEvent element_send_event = nullptr;
+  EventNewFlushStart event_new_flush_start = nullptr;
   ElementGetBus element_get_bus = nullptr;
   ObjectUnref object_unref = nullptr;
   PadGetCurrentCaps pad_get_current_caps = nullptr;
@@ -380,7 +386,20 @@ public:
   GstreamerPipelineResources(const GstreamerPipelineResources&) = delete;
   GstreamerPipelineResources& operator=(const GstreamerPipelineResources&) = delete;
 
+  void interrupt() noexcept {
+    std::lock_guard lock(mutex_);
+    if (interrupted_ || closed_ || pipeline == nullptr) {
+      return;
+    }
+    interrupted_ = true;
+    if (void* flush = api_->event_new_flush_start(); flush != nullptr) {
+      // gst_element_send_event takes ownership of the event, including on failure.
+      (void)api_->element_send_event(pipeline, flush);
+    }
+  }
+
   void close() noexcept {
+    std::lock_guard lock(mutex_);
     if (closed_) {
       return;
     }
@@ -438,6 +457,8 @@ public:
 
 private:
   std::shared_ptr<GstreamerApi> api_;
+  std::mutex mutex_;
+  bool interrupted_ = false;
   bool closed_ = false;
 };
 
@@ -960,11 +981,18 @@ public:
     if (!stop_requested_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
       return;
     }
-    // Wait out the bounded appsink poll before releasing the source's pipeline ownership. Any
-    // returned frame leases keep the resources alive independently until their CUDA work ends.
+    // Flush first: NVIDIA GStreamer elements can otherwise retain a streaming-pad lock while a
+    // bounded appsink pull is active, making the subsequent NULL state transition deadlock.
+    resources_->interrupt();
+    // Wait out the bounded appsink poll. Pipeline ownership stays with the source until normal
+    // destruction so a stereo session can flush and join both decoders before either NVIDIA
+    // pipeline begins its NULL state transition.
     std::lock_guard lock(read_mutex_);
     ended_ = true;
-    close();
+    for (void* sample = api_->app_sink_try_pull_sample(sink_, 0); sample != nullptr;
+         sample = api_->app_sink_try_pull_sample(sink_, 0)) {
+      api_->sample_unref(sample);
+    }
   }
 
   void seek_to_frame(std::uint64_t frame_index) override {

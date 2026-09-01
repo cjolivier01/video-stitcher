@@ -226,7 +226,8 @@ std::string build_gstreamer_gpu_file_decode_pipeline(const GpuFileDecodeConfig& 
            << " ! video/x-raw(memory:NVMM),format=NV12"
            << " ! identity name=output_info silent=true"
            << " ! appsink name=sink emit-signals=false sync=false max-buffers="
-           << config.max_buffers << " drop=" << (config.drop ? "true" : "false");
+           << config.max_buffers << " drop=" << (config.drop ? "true" : "false")
+           << " wait-on-eos=false";
   return pipeline.str();
 }
 

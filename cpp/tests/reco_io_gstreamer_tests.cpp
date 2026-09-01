@@ -189,6 +189,8 @@ void gpu_file_decode_pipeline_preserves_nvmm() {
   expect_true(pipeline.find("appsink name=sink") != std::string::npos, "appsink selected");
   expect_true(pipeline.find("drop=false") != std::string::npos,
               "offline GPU decode is lossless by default");
+  expect_true(pipeline.find("wait-on-eos=false") != std::string::npos,
+              "early GPU decode stop cannot wait forever on queued appsink frames");
 
   config.path = "/data/left.hevc";
   config.codec = gpu_decode_codec_for_path(config.path);
