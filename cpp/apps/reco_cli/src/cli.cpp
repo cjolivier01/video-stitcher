@@ -11,6 +11,7 @@
 #include "reco/io/gpu_decode.hpp"
 #include "reco/io/gstreamer.hpp"
 #include "rules_cc/cc/runfiles/runfiles.h"
+#include "stitch.hpp"
 
 #include <algorithm>
 #include <array>
@@ -2925,6 +2926,21 @@ require_gpu_video_backend(const reco::calibrate::CalibrationBackendStatus& backe
 }
 
 std::optional<std::string>
+require_gpu_stitch_backend(const reco::calibrate::CalibrationBackendStatus& backends) {
+  if (!backends.cuda.available) {
+    return "CUDA is required for the C++ GPU stitch path: " + backends.cuda.detail;
+  }
+  if (!backends.gstreamer.available) {
+    return "GStreamer is required for the C++ GPU stitch path: " + backends.gstreamer.detail;
+  }
+  if (!backends.nvbufsurface.available) {
+    return "NvBufSurface is required for GPU-resident decode and encode: " +
+           backends.nvbufsurface.detail;
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string>
 require_cuda_npp_backend(const reco::calibrate::CalibrationBackendStatus& backends) {
   if (!backends.cuda.available) {
     return "CUDA is required for the C++ GPU video path: " + backends.cuda.detail;
@@ -2996,11 +3012,8 @@ RuntimePlan build_stitch_plan(const StitchCommand& command,
   if (command.no_zero_copy) {
     plan.blocked_reason =
         "C++ stitch does not support --no-zero-copy because it would force a CPU path";
-  } else if (auto error = require_gpu_video_backend(backends, false); error.has_value()) {
+  } else if (auto error = require_gpu_stitch_backend(backends); error.has_value()) {
     plan.blocked_reason = *error;
-  } else {
-    plan.blocked_reason =
-        "C++ GPU stitch renderer and encode execution are not ported yet; refusing CPU fallback";
   }
   return plan;
 }
@@ -4089,11 +4102,19 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err,
     return 0;
   }
 
-  RuntimePlan runtime_plan;
   if (const auto* stitch = std::get_if<StitchCommand>(&command)) {
     const auto backends = reco::calibrate::probe_calibration_backends();
-    runtime_plan = build_stitch_plan(*stitch, backends);
-  } else if (const auto* preview = std::get_if<PreviewCommand>(&command)) {
+    const auto plan = build_stitch_plan(*stitch, backends);
+    write_runtime_plan(out, plan);
+    if (plan.blocked_reason.has_value()) {
+      err << "error: " << *plan.blocked_reason << '\n';
+      return 2;
+    }
+    return detail::run_gpu_stitch(*stitch, executable_path, out, err);
+  }
+
+  RuntimePlan runtime_plan;
+  if (const auto* preview = std::get_if<PreviewCommand>(&command)) {
     const auto backends = reco::calibrate::probe_calibration_backends();
     runtime_plan = build_preview_plan(*preview, backends);
   } else if (const auto* camera = std::get_if<CameraCommand>(&command)) {
