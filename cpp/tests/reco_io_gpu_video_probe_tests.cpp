@@ -67,6 +67,7 @@ constexpr const char* kProbeCallerInheritedChildPath =
 constexpr const char* kProbeCallerInheritedAuditPath =
     "RECO_FAKE_PROBE_CALLER_INHERITED_AUDIT_PATH";
 volatile sig_atomic_t signal_fork_report_descriptor = -1;
+volatile sig_atomic_t signal_fork_handled = 0;
 
 void fork_from_signal_handler(int) {
   const auto saved_error = errno;
@@ -78,6 +79,7 @@ void fork_from_signal_handler(int) {
   if (child > 0 && descriptor >= 0) {
     (void)::write(descriptor, &child, sizeof(child));
   }
+  signal_fork_handled = 1;
   errno = saved_error;
 }
 #endif
@@ -3455,13 +3457,15 @@ void signal_handler_fork_cannot_deadlock_the_probe_registry() {
     return;
   }
   signal_fork_report_descriptor = report[1];
+  signal_fork_handled = 0;
   std::exception_ptr holder_error;
   std::thread holder([&] {
     try {
       reco::io::detail::hold_probe_fork_descriptor_registry_for_test(ready[1], release[0]);
-      // Darwin may defer a thread-directed pending signal until after the
-      // unmasking call returns. Keep the target thread alive for delivery.
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (signal_fork_handled == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
     } catch (...) {
       holder_error = std::current_exception();
     }
@@ -3494,6 +3498,7 @@ void signal_handler_fork_cannot_deadlock_the_probe_registry() {
                 "probe signal-handler child exits cleanly");
   }
   signal_fork_report_descriptor = -1;
+  signal_fork_handled = 0;
   expect_true(::sigaction(SIGUSR1, &previous, nullptr) == 0, "probe signal-fork handler restores");
   for (const auto descriptor : {ready[0], ready[1], release[0], release[1], report[0], report[1]}) {
     (void)::close(descriptor);
