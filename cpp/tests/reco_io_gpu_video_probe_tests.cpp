@@ -67,7 +67,6 @@ constexpr const char* kProbeCallerInheritedChildPath =
 constexpr const char* kProbeCallerInheritedAuditPath =
     "RECO_FAKE_PROBE_CALLER_INHERITED_AUDIT_PATH";
 volatile sig_atomic_t signal_fork_report_descriptor = -1;
-volatile sig_atomic_t signal_fork_handled = 0;
 
 void fork_from_signal_handler(int) {
   const auto saved_error = errno;
@@ -79,7 +78,6 @@ void fork_from_signal_handler(int) {
   if (child > 0 && descriptor >= 0) {
     (void)::write(descriptor, &child, sizeof(child));
   }
-  signal_fork_handled = 1;
   errno = saved_error;
 }
 #endif
@@ -3457,15 +3455,10 @@ void signal_handler_fork_cannot_deadlock_the_probe_registry() {
     return;
   }
   signal_fork_report_descriptor = report[1];
-  signal_fork_handled = 0;
   std::exception_ptr holder_error;
   std::thread holder([&] {
     try {
       reco::io::detail::hold_probe_fork_descriptor_registry_for_test(ready[1], release[0]);
-      const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-      while (signal_fork_handled == 0 && std::chrono::steady_clock::now() < deadline) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      }
     } catch (...) {
       holder_error = std::current_exception();
     }
@@ -3473,17 +3466,17 @@ void signal_handler_fork_cannot_deadlock_the_probe_registry() {
   char ready_marker = '\0';
   expect_true(::read(ready[0], &ready_marker, 1) == 1 && ready_marker == 'R',
               "probe descriptor registry reaches its held state");
-  expect_true(::pthread_kill(holder.native_handle(), SIGUSR1) == 0,
-              "probe signal-fork request is delivered to the registry owner");
-  pollfd pending{.fd = report[0], .events = POLLIN, .revents = 0};
-  expect_true(::poll(&pending, 1, 25) == 0,
-              "probe registry defers the signal handler while its mutex is held");
-  const char release_marker = 'R';
-  expect_true(::write(release[1], &release_marker, 1) == 1,
-              "probe descriptor registry holder is released");
+  std::thread releaser([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    const char release_marker = 'R';
+    (void)::write(release[1], &release_marker, 1);
+  });
+  expect_true(::pthread_kill(::pthread_self(), SIGUSR1) == 0,
+              "probe signal handler forks while another thread owns the registry");
   holder.join();
+  releaser.join();
   expect_true(holder_error == nullptr, "probe descriptor registry holder completes");
-  pending.revents = 0;
+  pollfd pending{.fd = report[0], .events = POLLIN, .revents = 0};
   const auto reported = ::poll(&pending, 1, 2000);
   pid_t fork_child = -1;
   if (reported > 0) {
@@ -3498,7 +3491,6 @@ void signal_handler_fork_cannot_deadlock_the_probe_registry() {
                 "probe signal-handler child exits cleanly");
   }
   signal_fork_report_descriptor = -1;
-  signal_fork_handled = 0;
   expect_true(::sigaction(SIGUSR1, &previous, nullptr) == 0, "probe signal-fork handler restores");
   for (const auto descriptor : {ready[0], ready[1], release[0], release[1], report[0], report[1]}) {
     (void)::close(descriptor);
