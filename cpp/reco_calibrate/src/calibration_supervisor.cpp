@@ -2078,9 +2078,10 @@ void close_child_descriptors_except(int preserved) noexcept {
 #if defined(RECO_CALIBRATION_THREAD_SANITIZER)
   return true;
 #elif defined(__x86_64__) || defined(__aarch64__)
-#define RECO_PRE_MAIN_DENY(syscall_number)                                                         \
+#define RECO_PRE_MAIN_DENY_ERROR(syscall_number, error_number)                                     \
   BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, syscall_number, 0, 1),                                       \
-      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM)
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | error_number)
+#define RECO_PRE_MAIN_DENY(syscall_number) RECO_PRE_MAIN_DENY_ERROR(syscall_number, EPERM)
   const sock_filter filter[] = {
       BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, arch)),
       BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kSeccompArchitecture, 1, 0),
@@ -2115,23 +2116,10 @@ void close_child_descriptors_except(int preserved) noexcept {
       BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
 #endif
 #if defined(SYS_openat2)
-      RECO_PRE_MAIN_DENY(SYS_openat2),
+      RECO_PRE_MAIN_DENY_ERROR(SYS_openat2, ENOSYS),
 #endif
-#if defined(SYS_unlink)
-      RECO_PRE_MAIN_DENY(SYS_unlink),
-#endif
-#if defined(SYS_unlinkat)
-      RECO_PRE_MAIN_DENY(SYS_unlinkat),
-#endif
-#if defined(SYS_rename)
-      RECO_PRE_MAIN_DENY(SYS_rename),
-#endif
-#if defined(SYS_renameat)
-      RECO_PRE_MAIN_DENY(SYS_renameat),
-#endif
-#if defined(SYS_renameat2)
-      RECO_PRE_MAIN_DENY(SYS_renameat2),
-#endif
+      // Landlock confines pathname mutations; preserving native unlink/rename errors is required
+      // by NVIDIA's device discovery, which deliberately probes unlink("").
       RECO_PRE_MAIN_DENY(SYS_kill),
       RECO_PRE_MAIN_DENY(SYS_tkill),
       RECO_PRE_MAIN_DENY(SYS_tgkill),
@@ -2242,6 +2230,7 @@ void close_child_descriptors_except(int preserved) noexcept {
       BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
   };
 #undef RECO_PRE_MAIN_DENY
+#undef RECO_PRE_MAIN_DENY_ERROR
   const sock_fprog program{.len = static_cast<unsigned short>(std::size(filter)),
                            .filter = const_cast<sock_filter*>(filter)};
   return ::prctl(PR_SET_NO_NEW_PRIVS, 1L, 0L, 0L, 0L) == 0 &&
@@ -2490,22 +2479,7 @@ void close_child_descriptors_except(int preserved) noexcept {
       BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
 #endif
 #if defined(SYS_openat2)
-      RECO_WORKER_DENY(SYS_openat2, EPERM),
-#endif
-#if defined(SYS_unlink)
-      RECO_WORKER_DENY(SYS_unlink, EPERM),
-#endif
-#if defined(SYS_unlinkat)
-      RECO_WORKER_DENY(SYS_unlinkat, EPERM),
-#endif
-#if defined(SYS_rename)
-      RECO_WORKER_DENY(SYS_rename, EPERM),
-#endif
-#if defined(SYS_renameat)
-      RECO_WORKER_DENY(SYS_renameat, EPERM),
-#endif
-#if defined(SYS_renameat2)
-      RECO_WORKER_DENY(SYS_renameat2, EPERM),
+      RECO_WORKER_DENY(SYS_openat2, ENOSYS),
 #endif
 #if defined(SYS_io_uring_setup)
       RECO_WORKER_DENY(SYS_io_uring_setup, EPERM),
@@ -2665,22 +2639,7 @@ void close_child_descriptors_except(int preserved) noexcept {
       BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
 #endif
 #if defined(SYS_openat2)
-      RECO_WORKER_DENY(SYS_openat2, EPERM),
-#endif
-#if defined(SYS_unlink)
-      RECO_WORKER_DENY(SYS_unlink, EPERM),
-#endif
-#if defined(SYS_unlinkat)
-      RECO_WORKER_DENY(SYS_unlinkat, EPERM),
-#endif
-#if defined(SYS_rename)
-      RECO_WORKER_DENY(SYS_rename, EPERM),
-#endif
-#if defined(SYS_renameat)
-      RECO_WORKER_DENY(SYS_renameat, EPERM),
-#endif
-#if defined(SYS_renameat2)
-      RECO_WORKER_DENY(SYS_renameat2, EPERM),
+      RECO_WORKER_DENY(SYS_openat2, ENOSYS),
 #endif
 #if defined(SYS_io_uring_setup)
       RECO_WORKER_DENY(SYS_io_uring_setup, EPERM),

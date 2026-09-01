@@ -871,6 +871,10 @@ int main(int argc, char** argv) {
         (errno != EPERM && errno != EACCES)) {
       return EXIT_FAILURE;
     }
+    errno = 0;
+    if (::unlink("") == 0 || errno != ENOENT) {
+      return EXIT_FAILURE;
+    }
 #if defined(SYS_renameat2)
     errno = 0;
     if (::syscall(SYS_renameat2, AT_FDCWD, scratch_file.c_str(), AT_FDCWD,
