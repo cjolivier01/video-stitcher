@@ -35,6 +35,7 @@
 #include <pthread.h>
 #include <sys/resource.h>
 #if defined(__APPLE__)
+#include <sys/sysctl.h>
 #include <sys/xattr.h>
 #endif
 #if defined(__linux__)
@@ -225,6 +226,19 @@ std::vector<std::filesystem::path> mac_probe_snapshot_directories() {
   }
   std::sort(result.begin(), result.end());
   return result;
+}
+
+std::optional<pid_t> mac_parent_process(pid_t process) {
+  kinfo_proc process_info{};
+  std::size_t process_info_size = sizeof(process_info);
+  int query[] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, process};
+  if (::sysctl(query, static_cast<unsigned int>(std::size(query)), &process_info,
+               &process_info_size, nullptr, 0) != 0 ||
+      process_info_size != sizeof(process_info) || process_info.kp_proc.p_pid != process ||
+      process_info.kp_eproc.e_ppid <= 0) {
+    return std::nullopt;
+  }
+  return process_info.kp_eproc.e_ppid;
 }
 #endif
 
@@ -2886,10 +2900,9 @@ void mac_owner_reclaims_stalled_guardian_session(const std::filesystem::path& vi
 
   const auto discovery_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
   const auto guardian = wait_for_process_marker(marker, discovery_deadline);
-  const auto owner =
-      wait_for_descendant(::getpid(), discovery_deadline, "--reco-video-probe-owner");
   const auto supervisor =
-      owner.has_value() ? wait_for_direct_child(*owner, discovery_deadline) : std::nullopt;
+      guardian.has_value() ? mac_parent_process(static_cast<pid_t>(*guardian)) : std::nullopt;
+  const auto owner = supervisor.has_value() ? mac_parent_process(*supervisor) : std::nullopt;
   expect_true(guardian.has_value(), "Darwin stalled guardian starts before owner cleanup");
   expect_true(owner.has_value(), "Darwin stalled guardian has an exec-backed session owner");
   expect_true(supervisor.has_value(), "Darwin stalled guardian has a supervisor");

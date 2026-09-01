@@ -3196,7 +3196,9 @@ GuardianLaunch spawn_guardian_process(
   }
   (void)::close(kSupervisorWatchdogReady);
 
+#if defined(__linux__)
   const auto expected_supervisor_pid = ::getpid();
+#endif
   const auto guardian_pid = ::fork();
   if (guardian_pid == 0) {
     (void)::close(worker_authority[0]);
