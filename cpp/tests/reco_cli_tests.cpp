@@ -2221,7 +2221,7 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
         left_input, right_input, {}, {}, {}, false,
         [] { throw std::runtime_error("synthetic Windows rollback race"); }, {},
         std::chrono::seconds(2), {},
-        [&] {
+        [&](const std::filesystem::path&) {
           std::filesystem::rename(windows_rollback_race_destination,
                                   windows_rollback_race_published);
           write_text_file(windows_rollback_race_destination,
@@ -2242,7 +2242,7 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
             "Windows rollback race preserves the displaced published output");
   bool windows_rollback_original_retained = false;
   for (const auto& entry : std::filesystem::directory_iterator(root.path())) {
-    if (entry.path().filename().string().starts_with("windows-rollback-race.json.rollback.") &&
+    if (entry.path().filename().wstring().starts_with(L"windows-rollback-race.json.rollback.") &&
         read_text_file(entry.path()) == "Windows rollback original output\n") {
       windows_rollback_original_retained = true;
     }
@@ -2263,18 +2263,11 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
         left_input, right_input, {}, {}, {}, false,
         [] { throw std::runtime_error("synthetic Windows rollback-source race"); }, {},
         std::chrono::seconds(2), {},
-        [&] {
-          for (const auto& entry : std::filesystem::directory_iterator(root.path())) {
-            if (entry.path().filename().string().starts_with(
-                    "windows-rollback-source-race.json.rollback.")) {
-              windows_rollback_source_substitute = entry.path();
-              std::filesystem::rename(entry.path(), windows_rollback_source_retained);
-              write_text_file(windows_rollback_source_substitute,
-                              "Windows rollback-source concurrent replacement\n");
-              return;
-            }
-          }
-          throw std::runtime_error("Windows rollback-source fixture was not found");
+        [&](const std::filesystem::path& displaced) {
+          windows_rollback_source_substitute = displaced;
+          std::filesystem::rename(displaced, windows_rollback_source_retained);
+          write_text_file(windows_rollback_source_substitute,
+                          "Windows rollback-source concurrent replacement\n");
         });
   } catch (const std::exception& error) {
     windows_rollback_source_rejected =

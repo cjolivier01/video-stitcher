@@ -2096,7 +2096,7 @@ void write_calibration_json_atomically_impl(
     const std::function<void()>& after_publish, const std::function<void()>& on_lock_contention,
     std::chrono::milliseconds lock_timeout,
     const std::function<void(const std::filesystem::path&)>& before_windows_publish_replace,
-    const std::function<void()>& before_windows_rollback_replace) {
+    const std::function<void(const std::filesystem::path&)>& before_windows_rollback_replace) {
   std::string contents(json);
   contents.push_back('\n');
 #if defined(_WIN32)
@@ -2171,7 +2171,8 @@ void write_calibration_json_atomically_impl(
             return false;
           }
           if (before_windows_rollback_replace) {
-            before_windows_rollback_replace();
+            before_windows_rollback_replace(output_directory.resolved_path /
+                                             displaced_output->name);
           }
           if (!published_path_identifies_handle(output_directory.handle.get(), destination_name,
                                                 handle) ||
@@ -3906,7 +3907,7 @@ void write_calibration_json_atomically(
     const std::function<void()>& after_publish, const std::function<void()>& on_lock_contention,
     std::chrono::milliseconds lock_timeout,
     const std::function<void(const std::filesystem::path&)>& before_windows_publish_replace,
-    const std::function<void()>& before_windows_rollback_replace) {
+    const std::function<void(const std::filesystem::path&)>& before_windows_rollback_replace) {
   write_calibration_json_atomically_impl(
       json, destination, left_input, right_input, before_publish, lens_profiles, before_commit,
       force_rename_fallback, after_publish, on_lock_contention, lock_timeout,
