@@ -1,6 +1,7 @@
 #include "reco/io/detail/nvbufsurface_7_1.hpp"
 #include "reco/io/detail/nvbufsurface_9_1.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -32,6 +33,12 @@ void* mapped_device_pointer(std::uint64_t descriptor) {
 #if !defined(RECO_FAKE_NVBUFSURFACE_7_1)
 std::mutex cuda_buffers_mutex;
 std::unordered_map<void*, std::unique_ptr<abi::CudaBuffer>> cuda_buffers;
+std::atomic<std::uintptr_t> next_fake_device_pointer{0x50000000U};
+
+struct FakeSurfaceAllocation {
+  abi::Surface surface;
+  abi::SurfaceParams params;
+};
 #endif
 
 } // namespace
@@ -62,6 +69,64 @@ extern "C" void nvds_version(unsigned int* major, unsigned int* minor) {
 }
 
 #if !defined(RECO_FAKE_NVBUFSURFACE_7_1)
+extern "C" int NvBufSurfaceCreate(void** output, std::uint32_t batch_size, void* raw_params) {
+  if (output == nullptr || raw_params == nullptr || batch_size != 1U) {
+    return -1;
+  }
+  const auto* create = static_cast<const abi::CreateParams*>(raw_params);
+  if (create->width == 0 || create->height == 0 || (create->width % 2U) != 0 ||
+      (create->height % 2U) != 0) {
+    return -1;
+  }
+  auto allocation =
+      std::unique_ptr<FakeSurfaceAllocation>(new (std::nothrow) FakeSurfaceAllocation);
+  if (!allocation) {
+    return -1;
+  }
+  const auto pitch = (create->width + 255U) & ~255U;
+  const auto y_size = pitch * create->height;
+  const auto uv_size = pitch * (create->height / 2U);
+  auto& surface = allocation->surface;
+  auto& params = allocation->params;
+  surface.gpu_id = create->gpu_id;
+  surface.batch_size = 1;
+  surface.num_filled = 1;
+  surface.is_contiguous = 1;
+  surface.mem_type = abi::kMemCudaDevice;
+  surface.surface_list = &params;
+  params.width = create->width;
+  params.height = create->height;
+  params.pitch = pitch;
+  params.color_format = create->color_format;
+  params.layout = create->layout;
+  params.data_size = y_size + uv_size;
+  params.data_ptr = reinterpret_cast<void*>(
+      next_fake_device_pointer.fetch_add(0x200000U, std::memory_order_relaxed));
+  params.plane_params.num_planes = 2;
+  params.plane_params.width[0] = create->width;
+  params.plane_params.width[1] = create->width / 2U;
+  params.plane_params.height[0] = create->height;
+  params.plane_params.height[1] = create->height / 2U;
+  params.plane_params.pitch[0] = pitch;
+  params.plane_params.pitch[1] = pitch;
+  params.plane_params.offset[0] = 0;
+  params.plane_params.offset[1] = y_size;
+  params.plane_params.psize[0] = y_size;
+  params.plane_params.psize[1] = uv_size;
+  params.plane_params.bytes_per_pix[0] = 1;
+  params.plane_params.bytes_per_pix[1] = 2;
+  *output = &allocation.release()->surface;
+  return 0;
+}
+
+extern "C" int NvBufSurfaceDestroy(void* raw_surface) {
+  if (raw_surface == nullptr) {
+    return -1;
+  }
+  delete reinterpret_cast<FakeSurfaceAllocation*>(raw_surface);
+  return 0;
+}
+
 extern "C" int NvBufSurfaceMapCudaBuffer(void* raw_surface, int index) {
   if (raw_surface == nullptr || index != 0) {
     return -1;

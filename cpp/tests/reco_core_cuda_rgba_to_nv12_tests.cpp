@@ -1,0 +1,784 @@
+#if defined(RECO_CUDA_RGBA_TO_NV12_FAKE_DRIVER)
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <string_view>
+
+#if defined(_WIN32)
+#define RECO_FAKE_CUDA_EXPORT extern "C" __declspec(dllexport)
+#else
+#define RECO_FAKE_CUDA_EXPORT extern "C" __attribute__((visibility("default")))
+#endif
+
+namespace {
+
+constexpr std::uintptr_t kContextIdentity = 0xCAFE2901U;
+thread_local void* current_context = nullptr;
+std::atomic<int> retain_count{0};
+std::atomic<int> launch_count{0};
+std::atomic<int> synchronize_count{0};
+std::atomic<int> sequence{0};
+std::atomic<int> launch_sequence{0};
+std::atomic<int> synchronize_sequence{0};
+std::array<std::uint64_t, 6> captured_u64{};
+std::array<std::uint32_t, 8> captured_u32{};
+std::array<float, 8> captured_color{};
+
+struct ColorParams {
+  float values[8];
+};
+
+} // namespace
+
+RECO_FAKE_CUDA_EXPORT void recoFakeCudaRgbaToNv12Reset() {
+  launch_count = 0;
+  synchronize_count = 0;
+  sequence = 0;
+  launch_sequence = 0;
+  synchronize_sequence = 0;
+  captured_u64.fill(0);
+  captured_u32.fill(0);
+  captured_color.fill(0.0F);
+}
+RECO_FAKE_CUDA_EXPORT int recoFakeCudaRgbaToNv12LaunchCount() { return launch_count.load(); }
+RECO_FAKE_CUDA_EXPORT int recoFakeCudaRgbaToNv12SynchronizeCount() {
+  return synchronize_count.load();
+}
+RECO_FAKE_CUDA_EXPORT int recoFakeCudaRgbaToNv12LaunchSequence() { return launch_sequence.load(); }
+RECO_FAKE_CUDA_EXPORT int recoFakeCudaRgbaToNv12SynchronizeSequence() {
+  return synchronize_sequence.load();
+}
+RECO_FAKE_CUDA_EXPORT std::uint64_t recoFakeCudaRgbaToNv12CapturedU64(int index) {
+  return index >= 0 && static_cast<std::size_t>(index) < captured_u64.size()
+             ? captured_u64[static_cast<std::size_t>(index)]
+             : 0;
+}
+RECO_FAKE_CUDA_EXPORT std::uint32_t recoFakeCudaRgbaToNv12CapturedU32(int index) {
+  return index >= 0 && static_cast<std::size_t>(index) < captured_u32.size()
+             ? captured_u32[static_cast<std::size_t>(index)]
+             : 0;
+}
+RECO_FAKE_CUDA_EXPORT float recoFakeCudaRgbaToNv12CapturedColor(int index) {
+  return index >= 0 && static_cast<std::size_t>(index) < captured_color.size()
+             ? captured_color[static_cast<std::size_t>(index)]
+             : 0.0F;
+}
+
+RECO_FAKE_CUDA_EXPORT int cuInit(unsigned int) { return 0; }
+RECO_FAKE_CUDA_EXPORT int cuDeviceGetCount(int* count) {
+  if (count == nullptr) {
+    return 1;
+  }
+  *count = 1;
+  return 0;
+}
+RECO_FAKE_CUDA_EXPORT int cuDeviceGet(int* device, int ordinal) {
+  if (device == nullptr || ordinal != 0) {
+    return 1;
+  }
+  *device = 0;
+  return 0;
+}
+RECO_FAKE_CUDA_EXPORT int cuDeviceGetAttribute(int* value, int attribute, int device) {
+  if (value == nullptr || device != 0) {
+    return 1;
+  }
+  if (attribute == 75) {
+    *value = 8;
+    return 0;
+  }
+  if (attribute == 76) {
+    *value = 9;
+    return 0;
+  }
+  return 1;
+}
+RECO_FAKE_CUDA_EXPORT int cuDeviceGetName(char* name, int length, int device) {
+  if (name == nullptr || length <= 0 || device != 0) {
+    return 1;
+  }
+  constexpr std::string_view kName = "fake RGBA-to-NV12 CUDA device";
+  const auto count = std::min<std::size_t>(kName.size(), static_cast<std::size_t>(length - 1));
+  std::memcpy(name, kName.data(), count);
+  name[count] = '\0';
+  return 0;
+}
+RECO_FAKE_CUDA_EXPORT int cuDeviceGetUuid(void* uuid, int device) {
+  if (uuid == nullptr || device != 0) {
+    return 1;
+  }
+  std::memset(uuid, 0x29, 16);
+  return 0;
+}
+RECO_FAKE_CUDA_EXPORT int cuDevicePrimaryCtxRetain(void** context, int device) {
+  if (context == nullptr || device != 0) {
+    return 1;
+  }
+  ++retain_count;
+  *context = reinterpret_cast<void*>(kContextIdentity);
+  return 0;
+}
+RECO_FAKE_CUDA_EXPORT int cuDevicePrimaryCtxRelease_v2(int device) {
+  if (device != 0 || retain_count.load() <= 0) {
+    return 1;
+  }
+  --retain_count;
+  return 0;
+}
+RECO_FAKE_CUDA_EXPORT int cuCtxGetCurrent(void** context) {
+  if (context == nullptr) {
+    return 1;
+  }
+  *context = current_context;
+  return 0;
+}
+RECO_FAKE_CUDA_EXPORT int cuCtxGetDevice(int* device) {
+  if (device == nullptr || current_context != reinterpret_cast<void*>(kContextIdentity)) {
+    return 1;
+  }
+  *device = 0;
+  return 0;
+}
+RECO_FAKE_CUDA_EXPORT int cuCtxSetCurrent(void* context) {
+  current_context = context;
+  return 0;
+}
+RECO_FAKE_CUDA_EXPORT int cuCtxSynchronize() {
+  if (current_context != reinterpret_cast<void*>(kContextIdentity)) {
+    return 1;
+  }
+  ++synchronize_count;
+  synchronize_sequence = ++sequence;
+  return 0;
+}
+RECO_FAKE_CUDA_EXPORT int cuModuleLoadData(void** module, const void* image) {
+  if (module == nullptr || image == nullptr ||
+      current_context != reinterpret_cast<void*>(kContextIdentity)) {
+    return 1;
+  }
+  *module = reinterpret_cast<void*>(0x2902U);
+  return 0;
+}
+RECO_FAKE_CUDA_EXPORT int cuModuleUnload(void* module) {
+  return module == reinterpret_cast<void*>(0x2902U) ? 0 : 1;
+}
+RECO_FAKE_CUDA_EXPORT int cuModuleGetFunction(void** function, void* module, const char* name) {
+  if (function == nullptr || module != reinterpret_cast<void*>(0x2902U) || name == nullptr ||
+      std::string_view(name) != "reco_rgba_to_nv12") {
+    return 1;
+  }
+  *function = reinterpret_cast<void*>(0x2903U);
+  return 0;
+}
+RECO_FAKE_CUDA_EXPORT int cuLaunchKernel(void* function, unsigned int grid_x, unsigned int grid_y,
+                                         unsigned int grid_z, unsigned int block_x,
+                                         unsigned int block_y, unsigned int block_z,
+                                         unsigned int shared_memory, void*, void** parameters,
+                                         void**) {
+  if (function != reinterpret_cast<void*>(0x2903U) || parameters == nullptr ||
+      current_context != reinterpret_cast<void*>(kContextIdentity) || shared_memory != 0U) {
+    return 1;
+  }
+  for (std::size_t index = 0; index < captured_u64.size(); ++index) {
+    captured_u64[index] = *static_cast<const std::uint64_t*>(parameters[index]);
+  }
+  captured_u32 = {
+      *static_cast<const std::uint32_t*>(parameters[6]),
+      *static_cast<const std::uint32_t*>(parameters[7]),
+      grid_x,
+      grid_y,
+      grid_z,
+      block_x,
+      block_y,
+      block_z,
+  };
+  const auto& color = *static_cast<const ColorParams*>(parameters[8]);
+  std::copy(std::begin(color.values), std::end(color.values), captured_color.begin());
+  ++launch_count;
+  launch_sequence = ++sequence;
+  return 0;
+}
+
+RECO_FAKE_CUDA_EXPORT int cuMemAlloc_v2(std::uint64_t*, std::size_t) { return 1; }
+RECO_FAKE_CUDA_EXPORT int cuMemAllocPitch_v2(std::uint64_t*, std::size_t*, std::size_t, std::size_t,
+                                             unsigned int) {
+  return 1;
+}
+RECO_FAKE_CUDA_EXPORT int cuMemFree_v2(std::uint64_t) { return 1; }
+RECO_FAKE_CUDA_EXPORT int cuMemsetD8_v2(std::uint64_t, unsigned char, std::size_t) { return 1; }
+RECO_FAKE_CUDA_EXPORT int cuMemcpy2D_v2(const void*) { return 1; }
+RECO_FAKE_CUDA_EXPORT int cuMemcpyDtoH_v2(void*, std::uint64_t, std::size_t) { return 1; }
+RECO_FAKE_CUDA_EXPORT int cuMemGetInfo_v2(std::size_t*, std::size_t*) { return 1; }
+RECO_FAKE_CUDA_EXPORT int cuMemGetAllocationGranularity(std::size_t*, const void*, unsigned int) {
+  return 1;
+}
+RECO_FAKE_CUDA_EXPORT int cuMemAddressReserve(std::uint64_t*, std::size_t, std::size_t,
+                                              std::uint64_t, std::uint64_t) {
+  return 1;
+}
+RECO_FAKE_CUDA_EXPORT int cuMemCreate(std::uint64_t*, std::size_t, const void*, std::uint64_t) {
+  return 1;
+}
+RECO_FAKE_CUDA_EXPORT int cuMemExportToShareableHandle(void*, std::uint64_t, unsigned int,
+                                                       std::uint64_t) {
+  return 1;
+}
+RECO_FAKE_CUDA_EXPORT int cuMemMap(std::uint64_t, std::size_t, std::size_t, std::uint64_t,
+                                   std::uint64_t) {
+  return 1;
+}
+RECO_FAKE_CUDA_EXPORT int cuMemSetAccess(std::uint64_t, std::size_t, const void*, std::size_t) {
+  return 1;
+}
+RECO_FAKE_CUDA_EXPORT int cuMemRelease(std::uint64_t) { return 1; }
+RECO_FAKE_CUDA_EXPORT int cuMemUnmap(std::uint64_t, std::size_t) { return 1; }
+RECO_FAKE_CUDA_EXPORT int cuMemAddressFree(std::uint64_t, std::size_t) { return 1; }
+
+#else
+
+#include "reco/core/cuda_rgba_to_nv12.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <functional>
+#include <iostream>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
+namespace {
+
+using namespace reco::core;
+
+static_assert(!std::is_copy_constructible_v<CudaRgbaToNv12Converter>);
+static_assert(!std::is_copy_assignable_v<CudaRgbaToNv12Converter>);
+static_assert(std::is_nothrow_move_constructible_v<CudaRgbaToNv12Converter>);
+static_assert(std::is_nothrow_move_assignable_v<CudaRgbaToNv12Converter>);
+
+int failures = 0;
+
+template <typename Function> void run_case(std::string_view name, Function&& function) {
+  try {
+    function();
+    std::cout << "PASS: " << name << '\n';
+  } catch (const std::exception& error) {
+    ++failures;
+    std::cerr << "FAIL: " << name << ": " << error.what() << '\n';
+  }
+}
+
+void expect_true(bool value, std::string_view message) {
+  if (!value) {
+    throw std::runtime_error(std::string(message));
+  }
+}
+
+template <typename Actual, typename Expected>
+void expect_eq(const Actual& actual, const Expected& expected, std::string_view message) {
+  if (!(actual == expected)) {
+    throw std::runtime_error(std::string(message));
+  }
+}
+
+void expect_near(float actual, float expected, float tolerance, std::string_view message) {
+  if (std::abs(actual - expected) > tolerance) {
+    throw std::runtime_error(std::string(message) + ": expected " + std::to_string(expected) +
+                             ", got " + std::to_string(actual));
+  }
+}
+
+template <typename Exception, typename Function>
+void expect_throws(Function&& function, std::string_view fragment, std::string_view message) {
+  try {
+    function();
+  } catch (const Exception& error) {
+    if (std::string_view(error.what()).find(fragment) == std::string_view::npos) {
+      throw std::runtime_error(std::string(message) + ": unexpected diagnostic: " + error.what());
+    }
+    return;
+  }
+  throw std::runtime_error(std::string(message) + ": expected exception");
+}
+
+class DynamicControl {
+public:
+  explicit DynamicControl(const std::filesystem::path& path) {
+#if defined(_WIN32)
+    handle_ = LoadLibraryW(path.c_str());
+#else
+    handle_ = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+#endif
+    if (handle_ == nullptr) {
+      throw std::runtime_error("failed to load test runtime: " + path.string());
+    }
+  }
+
+  DynamicControl(const DynamicControl&) = delete;
+  DynamicControl& operator=(const DynamicControl&) = delete;
+
+  ~DynamicControl() {
+#if defined(_WIN32)
+    FreeLibrary(static_cast<HMODULE>(handle_));
+#else
+    dlclose(handle_);
+#endif
+  }
+
+  template <typename Function> Function symbol(const char* name) const {
+#if defined(_WIN32)
+    auto* result = reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(handle_), name));
+#else
+    auto* result = dlsym(handle_, name);
+#endif
+    if (result == nullptr) {
+      throw std::runtime_error(std::string("missing test control symbol ") + name);
+    }
+    return reinterpret_cast<Function>(result);
+  }
+
+private:
+  void* handle_ = nullptr;
+};
+
+struct FakeCudaControl {
+  explicit FakeCudaControl(const std::filesystem::path& path) : library(path) {
+    reset_fn = library.symbol<void (*)()>("recoFakeCudaRgbaToNv12Reset");
+    launch_count_fn = library.symbol<int (*)()>("recoFakeCudaRgbaToNv12LaunchCount");
+    synchronize_count_fn = library.symbol<int (*)()>("recoFakeCudaRgbaToNv12SynchronizeCount");
+    launch_sequence_fn = library.symbol<int (*)()>("recoFakeCudaRgbaToNv12LaunchSequence");
+    synchronize_sequence_fn =
+        library.symbol<int (*)()>("recoFakeCudaRgbaToNv12SynchronizeSequence");
+    captured_u64_fn = library.symbol<std::uint64_t (*)(int)>("recoFakeCudaRgbaToNv12CapturedU64");
+    captured_u32_fn = library.symbol<std::uint32_t (*)(int)>("recoFakeCudaRgbaToNv12CapturedU32");
+    captured_color_fn = library.symbol<float (*)(int)>("recoFakeCudaRgbaToNv12CapturedColor");
+  }
+
+  void reset() const { reset_fn(); }
+  int launch_count() const { return launch_count_fn(); }
+  int synchronize_count() const { return synchronize_count_fn(); }
+  int launch_sequence() const { return launch_sequence_fn(); }
+  int synchronize_sequence() const { return synchronize_sequence_fn(); }
+  std::uint64_t captured_u64(int index) const { return captured_u64_fn(index); }
+  std::uint32_t captured_u32(int index) const { return captured_u32_fn(index); }
+  float captured_color(int index) const { return captured_color_fn(index); }
+
+  DynamicControl library;
+  void (*reset_fn)() = nullptr;
+  int (*launch_count_fn)() = nullptr;
+  int (*synchronize_count_fn)() = nullptr;
+  int (*launch_sequence_fn)() = nullptr;
+  int (*synchronize_sequence_fn)() = nullptr;
+  std::uint64_t (*captured_u64_fn)(int) = nullptr;
+  std::uint32_t (*captured_u32_fn)(int) = nullptr;
+  float (*captured_color_fn)(int) = nullptr;
+};
+
+struct FakeNvrtcControl {
+  explicit FakeNvrtcControl(const std::filesystem::path& path) : library(path) {
+    reset_fn = library.symbol<void (*)()>("recoFakeNvrtcReset");
+    create_count_fn = library.symbol<int (*)()>("recoFakeNvrtcCreateCount");
+    destroy_count_fn = library.symbol<int (*)()>("recoFakeNvrtcDestroyCount");
+    last_architecture_fn = library.symbol<int (*)()>("recoFakeNvrtcLastArchitecture");
+  }
+
+  void reset() const { reset_fn(); }
+  int create_count() const { return create_count_fn(); }
+  int destroy_count() const { return destroy_count_fn(); }
+  int last_architecture() const { return last_architecture_fn(); }
+
+  DynamicControl library;
+  void (*reset_fn)() = nullptr;
+  int (*create_count_fn)() = nullptr;
+  int (*destroy_count_fn)() = nullptr;
+  int (*last_architecture_fn)() = nullptr;
+};
+
+std::filesystem::path runtime_path(const char* environment_name, std::string_view runfile) {
+  if (const char* explicit_path = std::getenv(environment_name); explicit_path != nullptr) {
+    return explicit_path;
+  }
+  const char* source_root = std::getenv("TEST_SRCDIR");
+  const char* workspace = std::getenv("TEST_WORKSPACE");
+  if (source_root != nullptr && workspace != nullptr) {
+    return std::filesystem::path(source_root) / workspace / runfile;
+  }
+  throw std::runtime_error(std::string("set ") + environment_name + " to the test runtime path");
+}
+
+CudaRgbaFrameView rgba_frame(CudaDevicePtr base, CudaContextId context, int device = 0,
+                             std::uint32_t width = 34, std::uint32_t height = 18) {
+  const auto row_bytes = static_cast<std::size_t>(width) * 4U;
+  const auto pitch = row_bytes + 20U;
+  return CudaRgbaFrameView(
+      CudaPitchedPlaneView(base, pitch * height, pitch, row_bytes, height, context, device), width,
+      height);
+}
+
+CudaNv12FrameView nv12_frame(CudaDevicePtr y_base, CudaDevicePtr uv_base, CudaContextId context,
+                             YuvColorMatrix matrix = YuvColorMatrix::Bt709,
+                             YuvColorRange range = YuvColorRange::Limited, int device = 0,
+                             std::uint32_t width = 34, std::uint32_t height = 18) {
+  const auto y_pitch = static_cast<std::size_t>(width) + 14U;
+  const auto uv_pitch = static_cast<std::size_t>(width) + 30U;
+  return CudaNv12FrameView(
+      CudaPitchedPlaneView(y_base, y_pitch * height, y_pitch, width, height, context, device),
+      CudaPitchedPlaneView(uv_base, uv_pitch * (height / 2U), uv_pitch, width, height / 2U, context,
+                           device),
+      width, height, matrix, range);
+}
+
+CudaRgbaToNv12Converter create_converter(const CudaRgbaToNv12Config& config,
+                                         const std::filesystem::path& cuda_runtime,
+                                         const std::filesystem::path& nvrtc_runtime) {
+  return CudaRgbaToNv12Converter::create(config, CudaBackend::load(cuda_runtime.string()),
+                                         NvrtcCompiler::load(nvrtc_runtime.string()));
+}
+
+void compiles_once_and_synchronizes(const std::filesystem::path& cuda_runtime,
+                                    const std::filesystem::path& nvrtc_runtime,
+                                    const FakeCudaControl& cuda_control,
+                                    const FakeNvrtcControl& nvrtc_control) {
+  cuda_control.reset();
+  nvrtc_control.reset();
+  auto converter = create_converter({.width = 34, .height = 18}, cuda_runtime, nvrtc_runtime);
+  expect_eq(nvrtc_control.create_count(), 1, "converter performs one NVRTC compilation");
+  expect_eq(nvrtc_control.destroy_count(), 1, "converter releases its NVRTC program");
+  expect_eq(nvrtc_control.last_architecture(), 86,
+            "converter selects the highest compatible NVRTC architecture");
+  expect_eq(converter.device_ordinal(), 0, "converter device ordinal");
+  expect_eq(converter.width(), 34U, "converter width");
+  expect_eq(converter.height(), 18U, "converter height");
+
+  const auto context = converter.context_id();
+  const auto input = rgba_frame(0x10000U, context);
+  const auto limited =
+      nv12_frame(0x40000U, 0x50000U, context, YuvColorMatrix::Bt601, YuvColorRange::Limited);
+  converter.convert(input, limited);
+  expect_near(cuda_control.captured_color(0), 0.299F, 1.0e-6F, "BT.601 red luma");
+  expect_near(cuda_control.captured_color(1), 0.587F, 1.0e-6F, "BT.601 green luma");
+  expect_near(cuda_control.captured_color(2), 0.114F, 1.0e-6F, "BT.601 blue luma");
+  expect_near(cuda_control.captured_color(3), 219.0F / 255.0F, 1.0e-6F, "limited luma scale");
+  expect_near(cuda_control.captured_color(4), 16.0F, 1.0e-6F, "limited luma offset");
+  expect_near(cuda_control.captured_color(5), 224.0F / 255.0F, 1.0e-6F, "limited chroma scale");
+  expect_near(cuda_control.captured_color(6), 128.0F, 1.0e-6F, "limited chroma center");
+
+  const auto full =
+      nv12_frame(0x60000U, 0x70000U, context, YuvColorMatrix::Bt2020, YuvColorRange::Full);
+  converter.convert(input, full);
+  expect_eq(nvrtc_control.create_count(), 1, "conversion does not recompile");
+  expect_eq(cuda_control.launch_count(), 2, "one kernel launch per conversion");
+  expect_eq(cuda_control.synchronize_count(), 2, "each conversion synchronizes before return");
+  expect_true(cuda_control.launch_sequence() < cuda_control.synchronize_sequence(),
+              "kernel launch precedes synchronization");
+  expect_eq(cuda_control.captured_u64(0), input.plane().ptr(), "input pointer propagated");
+  expect_eq(cuda_control.captured_u64(1), input.plane().pitch_bytes(), "input pitch propagated");
+  expect_eq(cuda_control.captured_u64(2), full.y_plane().ptr(), "Y pointer propagated");
+  expect_eq(cuda_control.captured_u64(3), full.y_plane().pitch_bytes(), "Y pitch propagated");
+  expect_eq(cuda_control.captured_u64(4), full.uv_plane().ptr(), "UV pointer propagated");
+  expect_eq(cuda_control.captured_u64(5), full.uv_plane().pitch_bytes(), "UV pitch propagated");
+  expect_eq(cuda_control.captured_u32(0), 34U, "width propagated");
+  expect_eq(cuda_control.captured_u32(1), 18U, "height propagated");
+  expect_eq(cuda_control.captured_u32(2), 2U, "bounded grid X");
+  expect_eq(cuda_control.captured_u32(3), 1U, "bounded grid Y");
+  expect_eq(cuda_control.captured_u32(5), 16U, "block X");
+  expect_eq(cuda_control.captured_u32(6), 16U, "block Y");
+  expect_near(cuda_control.captured_color(0), 0.2627F, 1.0e-6F, "BT.2020 red luma");
+  expect_near(cuda_control.captured_color(1), 0.6780F, 1.0e-6F, "BT.2020 green luma");
+  expect_near(cuda_control.captured_color(2), 0.0593F, 1.0e-6F, "BT.2020 blue luma");
+  expect_near(cuda_control.captured_color(3), 1.0F, 1.0e-6F, "full luma scale");
+  expect_near(cuda_control.captured_color(4), 0.0F, 1.0e-6F, "full luma offset");
+  expect_near(cuda_control.captured_color(5), 1.0F, 1.0e-6F, "full chroma scale");
+  expect_near(cuda_control.captured_color(6), 127.5F, 1.0e-6F, "full chroma center");
+}
+
+void rejects_invalid_configuration(const std::filesystem::path& cuda_runtime,
+                                   const std::filesystem::path& nvrtc_runtime,
+                                   const FakeNvrtcControl& nvrtc_control) {
+  const auto check = [&](CudaRgbaToNv12Config config, std::string_view fragment,
+                         std::string_view label) {
+    nvrtc_control.reset();
+    expect_throws<std::exception>(
+        [&] { (void)create_converter(config, cuda_runtime, nvrtc_runtime); }, fragment, label);
+    expect_eq(nvrtc_control.create_count(), 0, std::string(label) + " does not compile");
+  };
+  check({.width = 0, .height = 2}, "non-zero and even", "zero width");
+  check({.width = 3, .height = 2}, "non-zero and even", "odd width");
+  check({.width = 2, .height = 3}, "non-zero and even", "odd height");
+  check({.width = std::numeric_limits<std::uint32_t>::max() - 1U,
+         .height = std::numeric_limits<std::uint32_t>::max() - 1U},
+        "overflows", "overflowing frame extent");
+  check({.width = 2, .height = 2U * 16U * 65'536U}, "grid limits", "oversized grid");
+  check({.width = 2, .height = 2, .device_ordinal = -1}, "out of range", "negative device");
+  check({.width = 2, .height = 2, .device_ordinal = 1}, "out of range", "missing device");
+}
+
+void rejects_unsafe_frames(const std::filesystem::path& cuda_runtime,
+                           const std::filesystem::path& nvrtc_runtime,
+                           const FakeCudaControl& cuda_control) {
+  auto converter = create_converter({.width = 34, .height = 18}, cuda_runtime, nvrtc_runtime);
+  const auto context = converter.context_id();
+  const auto input = rgba_frame(0x10000U, context);
+  const auto output = nv12_frame(0x40000U, 0x50000U, context);
+  cuda_control.reset();
+
+  expect_throws<std::invalid_argument>(
+      [&] { converter.convert(rgba_frame(0x60000U, context, 0, 32, 18), output); }, "dimensions",
+      "input shape mismatch");
+  expect_throws<std::invalid_argument>(
+      [&] {
+        converter.convert(input, nv12_frame(0x60000U, 0x70000U, context, YuvColorMatrix::Bt709,
+                                            YuvColorRange::Limited, 0, 32, 18));
+      },
+      "dimensions", "output shape mismatch");
+  expect_throws<std::invalid_argument>(
+      [&] { converter.convert(rgba_frame(0x60000U, context + 1U), output); }, "context",
+      "input context mismatch");
+  expect_throws<std::invalid_argument>(
+      [&] { converter.convert(input, nv12_frame(0x60000U, 0x70000U, context + 1U)); }, "context",
+      "output context mismatch");
+  expect_throws<std::invalid_argument>(
+      [&] { converter.convert(rgba_frame(0x60000U, context, 1), output); }, "device",
+      "input device mismatch");
+  expect_throws<std::invalid_argument>(
+      [&] {
+        converter.convert(input, nv12_frame(0x60000U, 0x70000U, context, YuvColorMatrix::Bt709,
+                                            YuvColorRange::Limited, 1));
+      },
+      "device", "output device mismatch");
+  expect_throws<std::invalid_argument>(
+      [&] { converter.convert(input, nv12_frame(input.plane().ptr(), 0x70000U, context)); },
+      "overlap", "input and Y overlap");
+  expect_throws<std::invalid_argument>(
+      [&] { converter.convert(input, nv12_frame(0x70000U, input.plane().ptr(), context)); },
+      "overlap", "input and UV overlap");
+  expect_eq(cuda_control.launch_count(), 0, "invalid frames do not launch");
+  expect_eq(cuda_control.synchronize_count(), 0, "invalid frames do not synchronize");
+}
+
+void moved_from_converter_is_diagnosed(const std::filesystem::path& cuda_runtime,
+                                       const std::filesystem::path& nvrtc_runtime) {
+  auto source = create_converter({.width = 34, .height = 18}, cuda_runtime, nvrtc_runtime);
+  const auto context = source.context_id();
+  auto converter = std::move(source);
+  expect_eq(converter.context_id(), context, "moved converter retains context");
+  expect_throws<std::logic_error>([&] { (void)source.context_id(); }, "moved-from",
+                                  "moved-from context access");
+  expect_throws<std::logic_error>(
+      [&] {
+        source.convert(rgba_frame(0x10000U, context), nv12_frame(0x40000U, 0x50000U, context));
+      },
+      "moved-from", "moved-from conversion");
+}
+
+bool require_cuda() {
+  const char* value = std::getenv("RECO_REQUIRE_CUDA_TEST");
+  return value != nullptr && std::string_view(value) != "0";
+}
+
+struct CpuColor {
+  float kr = 0.0F;
+  float kb = 0.0F;
+  float y_scale = 1.0F;
+  float y_offset = 0.0F;
+  float chroma_scale = 1.0F;
+  float chroma_center = 128.0F;
+};
+
+CpuColor cpu_color(YuvColorMatrix matrix, YuvColorRange range) {
+  CpuColor color;
+  switch (matrix) {
+  case YuvColorMatrix::Bt601:
+    color.kr = 0.299F;
+    color.kb = 0.114F;
+    break;
+  case YuvColorMatrix::Bt709:
+    color.kr = 0.2126F;
+    color.kb = 0.0722F;
+    break;
+  case YuvColorMatrix::Bt2020:
+    color.kr = 0.2627F;
+    color.kb = 0.0593F;
+    break;
+  }
+  if (range == YuvColorRange::Limited) {
+    color.y_scale = 219.0F / 255.0F;
+    color.y_offset = 16.0F;
+    color.chroma_scale = 224.0F / 255.0F;
+  } else {
+    color.chroma_center = 127.5F;
+  }
+  return color;
+}
+
+std::uint8_t quantize(float value) {
+  return static_cast<std::uint8_t>(std::floor(std::clamp(value, 0.0F, 255.0F) + 0.5F));
+}
+
+void hardware_parity_if_available() {
+  const auto cuda_error = CudaBackend::availability_error();
+  const auto nvrtc_error = NvrtcCompiler::availability_error();
+  if (!cuda_error.empty() || !nvrtc_error.empty()) {
+    const auto diagnostic =
+        "CUDA=" + (cuda_error.empty() ? std::string("available") : cuda_error) +
+        " NVRTC=" + (nvrtc_error.empty() ? std::string("available") : nvrtc_error);
+    if (require_cuda()) {
+      throw std::runtime_error("required CUDA RGBA-to-NV12 test unavailable: " + diagnostic);
+    }
+    std::cout << "SKIP: hardware CUDA RGBA-to-NV12 test unavailable: " << diagnostic << '\n';
+    return;
+  }
+
+  constexpr std::uint32_t width = 4;
+  constexpr std::uint32_t height = 2;
+  const std::array<std::uint8_t, width * height * 4U> rgba = {
+      255, 0, 0, 1, 0,   255, 0,   2, 0,   0,   255, 3, 255, 255, 255, 4,
+      0,   0, 0, 5, 127, 127, 127, 6, 255, 255, 0,   7, 0,   255, 255, 8,
+  };
+
+  auto backend = CudaBackend::create();
+  const auto context = backend.primary_context_id();
+  auto input_storage = backend.allocate_pitched(width * 4U, height, 4);
+  auto y_storage = backend.allocate_pitched(width, height, 4);
+  auto uv_storage = backend.allocate_pitched(width, height / 2U, 4);
+  backend.copy_host_to_device_2d({.src = rgba.data(),
+                                  .src_pitch = width * 4U,
+                                  .dst = input_storage.buffer.ptr(),
+                                  .dst_pitch = input_storage.pitch,
+                                  .width_bytes = width * 4U,
+                                  .height = height});
+  const CudaRgbaFrameView input(
+      CudaPitchedPlaneView(input_storage.buffer.ptr(), input_storage.buffer.size(),
+                           input_storage.pitch, width * 4U, height, context),
+      width, height);
+  auto converter = CudaRgbaToNv12Converter::create({.width = width, .height = height}, backend,
+                                                   NvrtcCompiler::create());
+
+  const std::array<YuvColorMatrix, 3> matrices = {YuvColorMatrix::Bt601, YuvColorMatrix::Bt709,
+                                                  YuvColorMatrix::Bt2020};
+  const std::array<YuvColorRange, 2> ranges = {YuvColorRange::Limited, YuvColorRange::Full};
+  for (const auto matrix : matrices) {
+    for (const auto range : ranges) {
+      const CudaNv12FrameView output(
+          CudaPitchedPlaneView(y_storage.buffer.ptr(), y_storage.buffer.size(), y_storage.pitch,
+                               width, height, context),
+          CudaPitchedPlaneView(uv_storage.buffer.ptr(), uv_storage.buffer.size(), uv_storage.pitch,
+                               width, height / 2U, context),
+          width, height, matrix, range);
+      converter.convert(input, output);
+
+      std::array<std::uint8_t, width * height> actual_y{};
+      std::array<std::uint8_t, width> actual_uv{};
+      backend.copy_device_to_host_2d({.dst = actual_y.data(),
+                                      .dst_pitch = width,
+                                      .src = y_storage.buffer.ptr(),
+                                      .src_pitch = y_storage.pitch,
+                                      .width_bytes = width,
+                                      .height = height});
+      backend.copy_device_to_host_2d({.dst = actual_uv.data(),
+                                      .dst_pitch = width,
+                                      .src = uv_storage.buffer.ptr(),
+                                      .src_pitch = uv_storage.pitch,
+                                      .width_bytes = width,
+                                      .height = height / 2U});
+
+      const auto color = cpu_color(matrix, range);
+      const float kg = 1.0F - color.kr - color.kb;
+      std::array<float, width * height> luma{};
+      for (std::size_t pixel = 0; pixel < luma.size(); ++pixel) {
+        const float red = rgba[pixel * 4U];
+        const float green = rgba[pixel * 4U + 1U];
+        const float blue = rgba[pixel * 4U + 2U];
+        luma[pixel] = color.kr * red + kg * green + color.kb * blue;
+        const auto expected = quantize(color.y_offset + color.y_scale * luma[pixel]);
+        expect_true(std::abs(static_cast<int>(actual_y[pixel]) - static_cast<int>(expected)) <= 1,
+                    "hardware luma parity");
+      }
+      for (std::size_t block = 0; block < width / 2U; ++block) {
+        const std::array<std::size_t, 4> pixels = {block * 2U, block * 2U + 1U, width + block * 2U,
+                                                   width + block * 2U + 1U};
+        float red = 0.0F;
+        float green = 0.0F;
+        float blue = 0.0F;
+        for (const auto pixel : pixels) {
+          red += rgba[pixel * 4U];
+          green += rgba[pixel * 4U + 1U];
+          blue += rgba[pixel * 4U + 2U];
+        }
+        red *= 0.25F;
+        green *= 0.25F;
+        blue *= 0.25F;
+        const float average_y = color.kr * red + kg * green + color.kb * blue;
+        const auto expected_u =
+            quantize(color.chroma_center +
+                     color.chroma_scale * (blue - average_y) / (2.0F * (1.0F - color.kb)));
+        const auto expected_v =
+            quantize(color.chroma_center +
+                     color.chroma_scale * (red - average_y) / (2.0F * (1.0F - color.kr)));
+        expect_true(
+            std::abs(static_cast<int>(actual_uv[block * 2U]) - static_cast<int>(expected_u)) <= 1,
+            "hardware chroma U parity");
+        expect_true(std::abs(static_cast<int>(actual_uv[block * 2U + 1U]) -
+                             static_cast<int>(expected_v)) <= 1,
+                    "hardware chroma V parity");
+      }
+    }
+  }
+  std::cout << "hardware CUDA RGBA-to-NV12 parity executed\n";
+}
+
+} // namespace
+
+int main() {
+#if defined(_WIN32)
+  constexpr std::string_view kFakeCudaRunfile =
+      "cpp/tests/reco_core_fake_cuda_rgba_to_nv12_driver.dll";
+  constexpr std::string_view kFakeNvrtcRunfile = "cpp/tests/reco_core_fake_nvrtc_runtime.dll";
+#else
+  constexpr std::string_view kFakeCudaRunfile =
+      "cpp/tests/libreco_core_fake_cuda_rgba_to_nv12_driver.so";
+  constexpr std::string_view kFakeNvrtcRunfile = "cpp/tests/libreco_core_fake_nvrtc_runtime.so";
+#endif
+  const auto cuda_runtime = runtime_path("RECO_TEST_FAKE_CUDA_DRIVER", kFakeCudaRunfile);
+  const auto nvrtc_runtime = runtime_path("RECO_TEST_FAKE_NVRTC_RUNTIME", kFakeNvrtcRunfile);
+  FakeCudaControl cuda_control(cuda_runtime);
+  FakeNvrtcControl nvrtc_control(nvrtc_runtime);
+
+  run_case("compile once and synchronize", [&] {
+    compiles_once_and_synchronizes(cuda_runtime, nvrtc_runtime, cuda_control, nvrtc_control);
+  });
+  run_case("configuration validation",
+           [&] { rejects_invalid_configuration(cuda_runtime, nvrtc_runtime, nvrtc_control); });
+  run_case("frame contract validation",
+           [&] { rejects_unsafe_frames(cuda_runtime, nvrtc_runtime, cuda_control); });
+  run_case("moved-from converter",
+           [&] { moved_from_converter_is_diagnosed(cuda_runtime, nvrtc_runtime); });
+  run_case("hardware parity", hardware_parity_if_available);
+
+  if (failures != 0) {
+    std::cerr << failures << " test(s) failed\n";
+    return EXIT_FAILURE;
+  }
+  std::cout << "all tests passed\n";
+  return EXIT_SUCCESS;
+}
+
+#endif

@@ -266,6 +266,91 @@ void source_destruction_stops_decode_with_a_retained_frame() {
             "retained-frame release performs deferred NULL teardown once");
 }
 
+void chained_sources_open_lazily_and_preserve_global_indices() {
+  set_scenario("frame-eos");
+  const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
+  std::filesystem::remove(event_path);
+
+  auto first_config = valid_config();
+  auto second_config = valid_config();
+  second_config.path = "/data/left-002.mp4";
+  GpuChainedFileDecodeConfig config{
+      .segments = {{.config = first_config, .exact_frame_count = 1U},
+                   {.config = second_config, .exact_frame_count = 1U}},
+  };
+  auto source =
+      open_gstreamer_gpu_chained_file_decode_source(config, NvbufSurfaceAbi::DeepStream9_1);
+  expect_true(source->gpu_resident(), "chained source reports GPU residency");
+  expect_true(source->pipeline().find("memory:NVMM") != std::string_view::npos,
+              "chained source exposes its NVMM residency contract");
+  expect_eq(count_event(read_events(event_path), "pull"), 0U,
+            "chained source does not open or pull future segments eagerly");
+
+  auto first = source->read();
+  expect_true(first.frame.has_value(), "first chained segment returns a frame");
+  if (first.frame.has_value()) {
+    expect_eq(first.frame->frame_index, 0U, "first chained segment starts at global frame zero");
+  }
+  auto second = source->read();
+  expect_true(second.frame.has_value(), "second chained segment returns a frame");
+  if (second.frame.has_value()) {
+    expect_eq(second.frame->frame_index, 1U,
+              "second chained segment continues the global frame timeline");
+  }
+  expect_true(source->read().status == GpuDecodeFrameStatus::EndOfStream,
+              "chained source reports EOS after its final segment");
+  expect_eq(count_event(read_events(event_path), "pull"), 4U,
+            "each segment is consumed exactly through its own EOS");
+
+  source.reset();
+  expect_eq(count_event(read_events(event_path), "state-null"), 0U,
+            "chained pipelines remain valid while returned frames retain them");
+  first.frame.reset();
+  expect_eq(count_event(read_events(event_path), "state-null"), 1U,
+            "releasing the first frame closes only its completed segment");
+  second.frame.reset();
+  expect_eq(count_event(read_events(event_path), "state-null"), 2U,
+            "releasing the final frame closes the final segment");
+
+  std::filesystem::remove(event_path);
+  config.start_frame_index = 1U;
+  source = open_gstreamer_gpu_chained_file_decode_source(std::move(config),
+                                                         NvbufSurfaceAbi::DeepStream9_1);
+  auto sought = source->read();
+  expect_true(sought.frame.has_value(), "global chained seek opens its target segment");
+  if (sought.frame.has_value()) {
+    expect_eq(sought.frame->frame_index, 1U, "global chained seek preserves absolute indexing");
+  }
+  sought.frame.reset();
+  expect_true(source->read().status == GpuDecodeFrameStatus::EndOfStream,
+              "global chained seek skips preceding segments entirely");
+  expect_eq(count_event(read_events(event_path), "pull"), 2U,
+            "global chained seek never opens a preceding segment");
+}
+
+void chained_source_stop_interrupts_the_active_segment() {
+  set_scenario("stop-blocked-read");
+  const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
+  std::filesystem::remove(event_path);
+  auto source = open_gstreamer_gpu_chained_file_decode_source(
+      {.segments = {{.config = valid_config(), .exact_frame_count = std::nullopt}}},
+      NvbufSurfaceAbi::DeepStream9_1);
+  std::atomic<bool> returned_eos{false};
+  std::thread reader([&] {
+    try {
+      returned_eos = source->read().status == GpuDecodeFrameStatus::EndOfStream;
+    } catch (...) {
+    }
+  });
+  expect_true(wait_for_event(event_path, "pull-blocked", std::chrono::seconds(2)),
+              "chained stop fixture blocks in its active segment");
+  source->request_stop();
+  reader.join();
+  expect_true(returned_eos.load(), "chained stop interrupts and joins the active segment read");
+  expect_eq(count_event(read_events(event_path), "send-flush-start"), 1U,
+            "chained stop flushes only the active segment");
+}
+
 void persistent_stereo_session_pairs_gstreamer_sources() {
   set_scenario("frame-eos");
   const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
@@ -1028,6 +1113,8 @@ int run_tests() {
 
   production_source_retains_mapped_sample();
   source_destruction_stops_decode_with_a_retained_frame();
+  chained_sources_open_lazily_and_preserve_global_indices();
+  chained_source_stop_interrupts_the_active_segment();
   persistent_stereo_session_pairs_gstreamer_sources();
   early_stereo_stop_flushes_both_pipelines_before_teardown();
   stop_flushes_a_blocked_appsink_read_before_teardown();
