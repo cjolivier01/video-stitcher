@@ -2322,17 +2322,59 @@ void post_admission_sigchld_change_is_supported(const std::filesystem::path& vid
 #endif
 }
 
+void owner_pre_main_startup_uses_probe_deadline(const std::filesystem::path& video_path) {
+#if !defined(_WIN32)
+  const auto marker =
+      video_path.parent_path() / (video_path.filename().string() + ".owner-pre-main-delay");
+  std::filesystem::remove(marker);
+  set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", marker.string());
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "owner-pre-main-delay");
+  std::optional<GpuVideoProbe> result;
+  std::string failure;
+  const auto started = std::chrono::steady_clock::now();
+  try {
+    result = reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
+                                       5'000'000'000ULL);
+  } catch (const std::exception& error) {
+    failure = error.what();
+  }
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  if (!failure.empty()) {
+    std::cerr << "FAIL: delayed owner startup probe threw: " << failure << '\n';
+    ++failures;
+  }
+  expect_true(std::filesystem::exists(marker), "delayed owner reaches its pre-main initializer");
+  expect_true(result.has_value() && result->width == 854U,
+              "owner startup may use the configured probe deadline");
+  expect_true(elapsed >= std::chrono::milliseconds(450) && elapsed < std::chrono::seconds(2),
+              "delayed owner startup is not capped by the termination reserve");
+  set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", "");
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+  std::filesystem::remove(marker);
+#else
+  (void)video_path;
+#endif
+}
+
 void competing_waitpid_reaper_cannot_steal_cleanup_authority(
     const std::filesystem::path& video_path) {
 #if !defined(_WIN32)
   std::atomic<bool> stop_reaper{false};
   std::atomic<std::size_t> reaped_children{0};
+  std::atomic<std::size_t> reaped_owners{0};
+  std::mutex owner_mutex;
+  std::vector<pid_t> owner_processes;
   std::thread reaper([&] {
     while (!stop_reaper.load(std::memory_order_acquire)) {
       int status = 0;
       const auto child = ::waitpid(-1, &status, WNOHANG);
       if (child > 0) {
         reaped_children.fetch_add(1, std::memory_order_release);
+        std::lock_guard lock(owner_mutex);
+        if (std::find(owner_processes.begin(), owner_processes.end(), child) !=
+            owner_processes.end()) {
+          reaped_owners.fetch_add(1, std::memory_order_release);
+        }
       } else if (child == 0 || errno == ECHILD) {
         std::this_thread::sleep_for(std::chrono::microseconds(50));
       }
@@ -2340,18 +2382,31 @@ void competing_waitpid_reaper_cannot_steal_cleanup_authority(
   });
 
   bool probes_succeeded = true;
-  for (std::size_t index = 0; index < 8; ++index) {
-    try {
-      probes_succeeded =
-          probes_succeeded && reco::io::probe_gpu_video(container_config(video_path),
-                                                        fake_probe_worker_path, 5'000'000'000ULL)
-                                      .width == 854U;
-    } catch (const std::exception& error) {
-      std::cerr << "FAIL: competing waitpid reaper probe threw: " << error.what() << '\n';
-      ++failures;
-      probes_succeeded = false;
-      break;
+  for (std::size_t index = 0; index < 4; ++index) {
+    std::optional<GpuVideoProbe> result;
+    std::string failure;
+    std::thread probe([&] {
+      try {
+        result = reco::io::detail::probe_gpu_video_with_pre_worker_report_delay_for_test(
+            container_config(video_path), fake_probe_worker_path, 5'000'000'000ULL, 100'000'000ULL);
+      } catch (const std::exception& error) {
+        failure = error.what();
+      }
+    });
+    const auto owner =
+        wait_for_descendant(::getpid(), std::chrono::steady_clock::now() + std::chrono::seconds(2),
+                            "--reco-video-probe-owner");
+    expect_true(owner.has_value(), "competing waitpid reaper observes the probe owner");
+    if (owner.has_value()) {
+      std::lock_guard lock(owner_mutex);
+      owner_processes.push_back(*owner);
     }
+    probe.join();
+    if (!failure.empty()) {
+      std::cerr << "FAIL: competing waitpid reaper probe threw: " << failure << '\n';
+      ++failures;
+    }
+    probes_succeeded = probes_succeeded && result.has_value() && result->width == 854U;
   }
   stop_reaper.store(true, std::memory_order_release);
   reaper.join();
@@ -2359,6 +2414,8 @@ void competing_waitpid_reaper_cannot_steal_cleanup_authority(
   expect_true(probes_succeeded, "competing waitpid reaper preserves every probe result");
   expect_true(reaped_children.load(std::memory_order_acquire) > 0,
               "competing waitpid reaper steals at least one host child");
+  expect_true(reaped_owners.load(std::memory_order_acquire) > 0,
+              "competing waitpid reaper steals an exact probe owner");
   expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
             "competing waitpid reaper cannot retain aggregate admission");
 #else
@@ -2758,6 +2815,62 @@ void caller_process_group_death_before_supervisor_main(const std::filesystem::pa
 #endif
 }
 
+void mac_owner_reclaims_stalled_guardian_session(const std::filesystem::path& video_path) {
+#if defined(__APPLE__)
+  const auto marker =
+      video_path.parent_path() / (video_path.filename().string() + ".stalled-guardian-session");
+  std::filesystem::remove(marker);
+  bool probe_failed = false;
+  std::thread probe([&] {
+    try {
+      (void)reco::io::detail::probe_gpu_video_with_pre_guardian_exec_delay_for_test(
+          container_config(video_path), fake_probe_worker_path, 2'000'000'000ULL, 30'000'000'000ULL,
+          marker);
+    } catch (...) {
+      probe_failed = true;
+    }
+  });
+
+  const auto discovery_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+  const auto guardian = wait_for_process_marker(marker, discovery_deadline);
+  const auto owner =
+      wait_for_descendant(::getpid(), discovery_deadline, "--reco-video-probe-owner");
+  const auto supervisor =
+      owner.has_value() ? wait_for_direct_child(*owner, discovery_deadline) : std::nullopt;
+  expect_true(guardian.has_value(), "Darwin stalled guardian starts before owner cleanup");
+  expect_true(owner.has_value(), "Darwin stalled guardian has an exec-backed session owner");
+  expect_true(supervisor.has_value(), "Darwin stalled guardian has a supervisor");
+  const bool supervisor_stopped = supervisor.has_value() && ::kill(*supervisor, SIGSTOP) == 0;
+  expect_true(supervisor_stopped, "Darwin supervisor stalls before caller timeout");
+
+  probe.join();
+  expect_true(probe_failed, "Darwin stalled guardian causes a bounded probe failure");
+  bool guardian_exited = false;
+  const auto exit_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (guardian.has_value() && std::chrono::steady_clock::now() < exit_deadline) {
+    errno = 0;
+    if (::kill(*guardian, 0) != 0 && errno == ESRCH) {
+      guardian_exited = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  expect_true(guardian_exited, "Darwin owner drains its stalled guardian session");
+  expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
+            "Darwin owner certifies only after its private session is empty");
+
+  if (supervisor.has_value()) {
+    (void)::kill(*supervisor, SIGCONT);
+  }
+  if (guardian.has_value() && !guardian_exited) {
+    (void)::kill(*guardian, SIGKILL);
+  }
+  std::filesystem::remove(marker);
+#else
+  (void)video_path;
+#endif
+}
+
 void caller_death_before_supervisor_arm(const std::filesystem::path& video_path) {
 #if !defined(_WIN32)
   const auto marker_path =
@@ -2864,11 +2977,14 @@ void caller_death_before_guardian_main(const std::filesystem::path& video_path) 
 #if !defined(_WIN32)
   const auto marker_path =
       video_path.parent_path() / (video_path.filename().string() + ".pre-main-guardian");
+  const auto inherited_child_path =
+      video_path.parent_path() / (video_path.filename().string() + ".pre-main-guardian-child");
   std::filesystem::remove(marker_path);
+  std::filesystem::remove(inherited_child_path);
   set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
-  const auto caller =
-      fork_exec_probe_caller(video_path, fake_probe_worker_path, "pre-guardian-exec-delay",
-                             30'000'000'000ULL, 30'000'000'000ULL, marker_path);
+  const auto caller = fork_exec_probe_caller(video_path, fake_probe_worker_path,
+                                             "pre-guardian-exec-delay", 30'000'000'000ULL,
+                                             30'000'000'000ULL, marker_path, inherited_child_path);
   expect_true(caller > 0, "POSIX pre-main guardian caller starts");
   if (caller <= 0) {
     return;
@@ -2876,7 +2992,11 @@ void caller_death_before_guardian_main(const std::filesystem::path& video_path) 
 
   const auto guardian = wait_for_process_marker(marker_path, std::chrono::steady_clock::now() +
                                                                  std::chrono::seconds(2));
+  const auto inherited_child = wait_for_process_marker(
+      inherited_child_path, std::chrono::steady_clock::now() + std::chrono::seconds(2));
   expect_true(guardian.has_value(), "POSIX guardian reaches its pre-main stall");
+  expect_true(inherited_child.has_value(),
+              "fork-only child starts after the guardian launch is committed");
   if (guardian.has_value() &&
       *guardian <= static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max())) {
     errno = 0;
@@ -2903,11 +3023,18 @@ void caller_death_before_guardian_main(const std::filesystem::path& video_path) 
   }
   expect_true(guardian_exited,
               "POSIX caller death reclaims the guardian before guardian main or loader completion");
+  if (inherited_child.has_value() &&
+      *inherited_child <= static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max())) {
+    expect_true(::kill(static_cast<pid_t>(*inherited_child), 0) == 0,
+                "guardian cleanup does not depend on a fork-only host child exiting");
+    (void)::kill(static_cast<pid_t>(*inherited_child), SIGKILL);
+  }
   if (guardian.has_value() && !guardian_exited &&
       *guardian <= static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max())) {
     (void)::kill(static_cast<pid_t>(*guardian), SIGKILL);
   }
   std::filesystem::remove(marker_path);
+  std::filesystem::remove(inherited_child_path);
   set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
 #else
   (void)video_path;
@@ -4337,6 +4464,7 @@ int main(int argc, char** argv) {
   auto_reaped_workers_are_supported(video_path);
   no_child_wait_workers_are_supported(video_path);
   post_admission_sigchld_change_is_supported(video_path);
+  owner_pre_main_startup_uses_probe_deadline(video_path);
   competing_waitpid_reaper_cannot_steal_cleanup_authority(video_path);
   windows_job_reclaims_worker_descendants(video_path);
   guardian_death_after_worker_release_reclaims_group(video_path);
@@ -4357,6 +4485,7 @@ int main(int argc, char** argv) {
   caller_death_before_supervisor_arm(video_path);
   caller_death_before_supervisor_main(video_path);
   caller_process_group_death_before_supervisor_main(video_path);
+  mac_owner_reclaims_stalled_guardian_session(video_path);
   executable_replacement_cannot_change_the_pinned_probe_image(video_path);
   linux_fork_child_does_not_retain_snapshot_memfd(video_path);
   mac_probe_snapshot_preserves_quarantine(video_path);

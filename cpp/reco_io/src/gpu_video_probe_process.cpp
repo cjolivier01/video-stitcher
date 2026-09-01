@@ -1155,6 +1155,7 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
                                       std::chrono::nanoseconds pre_worker_report_delay,
                                       std::chrono::nanoseconds pre_guardian_exec_delay,
                                       const std::filesystem::path& pre_guardian_exec_marker,
+                                      std::chrono::steady_clock::time_point launch_deadline,
                                       std::shared_ptr<SupervisorSlot>* reservation);
 
 bool guardian_watchdog_exit_is_fatal(bool memory_termination_sent, int wait_result, int wait_error,
@@ -2368,6 +2369,52 @@ void guardian_wait_for_worker_group_cleanup(pid_t worker_pid) {
   }
 }
 
+#if defined(__APPLE__)
+void guardian_reclaim_owned_session(pid_t supervisor_pid) {
+  constexpr timespec kSessionPollPause{.tv_sec = 0, .tv_nsec = 2'000'000};
+  const auto owner_pid = ::getpid();
+  const auto session_id = ::getsid(0);
+  if (session_id != owner_pid) {
+    while (true) {
+      (void)::nanosleep(&kSessionPollPause, nullptr);
+    }
+  }
+
+  while (true) {
+    std::array<kinfo_proc, 4096> processes{};
+    std::size_t bytes = sizeof(processes);
+    int query[] = {CTL_KERN, KERN_PROC, KERN_PROC_SESSION, session_id};
+    const auto query_result = ::sysctl(query, static_cast<unsigned int>(std::size(query)),
+                                       processes.data(), &bytes, nullptr, 0);
+    bool uncertain =
+        query_result != 0 || bytes % sizeof(kinfo_proc) != 0 || bytes >= sizeof(processes);
+    bool found_member = false;
+    if (query_result == 0) {
+      const auto process_count = std::min(bytes / sizeof(kinfo_proc), processes.size());
+      for (std::size_t index = 0; index < process_count; ++index) {
+        const auto process = processes[index].kp_proc.p_pid;
+        if (process <= 0 || process == owner_pid || process == supervisor_pid) {
+          continue;
+        }
+        errno = 0;
+        const auto process_session = ::getsid(process);
+        if (process_session == session_id) {
+          found_member = true;
+          (void)::kill(-process, SIGKILL);
+          (void)::kill(process, SIGKILL);
+        } else if (process_session < 0 && errno != ESRCH) {
+          uncertain = true;
+        }
+      }
+    }
+    if (!found_member && !uncertain) {
+      return;
+    }
+    (void)::nanosleep(&kSessionPollPause, nullptr);
+  }
+}
+#endif
+
 void guardian_terminate_worker(pid_t worker_pid, pid_t watchdog_pid = -1,
                                bool authority_reported = false) {
   kill_worker_process_group(worker_pid);
@@ -2463,6 +2510,9 @@ bool guardian_write_exact(int descriptor, const void* value, std::size_t size) {
     guardian_exit(127);
   }
 
+#if defined(__APPLE__)
+  guardian_reclaim_owned_session(supervisor_pid);
+#endif
   guardian_wait_for_worker_group_cleanup(supervisor_pid);
   int status = 0;
   while (::waitpid(supervisor_pid, &status, 0) < 0) {
@@ -2644,6 +2694,11 @@ bool guardian_write_exact(int descriptor, const void* value, std::size_t size) {
   if (mask_error != 0) {
     report_owner_start_error(mask_error);
   }
+#if defined(__APPLE__)
+  if (::getsid(0) != ::getpid()) {
+    report_owner_start_error(ENOSYS);
+  }
+#endif
 
   std::array<char, 32> worker_delay_text{};
   std::array<char, 32> guardian_delay_text{};
@@ -2722,6 +2777,7 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
                                       std::chrono::nanoseconds pre_worker_report_delay,
                                       std::chrono::nanoseconds pre_guardian_exec_delay,
                                       const std::filesystem::path& pre_guardian_exec_marker,
+                                      std::chrono::steady_clock::time_point launch_deadline,
                                       std::shared_ptr<SupervisorSlot>* reservation) {
   const auto maximum_descriptor = descriptor_scan_limit();
   if (maximum_descriptor < kOwnerFirstUnusedDescriptor) {
@@ -2804,11 +2860,16 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
     }
   }
 #if defined(SO_NOSIGPIPE) && !defined(MSG_NOSIGNAL)
-  const int suppress_lifetime_sigpipe = 1;
-  if (::setsockopt(caller_lifetime.get(), SOL_SOCKET, SO_NOSIGPIPE, &suppress_lifetime_sigpipe,
-                   sizeof(suppress_lifetime_sigpipe)) != 0) {
-    throw GpuVideoProbeError("failed to suppress SIGPIPE for video probe guardian lifetime: " +
-                             std::string(std::strerror(errno)));
+  const int suppress_sigpipe = 1;
+  for (const auto descriptor :
+       {supervisor_lifetime.get(), caller_lifetime.get(), watchdog_target.get(),
+        caller_watchdog_target.get(), supervisor_arm.get(), caller_supervisor_arm.get(),
+        watchdog_ready.get(), supervisor_watchdog_ready.get()}) {
+    if (::setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &suppress_sigpipe,
+                     sizeof(suppress_sigpipe)) != 0) {
+      throw GpuVideoProbeError("failed to suppress SIGPIPE for video probe ownership IPC: " +
+                               std::string(std::strerror(errno)));
+    }
   }
 #endif
   auto supervisor_lifetime_descriptor = duplicate_for_owner(supervisor_lifetime.get());
@@ -2898,10 +2959,31 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
   supervisor_arm.reset();
   supervisor_watchdog_ready.reset();
 
+  const auto poll_until_launch_deadline = [&](pollfd* descriptor) {
+    while (true) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= launch_deadline) {
+        return false;
+      }
+      const auto remaining =
+          std::chrono::duration_cast<std::chrono::milliseconds>(launch_deadline - now);
+      const auto timeout = static_cast<int>(
+          std::clamp<std::int64_t>(remaining.count() + 1, 1, std::numeric_limits<int>::max()));
+      descriptor->revents = 0;
+      const auto result = ::poll(descriptor, 1, timeout);
+      if (result > 0) {
+        return true;
+      }
+      if (result < 0 && errno == EINTR) {
+        continue;
+      }
+      return false;
+    }
+  };
   SupervisorLaunchReport supervisor_report{};
   bool supervisor_reported = false;
   pollfd report_ready{.fd = caller_watchdog_target.get(), .events = POLLIN, .revents = 0};
-  if (::poll(&report_ready, 1, static_cast<int>(kMaximumTerminationReserve.count())) > 0) {
+  if (poll_until_launch_deadline(&report_ready)) {
     std::size_t offset = 0;
     while (offset < sizeof(supervisor_report)) {
       const auto received =
@@ -2945,11 +3027,10 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
   if (supervisor_pid > 0 && supervisor_group_error == 0 &&
       guardian_write(caller_watchdog_target.get(), &kGuardianRelease, 1)) {
     pollfd acknowledgment{.fd = caller_watchdog_target.get(), .events = POLLIN, .revents = 0};
-    const auto acknowledgment_wait =
-        ::poll(&acknowledgment, 1, static_cast<int>(kMaximumTerminationReserve.count()));
+    const auto acknowledgment_wait = poll_until_launch_deadline(&acknowledgment);
     char value = '\0';
     ssize_t received = -1;
-    if (acknowledgment_wait > 0) {
+    if (acknowledgment_wait) {
       do {
         received = ::read(caller_watchdog_target.get(), &value, 1);
       } while (received < 0 && errno == EINTR);
@@ -3586,8 +3667,8 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
 
 class GuardianProcess {
 public:
-  GuardianProcess(pid_t pid, pid_t watchdog_pid, UniqueFd control, ForkProtectedFd caller_lifetime,
-                  std::chrono::steady_clock::time_point deadline,
+  GuardianProcess(pid_t pid, pid_t watchdog_pid, ForkProtectedFd control,
+                  ForkProtectedFd caller_lifetime, std::chrono::steady_clock::time_point deadline,
                   std::shared_ptr<SupervisorSlot> reservation)
       : pid_(pid), watchdog_pid_(watchdog_pid), control_(std::move(control)),
         caller_lifetime_(std::move(caller_lifetime)), deadline_(deadline),
@@ -3684,7 +3765,7 @@ private:
 
   pid_t pid_ = -1;
   pid_t watchdog_pid_ = -1;
-  UniqueFd control_;
+  ForkProtectedFd control_;
   ForkProtectedFd caller_lifetime_;
   std::chrono::steady_clock::time_point deadline_;
   std::shared_ptr<SupervisorSlot> reservation_;
@@ -3711,16 +3792,16 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
 #endif
   int request_socket[2] = {-1, -1};
   int response_socket[2] = {-1, -1};
-  int control_socket[2] = {-1, -1};
   create_socket_pair(request_socket, "input");
   UniqueFd child_input(request_socket[0]);
   UniqueFd parent_input(request_socket[1]);
   create_socket_pair(response_socket, "output");
   UniqueFd parent_output(response_socket[0]);
   UniqueFd child_output(response_socket[1]);
-  create_socket_pair(control_socket, "guardian control");
-  UniqueFd child_control(control_socket[0]);
-  UniqueFd parent_control(control_socket[1]);
+  auto control_descriptors =
+      ForkProtectedFd::create_writer_protected_socket_pair("guardian control");
+  auto child_control = std::move(control_descriptors.first);
+  auto parent_control = std::move(control_descriptors.second);
   make_nonblocking(parent_input.get());
   make_nonblocking(parent_output.get());
   make_nonblocking(parent_control.get());
@@ -3766,7 +3847,7 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
       executable, pinned_executable.get(), guard_control.get(), guard_input.get(),
       guard_output.get(), options.pre_supervisor_arm_delay, options.pre_supervisor_arm_marker,
       options.pre_worker_report_delay, options.pre_guardian_exec_delay,
-      options.pre_guardian_exec_marker, &reservation);
+      options.pre_guardian_exec_marker, deadline, &reservation);
   pinned_executable.reset();
   GuardianProcess guardian(guardian_launch.supervisor_pid, guardian_launch.watchdog_pid,
                            std::move(parent_control), std::move(guardian_launch.caller_lifetime),

@@ -81,10 +81,15 @@ public:
     const bool supervisor_block =
         scenario != nullptr && std::strcmp(scenario, "supervisor-pre-main-block") == 0 &&
         process_role != nullptr && std::strcmp(process_role, "supervisor") == 0;
+    const bool owner_delay = scenario != nullptr &&
+                             std::strcmp(scenario, "owner-pre-main-delay") == 0 &&
+                             process_role != nullptr && std::strcmp(process_role, "owner") == 0;
 #else
     constexpr bool supervisor_block = false;
+    constexpr bool owner_delay = false;
 #endif
-    if ((!worker_block && !supervisor_block) || marker_path == nullptr || marker_path[0] == '\0') {
+    if ((!worker_block && !supervisor_block && !owner_delay) || marker_path == nullptr ||
+        marker_path[0] == '\0') {
       return;
     }
 #if defined(_WIN32)
@@ -122,7 +127,14 @@ public:
     }
     (void)::close(marker);
 #endif
-    std::this_thread::sleep_for(std::chrono::seconds(30));
+    if (owner_delay) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+#if !defined(_WIN32)
+      (void)::setenv("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata", 1);
+#endif
+    } else {
+      std::this_thread::sleep_for(std::chrono::seconds(30));
+    }
   }
 };
 
