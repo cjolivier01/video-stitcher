@@ -140,12 +140,14 @@ jobs:
           //cpp/tests:reco_io_gpu_video_probe_fallback_tests
           //cpp/tests:reco_io_nvmm_cuda_interop_tests
 
-  # This job requires a runner whose service cgroup delegates the memory and pids controllers.
+  # Same-repository PR branches are trusted on the delegated containment runner. Fork PRs remain
+  # excluded because this job executes code outside GitHub-hosted isolation.
   calibration-containment-self-hosted-conditional:
     name: Bazel C++ calibration containment (self-hosted)
     if: >-
       vars.RECO_CONTAINMENT_RUNNER_ENABLED == 'true' &&
-      github.event_name != 'pull_request'
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, linux, x64, delegated-cgroup-v2]
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -161,12 +163,13 @@ jobs:
           --test_output=errors
           //cpp/tests:reco_calibrate_supervisor_tests
 
-  # Persistent hardware runners only execute trusted main pushes and manual dispatches.
+  # Persistent hardware runners also execute trusted same-repository PR branches.
   gpu-calibration-hardware-conditional:
     name: Bazel C++ GPU calibration (hardware-conditional)
     if: >-
       vars.RECO_GPU_RUNNER_ENABLED == 'true' &&
-      github.event_name != 'pull_request'
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, linux, x64, nvidia-gpu, delegated-cgroup-v2]
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -188,6 +191,7 @@ jobs:
           //cpp/tests:reco_calibrate_gpu_features_full_resolution_tests
           //cpp/tests:reco_calibrate_gpu_pipeline_tests
           //cpp/tests:reco_calibrate_gpu_video_parity_tests
+          //cpp/tests:reco_detect_npp_interop_tests
       - name: Require Rust/C++ decoded-video calibration parity
         env:
           RECO_REQUIRE_CPP_GPU_VIDEO_PARITY: "1"

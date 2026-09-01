@@ -39,6 +39,7 @@ constexpr DWORD_PTR kProcThreadAttributeJobList = ProcThreadAttributeValue(13, F
 #include <pthread.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -814,7 +815,9 @@ std::string read_response(int input, std::chrono::steady_clock::time_point deadl
 constexpr int kGuardianWorkerInput = 3;
 constexpr int kGuardianWorkerOutput = 4;
 constexpr int kGuardianWorkerAuthority = 5;
-constexpr int kGuardianFirstUnusedDescriptor = 6;
+constexpr int kGuardianExecutable = 6;
+constexpr int kGuardianFirstUnusedDescriptor = 7;
+constexpr int kWorkerExecutable = 3;
 constexpr int kPreMainWatchdogFirstUnusedDescriptor = 5;
 constexpr int kPreMainWatchdogTarget = 3;
 constexpr int kPreMainWatchdogReady = 4;
@@ -823,7 +826,8 @@ constexpr int kSupervisorWorkerInput = 4;
 constexpr int kSupervisorWorkerOutput = 5;
 constexpr int kSupervisorMarker = 6;
 constexpr int kSupervisorWatchdogReady = 7;
-constexpr int kSupervisorFirstUnusedDescriptor = 8;
+constexpr int kSupervisorExecutable = 8;
+constexpr int kSupervisorFirstUnusedDescriptor = 9;
 constexpr char kGuardianReady = 'R';
 constexpr char kGuardianLaunch = 'L';
 constexpr char kGuardianStarted = 'S';
@@ -843,8 +847,9 @@ struct GuardianLaunch {
   UniqueFd caller_lifetime;
 };
 
-GuardianLaunch spawn_guardian_process(const std::string& executable, int control_descriptor,
-                                      int worker_input_descriptor, int worker_output_descriptor,
+GuardianLaunch spawn_guardian_process(const std::string& executable, int executable_descriptor,
+                                      int control_descriptor, int worker_input_descriptor,
+                                      int worker_output_descriptor,
                                       std::chrono::nanoseconds pre_worker_report_delay,
                                       std::chrono::nanoseconds pre_guardian_exec_delay,
                                       const std::filesystem::path& pre_guardian_exec_marker,
@@ -884,6 +889,30 @@ UniqueFd duplicate_for_guardian(int descriptor) {
 
 UniqueFd duplicate_for_supervisor(int descriptor) {
   return duplicate_close_on_exec(descriptor, kSupervisorFirstUnusedDescriptor);
+}
+
+UniqueFd open_probe_executable(const std::filesystem::path& path) {
+  int flags = O_CLOEXEC;
+#if defined(__linux__) && defined(O_PATH)
+  flags |= O_PATH;
+#elif defined(O_EXEC)
+  flags |= O_EXEC;
+#else
+  flags |= O_RDONLY;
+#endif
+  UniqueFd executable(::open(path.c_str(), flags));
+  struct stat status{};
+  if (executable.get() < 0) {
+    throw GpuVideoProbeError("failed to start video probe worker: cannot open executable: " +
+                             std::string(std::strerror(errno)));
+  }
+  if (::fstat(executable.get(), &status) != 0 || !S_ISREG(status.st_mode) || status.st_size <= 0 ||
+      (status.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) == 0 ||
+      (status.st_mode & (S_ISUID | S_ISGID)) != 0) {
+    throw GpuVideoProbeError(
+        "failed to start video probe worker: executable must be a non-set-id regular file");
+  }
+  return executable;
 }
 
 void kill_worker_process_group(pid_t worker_pid) {
@@ -1722,8 +1751,9 @@ std::size_t format_guardian_parent_argument(char* destination, std::size_t capac
   }
 }
 
-GuardianLaunch spawn_guardian_process(const std::string& executable, int control_descriptor,
-                                      int worker_input_descriptor, int worker_output_descriptor,
+GuardianLaunch spawn_guardian_process(const std::string& executable, int executable_descriptor,
+                                      int control_descriptor, int worker_input_descriptor,
+                                      int worker_output_descriptor,
                                       std::chrono::nanoseconds pre_worker_report_delay,
                                       std::chrono::nanoseconds pre_guardian_exec_delay,
                                       const std::filesystem::path& pre_guardian_exec_marker,
@@ -1811,6 +1841,7 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int control
   }
 #endif
   auto supervisor_lifetime_descriptor = duplicate_for_supervisor(supervisor_lifetime.get());
+  auto supervisor_executable = duplicate_for_supervisor(executable_descriptor);
   auto supervisor_control = duplicate_for_supervisor(control_descriptor);
   auto supervisor_worker_input = duplicate_for_supervisor(worker_input_descriptor);
   auto supervisor_worker_output = duplicate_for_supervisor(worker_output_descriptor);
@@ -1823,7 +1854,6 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int control
   const auto caller_lifetime_descriptor = caller_lifetime.get();
   const auto inherited_watchdog_target_writer = caller_watchdog_target.get();
   const auto inherited_supervisor_arm_writer = caller_supervisor_arm.get();
-  const char* const executable_path = executable.c_str();
   char* const* const environment = guardian_environment.data();
 
   sigset_t blocked_mask{};
@@ -1902,6 +1932,7 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int control
     }
     for (const auto [source, destination] :
          {std::pair(supervisor_lifetime_descriptor.get(), STDIN_FILENO),
+          std::pair(supervisor_executable.get(), kSupervisorExecutable),
           std::pair(supervisor_worker_input.get(), kSupervisorWorkerInput),
           std::pair(supervisor_worker_output.get(), kSupervisorWorkerOutput),
           std::pair(supervisor_watchdog_ready_descriptor.get(), kSupervisorWatchdogReady)}) {
@@ -1918,7 +1949,7 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int control
     if (!guardian_close_from(kSupervisorFirstUnusedDescriptor, maximum_descriptor)) {
       report_error(errno);
     }
-    ::execve(executable_path, arguments, environment);
+    ::fexecve(kSupervisorExecutable, arguments, environment);
     report_error(errno);
   }
 
@@ -2122,13 +2153,16 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int control
         offset += static_cast<std::size_t>(written);
       }
     }
+    if (::dup2(kSupervisorExecutable, kGuardianExecutable) < 0) {
+      report_error(STDOUT_FILENO, errno);
+    }
     if (!guardian_close_from(kGuardianFirstUnusedDescriptor, maximum_descriptor)) {
       report_error(STDOUT_FILENO, errno);
     }
     if (!guardian_sleep(pre_guardian_exec_delay)) {
       report_error(STDOUT_FILENO, errno);
     }
-    ::execve(executable, arguments, environ);
+    ::fexecve(kGuardianExecutable, arguments, environ);
     report_error(STDOUT_FILENO, errno);
   }
 
@@ -2338,6 +2372,7 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int control
   }
   const auto guardian_pid = ::getpid();
   const auto worker_pid = ::fork();
+  const auto worker_fork_error = errno;
   if (worker_pid == 0) {
     (void)::close(start_gate[1]);
     (void)::close(lifetime_gate[0]);
@@ -2351,7 +2386,9 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int control
     }
 #endif
     if (::setpgid(0, 0) != 0 || ::dup2(kGuardianWorkerInput, STDIN_FILENO) < 0 ||
-        ::dup2(kGuardianWorkerOutput, STDOUT_FILENO) < 0) {
+        ::dup2(kGuardianWorkerOutput, STDOUT_FILENO) < 0 ||
+        ::dup2(kGuardianExecutable, kWorkerExecutable) < 0 ||
+        ::fcntl(kWorkerExecutable, F_SETFD, FD_CLOEXEC) != 0) {
       guardian_exit(127);
     }
     if (!guardian_restrict_worker_process_creation()) {
@@ -2366,7 +2403,7 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int control
       guardian_exit(127);
     }
     (void)::close(start_gate[0]);
-    if (!guardian_close_from(kGuardianWorkerInput, maximum_descriptor)) {
+    if (!guardian_close_from(kWorkerExecutable + 1, maximum_descriptor)) {
       guardian_exit(127);
     }
     char parent_argument[40]{};
@@ -2377,18 +2414,18 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int control
     char* const arguments[] = {const_cast<char*>(executable),
                                const_cast<char*>("--reco-video-probe-worker"), parent_argument,
                                nullptr};
-    ::execve(executable, arguments, environ);
+    ::fexecve(kWorkerExecutable, arguments, environ);
     guardian_exit(127);
   }
   (void)::close(start_gate[0]);
+  (void)::close(kGuardianExecutable);
   if (worker_pid < 0) {
-    const auto fork_error = errno;
     (void)::close(start_gate[1]);
     (void)::close(lifetime_gate[0]);
     (void)::close(lifetime_gate[1]);
     (void)::close(watchdog_gate[0]);
     (void)::close(watchdog_gate[1]);
-    report_guardian_startup_error(fork_error);
+    report_guardian_startup_error(worker_fork_error);
   }
   if (::setpgid(worker_pid, worker_pid) != 0) {
     const auto group_error = errno;
@@ -2696,6 +2733,7 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
                              std::shared_ptr<SupervisorSlot> reservation) {
   require_worker_launch_active(deadline);
   (void)deferred_process_reaper();
+  auto pinned_executable = open_probe_executable(worker_path);
   int request_socket[2] = {-1, -1};
   int response_socket[2] = {-1, -1};
   int control_socket[2] = {-1, -1};
@@ -2729,10 +2767,11 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   auto guard_input = duplicate_for_guardian(child_input.get());
   auto guard_output = duplicate_for_guardian(child_output.get());
   wait_for_worker_launch_delay(options.pre_worker_spawn_delay, deadline);
-  auto guardian_launch =
-      spawn_guardian_process(executable, guard_control.get(), guard_input.get(), guard_output.get(),
-                             options.pre_worker_report_delay, options.pre_guardian_exec_delay,
-                             options.pre_guardian_exec_marker, &reservation);
+  auto guardian_launch = spawn_guardian_process(
+      executable, pinned_executable.get(), guard_control.get(), guard_input.get(),
+      guard_output.get(), options.pre_worker_report_delay, options.pre_guardian_exec_delay,
+      options.pre_guardian_exec_marker, &reservation);
+  pinned_executable.reset();
   GuardianProcess guardian(guardian_launch.supervisor_pid, guardian_launch.watchdog_pid,
                            std::move(parent_control), std::move(guardian_launch.caller_lifetime),
                            cleanup_deadline, std::move(reservation));

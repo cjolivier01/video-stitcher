@@ -102,7 +102,7 @@ constexpr std::uint64_t kMaximumWorkerExecutableBytes = 64ULL * 1024ULL * 1024UL
 constexpr std::uint64_t kMaximumRuntimeSnapshotFileBytes = 256ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kMaximumRuntimeSnapshotBytes = 256ULL * 1024ULL * 1024ULL;
 constexpr std::uint64_t kMaximumScratchAllocatedBytes = 384ULL * 1024ULL * 1024ULL;
-constexpr std::uint64_t kMaximumWorkerFileBytes = 512ULL * 1024ULL * 1024ULL;
+constexpr std::uint64_t kMaximumWorkerFileBytes = kMaximumScratchAllocatedBytes;
 constexpr std::size_t kMaximumScratchEntries = 4'096U;
 constexpr std::size_t kMaximumScratchTraversalPathBytes = 4U * 1024U * 1024U;
 constexpr std::size_t kMaximumScratchRelativePathBytes = 4'096U;
@@ -1453,7 +1453,6 @@ struct ScratchQuotaInspection {
       return {.state = ScratchQuotaState::InspectionFailed, .error = errno};
     }
     std::size_t component_start = 0;
-    bool vanished = false;
     while (component_start < relative.size()) {
       const auto component_end = relative.find('/', component_start);
       const auto size =
@@ -1466,10 +1465,6 @@ struct ScratchQuotaInspection {
       const auto next = ::openat(directory.get(), component.c_str(),
                                  O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
       if (next < 0) {
-        if (errno == ENOENT || errno == ENOTDIR || errno == ELOOP) {
-          vanished = true;
-          break;
-        }
         return {.state = ScratchQuotaState::InspectionFailed, .error = errno};
       }
       directory.reset(next);
@@ -1478,10 +1473,6 @@ struct ScratchQuotaInspection {
       }
       component_start = component_end + 1U;
     }
-    if (vanished) {
-      continue;
-    }
-
     DIR* stream = ::fdopendir(directory.get());
     if (stream == nullptr) {
       return {.state = ScratchQuotaState::InspectionFailed, .error = errno};
@@ -1509,9 +1500,6 @@ struct ScratchQuotaInspection {
 
       struct stat status{};
       if (::fstatat(::dirfd(stream), entry->d_name, &status, AT_SYMLINK_NOFOLLOW) != 0) {
-        if (errno == ENOENT) {
-          continue;
-        }
         result = {.state = ScratchQuotaState::InspectionFailed, .error = errno};
         break;
       }
@@ -2112,6 +2100,38 @@ void close_child_descriptors_except(int preserved) noexcept {
       BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 1),
       BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
       BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+#if defined(O_TMPFILE) && defined(SYS_open)
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_open, 0, 4),
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, args[1])),
+      BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, O_TMPFILE & ~O_DIRECTORY, 0, 1),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+#endif
+#if defined(O_TMPFILE) && defined(SYS_openat)
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_openat, 0, 4),
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, args[2])),
+      BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, O_TMPFILE & ~O_DIRECTORY, 0, 1),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+#endif
+#if defined(SYS_openat2)
+      RECO_PRE_MAIN_DENY(SYS_openat2),
+#endif
+#if defined(SYS_unlink)
+      RECO_PRE_MAIN_DENY(SYS_unlink),
+#endif
+#if defined(SYS_unlinkat)
+      RECO_PRE_MAIN_DENY(SYS_unlinkat),
+#endif
+#if defined(SYS_rename)
+      RECO_PRE_MAIN_DENY(SYS_rename),
+#endif
+#if defined(SYS_renameat)
+      RECO_PRE_MAIN_DENY(SYS_renameat),
+#endif
+#if defined(SYS_renameat2)
+      RECO_PRE_MAIN_DENY(SYS_renameat2),
+#endif
       RECO_PRE_MAIN_DENY(SYS_kill),
       RECO_PRE_MAIN_DENY(SYS_tkill),
       RECO_PRE_MAIN_DENY(SYS_tgkill),
@@ -2251,14 +2271,15 @@ void close_child_descriptors_except(int preserved) noexcept {
   if (abi < 1) {
     return false;
   }
-  std::uint64_t write_access = LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_REMOVE_DIR |
-                               LANDLOCK_ACCESS_FS_REMOVE_FILE | LANDLOCK_ACCESS_FS_MAKE_CHAR |
+  std::uint64_t write_access = LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_MAKE_CHAR |
                                LANDLOCK_ACCESS_FS_MAKE_DIR | LANDLOCK_ACCESS_FS_MAKE_REG |
                                LANDLOCK_ACCESS_FS_MAKE_SOCK | LANDLOCK_ACCESS_FS_MAKE_FIFO |
                                LANDLOCK_ACCESS_FS_MAKE_BLOCK | LANDLOCK_ACCESS_FS_MAKE_SYM;
+  std::uint64_t namespace_mutation_access =
+      LANDLOCK_ACCESS_FS_REMOVE_DIR | LANDLOCK_ACCESS_FS_REMOVE_FILE;
 #if defined(LANDLOCK_ACCESS_FS_REFER)
   if (abi >= 2) {
-    write_access |= LANDLOCK_ACCESS_FS_REFER;
+    namespace_mutation_access |= LANDLOCK_ACCESS_FS_REFER;
   }
 #endif
 #if defined(LANDLOCK_ACCESS_FS_TRUNCATE)
@@ -2268,7 +2289,8 @@ void close_child_descriptors_except(int preserved) noexcept {
 #endif
   constexpr std::uint64_t read_access =
       LANDLOCK_ACCESS_FS_EXECUTE | LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
-  const landlock_ruleset_attr ruleset_attributes{.handled_access_fs = write_access | read_access};
+  const landlock_ruleset_attr ruleset_attributes{
+      .handled_access_fs = write_access | namespace_mutation_access | read_access};
   UniqueFd ruleset(static_cast<int>(
       ::syscall(SYS_landlock_create_ruleset, &ruleset_attributes, sizeof(ruleset_attributes), 0U)));
   if (!ruleset) {
@@ -2453,6 +2475,38 @@ void close_child_descriptors_except(int preserved) noexcept {
       RECO_WORKER_DENY(SYS_pivot_root, EPERM),
       RECO_WORKER_DENY(SYS_setns, EPERM),
       RECO_WORKER_DENY(SYS_unshare, EPERM),
+#if defined(O_TMPFILE) && defined(SYS_open)
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_open, 0, 4),
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, args[1])),
+      BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, O_TMPFILE & ~O_DIRECTORY, 0, 1),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+#endif
+#if defined(O_TMPFILE) && defined(SYS_openat)
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_openat, 0, 4),
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, args[2])),
+      BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, O_TMPFILE & ~O_DIRECTORY, 0, 1),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+#endif
+#if defined(SYS_openat2)
+      RECO_WORKER_DENY(SYS_openat2, EPERM),
+#endif
+#if defined(SYS_unlink)
+      RECO_WORKER_DENY(SYS_unlink, EPERM),
+#endif
+#if defined(SYS_unlinkat)
+      RECO_WORKER_DENY(SYS_unlinkat, EPERM),
+#endif
+#if defined(SYS_rename)
+      RECO_WORKER_DENY(SYS_rename, EPERM),
+#endif
+#if defined(SYS_renameat)
+      RECO_WORKER_DENY(SYS_renameat, EPERM),
+#endif
+#if defined(SYS_renameat2)
+      RECO_WORKER_DENY(SYS_renameat2, EPERM),
+#endif
 #if defined(SYS_io_uring_setup)
       RECO_WORKER_DENY(SYS_io_uring_setup, EPERM),
 #endif
@@ -2603,6 +2657,31 @@ void close_child_descriptors_except(int preserved) noexcept {
       RECO_WORKER_DENY(SYS_pivot_root, EPERM),
       RECO_WORKER_DENY(SYS_setns, EPERM),
       RECO_WORKER_DENY(SYS_unshare, EPERM),
+#if defined(O_TMPFILE) && defined(SYS_openat)
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_openat, 0, 4),
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, args[2])),
+      BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, O_TMPFILE & ~O_DIRECTORY, 0, 1),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+#endif
+#if defined(SYS_openat2)
+      RECO_WORKER_DENY(SYS_openat2, EPERM),
+#endif
+#if defined(SYS_unlink)
+      RECO_WORKER_DENY(SYS_unlink, EPERM),
+#endif
+#if defined(SYS_unlinkat)
+      RECO_WORKER_DENY(SYS_unlinkat, EPERM),
+#endif
+#if defined(SYS_rename)
+      RECO_WORKER_DENY(SYS_rename, EPERM),
+#endif
+#if defined(SYS_renameat)
+      RECO_WORKER_DENY(SYS_renameat, EPERM),
+#endif
+#if defined(SYS_renameat2)
+      RECO_WORKER_DENY(SYS_renameat2, EPERM),
+#endif
 #if defined(SYS_io_uring_setup)
       RECO_WORKER_DENY(SYS_io_uring_setup, EPERM),
 #endif

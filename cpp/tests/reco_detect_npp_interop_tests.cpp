@@ -75,7 +75,7 @@ void expect_bytes(CudaBackend& backend, const CudaDeviceBuffer& buffer,
   expect_eq(actual.size(), expected.size(), label);
   const auto n = std::min(actual.size(), expected.size());
   for (std::size_t i = 0; i < n; ++i) {
-    expect_eq(actual[i], expected[i], label);
+    expect_eq(static_cast<unsigned int>(actual[i]), static_cast<unsigned int>(expected[i]), label);
   }
 }
 
@@ -154,6 +154,54 @@ int main() {
     npp_resize_c1(gray_large_src.ptr(), 4, 4, 4, gray_small_dst.ptr(), 2, 2, 2);
     backend.synchronize();
     expect_bytes(backend, gray_small_dst, {10, 20, 30, 40}, "resize c1 area downscale");
+
+    const std::vector<std::uint8_t> gray_nonuniform{0, 64, 128, 255};
+    auto gray_nonuniform_src = backend.allocate(gray_nonuniform.size());
+    auto gray_upsampled_dst = backend.allocate(16);
+    upload_bytes(backend, gray_nonuniform, gray_nonuniform_src);
+    npp_resize_c1(gray_nonuniform_src.ptr(), 2, 2, 2, gray_upsampled_dst.ptr(), 4, 4, 4);
+    backend.synchronize();
+    expect_bytes(backend, gray_upsampled_dst,
+                 {
+                     0,
+                     16,
+                     48,
+                     64,
+                     32,
+                     52,
+                     92,
+                     112,
+                     96,
+                     124,
+                     179,
+                     207,
+                     128,
+                     160,
+                     223,
+                     255,
+                 },
+                 "resize c1 nonuniform linear upsample");
+
+    const std::vector<std::uint8_t> gray_mixed{
+        0, 64, 32, 96, 128, 192, 160, 224,
+    };
+    auto gray_mixed_src = backend.allocate(gray_mixed.size());
+    auto gray_mixed_dst = backend.allocate(8);
+    upload_bytes(backend, gray_mixed, gray_mixed_src);
+    npp_resize_c1(gray_mixed_src.ptr(), 2, 2, 4, gray_mixed_dst.ptr(), 4, 4, 2);
+    backend.synchronize();
+    expect_bytes(backend, gray_mixed_dst,
+                 {
+                     0,
+                     16,
+                     48,
+                     64,
+                     128,
+                     144,
+                     176,
+                     192,
+                 },
+                 "resize c1 nonuniform mixed-axis linear");
 
     const auto expect_mixed_axis_resize = [&](std::uint32_t src_width, std::uint32_t src_height,
                                               std::uint32_t dst_width, std::uint32_t dst_height,

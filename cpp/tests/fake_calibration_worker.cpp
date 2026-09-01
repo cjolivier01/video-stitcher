@@ -768,7 +768,8 @@ int main(int argc, char** argv) {
 #endif
 #undef RECO_REQUIRE_METADATA_DENIED
     (void)::close(metadata_descriptor);
-    if (::unlink(metadata_scratch_path.c_str()) != 0) {
+    errno = 0;
+    if (::unlink(metadata_scratch_path.c_str()) == 0 || (errno != EPERM && errno != EACCES)) {
       return EXIT_FAILURE;
     }
     errno = 0;
@@ -864,7 +865,32 @@ int main(int argc, char** argv) {
       return EXIT_FAILURE;
     }
     (void)::close(allowed_write);
-    if (::unlink(scratch_file.c_str()) != 0) {
+    const auto renamed_scratch_file = std::string(scratch) + "/worker-write-renamed";
+    errno = 0;
+    if (::rename(scratch_file.c_str(), renamed_scratch_file.c_str()) == 0 ||
+        (errno != EPERM && errno != EACCES)) {
+      return EXIT_FAILURE;
+    }
+#if defined(SYS_renameat2)
+    errno = 0;
+    if (::syscall(SYS_renameat2, AT_FDCWD, scratch_file.c_str(), AT_FDCWD,
+                  renamed_scratch_file.c_str(), 0U) == 0 ||
+        (errno != EPERM && errno != EACCES)) {
+      return EXIT_FAILURE;
+    }
+#endif
+#if defined(O_TMPFILE)
+    errno = 0;
+    const auto anonymous = ::open(scratch, O_RDWR | O_TMPFILE | O_CLOEXEC, S_IRUSR | S_IWUSR);
+    if (anonymous >= 0 || (errno != EPERM && errno != EACCES)) {
+      if (anonymous >= 0) {
+        (void)::close(anonymous);
+      }
+      return EXIT_FAILURE;
+    }
+#endif
+    errno = 0;
+    if (::unlink(scratch_file.c_str()) == 0 || (errno != EPERM && errno != EACCES)) {
       return EXIT_FAILURE;
     }
     struct rlimit core{};
@@ -890,7 +916,7 @@ int main(int argc, char** argv) {
     write_bytes(descriptor, encode_calibration_worker_success(result()), deadline);
     return EXIT_SUCCESS;
   }
-  if (scenario == "scratch-oversized-file") {
+  if (scenario == "scratch-oversized-file" || scenario == "scratch-unlink-oversized-file") {
     const char* scratch = std::getenv("TMPDIR");
     if (scratch == nullptr) {
       return EXIT_FAILURE;
@@ -900,6 +926,13 @@ int main(int argc, char** argv) {
         ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, S_IRUSR | S_IWUSR);
     if (output < 0) {
       return EXIT_FAILURE;
+    }
+    if (scenario == "scratch-unlink-oversized-file") {
+      errno = 0;
+      if (::unlink(path.c_str()) == 0 || (errno != EPERM && errno != EACCES)) {
+        (void)::close(output);
+        return EXIT_FAILURE;
+      }
     }
     std::array<char, 64U * 1024U> block{};
     constexpr std::size_t attack_bytes = 4U * 1024U * 1024U;

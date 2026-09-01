@@ -18,7 +18,7 @@
 namespace reco::detect {
 namespace {
 
-constexpr int kNppiInterLinear = 1;
+constexpr int kNppiInterLinear = 2;
 constexpr int kNppiInterSuper = 8;
 constexpr int kNppiAxisBoth = 2;
 constexpr std::uint32_t kCudaStreamNonBlocking = 1;

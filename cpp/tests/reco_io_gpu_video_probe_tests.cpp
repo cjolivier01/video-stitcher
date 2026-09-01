@@ -2238,6 +2238,102 @@ void caller_death_before_guardian_main(const std::filesystem::path& video_path) 
 #endif
 }
 
+void executable_replacement_cannot_change_the_pinned_probe_image(
+    const std::filesystem::path& video_path) {
+#if !defined(_WIN32)
+  const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("reco_probe_executable_race_" + std::to_string(unique));
+  std::error_code cleanup_error;
+  std::filesystem::remove_all(root, cleanup_error);
+
+  try {
+    std::filesystem::create_directory(root);
+    const auto original = root / "original-probe-worker";
+    const auto hostile = root / "replacement-probe-worker";
+    std::filesystem::copy_file(fake_probe_worker_path, original);
+    std::filesystem::permissions(original,
+                                 std::filesystem::perms::owner_read |
+                                     std::filesystem::perms::owner_write |
+                                     std::filesystem::perms::owner_exec,
+                                 std::filesystem::perm_options::replace);
+    {
+      std::ofstream output(hostile, std::ios::binary | std::ios::trunc);
+      output << "#!/bin/sh\nexit 97\n";
+      if (!output) {
+        throw std::runtime_error("failed to create hostile probe replacement");
+      }
+    }
+    std::filesystem::permissions(hostile,
+                                 std::filesystem::perms::owner_read |
+                                     std::filesystem::perms::owner_write |
+                                     std::filesystem::perms::owner_exec,
+                                 std::filesystem::perm_options::replace);
+
+    const auto run_race = [&](std::string_view name, bool symlink_retarget) {
+      const auto selected = root / (std::string(name) + "-selected");
+      const auto staged = root / (std::string(name) + "-staged");
+      const auto marker = root / (std::string(name) + "-marker");
+      if (symlink_retarget) {
+        std::filesystem::create_symlink(original.filename(), selected);
+        std::filesystem::create_symlink(hostile.filename(), staged);
+      } else {
+        std::filesystem::copy_file(original, selected);
+        std::filesystem::copy_file(hostile, staged);
+      }
+
+      std::optional<GpuVideoProbe> result;
+      std::exception_ptr probe_error;
+      std::thread probe([&] {
+        try {
+          result = reco::io::detail::probe_gpu_video_with_pre_guardian_exec_delay_for_test(
+              container_config(video_path), selected, 5'000'000'000ULL, 1'000'000'000ULL, marker);
+        } catch (...) {
+          probe_error = std::current_exception();
+        }
+      });
+
+      const auto guardian = wait_for_process_marker(marker, std::chrono::steady_clock::now() +
+                                                                std::chrono::seconds(2));
+      expect_true(guardian.has_value(), std::string(name) + " reaches the pre-exec race hook");
+      std::error_code replace_error;
+      if (guardian.has_value()) {
+        std::filesystem::rename(staged, selected, replace_error);
+      }
+      expect_true(!replace_error, std::string(name) + " replacement is atomic");
+      probe.join();
+
+      if (probe_error != nullptr) {
+        try {
+          std::rethrow_exception(probe_error);
+        } catch (const std::exception& error) {
+          std::cerr << "FAIL: " << name << " changed the pinned executable: " << error.what()
+                    << '\n';
+          ++failures;
+        } catch (...) {
+          std::cerr << "FAIL: " << name << " changed the pinned executable with an unknown error\n";
+          ++failures;
+        }
+      }
+      expect_true(result.has_value() && result->width == 854U,
+                  std::string(name) + " executes the originally pinned image");
+    };
+
+    set_scenario("probe-ok");
+    set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+    run_race("regular executable replacement", false);
+    run_race("symlink retarget", true);
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: pinned executable race fixture failed: " << error.what() << '\n';
+    ++failures;
+  }
+  std::filesystem::remove_all(root, cleanup_error);
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+#else
+  (void)video_path;
+#endif
+}
+
 void caller_death_before_worker_main(const std::filesystem::path& video_path) {
 #if defined(_WIN32)
   const auto worker_marker =
@@ -2825,6 +2921,7 @@ int main(int argc, char** argv) {
   parent_death_reclaims_worker(video_path);
   caller_death_reclaims_worker_and_descendant(video_path);
   caller_death_before_supervisor_main(video_path);
+  executable_replacement_cannot_change_the_pinned_probe_image(video_path);
   caller_death_before_guardian_main(video_path);
   caller_death_before_worker_main(video_path);
   pre_main_loader_stall_respects_timeout(video_path);

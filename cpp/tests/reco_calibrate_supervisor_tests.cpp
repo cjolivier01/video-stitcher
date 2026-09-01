@@ -758,6 +758,23 @@ void oversized_scratch_file_is_terminated_by_pidfd() {
               "oversized scratch allocation leaves no scratch tree");
 }
 
+void unlinked_scratch_file_cannot_escape_the_quota() {
+  const auto before = calibration_scratch_roots();
+  const auto started = std::chrono::steady_clock::now();
+  {
+    EnvironmentValue scratch_limit("RECO_FAKE_CALIBRATION_SCRATCH_LIMIT_BYTES", "1048576");
+    Scenario scenario("scratch-unlink-oversized-file");
+    expect_execution_error(
+        [&] { (void)run_gpu_calibration(lifecycle_request_fixture(), ready_backends()); },
+        "scratch disk quota",
+        "worker cannot unlink an open cache file to evade scratch accounting");
+  }
+  expect_true(std::chrono::steady_clock::now() - started < std::chrono::seconds(2),
+              "unlink evasion is contained before the worker deadline");
+  expect_true(calibration_scratch_roots() == before,
+              "unlink-evasion attempt leaves no scratch tree");
+}
+
 void excessive_scratch_entries_are_terminated_by_pidfd() {
   const auto before = calibration_scratch_roots();
   const auto started = std::chrono::steady_clock::now();
@@ -1224,6 +1241,7 @@ int main() {
   run_case("recursive scratch cleanup", worker_scratch_is_removed_recursively);
   run_case("runtime snapshot aggregate quota", runtime_snapshots_have_an_aggregate_byte_limit);
   run_case("scratch disk quota", oversized_scratch_file_is_terminated_by_pidfd);
+  run_case("scratch unlink evasion", unlinked_scratch_file_cannot_escape_the_quota);
   run_case("scratch inode quota", excessive_scratch_entries_are_terminated_by_pidfd);
   run_case("SIGCHLD ownership", caller_sigchld_policy_cannot_steal_worker_ownership);
   run_case("descriptor isolation", worker_descriptors_are_isolated_across_exec);
