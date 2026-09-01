@@ -3427,7 +3427,8 @@ void unrelated_descriptors_are_not_inherited(const std::filesystem::path& video_
 #endif
 }
 
-int run_registry_owner_signal_fork_fixture() {
+int run_registry_owner_signal_fork_fixture(std::string_view mode,
+                                           int descendant_lifetime_descriptor) {
 #if defined(_WIN32)
   return 0;
 #else
@@ -3509,10 +3510,15 @@ int run_registry_owner_signal_fork_fixture() {
   }
   if (fork_child > 0) {
     int status = 0;
-    while (::waitpid(fork_child, &status, 0) < 0 && errno == EINTR) {
+    pid_t waited = -1;
+    do {
+      waited = ::waitpid(fork_child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != fork_child) {
+      return 17;
     }
     if (!WIFEXITED(status) || WEXITSTATUS(status) != EXIT_SUCCESS) {
-      return 17;
+      return 19;
     }
   }
   signal_fork_report_descriptor = -1;
@@ -3523,50 +3529,249 @@ int run_registry_owner_signal_fork_fixture() {
   for (const auto descriptor : {ready[0], ready[1], release[0], release[1], report[0], report[1]}) {
     (void)::close(descriptor);
   }
+  if (mode == "--fail-with-retained-descendant") {
+    const auto descendant = ::fork();
+    if (descendant == 0) {
+      for (;;) {
+        (void)::pause();
+      }
+    }
+    (void)::close(descendant_lifetime_descriptor);
+    return descendant > 0 ? 20 : 21;
+  }
+  if (mode == "--fail-after-signal-fork") {
+    (void)::close(descendant_lifetime_descriptor);
+    return 20;
+  }
+  if (mode != "--success") {
+    (void)::close(descendant_lifetime_descriptor);
+    return 22;
+  }
+  (void)::close(descendant_lifetime_descriptor);
   return 0;
 #endif
 }
 
-void signal_handler_fork_cannot_deadlock_the_probe_registry() {
+void signal_handler_fork_cannot_deadlock_the_probe_registry(std::string_view fixture_mode = {}) {
 #if !defined(_WIN32)
-  const auto fixture = ::fork();
-  if (fixture == 0) {
-    const auto executable = test_executable_path.string();
-    ::execl(executable.c_str(), executable.c_str(), "--reco-registry-owner-signal-fork-fixture",
-            static_cast<char*>(nullptr));
-    ::_exit(127);
-  }
-  expect_true(fixture > 0, "probe owner-thread signal-fork fixture starts");
-  if (fixture <= 0) {
+  struct sigaction default_child_disposition{};
+  default_child_disposition.sa_handler = SIG_DFL;
+  (void)sigemptyset(&default_child_disposition.sa_mask);
+  struct sigaction previous_child_disposition{};
+  if (::sigaction(SIGCHLD, &default_child_disposition, &previous_child_disposition) != 0) {
+    expect_true(false, "probe owner-thread signal-fork fixture makes children waitable");
     return;
   }
-  int status = 0;
+  struct SigchldRestorer {
+    ~SigchldRestorer() { (void)::sigaction(SIGCHLD, &previous, nullptr); }
+    struct sigaction previous{};
+  } sigchld_restorer{previous_child_disposition};
+
+  const auto executable = test_executable_path.string();
+  std::array<int, 2> group_ready{-1, -1};
+  std::array<int, 2> descendant_lifetime{-1, -1};
+  if (::pipe(group_ready.data()) != 0 || ::pipe(descendant_lifetime.data()) != 0) {
+    for (const auto descriptor :
+         {group_ready[0], group_ready[1], descendant_lifetime[0], descendant_lifetime[1]}) {
+      if (descriptor >= 0) {
+        (void)::close(descriptor);
+      }
+    }
+    expect_true(false, "probe owner-thread signal-fork fixture creates its containment pipes");
+    return;
+  }
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-  pid_t waited = 0;
-  while ((waited = ::waitpid(fixture, &status, WNOHANG)) == 0 &&
-         std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
-  if (waited == 0) {
-    (void)::kill(fixture, SIGKILL);
+  const auto selected_fixture_mode =
+      fixture_mode.empty() ? std::string("--success") : std::string(fixture_mode);
+  const auto lifetime_descriptor_argument = std::to_string(descendant_lifetime[1]);
+  std::array<char*, 5> arguments{
+      const_cast<char*>(executable.c_str()),
+      const_cast<char*>("--reco-registry-owner-signal-fork-fixture"),
+      const_cast<char*>(selected_fixture_mode.c_str()),
+      const_cast<char*>(lifetime_descriptor_argument.c_str()),
+      nullptr,
+  };
+  const auto fixture = ::fork();
+  if (fixture == 0) {
+    (void)::close(group_ready[0]);
+    (void)::close(descendant_lifetime[0]);
+    const int group_error = ::setpgid(0, 0) == 0 ? 0 : errno;
+    ssize_t written = -1;
     do {
-      waited = ::waitpid(fixture, &status, 0);
-    } while (waited < 0 && errno == EINTR);
+      written = ::write(group_ready[1], &group_error, sizeof(group_error));
+    } while (written < 0 && errno == EINTR);
+    (void)::close(group_ready[1]);
+    if (group_error != 0 || written != static_cast<ssize_t>(sizeof(group_error))) {
+      ::_exit(126);
+    }
+    ::execv(arguments[0], arguments.data());
+    ::_exit(127);
   }
-  if (waited < 0) {
+  (void)::close(group_ready[1]);
+  (void)::close(descendant_lifetime[1]);
+  expect_true(fixture > 0, "probe owner-thread signal-fork fixture starts");
+  if (fixture <= 0) {
+    (void)::close(group_ready[0]);
+    (void)::close(descendant_lifetime[0]);
+    return;
+  }
+  bool parent_established_group = ::setpgid(fixture, fixture) == 0;
+  if (!parent_established_group && errno == EACCES) {
+    parent_established_group = ::getpgid(fixture) == fixture;
+  }
+  const auto kill_fixture_group = [fixture] { (void)::kill(-fixture, SIGKILL); };
+  const auto terminate_fixture = [fixture, &kill_fixture_group] {
+    kill_fixture_group();
+    (void)::kill(fixture, SIGKILL);
+  };
+  const auto reap_fixture = [fixture](int* status) {
+    pid_t waited = -1;
+    do {
+      waited = ::waitpid(fixture, status, 0);
+    } while (waited < 0 && errno == EINTR);
+    return waited;
+  };
+  const auto wait_for_descendant_lifetime_eof = [&descendant_lifetime] {
+    const auto eof_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < eof_deadline) {
+      const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+          eof_deadline - std::chrono::steady_clock::now());
+      pollfd pending{.fd = descendant_lifetime[0], .events = POLLIN, .revents = 0};
+      const auto polled = ::poll(&pending, 1, std::max(1, static_cast<int>(remaining.count())));
+      if (polled < 0 && errno == EINTR) {
+        continue;
+      }
+      if (polled <= 0) {
+        return false;
+      }
+      char marker = '\0';
+      ssize_t received = -1;
+      do {
+        received = ::read(descendant_lifetime[0], &marker, 1);
+      } while (received < 0 && errno == EINTR);
+      return received == 0;
+    }
+    return false;
+  };
+  int group_error = EIO;
+  ssize_t received = -1;
+  while (std::chrono::steady_clock::now() < deadline) {
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now());
+    pollfd pending{.fd = group_ready[0], .events = POLLIN, .revents = 0};
+    const auto polled = ::poll(&pending, 1, std::max(1, static_cast<int>(remaining.count())));
+    if (polled < 0 && errno == EINTR) {
+      continue;
+    }
+    if (polled <= 0) {
+      break;
+    }
+    do {
+      received = ::read(group_ready[0], &group_error, sizeof(group_error));
+    } while (received < 0 && errno == EINTR);
+    break;
+  }
+  (void)::close(group_ready[0]);
+  const bool private_group_ready = parent_established_group &&
+                                   received == static_cast<ssize_t>(sizeof(group_error)) &&
+                                   group_error == 0;
+  expect_true(private_group_ready,
+              "probe owner-thread signal-fork fixture acknowledges its private process group");
+  if (!private_group_ready) {
+    terminate_fixture();
+    (void)wait_for_descendant_lifetime_eof();
+    (void)reap_fixture(nullptr);
+    (void)::close(descendant_lifetime[0]);
+    return;
+  }
+  siginfo_t observed_status{};
+  bool fixture_observed = false;
+  int observation_error = 0;
+  while (std::chrono::steady_clock::now() < deadline) {
+    observed_status = {};
+    if (::waitid(P_PID, static_cast<id_t>(fixture), &observed_status,
+                 WEXITED | WNOHANG | WNOWAIT) == 0) {
+      if (observed_status.si_pid == fixture) {
+        fixture_observed = true;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      continue;
+    }
+    if (errno == EINTR) {
+      continue;
+    }
+    observation_error = errno;
+    break;
+  }
+
+  int status = 0;
+  pid_t waited = -1;
+  bool descendants_terminated = false;
+  if (!fixture_observed && observation_error == 0) {
+    terminate_fixture();
+    descendants_terminated = wait_for_descendant_lifetime_eof();
+    waited = reap_fixture(&status);
+  } else if (!fixture_observed) {
+    if (observation_error != ECHILD) {
+      terminate_fixture();
+      (void)wait_for_descendant_lifetime_eof();
+      (void)reap_fixture(nullptr);
+    }
+    (void)::close(descendant_lifetime[0]);
+    expect_true(false, "probe owner-thread signal-fork fixture remains waitable");
+    return;
+  } else {
+    const bool observed_success =
+        observed_status.si_code == CLD_EXITED && observed_status.si_status == EXIT_SUCCESS;
+    if (!observed_success) {
+      kill_fixture_group();
+      descendants_terminated = wait_for_descendant_lifetime_eof();
+    }
+    waited = reap_fixture(&status);
+  }
+  (void)::close(descendant_lifetime[0]);
+  if (waited != fixture) {
     expect_true(false, "probe owner-thread signal-fork fixture is reaped");
     return;
   }
-  if (WIFSIGNALED(status)) {
-    expect_true(false, "probe owner-thread signal-fork fixture does not time out");
+  const bool fixture_succeeded = WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS;
+  if (fixture_mode.empty()) {
+    expect_true(fixture_succeeded,
+                "probe registry owner defers signal-handler fork until after unlock");
     return;
   }
-  if (!WIFEXITED(status)) {
-    while ((waited = ::waitpid(fixture, &status, 0)) < 0 && errno == EINTR) {
-    }
+  const bool expected_failure = WIFEXITED(status) && WEXITSTATUS(status) == 20;
+  expect_true(expected_failure, "probe signal-fork failure fixture reaches its forced outcome");
+  expect_true(descendants_terminated,
+              "probe signal-fork failure closes every inherited descendant lifetime");
+#endif
+}
+
+void ignored_sigchld_cannot_auto_reap_the_signal_fork_fixture() {
+#if !defined(_WIN32)
+  struct sigaction ignored{};
+  ignored.sa_handler = SIG_IGN;
+  (void)sigemptyset(&ignored.sa_mask);
+  struct sigaction previous{};
+  if (::sigaction(SIGCHLD, &ignored, &previous) != 0) {
+    expect_true(false, "probe signal-fork regression ignores SIGCHLD");
+    return;
   }
-  expect_true(WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS,
-              "probe registry owner defers signal-handler fork until after unlock");
+  signal_handler_fork_cannot_deadlock_the_probe_registry();
+  struct sigaction restored{};
+  const bool disposition_restored =
+      ::sigaction(SIGCHLD, nullptr, &restored) == 0 && restored.sa_handler == SIG_IGN;
+  (void)::sigaction(SIGCHLD, &previous, nullptr);
+  expect_true(disposition_restored,
+              "probe signal-fork fixture restores an ignored SIGCHLD disposition");
+#endif
+}
+
+void failed_signal_fork_fixtures_are_terminated_before_leader_reap() {
+#if !defined(_WIN32)
+  signal_handler_fork_cannot_deadlock_the_probe_registry("--fail-after-signal-fork");
+  signal_handler_fork_cannot_deadlock_the_probe_registry("--fail-with-retained-descendant");
 #endif
 }
 
@@ -3886,8 +4091,17 @@ int main(int argc, char** argv) {
   if (argc == 2 && std::string_view(argv[1]) == "--reco-posix-probe-caller") {
     return run_posix_probe_caller();
   }
-  if (argc == 2 && std::string_view(argv[1]) == "--reco-registry-owner-signal-fork-fixture") {
-    return run_registry_owner_signal_fork_fixture();
+  if (argc == 4 && std::string_view(argv[1]) == "--reco-registry-owner-signal-fork-fixture") {
+    int lifetime_descriptor = -1;
+    const std::string_view descriptor_argument(argv[3]);
+    const auto [end, error] = std::from_chars(
+        descriptor_argument.data(), descriptor_argument.data() + descriptor_argument.size(),
+        lifetime_descriptor);
+    if (error != std::errc{} || end != descriptor_argument.data() + descriptor_argument.size() ||
+        lifetime_descriptor < 0) {
+      return EXIT_FAILURE;
+    }
+    return run_registry_owner_signal_fork_fixture(argv[2], lifetime_descriptor);
   }
 #endif
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
@@ -3947,6 +4161,8 @@ int main(int argc, char** argv) {
   guardian_death_after_worker_release_reclaims_group(video_path);
   unrelated_descriptors_are_not_inherited(video_path);
   signal_handler_fork_cannot_deadlock_the_probe_registry();
+  ignored_sigchld_cannot_auto_reap_the_signal_fork_fixture();
+  failed_signal_fork_fixtures_are_terminated_before_leader_reap();
   worker_main_preserves_a_reused_executable_descriptor(video_path);
   guardian_initializers_cannot_observe_unrelated_descriptors(video_path);
   lowered_file_limit_does_not_leak_high_descriptors(video_path);
