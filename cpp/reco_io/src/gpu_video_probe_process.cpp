@@ -1833,6 +1833,29 @@ bool guardian_pipe_write_process_id(int descriptor, pid_t value) {
   return written == static_cast<ssize_t>(sizeof(value));
 }
 
+bool guardian_write_process_marker(int descriptor, pid_t value) {
+  std::array<char, 32> marker{};
+  const auto [end, error] = std::to_chars(marker.data(), marker.data() + marker.size(), value);
+  if (error != std::errc{}) {
+    return false;
+  }
+  std::size_t offset = 0;
+  const auto size = static_cast<std::size_t>(end - marker.data());
+  while (offset < size) {
+    ssize_t written = -1;
+    do {
+      written =
+          ::pwrite(descriptor, marker.data() + offset, size - offset,
+                   static_cast<off_t>(detail::kProbeSupervisorStopMarkerOffsetForTest + offset));
+    } while (written < 0 && errno == EINTR);
+    if (written <= 0) {
+      return false;
+    }
+    offset += static_cast<std::size_t>(written);
+  }
+  return true;
+}
+
 bool guardian_sleep(std::chrono::nanoseconds delay) {
   if (delay.count() <= 0) {
     return true;
@@ -2361,7 +2384,24 @@ bool guardian_worker_group_has_other_members(pid_t worker_pid) {
   }
   const auto process_count = static_cast<std::size_t>(bytes) / sizeof(pid_t);
   for (std::size_t index = 0; index < process_count; ++index) {
-    if (processes[index] > 0 && processes[index] != worker_pid) {
+    const auto process = processes[index];
+    if (process <= 0 || process == worker_pid) {
+      continue;
+    }
+    kinfo_proc process_info{};
+    std::size_t process_info_size = sizeof(process_info);
+    int query[] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, process};
+    if (::sysctl(query, static_cast<unsigned int>(std::size(query)), &process_info,
+                 &process_info_size, nullptr, 0) != 0) {
+      return true;
+    }
+    if (process_info_size == 0) {
+      continue;
+    }
+    if (process_info_size != sizeof(process_info) || process_info.kp_proc.p_pid != process) {
+      return true;
+    }
+    if (process_info.kp_proc.p_stat != SZOMB && process_info.kp_eproc.e_pgid == worker_pid) {
       return true;
     }
   }
@@ -2535,7 +2575,7 @@ bool guardian_write_exact(int descriptor, const void* value, std::size_t size) {
   guardian_exit(owner_exit_status);
 }
 
-[[noreturn]] void run_pre_main_supervisor_owner(pid_t supervisor_pid) {
+[[noreturn]] void run_pre_main_supervisor_owner(pid_t supervisor_pid, bool report_supervisor_stop) {
   if (supervisor_pid <= 0) {
     guardian_exit(127);
   }
@@ -2584,17 +2624,31 @@ bool guardian_write_exact(int descriptor, const void* value, std::size_t size) {
   }
 
   (void)::close(kOwnerReady);
+  bool supervisor_stop_reported = !report_supervisor_stop;
   while (true) {
     siginfo_t supervisor_info{};
     int wait_result = -1;
+    auto wait_options = WEXITED | WNOHANG | WNOWAIT;
+    if (!supervisor_stop_reported) {
+      wait_options |= WSTOPPED;
+    }
     do {
-      wait_result = ::waitid(P_PID, static_cast<id_t>(supervisor_pid), &supervisor_info,
-                             WEXITED | WNOHANG | WNOWAIT);
+      wait_result =
+          ::waitid(P_PID, static_cast<id_t>(supervisor_pid), &supervisor_info, wait_options);
     } while (wait_result < 0 && errno == EINTR);
     if (wait_result < 0) {
       guardian_exit(127);
     }
     if (supervisor_info.si_pid == supervisor_pid) {
+      if (supervisor_info.si_code == CLD_STOPPED) {
+        if (supervisor_stop_reported || supervisor_info.si_status != SIGSTOP ||
+            !guardian_write_process_marker(kOwnerSupervisorMarker, supervisor_pid)) {
+          certify_and_reap_supervisor(supervisor_pid, 127);
+        }
+        supervisor_stop_reported = true;
+        (void)::close(kOwnerSupervisorMarker);
+        continue;
+      }
       const auto succeeded =
           supervisor_info.si_code == CLD_EXITED && supervisor_info.si_status == 0;
       certify_and_reap_supervisor(supervisor_pid, succeeded ? 0 : 127);
@@ -2774,9 +2828,13 @@ bool guardian_write_exact(int descriptor, const void* value, std::size_t size) {
 
   for (int descriptor = kOwnerSupervisorLifetime; descriptor < kOwnerFirstUnusedDescriptor;
        ++descriptor) {
-    (void)::close(descriptor);
+    if (descriptor != kOwnerSupervisorMarker || !has_marker ||
+        !stop_supervisor_after_guardian_launch) {
+      (void)::close(descriptor);
+    }
   }
-  run_pre_main_supervisor_owner(supervisor_pid);
+  run_pre_main_supervisor_owner(supervisor_pid,
+                                has_marker && stop_supervisor_after_guardian_launch);
 }
 
 GuardianLaunch spawn_guardian_process(

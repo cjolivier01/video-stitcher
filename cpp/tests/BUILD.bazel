@@ -1,4 +1,4 @@
-load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_test")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
 
 cc_test(
     name = "reco_control_tests",
@@ -59,7 +59,12 @@ cc_test(
     name = "reco_core_cuda_backend_tests",
     size = "small",
     srcs = ["reco_core_cuda_backend_tests.cpp"],
-    data = [":libfake_cuda_driver.so"],
+    data = [
+        ":libfake_cuda_driver.so",
+        ":libfake_cuda_driver_path.so",
+        ":libfake_windows_runtime_primary.so",
+        ":recowindepsplit",
+    ],
     deps = [
         "//cpp/reco_core",
     ],
@@ -194,6 +199,30 @@ cc_binary(
     testonly = True,
     srcs = ["fake_cuda_driver.cpp"],
     linkshared = True,
+)
+
+cc_binary(
+    name = "libfake_cuda_driver_path.so",
+    testonly = True,
+    srcs = ["fake_cuda_driver.cpp"],
+    linkshared = True,
+    local_defines = ["RECO_FAKE_CUDA_DRIVER_MARKER=2"],
+)
+
+cc_library(
+    name = "recowindepsplit",
+    testonly = True,
+    srcs = ["fake_windows_runtime_dependency.cpp"],
+    linkstatic = False,
+)
+
+cc_binary(
+    name = "libfake_windows_runtime_primary.so",
+    testonly = True,
+    srcs = ["fake_windows_runtime_primary.cpp"],
+    linkshared = True,
+    linkstatic = False,
+    deps = [":recowindepsplit"],
 )
 
 cc_test(

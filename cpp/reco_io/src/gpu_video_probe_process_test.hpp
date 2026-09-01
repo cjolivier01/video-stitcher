@@ -44,6 +44,8 @@ probe_gpu_video_bounded_in_process_for_test(const GpuFileDecodeConfig& config,
 void hold_probe_worker_memory_reservation_for_test(std::uint64_t hold_ns);
 
 #if !defined(_WIN32)
+inline constexpr std::uint64_t kProbeSupervisorStopMarkerOffsetForTest = 64;
+
 void hold_probe_worker_admission_lock_for_test(std::uint64_t hold_ns, int ready_descriptor);
 void hold_probe_fork_descriptor_registry_for_test(int ready_descriptor, int release_descriptor);
 

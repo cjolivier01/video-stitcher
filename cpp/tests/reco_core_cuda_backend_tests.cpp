@@ -87,6 +87,109 @@ template <typename Fn> void expect_runtime_error(Fn&& fn, std::string_view messa
   }
 }
 
+#if defined(_WIN32)
+std::filesystem::path find_windows_runtime_fixture(std::string_view target_name) {
+  const char* runfiles = std::getenv("TEST_SRCDIR");
+  if (runfiles == nullptr || runfiles[0] == '\0') {
+    throw std::runtime_error("TEST_SRCDIR is not set");
+  }
+  std::error_code error;
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(runfiles, error)) {
+    if (error) {
+      break;
+    }
+    const auto filename = entry.path().filename().string();
+    const auto position = filename.find(target_name);
+    const auto target_end =
+        position == std::string::npos ? position : position + target_name.size();
+    const auto target_matches = position != std::string::npos &&
+                                (target_end == filename.size() || filename[target_end] == '.' ||
+                                 filename[target_end] == '-');
+    if (target_matches && entry.is_regular_file(error) && !error &&
+        (entry.path().extension() == ".dll" || filename.ends_with(".so"))) {
+      return entry.path();
+    }
+  }
+  throw std::runtime_error("Windows runtime DLL fixture not found: " + std::string(target_name));
+}
+
+std::vector<std::filesystem::path>
+find_windows_runtime_fixtures_containing(std::string_view target_name) {
+  const char* runfiles = std::getenv("TEST_SRCDIR");
+  if (runfiles == nullptr || runfiles[0] == '\0') {
+    throw std::runtime_error("TEST_SRCDIR is not set");
+  }
+  std::vector<std::filesystem::path> fixtures;
+  std::error_code error;
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(runfiles, error)) {
+    if (error) {
+      break;
+    }
+    const auto filename = entry.path().filename().string();
+    if (filename.find(target_name) != std::string::npos && entry.is_regular_file(error) && !error &&
+        (entry.path().extension() == ".dll" || filename.ends_with(".so"))) {
+      fixtures.push_back(entry.path());
+    }
+  }
+  if (fixtures.empty()) {
+    throw std::runtime_error("Windows runtime DLL fixtures not found: " + std::string(target_name));
+  }
+  return fixtures;
+}
+
+class ScopedWindowsEnvironment final {
+public:
+  ScopedWindowsEnvironment(std::wstring name, const std::wstring& value) : name_(std::move(name)) {
+    SetLastError(ERROR_SUCCESS);
+    const auto required = GetEnvironmentVariableW(name_.c_str(), nullptr, 0);
+    if (required != 0) {
+      previous_.resize(required);
+      const auto written = GetEnvironmentVariableW(name_.c_str(), previous_.data(), required);
+      if (written >= required) {
+        throw std::runtime_error("failed to read Windows environment variable");
+      }
+      previous_.resize(written);
+      existed_ = true;
+    } else if (GetLastError() != ERROR_ENVVAR_NOT_FOUND) {
+      existed_ = true;
+    }
+    if (SetEnvironmentVariableW(name_.c_str(), value.c_str()) == 0) {
+      throw std::runtime_error("failed to set Windows environment variable");
+    }
+  }
+
+  ~ScopedWindowsEnvironment() {
+    SetEnvironmentVariableW(name_.c_str(), existed_ ? previous_.c_str() : nullptr);
+  }
+
+  ScopedWindowsEnvironment(const ScopedWindowsEnvironment&) = delete;
+  ScopedWindowsEnvironment& operator=(const ScopedWindowsEnvironment&) = delete;
+
+private:
+  std::wstring name_;
+  std::wstring previous_;
+  bool existed_ = false;
+};
+
+class ScopedWindowsDllDirectory final {
+public:
+  explicit ScopedWindowsDllDirectory(const std::filesystem::path& directory)
+      : cookie_(AddDllDirectory(directory.c_str())) {
+    if (cookie_ == nullptr) {
+      throw std::runtime_error("failed to add Windows DLL directory");
+    }
+  }
+
+  ~ScopedWindowsDllDirectory() { RemoveDllDirectory(cookie_); }
+
+  ScopedWindowsDllDirectory(const ScopedWindowsDllDirectory&) = delete;
+  ScopedWindowsDllDirectory& operator=(const ScopedWindowsDllDirectory&) = delete;
+
+private:
+  DLL_DIRECTORY_COOKIE cookie_ = nullptr;
+};
+#endif
+
 bool require_cuda() {
   const char* value = std::getenv("RECO_REQUIRE_CUDA_TEST");
   return value != nullptr && std::string_view(value) == "1";
@@ -108,28 +211,8 @@ bool address_sanitizer_build() {
 
 void windows_runtime_loader_rejects_current_directory_planting() {
 #if defined(_WIN32)
-  const char* runfiles = std::getenv("TEST_SRCDIR");
-  if (runfiles == nullptr || runfiles[0] == '\0') {
-    throw std::runtime_error("TEST_SRCDIR is not set");
-  }
-  std::filesystem::path fixture;
+  const auto fixture = find_windows_runtime_fixture("fake_cuda_driver");
   std::error_code error;
-  for (const auto& entry : std::filesystem::recursive_directory_iterator(runfiles, error)) {
-    if (error) {
-      break;
-    }
-    const auto filename = entry.path().filename().string();
-    if (entry.is_regular_file(error) && !error &&
-        filename.find("fake_cuda_driver") != std::string::npos &&
-        (entry.path().extension() == ".dll" || filename.ends_with(".so"))) {
-      fixture = entry.path();
-      break;
-    }
-  }
-  if (fixture.empty()) {
-    throw std::runtime_error("fake CUDA driver DLL runfile not found");
-  }
-
   const auto original_directory = std::filesystem::current_path();
   const auto directory = std::filesystem::temp_directory_path() /
                          ("reco-dll-plant-" + std::to_string(GetCurrentProcessId()));
@@ -160,6 +243,119 @@ void windows_runtime_loader_rejects_current_directory_planting() {
 
   std::filesystem::current_path(original_directory);
   std::filesystem::remove_all(directory, error);
+#endif
+}
+
+void windows_runtime_loader_prefers_default_search_to_path() {
+#if defined(_WIN32)
+  const auto default_fixture = find_windows_runtime_fixture("fake_cuda_driver");
+  const auto path_fixture = find_windows_runtime_fixture("fake_cuda_driver_path");
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("reco-dll-precedence-" + std::to_string(GetCurrentProcessId()));
+  const auto default_directory = root / "default";
+  const auto path_directory = root / "path";
+  constexpr auto library_name = L"reco-runtime-precedence.dll";
+  std::error_code error;
+  std::filesystem::remove_all(root, error);
+  std::filesystem::create_directories(default_directory);
+  std::filesystem::create_directories(path_directory);
+  std::filesystem::copy_file(default_fixture, default_directory / library_name,
+                             std::filesystem::copy_options::overwrite_existing);
+  std::filesystem::copy_file(path_fixture, path_directory / library_name,
+                             std::filesystem::copy_options::overwrite_existing);
+
+  {
+    ScopedWindowsEnvironment path(L"PATH", path_directory.native());
+    ScopedWindowsDllDirectory default_search(default_directory);
+    auto* library = reco::core::detail::load_windows_runtime_library("reco-runtime-precedence.dll");
+    expect_true(library != nullptr,
+                "Windows runtime loading searches safe default directories before PATH");
+    if (library != nullptr) {
+      using Marker = int (*)();
+      const auto marker = reinterpret_cast<Marker>(
+          GetProcAddress(static_cast<HMODULE>(library), "recoFakeRuntimeMarker"));
+      expect_true(marker != nullptr, "Windows runtime precedence fixture exports its marker");
+      if (marker != nullptr) {
+        expect_eq(marker(), 1, "Windows safe default directory takes precedence over PATH");
+      }
+      FreeLibrary(static_cast<HMODULE>(library));
+    }
+  }
+  std::filesystem::remove_all(root, error);
+#endif
+}
+
+#if defined(_WIN32)
+int windows_runtime_loader_dependent_path_helper() {
+  auto* library = reco::core::detail::load_windows_runtime_library("reco-runtime-dependent.dll");
+  if (library == nullptr) {
+    return 2;
+  }
+  using Marker = int (*)();
+  const auto marker = reinterpret_cast<Marker>(
+      GetProcAddress(static_cast<HMODULE>(library), "recoFakeWindowsRuntimeDependentMarker"));
+  const auto result = marker != nullptr && marker() == 42 ? 0 : 3;
+  FreeLibrary(static_cast<HMODULE>(library));
+  return result;
+}
+#endif
+
+void windows_runtime_loader_resolves_dependencies_from_absolute_path() {
+#if defined(_WIN32)
+  const auto primary_fixture = find_windows_runtime_fixture("fake_windows_runtime_primary");
+  const auto dependency_fixtures = find_windows_runtime_fixtures_containing("recowindepsplit");
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("reco-dll-dependency-" + std::to_string(GetCurrentProcessId()));
+  const auto primary_directory = root / "primary";
+  const auto dependency_directory = root / "dependency";
+  const auto helper = root / "reco-runtime-loader-helper.exe";
+  std::error_code error;
+  std::filesystem::remove_all(root, error);
+  std::filesystem::create_directories(primary_directory);
+  std::filesystem::create_directories(dependency_directory);
+  std::filesystem::copy_file(primary_fixture, primary_directory / "reco-runtime-dependent.dll",
+                             std::filesystem::copy_options::overwrite_existing);
+  for (const auto& dependency_fixture : dependency_fixtures) {
+    std::filesystem::copy_file(dependency_fixture,
+                               dependency_directory / dependency_fixture.filename(),
+                               std::filesystem::copy_options::overwrite_existing);
+  }
+
+  std::wstring executable(32'768, L'\0');
+  const auto executable_size =
+      GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+  if (executable_size == 0 || executable_size >= executable.size()) {
+    throw std::runtime_error("failed to locate Windows runtime loader test executable");
+  }
+  executable.resize(executable_size);
+  std::filesystem::copy_file(executable, helper, std::filesystem::copy_options::overwrite_existing);
+
+  const auto path_value = primary_directory.native() + L";" + dependency_directory.native();
+  DWORD exit_code = std::numeric_limits<DWORD>::max();
+  {
+    ScopedWindowsEnvironment path(L"PATH", path_value);
+    std::wstring command = L"\"" + helper.native() + L"\" --windows-runtime-dependent-path-helper";
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    if (CreateProcessW(helper.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr,
+                       &startup, &process) == 0) {
+      throw std::runtime_error("failed to start Windows runtime loader dependency helper");
+    }
+    CloseHandle(process.hThread);
+    const auto waited = WaitForSingleObject(process.hProcess, 10'000);
+    if (waited != WAIT_OBJECT_0) {
+      TerminateProcess(process.hProcess, 4);
+      WaitForSingleObject(process.hProcess, 10'000);
+    }
+    if (GetExitCodeProcess(process.hProcess, &exit_code) == 0) {
+      exit_code = std::numeric_limits<DWORD>::max();
+    }
+    CloseHandle(process.hProcess);
+  }
+  expect_eq(exit_code, DWORD{0},
+            "Windows runtime loading resolves dependencies from other absolute PATH entries");
+  std::filesystem::remove_all(root, error);
 #endif
 }
 
@@ -326,9 +522,19 @@ struct CountingCudaTrace final : CudaBackendTraceSink {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+#if defined(_WIN32)
+  if (argc == 2 && std::string_view(argv[1]) == "--windows-runtime-dependent-path-helper") {
+    return windows_runtime_loader_dependent_path_helper();
+  }
+#else
+  (void)argc;
+  (void)argv;
+#endif
   try {
     windows_runtime_loader_rejects_current_directory_planting();
+    windows_runtime_loader_prefers_default_search_to_path();
+    windows_runtime_loader_resolves_dependencies_from_absolute_path();
   } catch (const std::exception& error) {
     std::cerr << "FAIL: Windows runtime loader regression threw: " << error.what() << '\n';
     ++failures;

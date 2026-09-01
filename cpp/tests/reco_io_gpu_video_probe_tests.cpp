@@ -179,6 +179,23 @@ wait_for_process_marker(const std::filesystem::path& path,
   return std::nullopt;
 }
 
+#if defined(__APPLE__)
+std::optional<std::uint64_t>
+wait_for_process_marker_at_offset(const std::filesystem::path& path, std::uint64_t offset,
+                                  std::chrono::steady_clock::time_point deadline) {
+  while (std::chrono::steady_clock::now() < deadline) {
+    std::ifstream input(path);
+    input.seekg(static_cast<std::streamoff>(offset));
+    std::uint64_t process_id = 0;
+    if (input >> process_id && process_id != 0) {
+      return process_id;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return std::nullopt;
+}
+#endif
+
 std::optional<std::pair<std::uint64_t, std::uint64_t>>
 wait_for_process_pair_marker(const std::filesystem::path& path,
                              std::chrono::steady_clock::time_point deadline) {
@@ -2905,7 +2922,15 @@ void mac_owner_reclaims_stalled_guardian_session(const std::filesystem::path& vi
 
   const auto discovery_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
   const auto guardian = wait_for_process_marker(marker, discovery_deadline);
+  const auto stopped_supervisor = wait_for_process_marker_at_offset(
+      marker, reco::io::detail::kProbeSupervisorStopMarkerOffsetForTest, discovery_deadline);
   expect_true(guardian.has_value(), "Darwin stalled guardian starts before owner cleanup");
+  expect_true(stopped_supervisor.has_value(),
+              "Darwin owner observes its exact supervisor in CLD_STOPPED");
+  if (guardian.has_value() && stopped_supervisor.has_value()) {
+    expect_true(*guardian != *stopped_supervisor,
+                "Darwin stop acknowledgement distinguishes guardian and supervisor");
+  }
 
   probe.join();
   expect_true(probe_failed, "Darwin stalled guardian causes a bounded probe failure");
