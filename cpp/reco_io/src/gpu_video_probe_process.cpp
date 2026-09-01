@@ -921,6 +921,8 @@ UniqueFd open_probe_executable(const std::filesystem::path& path) {
   int flags = O_CLOEXEC;
 #if defined(__linux__) && defined(O_PATH)
   flags |= O_PATH;
+#elif defined(__APPLE__)
+  flags |= O_RDONLY;
 #elif defined(O_EXEC)
   flags |= O_EXEC;
 #else
