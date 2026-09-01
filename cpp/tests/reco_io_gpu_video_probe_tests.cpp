@@ -265,6 +265,31 @@ std::optional<pid_t> wait_for_direct_child(pid_t parent,
   return std::nullopt;
 }
 
+std::optional<pid_t> wait_for_descendant(pid_t parent,
+                                         std::chrono::steady_clock::time_point deadline,
+                                         std::string_view command_fragment) {
+  while (std::chrono::steady_clock::now() < deadline) {
+    std::vector<pid_t> pending{parent};
+    std::vector<pid_t> visited;
+    while (!pending.empty()) {
+      const auto process = pending.back();
+      pending.pop_back();
+      if (std::find(visited.begin(), visited.end(), process) != visited.end()) {
+        continue;
+      }
+      visited.push_back(process);
+      for (const auto child : direct_children(process)) {
+        if (process_command_line(child).find(command_fragment) != std::string::npos) {
+          return child;
+        }
+        pending.push_back(child);
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return std::nullopt;
+}
+
 bool process_has_linux_probe_memfd(pid_t process) {
   std::error_code directory_error;
   const auto descriptors = std::filesystem::path("/proc") / std::to_string(process) / "fd";
@@ -1945,15 +1970,17 @@ void deferred_cleanup_retains_worker_memory_reservation(const std::filesystem::p
     }
   });
 
+  const auto discovery_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  const auto owner =
+      wait_for_descendant(::getpid(), discovery_deadline, "--reco-video-probe-owner");
   const auto supervisor =
-      wait_for_direct_child(::getpid(), std::chrono::steady_clock::now() + std::chrono::seconds(2),
-                            "--reco-video-probe-supervisor");
+      owner.has_value() ? wait_for_direct_child(*owner, discovery_deadline) : std::nullopt;
   const auto guardian = supervisor.has_value()
-                            ? wait_for_direct_child(*supervisor, std::chrono::steady_clock::now() +
-                                                                     std::chrono::seconds(2))
+                            ? wait_for_direct_child(*supervisor, discovery_deadline)
                             : std::nullopt;
   const auto worker = wait_for_process_marker(worker_marker, std::chrono::steady_clock::now() +
                                                                  std::chrono::seconds(2));
+  expect_true(owner.has_value(), "deferred-cleanup probe owner starts");
   expect_true(supervisor.has_value(), "deferred-cleanup probe supervisor starts");
   expect_true(guardian.has_value(), "deferred-cleanup probe guardian starts");
   expect_true(worker.has_value(), "deferred-cleanup probe worker starts");
@@ -1961,19 +1988,25 @@ void deferred_cleanup_retains_worker_memory_reservation(const std::filesystem::p
       worker.has_value() && ::kill(-static_cast<pid_t>(*worker), SIGSTOP) == 0;
   const bool guardian_stopped = guardian.has_value() && ::kill(*guardian, SIGSTOP) == 0;
   const bool supervisor_stopped = supervisor.has_value() && ::kill(*supervisor, SIGSTOP) == 0;
+  const bool owner_stopped = owner.has_value() && ::kill(*owner, SIGSTOP) == 0;
   expect_true(worker_group_stopped, "deferred-cleanup worker group is frozen adversarially");
   expect_true(guardian_stopped, "deferred-cleanup guardian is frozen adversarially");
   expect_true(supervisor_stopped, "deferred-cleanup supervisor stops before timeout");
+  expect_true(owner_stopped, "deferred-cleanup owner stops before timeout");
 
   probe.join();
   expect_true(probe_failed, "stopped supervisor causes a bounded probe failure");
-  const bool process_tree_frozen = worker_group_stopped && guardian_stopped && supervisor_stopped;
+  const bool process_tree_frozen =
+      worker_group_stopped && guardian_stopped && supervisor_stopped && owner_stopped;
   if (process_tree_frozen) {
     expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(),
               reco::io::detail::maximum_probe_worker_address_space_bytes_for_test(),
               "deferred supervisor cleanup retains its worker memory reservation");
-    (void)::kill(*supervisor, SIGCONT);
+    (void)::kill(*owner, SIGCONT);
   } else {
+    if (owner.has_value()) {
+      (void)::kill(*owner, SIGCONT);
+    }
     if (supervisor.has_value()) {
       (void)::kill(*supervisor, SIGCONT);
     }
@@ -2001,6 +2034,9 @@ void deferred_cleanup_retains_worker_memory_reservation(const std::filesystem::p
       reco::io::detail::reserved_probe_worker_address_space_bytes_for_test() != 0) {
     (void)::kill(*supervisor, SIGKILL);
     (void)::kill(*supervisor, SIGCONT);
+  }
+  if (owner_stopped) {
+    (void)::kill(*owner, SIGCONT);
   }
   if (guardian.has_value()) {
     (void)::kill(*guardian, SIGCONT);
@@ -2034,14 +2070,13 @@ void killed_cleanup_authority_fails_closed(const std::filesystem::path& video_pa
     }
   });
 
-  const auto supervisor =
-      wait_for_direct_child(::getpid(), std::chrono::steady_clock::now() + std::chrono::seconds(2),
-                            "--reco-video-probe-supervisor");
+  const auto owner =
+      wait_for_direct_child(::getpid(), std::chrono::steady_clock::now() + std::chrono::seconds(2));
   const auto worker = wait_for_process_marker(worker_marker, std::chrono::steady_clock::now() +
                                                                  std::chrono::seconds(2));
-  expect_true(supervisor.has_value(), "killed-authority probe supervisor starts");
+  expect_true(owner.has_value(), "killed-authority probe owner starts");
   expect_true(worker.has_value(), "killed-authority probe worker starts");
-  const bool authority_killed = supervisor.has_value() && ::kill(*supervisor, SIGKILL) == 0;
+  const bool authority_killed = owner.has_value() && ::kill(*owner, SIGKILL) == 0;
   expect_true(authority_killed, "cleanup authority is killed before certification");
 
   probe.join();
@@ -2125,7 +2160,7 @@ void guardian_death_before_pid_report_reclaims_worker(const std::filesystem::pat
 
   const auto discovery_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
   const auto supervisor =
-      wait_for_direct_child(caller, discovery_deadline, "--reco-video-probe-supervisor");
+      wait_for_descendant(caller, discovery_deadline, "--reco-video-probe-supervisor");
   const auto guardian = supervisor.has_value()
                             ? wait_for_direct_child(*supervisor, discovery_deadline)
                             : std::nullopt;
@@ -2163,7 +2198,7 @@ void guardian_death_before_pid_report_reclaims_worker(const std::filesystem::pat
 #endif
 }
 
-void auto_reaped_workers_are_rejected(const std::filesystem::path& video_path) {
+void auto_reaped_workers_are_supported(const std::filesystem::path& video_path) {
 #if !defined(_WIN32)
   struct sigaction ignore_action{};
   struct sigaction previous_action{};
@@ -2174,17 +2209,14 @@ void auto_reaped_workers_are_rejected(const std::filesystem::path& video_path) {
     return;
   }
 
-  bool probe_rejected = false;
+  bool probe_succeeded = false;
   try {
     set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
-    (void)reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
-                                    5'000'000'000ULL);
-  } catch (const reco::io::GpuVideoProbeError& error) {
-    probe_rejected = std::string_view(error.what()) ==
-                     "video probe launch requires a waitable SIGCHLD disposition";
+    probe_succeeded = reco::io::probe_gpu_video(container_config(video_path),
+                                                fake_probe_worker_path, 5'000'000'000ULL)
+                          .width == 854U;
   } catch (const std::exception& error) {
-    std::cerr << "FAIL: auto-reaped worker probe returned the wrong error: " << error.what()
-              << '\n';
+    std::cerr << "FAIL: auto-reaped worker probe threw: " << error.what() << '\n';
     ++failures;
   }
   struct sigaction current_action{};
@@ -2193,14 +2225,14 @@ void auto_reaped_workers_are_rejected(const std::filesystem::path& video_path) {
   if (sigaction(SIGCHLD, &previous_action, nullptr) != 0) {
     expect_true(false, "SIGCHLD policy restores");
   }
-  expect_true(probe_rejected, "auto-reaped worker policy is rejected before launch");
-  expect_true(disposition_preserved, "rejected auto-reap policy remains installed");
+  expect_true(probe_succeeded, "auto-reaped host returns its framed worker response");
+  expect_true(disposition_preserved, "auto-reaped host policy remains installed");
 #else
   (void)video_path;
 #endif
 }
 
-void no_child_wait_workers_are_rejected(const std::filesystem::path& video_path) {
+void no_child_wait_workers_are_supported(const std::filesystem::path& video_path) {
 #if !defined(_WIN32) && defined(SA_NOCLDWAIT)
   struct sigaction no_wait_action{};
   struct sigaction previous_action{};
@@ -2212,16 +2244,14 @@ void no_child_wait_workers_are_rejected(const std::filesystem::path& video_path)
     return;
   }
 
-  bool probe_rejected = false;
+  bool probe_succeeded = false;
   try {
     set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
-    (void)reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
-                                    5'000'000'000ULL);
-  } catch (const reco::io::GpuVideoProbeError& error) {
-    probe_rejected = std::string_view(error.what()) ==
-                     "video probe launch requires a waitable SIGCHLD disposition";
+    probe_succeeded = reco::io::probe_gpu_video(container_config(video_path),
+                                                fake_probe_worker_path, 5'000'000'000ULL)
+                          .width == 854U;
   } catch (const std::exception& error) {
-    std::cerr << "FAIL: no-wait worker probe returned the wrong error: " << error.what() << '\n';
+    std::cerr << "FAIL: no-wait worker probe threw: " << error.what() << '\n';
     ++failures;
   }
   struct sigaction current_action{};
@@ -2230,8 +2260,107 @@ void no_child_wait_workers_are_rejected(const std::filesystem::path& video_path)
   if (sigaction(SIGCHLD, &previous_action, nullptr) != 0) {
     expect_true(false, "SIGCHLD no-wait policy restores");
   }
-  expect_true(probe_rejected, "no-wait worker policy is rejected before launch");
-  expect_true(disposition_preserved, "rejected no-wait policy remains installed");
+  expect_true(probe_succeeded, "no-wait host returns its framed worker response");
+  expect_true(disposition_preserved, "no-wait host policy remains installed");
+#else
+  (void)video_path;
+#endif
+}
+
+void post_admission_sigchld_change_is_supported(const std::filesystem::path& video_path) {
+#if !defined(_WIN32)
+  const auto marker =
+      video_path.parent_path() / (video_path.filename().string() + ".post-admission-sigchld");
+  std::filesystem::remove(marker);
+  std::optional<GpuVideoProbe> result;
+  std::string failure;
+  std::thread probe([&] {
+    try {
+      result = reco::io::detail::probe_gpu_video_with_pre_supervisor_exec_delay_for_test(
+          container_config(video_path), fake_probe_worker_path, 5'000'000'000ULL, 500'000'000ULL,
+          marker);
+    } catch (const std::exception& error) {
+      failure = error.what();
+    }
+  });
+
+  const auto marker_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while ((!std::filesystem::exists(marker) || std::filesystem::file_size(marker) == 0) &&
+         std::chrono::steady_clock::now() < marker_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  const bool admitted = std::filesystem::exists(marker) && std::filesystem::file_size(marker) > 0;
+  expect_true(admitted, "post-admission SIGCHLD probe reaches its owner-launch delay");
+
+  struct sigaction ignored{};
+  struct sigaction previous{};
+  ignored.sa_handler = SIG_IGN;
+  (void)sigemptyset(&ignored.sa_mask);
+  const bool disposition_installed = admitted && ::sigaction(SIGCHLD, &ignored, &previous) == 0;
+  expect_true(disposition_installed, "post-admission SIGCHLD auto-reap policy installs");
+  probe.join();
+
+  struct sigaction current{};
+  const bool disposition_preserved = disposition_installed &&
+                                     ::sigaction(SIGCHLD, nullptr, &current) == 0 &&
+                                     current.sa_handler == SIG_IGN;
+  if (disposition_installed) {
+    (void)::sigaction(SIGCHLD, &previous, nullptr);
+  }
+  if (!failure.empty()) {
+    std::cerr << "FAIL: post-admission SIGCHLD probe threw: " << failure << '\n';
+    ++failures;
+  }
+  expect_true(result.has_value() && result->width == 854U,
+              "post-admission SIGCHLD change preserves the probe result");
+  expect_true(disposition_preserved, "post-admission SIGCHLD change remains owned by the host");
+  expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
+            "post-admission SIGCHLD change releases aggregate admission");
+  std::filesystem::remove(marker);
+#else
+  (void)video_path;
+#endif
+}
+
+void competing_waitpid_reaper_cannot_steal_cleanup_authority(
+    const std::filesystem::path& video_path) {
+#if !defined(_WIN32)
+  std::atomic<bool> stop_reaper{false};
+  std::atomic<std::size_t> reaped_children{0};
+  std::thread reaper([&] {
+    while (!stop_reaper.load(std::memory_order_acquire)) {
+      int status = 0;
+      const auto child = ::waitpid(-1, &status, WNOHANG);
+      if (child > 0) {
+        reaped_children.fetch_add(1, std::memory_order_release);
+      } else if (child == 0 || errno == ECHILD) {
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+      }
+    }
+  });
+
+  bool probes_succeeded = true;
+  for (std::size_t index = 0; index < 8; ++index) {
+    try {
+      probes_succeeded =
+          probes_succeeded && reco::io::probe_gpu_video(container_config(video_path),
+                                                        fake_probe_worker_path, 5'000'000'000ULL)
+                                      .width == 854U;
+    } catch (const std::exception& error) {
+      std::cerr << "FAIL: competing waitpid reaper probe threw: " << error.what() << '\n';
+      ++failures;
+      probes_succeeded = false;
+      break;
+    }
+  }
+  stop_reaper.store(true, std::memory_order_release);
+  reaper.join();
+
+  expect_true(probes_succeeded, "competing waitpid reaper preserves every probe result");
+  expect_true(reaped_children.load(std::memory_order_acquire) > 0,
+              "competing waitpid reaper steals at least one host child");
+  expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
+            "competing waitpid reaper cannot retain aggregate admission");
 #else
   (void)video_path;
 #endif
@@ -2696,6 +2825,8 @@ void caller_death_before_supervisor_arm(const std::filesystem::path& video_path)
 
 void dead_watchdog_cannot_release_the_supervisor(const std::filesystem::path& video_path) {
 #if !defined(_WIN32)
+  const auto reserved_before =
+      reco::io::detail::reserved_probe_worker_address_space_bytes_for_test();
   const auto marker_path =
       video_path.parent_path() / (video_path.filename().string() + ".dead-pre-arm-watchdog");
   std::filesystem::remove(marker_path);
@@ -2720,6 +2851,9 @@ void dead_watchdog_cannot_release_the_supervisor(const std::filesystem::path& vi
   killer.join();
   expect_true(watchdog_killed.load(std::memory_order_acquire),
               "pre-main watchdog is killed before the supervisor launch gate opens");
+  expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(),
+            reserved_before + reco::io::detail::maximum_probe_worker_address_space_bytes_for_test(),
+            "uncertified pre-main owner death retains its admission for process life");
   std::filesystem::remove(marker_path);
 #else
   (void)video_path;
@@ -4081,7 +4215,7 @@ void parent_death_reclaims_worker(const std::filesystem::path& video_path) {
 
   const auto discovery_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
   const auto supervisor =
-      wait_for_direct_child(caller, discovery_deadline, "--reco-video-probe-supervisor");
+      wait_for_descendant(caller, discovery_deadline, "--reco-video-probe-supervisor");
   const auto guardian = supervisor.has_value()
                             ? wait_for_direct_child(*supervisor, discovery_deadline)
                             : std::nullopt;
@@ -4200,8 +4334,10 @@ int main(int argc, char** argv) {
   delayed_supervision_cannot_launch_worker(video_path);
   launch_gate_prevents_post_timeout_process_start(video_path);
   guardian_death_before_pid_report_reclaims_worker(video_path);
-  auto_reaped_workers_are_rejected(video_path);
-  no_child_wait_workers_are_rejected(video_path);
+  auto_reaped_workers_are_supported(video_path);
+  no_child_wait_workers_are_supported(video_path);
+  post_admission_sigchld_change_is_supported(video_path);
+  competing_waitpid_reaper_cannot_steal_cleanup_authority(video_path);
   windows_job_reclaims_worker_descendants(video_path);
   guardian_death_after_worker_release_reclaims_group(video_path);
   unrelated_descriptors_are_not_inherited(video_path);
@@ -4219,7 +4355,6 @@ int main(int argc, char** argv) {
   parent_death_reclaims_worker(video_path);
   caller_death_reclaims_worker_and_descendant(video_path);
   caller_death_before_supervisor_arm(video_path);
-  dead_watchdog_cannot_release_the_supervisor(video_path);
   caller_death_before_supervisor_main(video_path);
   caller_process_group_death_before_supervisor_main(video_path);
   executable_replacement_cannot_change_the_pinned_probe_image(video_path);
@@ -4233,6 +4368,7 @@ int main(int argc, char** argv) {
   caller_death_before_worker_main(video_path);
   pre_main_loader_stall_respects_timeout(video_path);
   killed_cleanup_authority_fails_closed(video_path);
+  dead_watchdog_cannot_release_the_supervisor(video_path);
   expect_no_unreaped_children();
 
   std::filesystem::remove(video_path);

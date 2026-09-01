@@ -32,6 +32,8 @@
 
 namespace reco::io::detail {
 #if !defined(_WIN32)
+int run_gpu_video_probe_owner(const char* executable, std::uint64_t pre_worker_report_delay_ns,
+                              std::uint64_t pre_guardian_exec_delay_ns, bool has_marker);
 int run_gpu_video_probe_supervisor(const char* executable, std::uint64_t pre_worker_report_delay_ns,
                                    std::uint64_t pre_guardian_exec_delay_ns,
                                    std::uint64_t caller_pid, bool has_marker);
@@ -447,6 +449,22 @@ int main(int argc, char** argv) {
     return EXIT_SUCCESS;
   }
 #if !defined(_WIN32)
+  if (argc == 5 && std::strcmp(argv[1], "--reco-video-probe-owner") == 0) {
+    std::array<std::uint64_t, 2> values{};
+    for (std::size_t index = 0; index < values.size(); ++index) {
+      const std::string_view value(argv[index + 2U]);
+      const auto [end, error] =
+          std::from_chars(value.data(), value.data() + value.size(), values[index]);
+      if (error != std::errc{} || end != value.data() + value.size()) {
+        return 2;
+      }
+    }
+    if (argv[4][0] == '\0' || argv[4][1] != '\0' || (argv[4][0] != '0' && argv[4][0] != '1')) {
+      return 2;
+    }
+    return reco::io::detail::run_gpu_video_probe_owner(argv[0], values[0], values[1],
+                                                       argv[4][0] == '1');
+  }
   if (argc == 6 && std::strcmp(argv[1], "--reco-video-probe-supervisor") == 0) {
     std::array<std::uint64_t, 3> values{};
     for (std::size_t index = 0; index < values.size(); ++index) {

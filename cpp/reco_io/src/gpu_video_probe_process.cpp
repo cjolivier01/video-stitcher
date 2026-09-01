@@ -16,6 +16,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -87,6 +88,8 @@ extern char** environ;
 namespace reco::io {
 #if !defined(_WIN32)
 namespace detail {
+int run_gpu_video_probe_owner(const char* executable, std::uint64_t pre_worker_report_delay_ns,
+                              std::uint64_t pre_guardian_exec_delay_ns, bool has_marker);
 int run_gpu_video_probe_supervisor(const char* executable, std::uint64_t pre_worker_report_delay_ns,
                                    std::uint64_t pre_guardian_exec_delay_ns,
                                    std::uint64_t caller_pid, bool has_marker);
@@ -1088,9 +1091,18 @@ constexpr int kGuardianWorkerAuthority = 5;
 constexpr int kGuardianExecutable = 6;
 constexpr int kGuardianFirstUnusedDescriptor = 7;
 constexpr int kWorkerExecutable = 3;
-constexpr int kPreMainWatchdogFirstUnusedDescriptor = 5;
-constexpr int kPreMainWatchdogTarget = 3;
-constexpr int kPreMainWatchdogReady = 4;
+constexpr int kOwnerTarget = 3;
+constexpr int kOwnerReady = 4;
+constexpr int kOwnerSupervisorArm = 5;
+constexpr int kOwnerSupervisorLifetime = 6;
+constexpr int kOwnerSupervisorControl = 7;
+constexpr int kOwnerSupervisorWorkerInput = 8;
+constexpr int kOwnerSupervisorWorkerOutput = 9;
+constexpr int kOwnerSupervisorArmChild = 10;
+constexpr int kOwnerSupervisorReadyChild = 11;
+constexpr int kOwnerSupervisorExecutable = 12;
+constexpr int kOwnerSupervisorMarker = 13;
+constexpr int kOwnerFirstUnusedDescriptor = 14;
 constexpr int kSupervisorControl = 3;
 constexpr int kSupervisorWorkerInput = 4;
 constexpr int kSupervisorWorkerOutput = 5;
@@ -1121,6 +1133,7 @@ void execute_pinned_probe(int descriptor, char* const arguments[],
 constexpr char kGuardianTerminate = 'T';
 constexpr char kGuardianLaunchFailed = 'F';
 constexpr char kSupervisorCertified = 'C';
+constexpr char kSupervisorCertificationFailed = 'F';
 constexpr char kWorkerGroupCertified = 'C';
 
 long descriptor_scan_limit();
@@ -1176,8 +1189,8 @@ UniqueFd duplicate_for_guardian(int descriptor) {
   return duplicate_close_on_exec(descriptor, kGuardianFirstUnusedDescriptor);
 }
 
-UniqueFd duplicate_for_supervisor(int descriptor) {
-  return duplicate_close_on_exec(descriptor, kSupervisorFirstUnusedDescriptor);
+UniqueFd duplicate_for_owner(int descriptor) {
+  return duplicate_close_on_exec(descriptor, kOwnerFirstUnusedDescriptor);
 }
 
 int probe_executable_open_flags() {
@@ -1226,9 +1239,9 @@ ForkProtectedFd open_fork_protected_probe_executable(const std::filesystem::path
 ForkProtectedFd duplicate_fork_protected_for_supervisor(int descriptor) {
   auto duplicate = ForkProtectedFd::create([&] {
 #if defined(F_DUPFD_CLOEXEC)
-    return ::fcntl(descriptor, F_DUPFD_CLOEXEC, kSupervisorFirstUnusedDescriptor);
+    return ::fcntl(descriptor, F_DUPFD_CLOEXEC, kOwnerFirstUnusedDescriptor);
 #else
-    const auto value = ::fcntl(descriptor, F_DUPFD, kSupervisorFirstUnusedDescriptor);
+    const auto value = ::fcntl(descriptor, F_DUPFD, kOwnerFirstUnusedDescriptor);
     if (value >= 0 && ::fcntl(value, F_SETFD, FD_CLOEXEC) != 0) {
       const auto configure_error = errno;
       (void)::close(value);
@@ -1639,9 +1652,10 @@ bool worker_process_group_exists(pid_t worker_pid) {
   return ::kill(-worker_pid, 0) == 0 || errno != ESRCH;
 }
 
-template <typename Descriptor> bool take_supervisor_certificate(Descriptor* lifetime) noexcept {
+template <typename Descriptor>
+std::optional<bool> take_supervisor_certificate(Descriptor* lifetime) noexcept {
   if (lifetime == nullptr || lifetime->get() < 0) {
-    return false;
+    return std::nullopt;
   }
   char certificate = '\0';
   ssize_t received = -1;
@@ -1649,7 +1663,11 @@ template <typename Descriptor> bool take_supervisor_certificate(Descriptor* life
     received = ::recv(lifetime->get(), &certificate, 1, 0);
   } while (received < 0 && errno == EINTR);
   lifetime->reset();
-  return received == 1 && certificate == kSupervisorCertified;
+  if (received != 1 ||
+      (certificate != kSupervisorCertified && certificate != kSupervisorCertificationFailed)) {
+    return std::nullopt;
+  }
+  return certificate == kSupervisorCertified;
 }
 
 class DeferredProcessReaper {
@@ -1698,7 +1716,7 @@ private:
         int status = 0;
         const auto result = ::waitpid(item.pid, &status, WNOHANG);
         if (result == item.pid || (result < 0 && errno == ECHILD)) {
-          if (!item.reservation || take_supervisor_certificate(&item.certification)) {
+          if (!item.reservation || take_supervisor_certificate(&item.certification).has_value()) {
             item.reservation.reset();
           } else {
             item.certification.reset();
@@ -2405,68 +2423,295 @@ std::size_t format_guardian_parent_argument(char* destination, std::size_t capac
   return digits + 2U;
 }
 
-[[noreturn]] void run_pre_main_supervisor_watchdog(long maximum_descriptor) {
-  if (!guardian_close_from(kPreMainWatchdogFirstUnusedDescriptor, maximum_descriptor)) {
-    guardian_exit(127);
-  }
-  pid_t supervisor_pid = -1;
+struct SupervisorLaunchReport {
+  pid_t pid = -1;
+  int error = 0;
+};
+
+bool guardian_write_exact(int descriptor, const void* value, std::size_t size) {
+  const auto* bytes = static_cast<const char*>(value);
   std::size_t offset = 0;
-  while (offset < sizeof(supervisor_pid)) {
-    const auto received =
-        ::read(kPreMainWatchdogTarget, reinterpret_cast<char*>(&supervisor_pid) + offset,
-               sizeof(supervisor_pid) - offset);
-    if (received < 0 && errno == EINTR) {
+  while (offset < size) {
+    const auto written = ::send(descriptor, bytes + offset, size - offset,
+#if defined(MSG_NOSIGNAL)
+                                MSG_NOSIGNAL
+#else
+                                0
+#endif
+    );
+    if (written < 0 && errno == EINTR) {
       continue;
     }
-    if (received <= 0) {
-      guardian_exit(0);
+    if (written <= 0) {
+      return false;
     }
-    offset += static_cast<std::size_t>(received);
+    offset += static_cast<std::size_t>(written);
   }
+  return true;
+}
+
+[[noreturn]] void certify_and_reap_supervisor(pid_t supervisor_pid, int owner_exit_status) {
+  (void)::kill(-supervisor_pid, SIGKILL);
+  (void)::kill(supervisor_pid, SIGKILL);
+  siginfo_t supervisor_info{};
+  int wait_result = -1;
+  do {
+    wait_result =
+        ::waitid(P_PID, static_cast<id_t>(supervisor_pid), &supervisor_info, WEXITED | WNOWAIT);
+  } while (wait_result < 0 && errno == EINTR);
+  if (wait_result != 0 || supervisor_info.si_pid != supervisor_pid) {
+    guardian_exit(127);
+  }
+
+  guardian_wait_for_worker_group_cleanup(supervisor_pid);
+  int status = 0;
+  while (::waitpid(supervisor_pid, &status, 0) < 0) {
+    if (errno != EINTR) {
+      guardian_exit(127);
+    }
+  }
+  const char certificate =
+      owner_exit_status == 0 ? kSupervisorCertified : kSupervisorCertificationFailed;
+  if (!guardian_write(STDIN_FILENO, &certificate, 1)) {
+    guardian_exit(127);
+  }
+  guardian_exit(owner_exit_status);
+}
+
+[[noreturn]] void run_pre_main_supervisor_owner(pid_t supervisor_pid) {
   if (supervisor_pid <= 0) {
     guardian_exit(127);
   }
-  if (!guardian_pipe_write(kPreMainWatchdogTarget, kGuardianAcknowledge)) {
-    (void)::kill(-supervisor_pid, SIGKILL);
-    (void)::kill(supervisor_pid, SIGKILL);
-    (void)guardian_write(STDIN_FILENO, &kSupervisorCertified, 1);
-    guardian_exit(127);
+
+  const SupervisorLaunchReport report{.pid = supervisor_pid, .error = 0};
+  if (!guardian_write_exact(kOwnerTarget, &report, sizeof(report))) {
+    certify_and_reap_supervisor(supervisor_pid, 127);
   }
+  char release = '\0';
+  ssize_t release_size = -1;
+  do {
+    release_size = ::recv(kOwnerTarget, &release, 1, 0);
+  } while (release_size < 0 && errno == EINTR);
+  if (release_size != 1 || release != kGuardianRelease ||
+      !guardian_pipe_write(kOwnerSupervisorArm, kGuardianRelease) ||
+      !guardian_pipe_write(kOwnerTarget, kGuardianAcknowledge)) {
+    certify_and_reap_supervisor(supervisor_pid, 127);
+  }
+  (void)::close(kOwnerSupervisorArm);
+  (void)::close(kOwnerTarget);
 
   while (true) {
     std::array<pollfd, 2> descriptors{{
         {.fd = STDIN_FILENO, .events = POLLIN, .revents = 0},
-        {.fd = kPreMainWatchdogReady, .events = POLLIN, .revents = 0},
+        {.fd = kOwnerReady, .events = POLLIN, .revents = 0},
     }};
     const auto result = ::poll(descriptors.data(), descriptors.size(), -1);
     if (result < 0 && errno == EINTR) {
       continue;
     }
     if (result < 0) {
-      (void)::kill(-supervisor_pid, SIGKILL);
-      (void)::kill(supervisor_pid, SIGKILL);
-      (void)guardian_write(STDIN_FILENO, &kSupervisorCertified, 1);
-      guardian_exit(127);
+      certify_and_reap_supervisor(supervisor_pid, 127);
     }
     if (descriptors[1].revents != 0) {
       char ready = '\0';
-      const auto received = ::read(kPreMainWatchdogReady, &ready, 1);
+      const auto received = ::read(kOwnerReady, &ready, 1);
       if (received == 1 && ready == kGuardianReady &&
-          guardian_pipe_write(kPreMainWatchdogReady, kGuardianAcknowledge)) {
-        guardian_exit(0);
+          guardian_pipe_write(kOwnerReady, kGuardianAcknowledge)) {
+        break;
       }
-      (void)::kill(-supervisor_pid, SIGKILL);
-      (void)::kill(supervisor_pid, SIGKILL);
-      (void)guardian_write(STDIN_FILENO, &kSupervisorCertified, 1);
-      guardian_exit(127);
+      certify_and_reap_supervisor(supervisor_pid, 127);
     }
     if (descriptors[0].revents != 0) {
-      (void)::kill(-supervisor_pid, SIGKILL);
-      (void)::kill(supervisor_pid, SIGKILL);
-      (void)guardian_write(STDIN_FILENO, &kSupervisorCertified, 1);
-      guardian_exit(0);
+      certify_and_reap_supervisor(supervisor_pid, 0);
     }
   }
+
+  (void)::close(kOwnerReady);
+  while (true) {
+    siginfo_t supervisor_info{};
+    int wait_result = -1;
+    do {
+      wait_result = ::waitid(P_PID, static_cast<id_t>(supervisor_pid), &supervisor_info,
+                             WEXITED | WNOHANG | WNOWAIT);
+    } while (wait_result < 0 && errno == EINTR);
+    if (wait_result < 0) {
+      guardian_exit(127);
+    }
+    if (supervisor_info.si_pid == supervisor_pid) {
+      const auto succeeded =
+          supervisor_info.si_code == CLD_EXITED && supervisor_info.si_status == 0;
+      certify_and_reap_supervisor(supervisor_pid, succeeded ? 0 : 127);
+    }
+
+    pollfd lifetime{.fd = STDIN_FILENO, .events = POLLIN, .revents = 0};
+    const auto lifetime_result =
+        ::poll(&lifetime, 1, static_cast<int>(kProcessPollInterval.count()));
+    if (lifetime_result < 0 && errno == EINTR) {
+      continue;
+    }
+    if (lifetime_result < 0) {
+      certify_and_reap_supervisor(supervisor_pid, 127);
+    }
+    if (lifetime.revents != 0) {
+      certify_and_reap_supervisor(supervisor_pid, 0);
+    }
+  }
+}
+
+[[noreturn]] void run_pre_main_supervisor_child(char* const arguments[], char* const environment[],
+                                                bool has_marker, long maximum_descriptor) {
+  const auto report_error = [&](int error) {
+    const auto write_exact = [](const void* data, std::size_t size) {
+      const auto* bytes = static_cast<const char*>(data);
+      std::size_t offset = 0;
+      while (offset < size) {
+        ssize_t written = -1;
+        do {
+          written = ::write(kSupervisorControl, bytes + offset, size - offset);
+        } while (written < 0 && errno == EINTR);
+        if (written <= 0) {
+          guardian_exit(127);
+        }
+        offset += static_cast<std::size_t>(written);
+      }
+    };
+    write_exact(&kGuardianLaunchFailed, 1);
+    write_exact(&error, sizeof(error));
+    guardian_exit(127);
+  };
+
+  if (::dup2(kOwnerSupervisorControl, kSupervisorControl) < 0) {
+    guardian_exit(127);
+  }
+  if (::setpgid(0, 0) != 0) {
+    report_error(errno);
+  }
+  char arm = '\0';
+  ssize_t arm_size = -1;
+  do {
+    arm_size = ::read(kOwnerSupervisorArmChild, &arm, 1);
+  } while (arm_size < 0 && errno == EINTR);
+  if (arm_size != 1 || arm != kGuardianRelease) {
+    guardian_exit(0);
+  }
+  (void)::close(kOwnerSupervisorArmChild);
+  for (const auto [source, destination] :
+       {std::pair(kOwnerSupervisorLifetime, STDIN_FILENO),
+        std::pair(kOwnerSupervisorWorkerInput, kSupervisorWorkerInput),
+        std::pair(kOwnerSupervisorWorkerOutput, kSupervisorWorkerOutput),
+        std::pair(kOwnerSupervisorReadyChild, kSupervisorWatchdogReady),
+        std::pair(kOwnerSupervisorExecutable, kSupervisorExecutable)}) {
+    if (::dup2(source, destination) < 0) {
+      report_error(errno);
+    }
+  }
+  if (has_marker && ::dup2(kOwnerSupervisorMarker, kSupervisorMarker) < 0) {
+    report_error(errno);
+  }
+  if (!has_marker) {
+    (void)::close(kSupervisorMarker);
+  }
+  if (!guardian_close_from(kSupervisorFirstUnusedDescriptor, maximum_descriptor)) {
+    report_error(errno);
+  }
+  execute_pinned_probe(kSupervisorExecutable, arguments, environment);
+  report_error(errno);
+  guardian_exit(127);
+}
+
+[[noreturn]] void run_supervisor_owner(const char* executable,
+                                       std::chrono::nanoseconds pre_worker_report_delay,
+                                       std::chrono::nanoseconds pre_guardian_exec_delay,
+                                       bool has_marker) {
+  const auto maximum_descriptor = descriptor_scan_limit();
+  if (maximum_descriptor < kOwnerFirstUnusedDescriptor) {
+    guardian_exit(127);
+  }
+
+  struct sigaction default_child_action{};
+  default_child_action.sa_handler = SIG_DFL;
+  sigset_t empty_mask{};
+  const auto report_owner_start_error = [](int error) {
+    const SupervisorLaunchReport report{.pid = -1, .error = error == 0 ? EIO : error};
+    (void)guardian_write_exact(kOwnerTarget, &report, sizeof(report));
+    guardian_exit(127);
+  };
+  if (sigemptyset(&default_child_action.sa_mask) != 0 ||
+      ::sigaction(SIGCHLD, &default_child_action, nullptr) != 0 || sigemptyset(&empty_mask) != 0) {
+    report_owner_start_error(errno);
+  }
+  const auto mask_error = ::pthread_sigmask(SIG_SETMASK, &empty_mask, nullptr);
+  if (mask_error != 0) {
+    report_owner_start_error(mask_error);
+  }
+
+  std::array<char, 32> worker_delay_text{};
+  std::array<char, 32> guardian_delay_text{};
+  std::array<char, 32> owner_pid_text{};
+  const auto encode_argument = [](std::array<char, 32>* destination, std::uint64_t value) {
+    const auto [end, error] =
+        std::to_chars(destination->data(), destination->data() + destination->size() - 1, value);
+    if (error != std::errc{}) {
+      return false;
+    }
+    *end = '\0';
+    return true;
+  };
+  if (!encode_argument(&worker_delay_text,
+                       static_cast<std::uint64_t>(pre_worker_report_delay.count())) ||
+      !encode_argument(&guardian_delay_text,
+                       static_cast<std::uint64_t>(pre_guardian_exec_delay.count())) ||
+      !encode_argument(&owner_pid_text, static_cast<std::uint64_t>(::getpid())) ||
+      ::setenv("RECO_VIDEO_PROBE_PROCESS_ROLE", "supervisor", 1) != 0) {
+    report_owner_start_error(errno);
+  }
+  std::array<char, 2> marker_text{has_marker ? '1' : '0', '\0'};
+  char* const arguments[] = {const_cast<char*>(executable),
+                             const_cast<char*>("--reco-video-probe-supervisor"),
+                             worker_delay_text.data(),
+                             guardian_delay_text.data(),
+                             owner_pid_text.data(),
+                             marker_text.data(),
+                             nullptr};
+
+  fork_child_retained_descriptor = kOwnerSupervisorExecutable;
+  const auto supervisor_pid = ::fork();
+  const auto supervisor_fork_error = errno;
+  if (supervisor_pid != 0) {
+    fork_child_retained_descriptor = -1;
+  }
+  if (supervisor_pid == 0) {
+    run_pre_main_supervisor_child(arguments, environ, has_marker, maximum_descriptor);
+  }
+  if (supervisor_pid < 0) {
+    const SupervisorLaunchReport report{.pid = -1, .error = supervisor_fork_error};
+    (void)guardian_write_exact(kOwnerTarget, &report, sizeof(report));
+    guardian_exit(127);
+  }
+
+  int group_error = 0;
+  if (::setpgid(supervisor_pid, supervisor_pid) != 0) {
+    const auto set_group_error = errno;
+    if (set_group_error != EACCES) {
+      group_error = set_group_error;
+    }
+  }
+  errno = 0;
+  const auto observed_group = ::getpgid(supervisor_pid);
+  if (group_error == 0 && observed_group != supervisor_pid) {
+    group_error = observed_group < 0 && errno != 0 ? errno : EPERM;
+  }
+  if (group_error != 0) {
+    const SupervisorLaunchReport report{.pid = supervisor_pid, .error = group_error};
+    (void)guardian_write_exact(kOwnerTarget, &report, sizeof(report));
+    certify_and_reap_supervisor(supervisor_pid, 127);
+  }
+
+  for (int descriptor = kOwnerSupervisorLifetime; descriptor < kOwnerFirstUnusedDescriptor;
+       ++descriptor) {
+    (void)::close(descriptor);
+  }
+  run_pre_main_supervisor_owner(supervisor_pid);
 }
 
 GuardianLaunch spawn_guardian_process(const std::string& executable, int executable_descriptor,
@@ -2478,22 +2723,8 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
                                       std::chrono::nanoseconds pre_guardian_exec_delay,
                                       const std::filesystem::path& pre_guardian_exec_marker,
                                       std::shared_ptr<SupervisorSlot>* reservation) {
-  struct sigaction child_action{};
-  if (::sigaction(SIGCHLD, nullptr, &child_action) != 0) {
-    throw GpuVideoProbeError("failed to inspect SIGCHLD before video probe launch: " +
-                             std::string(std::strerror(errno)));
-  }
-  bool children_are_auto_reaped = child_action.sa_handler == SIG_IGN;
-#if defined(SA_NOCLDWAIT)
-  children_are_auto_reaped =
-      children_are_auto_reaped || (child_action.sa_flags & SA_NOCLDWAIT) != 0;
-#endif
-  if (children_are_auto_reaped) {
-    throw GpuVideoProbeError("video probe launch requires a waitable SIGCHLD disposition");
-  }
-
   const auto maximum_descriptor = descriptor_scan_limit();
-  if (maximum_descriptor < kSupervisorFirstUnusedDescriptor) {
+  if (maximum_descriptor < kOwnerFirstUnusedDescriptor) {
     throw GpuVideoProbeError("failed to determine video probe guardian descriptor limit");
   }
 
@@ -2507,20 +2738,16 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
   };
   std::array<char, 32> worker_delay_text{};
   std::array<char, 32> guardian_delay_text{};
-  std::array<char, 32> caller_pid_text{};
   encode_argument(&worker_delay_text, static_cast<std::uint64_t>(pre_worker_report_delay.count()));
   encode_argument(&guardian_delay_text,
                   static_cast<std::uint64_t>(pre_guardian_exec_delay.count()));
-  const auto caller_pid = ::getpid();
-  encode_argument(&caller_pid_text, static_cast<std::uint64_t>(caller_pid));
   std::array<char, 2> marker_text{pre_guardian_exec_marker.empty() ? '0' : '1', '\0'};
-  char* const arguments[] = {const_cast<char*>(executable.c_str()),
-                             const_cast<char*>("--reco-video-probe-supervisor"),
-                             worker_delay_text.data(),
-                             guardian_delay_text.data(),
-                             caller_pid_text.data(),
-                             marker_text.data(),
-                             nullptr};
+  char* const owner_arguments[] = {const_cast<char*>(executable.c_str()),
+                                   const_cast<char*>("--reco-video-probe-owner"),
+                                   worker_delay_text.data(),
+                                   guardian_delay_text.data(),
+                                   marker_text.data(),
+                                   nullptr};
   std::vector<std::string> environment_storage;
   for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
     if (std::string_view(*entry).rfind("RECO_VIDEO_PROBE_GUARDIAN_PROCESS=", 0) != 0 &&
@@ -2529,13 +2756,13 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
     }
   }
   environment_storage.emplace_back("RECO_VIDEO_PROBE_GUARDIAN_PROCESS=1");
-  environment_storage.emplace_back("RECO_VIDEO_PROBE_PROCESS_ROLE=supervisor");
-  std::vector<char*> guardian_environment;
-  guardian_environment.reserve(environment_storage.size() + 1U);
+  environment_storage.emplace_back("RECO_VIDEO_PROBE_PROCESS_ROLE=owner");
+  std::vector<char*> owner_environment;
+  owner_environment.reserve(environment_storage.size() + 1U);
   for (auto& entry : environment_storage) {
-    guardian_environment.push_back(entry.data());
+    owner_environment.push_back(entry.data());
   }
-  guardian_environment.push_back(nullptr);
+  owner_environment.push_back(nullptr);
 
   UniqueFd marker;
   if (!pre_guardian_exec_marker.empty()) {
@@ -2546,13 +2773,14 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
       throw GpuVideoProbeError("failed to create video probe guardian pre-exec marker: " +
                                std::string(std::strerror(errno)));
     }
-    marker = duplicate_for_supervisor(opened_marker.get());
+    marker = duplicate_for_owner(opened_marker.get());
   }
 
   auto lifetime_descriptors = ForkProtectedFd::create_socket_pair("guardian lifetime");
   auto supervisor_lifetime = std::move(lifetime_descriptors[0]);
   auto caller_lifetime = std::move(lifetime_descriptors[1]);
   make_nonblocking(supervisor_lifetime.get());
+  make_nonblocking(caller_lifetime.get());
   auto watchdog_target_descriptors =
       ForkProtectedFd::create_writer_protected_socket_pair("supervisor watchdog target");
   auto watchdog_target = std::move(watchdog_target_descriptors.first);
@@ -2583,21 +2811,18 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
                              std::string(std::strerror(errno)));
   }
 #endif
-  auto supervisor_lifetime_descriptor = duplicate_for_supervisor(supervisor_lifetime.get());
+  auto supervisor_lifetime_descriptor = duplicate_for_owner(supervisor_lifetime.get());
   auto supervisor_executable = duplicate_fork_protected_for_supervisor(executable_descriptor);
-  auto supervisor_control = duplicate_for_supervisor(control_descriptor);
-  auto supervisor_worker_input = duplicate_for_supervisor(worker_input_descriptor);
-  auto supervisor_worker_output = duplicate_for_supervisor(worker_output_descriptor);
-  auto watchdog_lifetime_descriptor = duplicate_for_supervisor(supervisor_lifetime.get());
-  auto watchdog_target_descriptor = duplicate_for_supervisor(watchdog_target.get());
-  auto watchdog_ready_descriptor = duplicate_for_supervisor(watchdog_ready.get());
-  auto supervisor_arm_descriptor = duplicate_for_supervisor(supervisor_arm.get());
-  auto supervisor_watchdog_ready_descriptor =
-      duplicate_for_supervisor(supervisor_watchdog_ready.get());
-  const auto caller_lifetime_descriptor = caller_lifetime.get();
-  const auto inherited_watchdog_target_writer = caller_watchdog_target.get();
-  const auto inherited_supervisor_arm_writer = caller_supervisor_arm.get();
-  char* const* const environment = guardian_environment.data();
+  auto supervisor_control = duplicate_for_owner(control_descriptor);
+  auto supervisor_worker_input = duplicate_for_owner(worker_input_descriptor);
+  auto supervisor_worker_output = duplicate_for_owner(worker_output_descriptor);
+  auto watchdog_lifetime_descriptor = duplicate_for_owner(supervisor_lifetime.get());
+  auto watchdog_target_descriptor = duplicate_for_owner(watchdog_target.get());
+  auto watchdog_ready_descriptor = duplicate_for_owner(watchdog_ready.get());
+  auto watchdog_supervisor_arm_descriptor = duplicate_for_owner(caller_supervisor_arm.get());
+  auto supervisor_arm_descriptor = duplicate_for_owner(supervisor_arm.get());
+  auto supervisor_watchdog_ready_descriptor = duplicate_for_owner(supervisor_watchdog_ready.get());
+  char* const* const environment = owner_environment.data();
 
   sigset_t blocked_mask{};
   sigset_t previous_mask{};
@@ -2611,107 +2836,89 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
                              std::string(std::strerror(block_error)));
   }
 
+  fork_child_retained_descriptor = supervisor_executable.get();
   const auto watchdog_pid = ::fork();
   const auto watchdog_fork_error = errno;
+  if (watchdog_pid != 0) {
+    fork_child_retained_descriptor = -1;
+  }
   if (watchdog_pid == 0) {
     if (::setsid() < 0) {
       guardian_exit(127);
     }
-    (void)::close(caller_lifetime_descriptor);
     for (const auto [source, destination] :
          {std::pair(watchdog_lifetime_descriptor.get(), STDIN_FILENO),
-          std::pair(watchdog_target_descriptor.get(), kPreMainWatchdogTarget),
-          std::pair(watchdog_ready_descriptor.get(), kPreMainWatchdogReady)}) {
+          std::pair(watchdog_target_descriptor.get(), kOwnerTarget),
+          std::pair(watchdog_ready_descriptor.get(), kOwnerReady),
+          std::pair(watchdog_supervisor_arm_descriptor.get(), kOwnerSupervisorArm),
+          std::pair(supervisor_lifetime_descriptor.get(), kOwnerSupervisorLifetime),
+          std::pair(supervisor_control.get(), kOwnerSupervisorControl),
+          std::pair(supervisor_worker_input.get(), kOwnerSupervisorWorkerInput),
+          std::pair(supervisor_worker_output.get(), kOwnerSupervisorWorkerOutput),
+          std::pair(supervisor_arm_descriptor.get(), kOwnerSupervisorArmChild),
+          std::pair(supervisor_watchdog_ready_descriptor.get(), kOwnerSupervisorReadyChild),
+          std::pair(supervisor_executable.get(), kOwnerSupervisorExecutable)}) {
       if (::dup2(source, destination) < 0) {
         guardian_exit(127);
       }
     }
-    run_pre_main_supervisor_watchdog(maximum_descriptor);
+    if (marker.get() >= 0 && ::dup2(marker.get(), kOwnerSupervisorMarker) < 0) {
+      guardian_exit(127);
+    }
+    if (marker.get() < 0) {
+      (void)::close(kOwnerSupervisorMarker);
+    }
+    if (!guardian_close_from(kOwnerFirstUnusedDescriptor, maximum_descriptor)) {
+      guardian_exit(127);
+    }
+    execute_pinned_probe(kOwnerSupervisorExecutable, owner_arguments, environment);
+    guardian_exit(127);
   }
   if (watchdog_pid < 0) {
     (void)::pthread_sigmask(SIG_SETMASK, &previous_mask, nullptr);
     errno = watchdog_fork_error;
-    throw GpuVideoProbeError("failed to start video probe supervisor watchdog: " +
+    throw GpuVideoProbeError("failed to start video probe supervisor owner: " +
                              std::string(std::strerror(errno)));
   }
   watchdog_lifetime_descriptor.reset();
   watchdog_target_descriptor.reset();
   watchdog_ready_descriptor.reset();
+  watchdog_supervisor_arm_descriptor.reset();
+  supervisor_lifetime_descriptor.reset();
+  supervisor_control.reset();
+  supervisor_worker_input.reset();
+  supervisor_worker_output.reset();
+  supervisor_arm_descriptor.reset();
+  supervisor_watchdog_ready_descriptor.reset();
+  supervisor_executable.reset();
+  marker.reset();
   watchdog_target.reset();
+  watchdog_ready.reset();
+  caller_supervisor_arm.reset();
+  supervisor_arm.reset();
+  supervisor_watchdog_ready.reset();
 
-  fork_child_retained_descriptor = supervisor_executable.get();
-  const auto supervisor_pid = ::fork();
-  const auto supervisor_fork_error = errno;
-  if (supervisor_pid != 0) {
-    fork_child_retained_descriptor = -1;
-  }
-  if (supervisor_pid == 0) {
-    const auto report_error = [&](int error) {
-      const auto write_exact = [](const void* data, std::size_t size) {
-        const auto* bytes = static_cast<const char*>(data);
-        std::size_t offset = 0;
-        while (offset < size) {
-          ssize_t written = -1;
-          do {
-            written = ::write(kSupervisorControl, bytes + offset, size - offset);
-          } while (written < 0 && errno == EINTR);
-          if (written <= 0) {
-            guardian_exit(127);
-          }
-          offset += static_cast<std::size_t>(written);
-        }
-      };
-      write_exact(&kGuardianLaunchFailed, 1);
-      write_exact(&error, sizeof(error));
-      (void)guardian_write(supervisor_lifetime_descriptor.get(), &kSupervisorCertified, 1);
-      guardian_exit(127);
-    };
-    (void)::close(caller_lifetime_descriptor);
-    (void)::close(inherited_watchdog_target_writer);
-    (void)::close(inherited_supervisor_arm_writer);
-    if (::dup2(supervisor_control.get(), kSupervisorControl) < 0) {
-      guardian_exit(127);
-    }
-    if (::setpgid(0, 0) != 0) {
-      report_error(errno);
-    }
-    char arm = '\0';
-    ssize_t arm_size = -1;
-    do {
-      arm_size = ::read(supervisor_arm_descriptor.get(), &arm, 1);
-    } while (arm_size < 0 && errno == EINTR);
-    if (arm_size != 1 || arm != kGuardianRelease) {
-      (void)guardian_write(supervisor_lifetime_descriptor.get(), &kSupervisorCertified, 1);
-      guardian_exit(0);
-    }
-    for (const auto [source, destination] :
-         {std::pair(supervisor_lifetime_descriptor.get(), STDIN_FILENO),
-          std::pair(supervisor_executable.get(), kSupervisorExecutable),
-          std::pair(supervisor_worker_input.get(), kSupervisorWorkerInput),
-          std::pair(supervisor_worker_output.get(), kSupervisorWorkerOutput),
-          std::pair(supervisor_watchdog_ready_descriptor.get(), kSupervisorWatchdogReady)}) {
-      if (::dup2(source, destination) < 0) {
-        report_error(errno);
+  SupervisorLaunchReport supervisor_report{};
+  bool supervisor_reported = false;
+  pollfd report_ready{.fd = caller_watchdog_target.get(), .events = POLLIN, .revents = 0};
+  if (::poll(&report_ready, 1, static_cast<int>(kMaximumTerminationReserve.count())) > 0) {
+    std::size_t offset = 0;
+    while (offset < sizeof(supervisor_report)) {
+      const auto received =
+          ::recv(caller_watchdog_target.get(), reinterpret_cast<char*>(&supervisor_report) + offset,
+                 sizeof(supervisor_report) - offset, 0);
+      if (received < 0 && errno == EINTR) {
+        continue;
       }
+      if (received <= 0) {
+        break;
+      }
+      offset += static_cast<std::size_t>(received);
     }
-    if (marker.get() >= 0 && ::dup2(marker.get(), kSupervisorMarker) < 0) {
-      report_error(errno);
-    }
-    if (marker.get() < 0) {
-      (void)::close(kSupervisorMarker);
-    }
-    if (!guardian_close_from(kSupervisorFirstUnusedDescriptor, maximum_descriptor)) {
-      report_error(errno);
-    }
-    execute_pinned_probe(kSupervisorExecutable, arguments, environment);
-    report_error(errno);
+    supervisor_reported = offset == sizeof(supervisor_report);
   }
-
-  int supervisor_group_error = 0;
-  if (supervisor_pid > 0 && ::setpgid(supervisor_pid, supervisor_pid) != 0 && errno != EACCES &&
-      errno != ESRCH) {
-    supervisor_group_error = errno;
-  }
+  const auto supervisor_pid = supervisor_reported ? supervisor_report.pid : -1;
+  int supervisor_group_error = supervisor_reported ? supervisor_report.error : 0;
 
   if (supervisor_pid > 0 && supervisor_group_error == 0 && pre_supervisor_arm_delay.count() > 0) {
     const auto marker = std::to_string(static_cast<std::uint64_t>(supervisor_pid)) + " " +
@@ -2736,7 +2943,7 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
 
   bool watchdog_armed = false;
   if (supervisor_pid > 0 && supervisor_group_error == 0 &&
-      guardian_write(caller_watchdog_target.get(), &supervisor_pid, sizeof(supervisor_pid))) {
+      guardian_write(caller_watchdog_target.get(), &kGuardianRelease, 1)) {
     pollfd acknowledgment{.fd = caller_watchdog_target.get(), .events = POLLIN, .revents = 0};
     const auto acknowledgment_wait =
         ::poll(&acknowledgment, 1, static_cast<int>(kMaximumTerminationReserve.count()));
@@ -2747,13 +2954,11 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
         received = ::read(caller_watchdog_target.get(), &value, 1);
       } while (received < 0 && errno == EINTR);
     }
-    if (received == 1 && value == kGuardianAcknowledge &&
-        guardian_write(caller_supervisor_arm.get(), &kGuardianRelease, 1)) {
+    if (received == 1 && value == kGuardianAcknowledge) {
       watchdog_armed = true;
     }
   }
   caller_watchdog_target.reset();
-  caller_supervisor_arm.reset();
 
   supervisor_lifetime.reset();
   const auto restore_error = ::pthread_sigmask(SIG_SETMASK, &previous_mask, nullptr);
@@ -2769,39 +2974,28 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
 #endif
       );
     } while (written < 0 && errno == EINTR);
-    if (supervisor_pid > 0) {
-      int status = 0;
-      const auto cleanup_deadline = std::chrono::steady_clock::now() + kMaximumTerminationReserve;
-      if (wait_for_process_exit(supervisor_pid, &status, cleanup_deadline)) {
-        if (take_supervisor_certificate(&caller_lifetime)) {
-          reservation->reset();
-        } else {
-          retain_uncertified_reservation(std::move(*reservation));
-        }
-      } else {
-        (void)::kill(-supervisor_pid, SIGKILL);
-        (void)::kill(supervisor_pid, SIGKILL);
-        if (!deferred_process_reaper().add(supervisor_pid, std::move(*reservation),
-                                           std::move(caller_lifetime))) {
-          caller_lifetime.reset();
-          retain_uncertified_reservation(std::move(*reservation));
-        }
-      }
-    } else {
-      caller_lifetime.reset();
-    }
     int watchdog_status = 0;
     const auto watchdog_deadline = std::chrono::steady_clock::now() + kMaximumTerminationReserve;
-    if (!wait_for_process_exit(watchdog_pid, &watchdog_status, watchdog_deadline)) {
-      (void)::kill(watchdog_pid, SIGKILL);
-      (void)deferred_process_reaper().add(watchdog_pid, nullptr);
+    if (wait_for_process_exit(watchdog_pid, &watchdog_status, watchdog_deadline)) {
+      if (supervisor_reported && supervisor_pid < 0 && supervisor_group_error != 0) {
+        caller_lifetime.reset();
+        reservation->reset();
+      } else if (take_supervisor_certificate(&caller_lifetime).has_value()) {
+        reservation->reset();
+      } else {
+        retain_uncertified_reservation(std::move(*reservation));
+      }
+    } else if (!deferred_process_reaper().add(watchdog_pid, std::move(*reservation),
+                                              std::move(caller_lifetime))) {
+      caller_lifetime.reset();
+      retain_uncertified_reservation(std::move(*reservation));
     }
     if (restore_error != 0) {
       throw GpuVideoProbeError("failed to restore signals after video probe guardian launch: " +
                                std::string(std::strerror(restore_error)));
     }
-    if (supervisor_pid < 0) {
-      errno = supervisor_fork_error;
+    if (supervisor_reported && supervisor_pid < 0 && supervisor_group_error != 0) {
+      errno = supervisor_group_error;
       throw GpuVideoProbeError("failed to start video probe worker guardian supervisor: " +
                                std::string(std::strerror(errno)));
     }
@@ -2839,13 +3033,11 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
   } while (initial_lifetime_size < 0 && errno == EINTR);
   if (::getppid() != caller_pid || initial_lifetime_size >= 0 ||
       (errno != EAGAIN && errno != EWOULDBLOCK)) {
-    (void)guardian_write(STDIN_FILENO, &kSupervisorCertified, 1);
     guardian_exit(0);
   }
   const auto report_supervisor_error = [](int error) {
     (void)guardian_write(kSupervisorControl, &kGuardianLaunchFailed, 1);
     (void)guardian_write(kSupervisorControl, &error, sizeof(error));
-    (void)guardian_write(STDIN_FILENO, &kSupervisorCertified, 1);
     guardian_exit(2);
   };
   struct sigaction child_action{};
@@ -2959,7 +3151,6 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
     (void)::close(worker_authority[0]);
     (void)guardian_write(kSupervisorControl, &kGuardianLaunchFailed, 1);
     (void)guardian_write(kSupervisorControl, &launch_error, sizeof(launch_error));
-    (void)guardian_write(STDIN_FILENO, &kSupervisorCertified, 1);
     guardian_exit(2);
   }
   (void)::close(kSupervisorControl);
@@ -3086,9 +3277,6 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
     while (::waitpid(-worker_group, &worker_status, WNOHANG) > 0) {
     }
 #endif
-  }
-  if (!guardian_write(STDIN_FILENO, &kSupervisorCertified, 1)) {
-    guardian_exit(2);
   }
   guardian_exit(supervisor_status);
 }
@@ -3411,7 +3599,7 @@ public:
   [[nodiscard]] int control() const { return control_.get(); }
 
   bool finish() {
-    if (pid_ <= 0) {
+    if (watchdog_pid_ <= 0) {
       return true;
     }
     const char acknowledge = kGuardianAcknowledge;
@@ -3426,26 +3614,20 @@ public:
       );
     } while (acknowledged < 0 && errno == EINTR);
     control_.reset();
-    int status = 0;
-    const auto exited = wait_for_process_exit(pid_, &status, deadline_);
-    int watchdog_status = 0;
-    const auto watchdog_exited =
-        watchdog_pid_ <= 0 || wait_for_process_exit(watchdog_pid_, &watchdog_status, deadline_);
-    if (exited) {
-      const auto certified = take_supervisor_certificate(&caller_lifetime_);
+    int owner_status = 0;
+    const auto owner_exited = wait_for_process_exit(watchdog_pid_, &owner_status, deadline_);
+    if (owner_exited) {
+      const auto certificate = take_supervisor_certificate(&caller_lifetime_);
       pid_ = -1;
-      if (certified) {
+      watchdog_pid_ = -1;
+      if (certificate.has_value()) {
         reservation_.reset();
       } else {
         retain_uncertified_reservation(std::move(reservation_));
       }
-      certified_ = certified;
+      return acknowledged == 1 && certificate.value_or(false);
     }
-    if (watchdog_exited) {
-      watchdog_pid_ = -1;
-    }
-    return acknowledged == 1 && exited && certified_ && watchdog_exited &&
-           (status == 0 || (WIFEXITED(status) && WEXITSTATUS(status) == 0));
+    return false;
   }
 
 private:
@@ -3473,35 +3655,28 @@ private:
 #endif
       );
     } while (lifetime_written < 0 && errno == EINTR);
-    int status = 0;
+    int owner_status = 0;
     const auto now = std::chrono::steady_clock::now();
     const auto maximum_grace = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
         std::chrono::milliseconds(50));
     const auto grace_deadline =
         now < deadline_ ? now + std::min((deadline_ - now) / 2, maximum_grace) : now;
-    const auto supervisor_exited = pid_ <= 0 ||
-                                   wait_for_process_exit(pid_, &status, grace_deadline) ||
-                                   wait_for_process_exit(pid_, &status, deadline_);
-    if (!supervisor_exited && !deferred_process_reaper().add(pid_, std::move(reservation_),
-                                                             std::move(caller_lifetime_))) {
+    const auto owner_exited = watchdog_pid_ <= 0 ||
+                              wait_for_process_exit(watchdog_pid_, &owner_status, grace_deadline) ||
+                              wait_for_process_exit(watchdog_pid_, &owner_status, deadline_);
+    if (!owner_exited && !deferred_process_reaper().add(watchdog_pid_, std::move(reservation_),
+                                                        std::move(caller_lifetime_))) {
       // The fixed queue has two entries per admitted probe, so this is only
       // reachable after an internal accounting violation. Keep the process
       // killed and fail closed by retaining the reservation for process life.
       caller_lifetime_.reset();
       retain_uncertified_reservation(std::move(reservation_));
-    } else if (supervisor_exited) {
-      if (take_supervisor_certificate(&caller_lifetime_)) {
+    } else if (owner_exited) {
+      if (take_supervisor_certificate(&caller_lifetime_).has_value()) {
         reservation_.reset();
       } else {
         retain_uncertified_reservation(std::move(reservation_));
       }
-    }
-    int watchdog_status = 0;
-    const auto watchdog_exited =
-        watchdog_pid_ <= 0 || wait_for_process_exit(watchdog_pid_, &watchdog_status, deadline_);
-    if (!watchdog_exited) {
-      (void)::kill(watchdog_pid_, SIGKILL);
-      (void)deferred_process_reaper().add(watchdog_pid_, nullptr);
     }
     pid_ = -1;
     watchdog_pid_ = -1;
@@ -3513,7 +3688,6 @@ private:
   ForkProtectedFd caller_lifetime_;
   std::chrono::steady_clock::time_point deadline_;
   std::shared_ptr<SupervisorSlot> reservation_;
-  bool certified_ = false;
 };
 
 std::string run_probe_worker(const std::filesystem::path& worker_path, std::string_view request,
@@ -3712,6 +3886,20 @@ GpuVideoProbe probe_gpu_video_with_delays(const GpuFileDecodeConfig& config,
 } // namespace
 
 #if !defined(_WIN32)
+int detail::run_gpu_video_probe_owner(const char* executable,
+                                      std::uint64_t pre_worker_report_delay_ns,
+                                      std::uint64_t pre_guardian_exec_delay_ns, bool has_marker) {
+  if (executable == nullptr || executable[0] == '\0' ||
+      pre_worker_report_delay_ns >
+          static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ||
+      pre_guardian_exec_delay_ns >
+          static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+    return 2;
+  }
+  run_supervisor_owner(executable, std::chrono::nanoseconds(pre_worker_report_delay_ns),
+                       std::chrono::nanoseconds(pre_guardian_exec_delay_ns), has_marker);
+}
+
 int detail::run_gpu_video_probe_supervisor(const char* executable,
                                            std::uint64_t pre_worker_report_delay_ns,
                                            std::uint64_t pre_guardian_exec_delay_ns,
