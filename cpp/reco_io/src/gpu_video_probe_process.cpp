@@ -696,7 +696,9 @@ int fork_descriptor_registration_error = 0;
 struct ForkProtectedDescriptorState {
   int value = -1;
 };
-constexpr std::size_t kMaximumForkProtectedDescriptors = kMaximumConcurrentProbeWorkers * 6U;
+// macOS retains a cleanup endpoint in addition to the six launch descriptors
+// held by every admitted probe at the supervisor-arm boundary.
+constexpr std::size_t kMaximumForkProtectedDescriptors = kMaximumConcurrentProbeWorkers * 7U;
 std::array<ForkProtectedDescriptorState*, kMaximumForkProtectedDescriptors>
     fork_protected_descriptors{};
 thread_local int fork_child_retained_descriptor = -1;
@@ -2598,6 +2600,9 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
   const auto watchdog_pid = ::fork();
   const auto watchdog_fork_error = errno;
   if (watchdog_pid == 0) {
+    if (::setsid() < 0) {
+      guardian_exit(127);
+    }
     (void)::close(caller_lifetime_descriptor);
     for (const auto [source, destination] :
          {std::pair(watchdog_lifetime_descriptor.get(), STDIN_FILENO),

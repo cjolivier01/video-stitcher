@@ -2542,6 +2542,49 @@ void caller_death_before_supervisor_main(const std::filesystem::path& video_path
 #endif
 }
 
+void caller_process_group_death_before_supervisor_main(const std::filesystem::path& video_path) {
+#if !defined(_WIN32)
+  const auto marker_path =
+      video_path.parent_path() / (video_path.filename().string() + ".pre-main-supervisor-group");
+  std::filesystem::remove(marker_path);
+  set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", marker_path.string());
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "supervisor-pre-main-block");
+  const auto caller = fork_exec_probe_caller(video_path, fake_probe_worker_path, "probe",
+                                             30'000'000'000ULL, 0, marker_path, {}, {}, true);
+  expect_true(caller > 0, "POSIX process-group supervisor caller starts");
+  if (caller > 0) {
+    const auto supervisor = wait_for_process_marker(marker_path, std::chrono::steady_clock::now() +
+                                                                     std::chrono::seconds(2));
+    expect_true(supervisor.has_value(), "supervisor reaches its process-group pre-main block");
+    (void)::kill(-caller, SIGKILL);
+    int caller_status = 0;
+    while (::waitpid(caller, &caller_status, 0) < 0 && errno == EINTR) {
+    }
+
+    bool exited = false;
+    const auto exit_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (supervisor.has_value() && std::chrono::steady_clock::now() < exit_deadline) {
+      errno = 0;
+      if (::kill(static_cast<pid_t>(*supervisor), 0) != 0 && errno == ESRCH) {
+        exited = true;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    expect_true(exited,
+                "detached pre-main watchdog reclaims the supervisor after caller group death");
+    if (supervisor.has_value() && !exited) {
+      (void)::kill(static_cast<pid_t>(*supervisor), SIGKILL);
+    }
+  }
+  set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", "");
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+  std::filesystem::remove(marker_path);
+#else
+  (void)video_path;
+#endif
+}
+
 void caller_death_before_supervisor_arm(const std::filesystem::path& video_path) {
 #if !defined(_WIN32)
   const auto marker_path =
@@ -2965,6 +3008,52 @@ void mac_snapshot_normal_cleanup_ignores_fork_only_children(
               "fork-only child cannot force the one-second snapshot cleanup fallback");
   std::filesystem::remove(snapshot_marker);
   std::filesystem::remove(child_marker);
+#else
+  (void)video_path;
+#endif
+}
+
+void mac_maximum_concurrent_probes_fit_descriptor_registry(
+    const std::filesystem::path& video_path) {
+#if defined(__APPLE__)
+  constexpr std::size_t probe_count = 4;
+  std::array<std::optional<GpuVideoProbe>, probe_count> results;
+  std::array<std::exception_ptr, probe_count> errors;
+  std::array<std::filesystem::path, probe_count> markers;
+  std::vector<std::thread> probes;
+  probes.reserve(probe_count);
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+  try {
+    for (std::size_t index = 0; index < probe_count; ++index) {
+      markers[index] = video_path.parent_path() / (video_path.filename().string() +
+                                                   ".maximum-concurrent-" + std::to_string(index));
+      std::filesystem::remove(markers[index]);
+      probes.emplace_back([&, index] {
+        try {
+          results[index] = reco::io::detail::probe_gpu_video_with_pre_supervisor_arm_delay_for_test(
+              container_config(video_path), fake_probe_worker_path, 10'000'000'000ULL,
+              2'000'000'000ULL, markers[index]);
+        } catch (...) {
+          errors[index] = std::current_exception();
+        }
+      });
+    }
+  } catch (...) {
+    for (auto& probe : probes) {
+      probe.join();
+    }
+    expect_true(false, "four concurrent macOS probe threads are created");
+    return;
+  }
+  for (auto& probe : probes) {
+    probe.join();
+  }
+  for (std::size_t index = 0; index < probe_count; ++index) {
+    expect_true(errors[index] == nullptr && results[index].has_value() &&
+                    results[index]->width == 854U,
+                "all four admitted macOS probes fit the protected descriptor registry");
+    std::filesystem::remove(markers[index]);
+  }
 #else
   (void)video_path;
 #endif
@@ -3796,10 +3885,12 @@ int main(int argc, char** argv) {
   caller_death_before_supervisor_arm(video_path);
   dead_watchdog_cannot_release_the_supervisor(video_path);
   caller_death_before_supervisor_main(video_path);
+  caller_process_group_death_before_supervisor_main(video_path);
   executable_replacement_cannot_change_the_pinned_probe_image(video_path);
   linux_fork_child_does_not_retain_snapshot_memfd(video_path);
   mac_probe_snapshot_preserves_quarantine(video_path);
   mac_snapshot_normal_cleanup_ignores_fork_only_children(video_path);
+  mac_maximum_concurrent_probes_fit_descriptor_registry(video_path);
   mac_snapshot_helper_survives_owner_process_group_termination(video_path);
   mac_probe_snapshot_cleanup_tracks_owner_process(video_path);
   caller_death_before_guardian_main(video_path);
