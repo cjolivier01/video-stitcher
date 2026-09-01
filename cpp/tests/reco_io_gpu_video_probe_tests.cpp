@@ -3459,6 +3459,9 @@ void signal_handler_fork_cannot_deadlock_the_probe_registry() {
   std::thread holder([&] {
     try {
       reco::io::detail::hold_probe_fork_descriptor_registry_for_test(ready[1], release[0]);
+      // Darwin may defer a thread-directed pending signal until after the
+      // unmasking call returns. Keep the target thread alive for delivery.
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
     } catch (...) {
       holder_error = std::current_exception();
     }
