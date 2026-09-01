@@ -834,6 +834,32 @@ constexpr char kGuardianStarted = 'S';
 constexpr char kGuardianRelease = 'G';
 constexpr char kGuardianExited = 'E';
 constexpr char kGuardianAcknowledge = 'A';
+
+void execute_pinned_probe(int descriptor, char* const arguments[],
+                          char* const environment[]) noexcept {
+#if defined(__APPLE__)
+  char path[32] = "/dev/fd/";
+  char reversed[16]{};
+  auto value = static_cast<unsigned int>(descriptor);
+  std::size_t digits = 0;
+  do {
+    reversed[digits++] = static_cast<char>('0' + value % 10U);
+    value /= 10U;
+  } while (value != 0U && digits < sizeof(reversed));
+  if (descriptor < 0 || value != 0U || sizeof("/dev/fd/") - 1U + digits >= sizeof(path)) {
+    errno = EBADF;
+    return;
+  }
+  auto offset = sizeof("/dev/fd/") - 1U;
+  while (digits > 0U) {
+    path[offset++] = reversed[--digits];
+  }
+  path[offset] = '\0';
+  ::execve(path, arguments, environment);
+#else
+  ::fexecve(descriptor, arguments, environment);
+#endif
+}
 constexpr char kGuardianTerminate = 'T';
 constexpr char kGuardianLaunchFailed = 'F';
 constexpr char kSupervisorCertified = 'C';
@@ -1949,7 +1975,7 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
     if (!guardian_close_from(kSupervisorFirstUnusedDescriptor, maximum_descriptor)) {
       report_error(errno);
     }
-    ::fexecve(kSupervisorExecutable, arguments, environment);
+    execute_pinned_probe(kSupervisorExecutable, arguments, environment);
     report_error(errno);
   }
 
@@ -2162,7 +2188,7 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
     if (!guardian_sleep(pre_guardian_exec_delay)) {
       report_error(STDOUT_FILENO, errno);
     }
-    ::fexecve(kGuardianExecutable, arguments, environ);
+    execute_pinned_probe(kGuardianExecutable, arguments, environ);
     report_error(STDOUT_FILENO, errno);
   }
 
@@ -2414,7 +2440,7 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
     char* const arguments[] = {const_cast<char*>(executable),
                                const_cast<char*>("--reco-video-probe-worker"), parent_argument,
                                nullptr};
-    ::fexecve(kWorkerExecutable, arguments, environ);
+    execute_pinned_probe(kWorkerExecutable, arguments, environ);
     guardian_exit(127);
   }
   (void)::close(start_gate[0]);
