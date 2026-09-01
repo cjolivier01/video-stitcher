@@ -189,7 +189,9 @@ void write_calibration_json_atomically(
     const std::function<void()>& before_commit = {}, bool force_rename_fallback = false,
     const std::function<void()>& after_publish = {},
     const std::function<void()>& on_lock_contention = {},
-    std::chrono::milliseconds lock_timeout = std::chrono::seconds(2));
+    std::chrono::milliseconds lock_timeout = std::chrono::seconds(2),
+    const std::function<void()>& before_windows_publish_replace = {},
+    const std::function<void()>& before_windows_rollback_replace = {});
 
 } // namespace detail
 

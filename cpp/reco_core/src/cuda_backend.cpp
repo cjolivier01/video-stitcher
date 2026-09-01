@@ -666,13 +666,20 @@ CudaDeviceBuffer CudaBackend::allocate(std::size_t bytes) const {
     throw std::invalid_argument("CUDA allocation size must be non-zero");
   }
   auto impl = impl_;
-  std::function<void(CudaDevicePtr)> deleter = [impl](CudaDevicePtr ptr) {
+  auto trace_sink = trace_sink_;
+  std::function<void(CudaDevicePtr)> deleter = [impl, trace_sink, bytes](CudaDevicePtr ptr) {
     impl->ensure_primary_context(0);
     check_cuda("cuMemFree_v2", impl->cu_mem_free(ptr));
+    if (trace_sink) {
+      trace_sink->device_allocation_released(bytes);
+    }
   };
   impl_->ensure_primary_context(0);
   CUdeviceptr ptr = 0;
   check_cuda("cuMemAlloc_v2", impl_->cu_mem_alloc(&ptr, bytes));
+  if (trace_sink_) {
+    trace_sink_->device_allocation_created(bytes);
+  }
   return CudaDeviceBuffer(ptr, bytes, std::move(deleter));
 }
 
@@ -688,11 +695,6 @@ CudaPitchedAllocation CudaBackend::allocate_pitched(std::size_t width_bytes, std
     throw std::overflow_error("CUDA pitched allocation size overflow");
   }
 
-  auto impl = impl_;
-  std::function<void(CudaDevicePtr)> deleter = [impl](CudaDevicePtr allocation) {
-    impl->ensure_primary_context(0);
-    check_cuda("cuMemFree_v2", impl->cu_mem_free(allocation));
-  };
   impl_->ensure_primary_context(0);
   CUdeviceptr ptr = 0;
   std::size_t pitch = 0;
@@ -705,6 +707,18 @@ CudaPitchedAllocation CudaBackend::allocate_pitched(std::size_t width_bytes, std
   }
 
   const std::size_t size = pitch * height;
+  auto impl = impl_;
+  auto trace_sink = trace_sink_;
+  std::function<void(CudaDevicePtr)> deleter = [impl, trace_sink, size](CudaDevicePtr allocation) {
+    impl->ensure_primary_context(0);
+    check_cuda("cuMemFree_v2", impl->cu_mem_free(allocation));
+    if (trace_sink) {
+      trace_sink->device_allocation_released(size);
+    }
+  };
+  if (trace_sink_) {
+    trace_sink_->device_allocation_created(size);
+  }
   return {.buffer = CudaDeviceBuffer(ptr, size, std::move(deleter)), .pitch = pitch};
 }
 

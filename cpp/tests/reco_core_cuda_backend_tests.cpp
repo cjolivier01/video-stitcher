@@ -239,6 +239,14 @@ INCREMENT_DONE:
 )ptx";
 
 struct CountingCudaTrace final : CudaBackendTraceSink {
+  void device_allocation_created(std::size_t bytes) noexcept override {
+    ++allocations;
+    allocated_bytes += bytes;
+  }
+  void device_allocation_released(std::size_t bytes) noexcept override {
+    ++releases;
+    released_bytes += bytes;
+  }
   void device_to_device_copy_submitted() noexcept override { ++copies; }
   void device_to_host_copy_submitted(std::size_t width_bytes,
                                      std::size_t height) noexcept override {
@@ -247,6 +255,10 @@ struct CountingCudaTrace final : CudaBackendTraceSink {
   }
   void context_synchronized() noexcept override { ++synchronizations; }
 
+  std::size_t allocations = 0;
+  std::size_t releases = 0;
+  std::size_t allocated_bytes = 0;
+  std::size_t released_bytes = 0;
   std::size_t copies = 0;
   std::size_t host_copies = 0;
   std::size_t host_copy_bytes = 0;
@@ -325,6 +337,12 @@ int main() {
         "null CUDA trace sink validation");
     auto trace = std::make_shared<CountingCudaTrace>();
     auto observed_backend = backend.with_trace_sink(trace);
+    auto observed_buffer = observed_backend.allocate(257);
+    expect_eq(trace->allocations, 1U, "successful CUDA allocation observed");
+    expect_eq(trace->allocated_bytes, 257U, "CUDA allocation byte count observed");
+    observed_buffer.reset();
+    expect_eq(trace->releases, 1U, "successful CUDA allocation release observed");
+    expect_eq(trace->released_bytes, 257U, "CUDA release byte count observed");
     observed_backend.synchronize();
     expect_eq(trace->synchronizations, 1U, "successful CUDA synchronization observed");
     const auto host = observed_backend.copy_to_host(buffer);

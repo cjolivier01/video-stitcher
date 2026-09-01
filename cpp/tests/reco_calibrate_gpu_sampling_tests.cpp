@@ -95,15 +95,19 @@ public:
 
   VectorSource(GpuFileDecodeConfig config, std::vector<GpuDecodedFrame> frames,
                bool gpu_resident = true,
-               std::shared_ptr<std::vector<std::uint64_t>> seek_trace = nullptr)
+               std::shared_ptr<std::vector<std::uint64_t>> seek_trace = nullptr,
+               std::function<void()> before_read = {})
       : config_(std::move(config)), pipeline_(build_gstreamer_gpu_file_decode_pipeline(config_)),
-        frames_(std::move(frames)), gpu_resident_(gpu_resident),
-        seek_trace_(std::move(seek_trace)) {}
+        frames_(std::move(frames)), gpu_resident_(gpu_resident), seek_trace_(std::move(seek_trace)),
+        before_read_(std::move(before_read)) {}
 
   [[nodiscard]] const GpuFileDecodeConfig& config() const override { return config_; }
   [[nodiscard]] std::string_view pipeline() const override { return pipeline_; }
   [[nodiscard]] bool gpu_resident() const override { return gpu_resident_; }
   [[nodiscard]] GpuDecodeReadResult read() override {
+    if (before_read_) {
+      before_read_();
+    }
     ++read_count_;
     if (next_ == frames_.size()) {
       return make_gpu_decode_eos();
@@ -132,6 +136,7 @@ private:
   std::size_t read_count_ = 0;
   bool gpu_resident_ = true;
   std::shared_ptr<std::vector<std::uint64_t>> seek_trace_;
+  std::function<void()> before_read_;
 };
 
 class MissingPayloadSource final : public GpuFileDecodeSource {
@@ -254,6 +259,30 @@ struct CopyOrderTrace final : CudaBackendTraceSink {
   std::array<CopyTraceEvent, 16> events{};
   std::size_t event_count = 0;
   bool overflow = false;
+};
+
+struct AllocationInterval {
+  std::size_t allocations = 0;
+  std::size_t releases = 0;
+  std::size_t allocated_bytes = 0;
+  std::size_t released_bytes = 0;
+};
+
+struct AllocationIntervalTrace final : CudaBackendTraceSink {
+  void device_allocation_created(std::size_t bytes) noexcept override {
+    ++current.allocations;
+    current.allocated_bytes += bytes;
+  }
+  void device_allocation_released(std::size_t bytes) noexcept override {
+    ++current.releases;
+    current.released_bytes += bytes;
+  }
+
+  void begin_left_read() noexcept { current = {}; }
+  void begin_right_read() { intervals.push_back(current); }
+
+  AllocationInterval current;
+  std::vector<AllocationInterval> intervals;
 };
 
 struct CudaNvmmOwner {
@@ -534,8 +563,11 @@ void seekable_source_calibration_releases_each_pair(CudaBackend& backend) {
   source_config.start_frame_index = indices.front();
   auto left_seeks = std::make_shared<std::vector<std::uint64_t>>();
   auto right_seeks = std::make_shared<std::vector<std::uint64_t>>();
-  VectorSource left_source(source_config, std::move(left_frames), true, left_seeks);
-  VectorSource right_source(source_config, std::move(right_frames), true, right_seeks);
+  auto allocation_trace = std::make_shared<AllocationIntervalTrace>();
+  VectorSource left_source(source_config, std::move(left_frames), true, left_seeks,
+                           [&] { allocation_trace->begin_left_read(); });
+  VectorSource right_source(source_config, std::move(right_frames), true, right_seeks,
+                            [&] { allocation_trace->begin_right_read(); });
   const CameraParams params{.width = 854,
                             .height = 64,
                             .fx = 1.0e10,
@@ -547,11 +579,12 @@ void seekable_source_calibration_releases_each_pair(CudaBackend& backend) {
   config.num_frames = indices.size();
   config.akaze.max_keypoints = 32;
   config.optimizer.max_iters = 10;
+  auto observed_backend = backend.with_trace_sink(allocation_trace);
 
   expect_error<CalibrationExecutionError>(
       [&] {
-        (void)run_gpu_calibration_sources(backend, left_source, right_source, indices, indices,
-                                          params, params, config);
+        (void)run_gpu_calibration_sources(observed_backend, left_source, right_source, indices,
+                                          indices, params, params, config);
       },
       "no usable frame pairs", "uniform seeked frames produce no calibration features");
   expect_eq(left_source.read_count(), indices.size(), "left source returns every selected frame");
@@ -563,6 +596,18 @@ void seekable_source_calibration_releases_each_pair(CudaBackend& backend) {
   expect_true(std::all_of(lifetimes.begin(), lifetimes.end(),
                           [](const auto& lifetime) { return lifetime.expired(); }),
               "seeked calibration releases every decoder-owned surface");
+  expect_eq(allocation_trace->intervals.size(), indices.size(),
+            "each calibration pair records its left-copy allocation interval");
+  for (const auto& interval : allocation_trace->intervals) {
+    expect_eq(interval.allocations, 1U,
+              "each left read creates exactly one calibration-owned allocation");
+    expect_true(interval.allocated_bytes >= 854U * 64U,
+                "each left read allocates a complete calibration luma plane");
+    expect_eq(interval.releases, 0U,
+              "previous copied pair is released before allocating the next left frame");
+    expect_eq(interval.released_bytes, 0U,
+              "no prior calibration allocation remains live during the next left read");
+  }
 }
 
 #endif

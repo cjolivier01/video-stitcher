@@ -1025,7 +1025,12 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
   std::thread reader([&] {
     while (running.load(std::memory_order_acquire)) {
       const auto result = read_atomic_output(destination);
-      if (result.status == AtomicReadStatus::RetryableFailure) {
+      // ReplaceFileW can transiently hide the destination while never exposing partial contents.
+      if (result.status == AtomicReadStatus::RetryableFailure
+#if defined(_WIN32)
+          || result.status == AtomicReadStatus::Missing
+#endif
+      ) {
         std::this_thread::yield();
         continue;
       }
@@ -2144,6 +2149,73 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
   expect_eq(read_text_file(windows_post_publish_destination),
             std::string("Windows post-publication replacement\n"),
             "Windows post-publication rejection preserves the substituted entry");
+
+  const auto windows_replace_race_destination = root.path() / "windows-replace-race.json";
+  const auto windows_replace_race_retained = root.path() / "windows-replace-race-retained.json";
+  write_text_file(windows_replace_race_destination, "Windows replace original output\n");
+  bool windows_replace_race_hook_ran = false;
+  bool windows_replace_race_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"windows-replace-race"})json", windows_replace_race_destination,
+        left_input, right_input, {}, {}, {}, false, {}, {}, std::chrono::seconds(2), [&] {
+          std::filesystem::rename(windows_replace_race_destination, windows_replace_race_retained);
+          write_text_file(windows_replace_race_destination, "Windows concurrent replacement\n");
+          windows_replace_race_hook_ran = true;
+        });
+  } catch (const std::exception& error) {
+    windows_replace_race_rejected =
+        std::string_view(error.what()).find("identity changed during atomic replacement") !=
+        std::string_view::npos;
+  }
+  expect_true(windows_replace_race_hook_ran, "Windows exact-replacement race hook runs");
+  expect_true(windows_replace_race_rejected, "Windows exact-replacement race is rejected");
+  expect_eq(read_text_file(windows_replace_race_destination),
+            std::string("Windows concurrent replacement\n"),
+            "Windows exact-replacement race restores the concurrent entry");
+  expect_eq(read_text_file(windows_replace_race_retained),
+            std::string("Windows replace original output\n"),
+            "Windows exact-replacement race preserves the prior output moved by the racer");
+
+  const auto windows_rollback_race_destination = root.path() / "windows-rollback-race.json";
+  const auto windows_rollback_race_published = root.path() / "windows-rollback-race-published.json";
+  write_text_file(windows_rollback_race_destination, "Windows rollback original output\n");
+  bool windows_rollback_race_hook_ran = false;
+  bool windows_rollback_race_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"windows-rollback-race"})json", windows_rollback_race_destination,
+        left_input, right_input, {}, {}, {}, false,
+        [] { throw std::runtime_error("synthetic Windows rollback race"); }, {},
+        std::chrono::seconds(2), {},
+        [&] {
+          std::filesystem::rename(windows_rollback_race_destination,
+                                  windows_rollback_race_published);
+          write_text_file(windows_rollback_race_destination,
+                          "Windows rollback concurrent replacement\n");
+          windows_rollback_race_hook_ran = true;
+        });
+  } catch (const std::exception& error) {
+    windows_rollback_race_rejected =
+        std::string_view(error.what()).find("rollback failed") != std::string_view::npos;
+  }
+  expect_true(windows_rollback_race_hook_ran, "Windows rollback race hook runs");
+  expect_true(windows_rollback_race_rejected, "Windows rollback race is rejected");
+  expect_eq(read_text_file(windows_rollback_race_destination),
+            std::string("Windows rollback concurrent replacement\n"),
+            "Windows rollback race restores the concurrent entry");
+  expect_eq(read_text_file(windows_rollback_race_published),
+            std::string("{\"writer\":\"windows-rollback-race\"}\n"),
+            "Windows rollback race preserves the displaced published output");
+  bool windows_rollback_original_retained = false;
+  for (const auto& entry : std::filesystem::directory_iterator(root.path())) {
+    if (entry.path().filename().string().starts_with("windows-rollback-race.json.rollback.") &&
+        read_text_file(entry.path()) == "Windows rollback original output\n") {
+      windows_rollback_original_retained = true;
+    }
+  }
+  expect_true(windows_rollback_original_retained,
+              "Windows rollback race retains the original output by identity");
 #endif
 
   const auto commit_alias_destination = root.path() / "commit-input-alias-output.json";

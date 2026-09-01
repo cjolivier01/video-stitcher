@@ -778,6 +778,8 @@ CalibrationResult run_gpu_calibration_sources(
   return run_gpu_calibration_frame_provider(
       backend, left_indices.size(),
       [&](std::size_t index) {
+        left_frame.reset();
+        right_frame.reset();
         left_frame = left_reader.read(left_indices[index]);
         right_frame = right_reader.read(right_indices[index]);
         return GpuCalibrationFramePairView{.left = left_frame->view(),
