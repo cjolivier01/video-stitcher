@@ -38,6 +38,8 @@ int run_gpu_video_probe_guardian(const char* executable, std::uint64_t pre_worke
 #if !defined(_WIN32)
 namespace {
 
+constexpr int kWorkerExecutable = 3;
+
 long descriptor_scan_limit() {
   long maximum = ::sysconf(_SC_OPEN_MAX);
   struct rlimit limits{};
@@ -152,6 +154,10 @@ int main(int argc, char** argv) {
   if (argc != 3) {
     return 2;
   }
+  // TSan re-executes a descriptor-backed PIE once during runtime startup.
+  // Production builds close this descriptor at exec; this close handles the
+  // sanitizer-only retained copy before any multimedia runtime is loaded.
+  (void)::close(kWorkerExecutable);
   const std::string_view value(argv[2]);
   const auto separator = value.find(':');
   if (separator == std::string_view::npos || separator + 2 != value.size() ||

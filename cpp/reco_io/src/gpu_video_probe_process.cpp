@@ -72,9 +72,15 @@ extern char** environ;
     __has_feature(memory_sanitizer)
 #define RECO_PROBE_WIDE_ADDRESS_SANITIZER 1
 #endif
+#if __has_feature(thread_sanitizer)
+#define RECO_PROBE_THREAD_SANITIZER 1
+#endif
 #endif
 #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
 #define RECO_PROBE_WIDE_ADDRESS_SANITIZER 1
+#endif
+#if defined(__SANITIZE_THREAD__)
+#define RECO_PROBE_THREAD_SANITIZER 1
 #endif
 
 namespace reco::io {
@@ -2885,8 +2891,11 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
 #endif
     if (::setpgid(0, 0) != 0 || ::dup2(kGuardianWorkerInput, STDIN_FILENO) < 0 ||
         ::dup2(kGuardianWorkerOutput, STDOUT_FILENO) < 0 ||
-        ::dup2(kGuardianExecutable, kWorkerExecutable) < 0 ||
-        ::fcntl(kWorkerExecutable, F_SETFD, FD_CLOEXEC) != 0) {
+        ::dup2(kGuardianExecutable, kWorkerExecutable) < 0
+#if !defined(RECO_PROBE_THREAD_SANITIZER)
+        || ::fcntl(kWorkerExecutable, F_SETFD, FD_CLOEXEC) != 0
+#endif
+    ) {
       guardian_exit(127);
     }
     if (!guardian_restrict_worker_process_creation()) {
