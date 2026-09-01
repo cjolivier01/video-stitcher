@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -141,6 +142,11 @@ struct ProbeLaunchOptions {
   std::chrono::nanoseconds pre_worker_report_delay{};
   std::chrono::nanoseconds pre_guardian_exec_delay{};
   std::filesystem::path pre_guardian_exec_marker;
+  int pre_owner_fork_ready_descriptor = -1;
+  int pre_owner_fork_release_descriptor = -1;
+  int owner_forked_pid_descriptor = -1;
+  int owner_fork_release_descriptor = -1;
+  std::chrono::nanoseconds pre_owner_wait_delay{};
 };
 
 struct SupervisorSlots {
@@ -699,9 +705,9 @@ int fork_descriptor_registration_error = 0;
 struct ForkProtectedDescriptorState {
   int value = -1;
 };
-// macOS retains a cleanup endpoint in addition to the six launch descriptors
-// held by every admitted probe at the supervisor-arm boundary.
-constexpr std::size_t kMaximumForkProtectedDescriptors = kMaximumConcurrentProbeWorkers * 7U;
+// macOS retains a cleanup endpoint while each launch holds the pinned image,
+// control/lifetime endpoints, ownership gates, and a temporary exec duplicate.
+constexpr std::size_t kMaximumForkProtectedDescriptors = kMaximumConcurrentProbeWorkers * 8U;
 std::array<ForkProtectedDescriptorState*, kMaximumForkProtectedDescriptors>
     fork_protected_descriptors{};
 thread_local int fork_child_retained_descriptor = -1;
@@ -1147,16 +1153,17 @@ struct GuardianLaunch {
   ForkProtectedFd caller_lifetime;
 };
 
-GuardianLaunch spawn_guardian_process(const std::string& executable, int executable_descriptor,
-                                      int control_descriptor, int worker_input_descriptor,
-                                      int worker_output_descriptor,
-                                      std::chrono::nanoseconds pre_supervisor_arm_delay,
-                                      const std::filesystem::path& pre_supervisor_arm_marker,
-                                      std::chrono::nanoseconds pre_worker_report_delay,
-                                      std::chrono::nanoseconds pre_guardian_exec_delay,
-                                      const std::filesystem::path& pre_guardian_exec_marker,
-                                      std::chrono::steady_clock::time_point launch_deadline,
-                                      std::shared_ptr<SupervisorSlot>* reservation);
+GuardianLaunch spawn_guardian_process(
+    const std::string& executable, int executable_descriptor, int control_descriptor,
+    int worker_input_descriptor, int worker_output_descriptor,
+    std::chrono::nanoseconds pre_supervisor_arm_delay,
+    const std::filesystem::path& pre_supervisor_arm_marker,
+    std::chrono::nanoseconds pre_worker_report_delay,
+    std::chrono::nanoseconds pre_guardian_exec_delay,
+    const std::filesystem::path& pre_guardian_exec_marker,
+    std::chrono::steady_clock::time_point launch_deadline, int pre_owner_fork_ready_descriptor,
+    int pre_owner_fork_release_descriptor, int owner_forked_pid_descriptor,
+    int owner_fork_release_descriptor, std::shared_ptr<SupervisorSlot>* reservation);
 
 bool guardian_watchdog_exit_is_fatal(bool memory_termination_sent, int wait_result, int wait_error,
                                      pid_t observed_pid, pid_t watchdog_pid) {
@@ -2370,7 +2377,7 @@ void guardian_wait_for_worker_group_cleanup(pid_t worker_pid) {
 }
 
 #if defined(__APPLE__)
-void guardian_reclaim_owned_session(pid_t supervisor_pid) {
+void guardian_wait_for_owned_session_cleanup(pid_t supervisor_pid) {
   constexpr timespec kSessionPollPause{.tv_sec = 0, .tv_nsec = 2'000'000};
   const auto owner_pid = ::getpid();
   const auto session_id = ::getsid(0);
@@ -2386,24 +2393,15 @@ void guardian_reclaim_owned_session(pid_t supervisor_pid) {
     int query[] = {CTL_KERN, KERN_PROC, KERN_PROC_SESSION, session_id};
     const auto query_result = ::sysctl(query, static_cast<unsigned int>(std::size(query)),
                                        processes.data(), &bytes, nullptr, 0);
-    bool uncertain =
+    const bool uncertain =
         query_result != 0 || bytes % sizeof(kinfo_proc) != 0 || bytes >= sizeof(processes);
     bool found_member = false;
     if (query_result == 0) {
       const auto process_count = std::min(bytes / sizeof(kinfo_proc), processes.size());
       for (std::size_t index = 0; index < process_count; ++index) {
         const auto process = processes[index].kp_proc.p_pid;
-        if (process <= 0 || process == owner_pid || process == supervisor_pid) {
-          continue;
-        }
-        errno = 0;
-        const auto process_session = ::getsid(process);
-        if (process_session == session_id) {
+        if (process > 0 && process != owner_pid && process != supervisor_pid) {
           found_member = true;
-          (void)::kill(-process, SIGKILL);
-          (void)::kill(process, SIGKILL);
-        } else if (process_session < 0 && errno != ESRCH) {
-          uncertain = true;
         }
       }
     }
@@ -2511,7 +2509,7 @@ bool guardian_write_exact(int descriptor, const void* value, std::size_t size) {
   }
 
 #if defined(__APPLE__)
-  guardian_reclaim_owned_session(supervisor_pid);
+  guardian_wait_for_owned_session_cleanup(supervisor_pid);
 #endif
   guardian_wait_for_worker_group_cleanup(supervisor_pid);
   int status = 0;
@@ -2769,16 +2767,17 @@ bool guardian_write_exact(int descriptor, const void* value, std::size_t size) {
   run_pre_main_supervisor_owner(supervisor_pid);
 }
 
-GuardianLaunch spawn_guardian_process(const std::string& executable, int executable_descriptor,
-                                      int control_descriptor, int worker_input_descriptor,
-                                      int worker_output_descriptor,
-                                      std::chrono::nanoseconds pre_supervisor_arm_delay,
-                                      const std::filesystem::path& pre_supervisor_arm_marker,
-                                      std::chrono::nanoseconds pre_worker_report_delay,
-                                      std::chrono::nanoseconds pre_guardian_exec_delay,
-                                      const std::filesystem::path& pre_guardian_exec_marker,
-                                      std::chrono::steady_clock::time_point launch_deadline,
-                                      std::shared_ptr<SupervisorSlot>* reservation) {
+GuardianLaunch spawn_guardian_process(
+    const std::string& executable, int executable_descriptor, int control_descriptor,
+    int worker_input_descriptor, int worker_output_descriptor,
+    std::chrono::nanoseconds pre_supervisor_arm_delay,
+    const std::filesystem::path& pre_supervisor_arm_marker,
+    std::chrono::nanoseconds pre_worker_report_delay,
+    std::chrono::nanoseconds pre_guardian_exec_delay,
+    const std::filesystem::path& pre_guardian_exec_marker,
+    std::chrono::steady_clock::time_point launch_deadline, int pre_owner_fork_ready_descriptor,
+    int pre_owner_fork_release_descriptor, int owner_forked_pid_descriptor,
+    int owner_fork_release_descriptor, std::shared_ptr<SupervisorSlot>* reservation) {
   const auto maximum_descriptor = descriptor_scan_limit();
   if (maximum_descriptor < kOwnerFirstUnusedDescriptor) {
     throw GpuVideoProbeError("failed to determine video probe guardian descriptor limit");
@@ -2885,6 +2884,26 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
   auto supervisor_watchdog_ready_descriptor = duplicate_for_owner(supervisor_watchdog_ready.get());
   char* const* const environment = owner_environment.data();
 
+  if ((pre_owner_fork_ready_descriptor < 0) != (pre_owner_fork_release_descriptor < 0)) {
+    throw GpuVideoProbeError("video probe owner-fork test barrier is incomplete");
+  }
+  if ((owner_forked_pid_descriptor < 0) != (owner_fork_release_descriptor < 0)) {
+    throw GpuVideoProbeError("video probe forked-owner test barrier is incomplete");
+  }
+  if (pre_owner_fork_ready_descriptor >= 0) {
+    if (!guardian_pipe_write(pre_owner_fork_ready_descriptor, kGuardianReady)) {
+      throw GpuVideoProbeError("failed to report the video probe owner-fork allocation peak");
+    }
+    char release = '\0';
+    ssize_t release_size = -1;
+    do {
+      release_size = ::read(pre_owner_fork_release_descriptor, &release, 1);
+    } while (release_size < 0 && errno == EINTR);
+    if (release_size != 1 || release != kGuardianRelease) {
+      throw GpuVideoProbeError("failed to release the video probe owner-fork allocation peak");
+    }
+  }
+
   sigset_t blocked_mask{};
   sigset_t previous_mask{};
   if (sigfillset(&blocked_mask) != 0) {
@@ -2941,6 +2960,19 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
     throw GpuVideoProbeError("failed to start video probe supervisor owner: " +
                              std::string(std::strerror(errno)));
   }
+  bool owner_fork_barrier_succeeded = true;
+  if (owner_forked_pid_descriptor >= 0) {
+    owner_fork_barrier_succeeded =
+        guardian_pipe_write_process_id(owner_forked_pid_descriptor, watchdog_pid);
+    if (owner_fork_barrier_succeeded) {
+      char release = '\0';
+      ssize_t release_size = -1;
+      do {
+        release_size = ::read(owner_fork_release_descriptor, &release, 1);
+      } while (release_size < 0 && errno == EINTR);
+      owner_fork_barrier_succeeded = release_size == 1 && release == kGuardianRelease;
+    }
+  }
   watchdog_lifetime_descriptor.reset();
   watchdog_target_descriptor.reset();
   watchdog_ready_descriptor.reset();
@@ -2980,25 +3012,31 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
       return false;
     }
   };
-  SupervisorLaunchReport supervisor_report{};
-  bool supervisor_reported = false;
-  pollfd report_ready{.fd = caller_watchdog_target.get(), .events = POLLIN, .revents = 0};
-  if (poll_until_launch_deadline(&report_ready)) {
+  const auto receive_exact_until_launch_deadline = [&](int descriptor, void* value,
+                                                       std::size_t size) {
+    auto* bytes = static_cast<char*>(value);
     std::size_t offset = 0;
-    while (offset < sizeof(supervisor_report)) {
-      const auto received =
-          ::recv(caller_watchdog_target.get(), reinterpret_cast<char*>(&supervisor_report) + offset,
-                 sizeof(supervisor_report) - offset, 0);
-      if (received < 0 && errno == EINTR) {
+    pollfd ready{.fd = descriptor, .events = POLLIN, .revents = 0};
+    while (offset < size) {
+      if (!poll_until_launch_deadline(&ready)) {
+        return false;
+      }
+      const auto received = ::recv(descriptor, bytes + offset, size - offset, MSG_DONTWAIT);
+      if (received < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
         continue;
       }
       if (received <= 0) {
-        break;
+        return false;
       }
       offset += static_cast<std::size_t>(received);
     }
-    supervisor_reported = offset == sizeof(supervisor_report);
-  }
+    return true;
+  };
+  SupervisorLaunchReport supervisor_report{};
+  const bool supervisor_reported =
+      owner_fork_barrier_succeeded &&
+      receive_exact_until_launch_deadline(caller_watchdog_target.get(), &supervisor_report,
+                                          sizeof(supervisor_report));
   const auto supervisor_pid = supervisor_reported ? supervisor_report.pid : -1;
   int supervisor_group_error = supervisor_reported ? supervisor_report.error : 0;
 
@@ -3026,16 +3064,9 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
   bool watchdog_armed = false;
   if (supervisor_pid > 0 && supervisor_group_error == 0 &&
       guardian_write(caller_watchdog_target.get(), &kGuardianRelease, 1)) {
-    pollfd acknowledgment{.fd = caller_watchdog_target.get(), .events = POLLIN, .revents = 0};
-    const auto acknowledgment_wait = poll_until_launch_deadline(&acknowledgment);
     char value = '\0';
-    ssize_t received = -1;
-    if (acknowledgment_wait) {
-      do {
-        received = ::read(caller_watchdog_target.get(), &value, 1);
-      } while (received < 0 && errno == EINTR);
-    }
-    if (received == 1 && value == kGuardianAcknowledge) {
+    if (receive_exact_until_launch_deadline(caller_watchdog_target.get(), &value, 1) &&
+        value == kGuardianAcknowledge) {
       watchdog_armed = true;
     }
   }
@@ -3180,9 +3211,13 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
         ::dup2(kSupervisorControl, STDOUT_FILENO) < 0) {
       report_error(kSupervisorControl, errno);
     }
+#if !defined(__APPLE__)
     if (::setpgid(0, 0) != 0) {
       report_error(STDOUT_FILENO, errno);
     }
+#else
+    // Keep pre-main code in the retained supervisor group until trusted guardian startup.
+#endif
 #if defined(__linux__)
     if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || ::getppid() != expected_supervisor_pid) {
       report_error(STDOUT_FILENO, errno == 0 ? ESRCH : errno);
@@ -3669,10 +3704,11 @@ class GuardianProcess {
 public:
   GuardianProcess(pid_t pid, pid_t watchdog_pid, ForkProtectedFd control,
                   ForkProtectedFd caller_lifetime, std::chrono::steady_clock::time_point deadline,
-                  std::shared_ptr<SupervisorSlot> reservation)
+                  std::shared_ptr<SupervisorSlot> reservation,
+                  std::chrono::nanoseconds pre_owner_wait_delay)
       : pid_(pid), watchdog_pid_(watchdog_pid), control_(std::move(control)),
         caller_lifetime_(std::move(caller_lifetime)), deadline_(deadline),
-        reservation_(std::move(reservation)) {}
+        reservation_(std::move(reservation)), pre_owner_wait_delay_(pre_owner_wait_delay) {}
   GuardianProcess(const GuardianProcess&) = delete;
   GuardianProcess& operator=(const GuardianProcess&) = delete;
   ~GuardianProcess() { terminate(); }
@@ -3695,6 +3731,9 @@ public:
       );
     } while (acknowledged < 0 && errno == EINTR);
     control_.reset();
+    if (pre_owner_wait_delay_.count() > 0) {
+      std::this_thread::sleep_for(pre_owner_wait_delay_);
+    }
     int owner_status = 0;
     const auto owner_exited = wait_for_process_exit(watchdog_pid_, &owner_status, deadline_);
     if (owner_exited) {
@@ -3769,6 +3808,7 @@ private:
   ForkProtectedFd caller_lifetime_;
   std::chrono::steady_clock::time_point deadline_;
   std::shared_ptr<SupervisorSlot> reservation_;
+  std::chrono::nanoseconds pre_owner_wait_delay_{};
 };
 
 std::string run_probe_worker(const std::filesystem::path& worker_path, std::string_view request,
@@ -3847,11 +3887,13 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
       executable, pinned_executable.get(), guard_control.get(), guard_input.get(),
       guard_output.get(), options.pre_supervisor_arm_delay, options.pre_supervisor_arm_marker,
       options.pre_worker_report_delay, options.pre_guardian_exec_delay,
-      options.pre_guardian_exec_marker, deadline, &reservation);
+      options.pre_guardian_exec_marker, deadline, options.pre_owner_fork_ready_descriptor,
+      options.pre_owner_fork_release_descriptor, options.owner_forked_pid_descriptor,
+      options.owner_fork_release_descriptor, &reservation);
   pinned_executable.reset();
   GuardianProcess guardian(guardian_launch.supervisor_pid, guardian_launch.watchdog_pid,
                            std::move(parent_control), std::move(guardian_launch.caller_lifetime),
-                           cleanup_deadline, std::move(reservation));
+                           cleanup_deadline, std::move(reservation), options.pre_owner_wait_delay);
   child_input.reset();
   child_output.reset();
   child_control.reset();
@@ -4186,6 +4228,27 @@ void detail::hold_probe_fork_descriptor_registry_for_test(int ready_descriptor,
   if (received != 1 || release != 'R') {
     throw GpuVideoProbeError("failed to release the held probe descriptor registry");
   }
+}
+
+GpuVideoProbe detail::probe_gpu_video_with_pre_owner_fork_barrier_for_test(
+    const GpuFileDecodeConfig& config, const std::filesystem::path& worker_path,
+    std::uint64_t timeout_ns, int ready_descriptor, int release_descriptor) {
+  return probe_gpu_video_with_delays(
+      config, worker_path, timeout_ns,
+      ProbeLaunchOptions{.pre_owner_fork_ready_descriptor = ready_descriptor,
+                         .pre_owner_fork_release_descriptor = release_descriptor});
+}
+
+GpuVideoProbe detail::probe_gpu_video_with_reaper_barrier_for_test(
+    const GpuFileDecodeConfig& config, const std::filesystem::path& worker_path,
+    std::uint64_t timeout_ns, int owner_pid_descriptor, int owner_release_descriptor,
+    std::uint64_t pre_owner_wait_delay_ns) {
+  return probe_gpu_video_with_delays(
+      config, worker_path, timeout_ns,
+      ProbeLaunchOptions{.owner_forked_pid_descriptor = owner_pid_descriptor,
+                         .owner_fork_release_descriptor = owner_release_descriptor,
+                         .pre_owner_wait_delay =
+                             std::chrono::nanoseconds(pre_owner_wait_delay_ns)});
 }
 
 GpuVideoProbe detail::probe_gpu_video_with_pre_guardian_exec_delay_for_test(

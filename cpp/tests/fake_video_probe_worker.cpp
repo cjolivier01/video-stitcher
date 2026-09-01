@@ -24,6 +24,7 @@
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -473,6 +474,43 @@ int main(int argc, char** argv) {
     }
     if (argv[4][0] == '\0' || argv[4][1] != '\0' || (argv[4][0] != '0' && argv[4][0] != '1')) {
       return 2;
+    }
+    const char* scenario = std::getenv("RECO_FAKE_PROBE_WORKER_SCENARIO");
+    if (scenario != nullptr && std::strcmp(scenario, "partial-owner-launch-report") == 0) {
+      constexpr char kPartialReport = 'P';
+      constexpr char kCleanupCertified = 'C';
+      if (::send(3, &kPartialReport, 1,
+#if defined(MSG_NOSIGNAL)
+                 MSG_NOSIGNAL
+#else
+                 0
+#endif
+                 ) != 1) {
+        return EXIT_FAILURE;
+      }
+      pollfd lifetime{.fd = STDIN_FILENO, .events = POLLIN, .revents = 0};
+      int lifetime_ready = -1;
+      do {
+        lifetime_ready = ::poll(&lifetime, 1, -1);
+      } while (lifetime_ready < 0 && errno == EINTR);
+      char command = '\0';
+      ssize_t received = -1;
+      if (lifetime_ready > 0) {
+        do {
+          received = ::recv(STDIN_FILENO, &command, 1, 0);
+        } while (received < 0 && errno == EINTR);
+      }
+      if (received != 1 || command != 'T' ||
+          ::send(STDIN_FILENO, &kCleanupCertified, 1,
+#if defined(MSG_NOSIGNAL)
+                 MSG_NOSIGNAL
+#else
+                 0
+#endif
+                 ) != 1) {
+        return EXIT_FAILURE;
+      }
+      return EXIT_SUCCESS;
     }
     return reco::io::detail::run_gpu_video_probe_owner(argv[0], values[0], values[1],
                                                        argv[4][0] == '1');

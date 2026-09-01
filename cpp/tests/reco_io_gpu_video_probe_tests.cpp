@@ -2356,68 +2356,121 @@ void owner_pre_main_startup_uses_probe_deadline(const std::filesystem::path& vid
 #endif
 }
 
+void partial_owner_launch_report_respects_probe_deadline(const std::filesystem::path& video_path) {
+#if !defined(_WIN32)
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "partial-owner-launch-report");
+  const auto started = std::chrono::steady_clock::now();
+  expect_probe_error(
+      [&] {
+        (void)reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
+                                        1'000'000'000ULL);
+      },
+      "failed to arm", "partial owner launch report cannot stall past the probe deadline");
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  expect_true(elapsed >= std::chrono::milliseconds(800) &&
+                  elapsed < std::chrono::milliseconds(1'300),
+              "partial owner launch report returns within the public timeout bound");
+  expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
+            "partial owner launch report releases aggregate admission after certification");
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+#else
+  (void)video_path;
+#endif
+}
+
 void competing_waitpid_reaper_cannot_steal_cleanup_authority(
     const std::filesystem::path& video_path) {
 #if !defined(_WIN32)
-  std::atomic<bool> stop_reaper{false};
-  std::atomic<std::size_t> reaped_children{0};
-  std::atomic<std::size_t> reaped_owners{0};
-  std::mutex owner_mutex;
-  std::vector<pid_t> owner_processes;
-  std::thread reaper([&] {
-    while (!stop_reaper.load(std::memory_order_acquire)) {
-      int status = 0;
-      const auto child = ::waitpid(-1, &status, WNOHANG);
-      if (child > 0) {
-        reaped_children.fetch_add(1, std::memory_order_release);
-        std::lock_guard lock(owner_mutex);
-        if (std::find(owner_processes.begin(), owner_processes.end(), child) !=
-            owner_processes.end()) {
-          reaped_owners.fetch_add(1, std::memory_order_release);
-        }
-      } else if (child == 0 || errno == ECHILD) {
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
-      }
+  int owner_pid_pipe[2] = {-1, -1};
+  int owner_release_pipe[2] = {-1, -1};
+  if (::pipe(owner_pid_pipe) != 0 || ::pipe(owner_release_pipe) != 0) {
+    (void)::close(owner_pid_pipe[0]);
+    (void)::close(owner_pid_pipe[1]);
+    (void)::close(owner_release_pipe[0]);
+    (void)::close(owner_release_pipe[1]);
+    expect_true(false, "competing waitpid reaper creates its owner barrier");
+    return;
+  }
+  std::optional<GpuVideoProbe> result;
+  std::string failure;
+  std::thread probe([&] {
+    try {
+      result = reco::io::detail::probe_gpu_video_with_reaper_barrier_for_test(
+          container_config(video_path), fake_probe_worker_path, 5'000'000'000ULL, owner_pid_pipe[1],
+          owner_release_pipe[0], 500'000'000ULL);
+    } catch (const std::exception& error) {
+      failure = error.what();
     }
   });
+  pollfd owner_ready{.fd = owner_pid_pipe[0], .events = POLLIN, .revents = 0};
+  int owner_wait = -1;
+  do {
+    owner_wait = ::poll(&owner_ready, 1, 2'000);
+  } while (owner_wait < 0 && errno == EINTR);
+  pid_t owner = -1;
+  ssize_t owner_size = -1;
+  if (owner_wait > 0) {
+    do {
+      owner_size = ::read(owner_pid_pipe[0], &owner, sizeof(owner));
+    } while (owner_size < 0 && errno == EINTR);
+  }
+  const bool owner_published = owner_size == static_cast<ssize_t>(sizeof(owner)) && owner > 0;
+  expect_true(owner_published, "competing waitpid reaper receives the exact live probe owner");
 
-  bool probes_succeeded = true;
-  for (std::size_t index = 0; index < 4; ++index) {
-    std::optional<GpuVideoProbe> result;
-    std::string failure;
-    std::thread probe([&] {
-      try {
-        result = reco::io::detail::probe_gpu_video_with_pre_worker_report_delay_for_test(
-            container_config(video_path), fake_probe_worker_path, 5'000'000'000ULL, 100'000'000ULL);
-      } catch (const std::exception& error) {
-        failure = error.what();
+  std::atomic<bool> stop_reaper{false};
+  std::atomic<bool> reaper_armed{false};
+  std::atomic<pid_t> reaped_owner{-1};
+  std::thread reaper;
+  if (owner_published) {
+    reaper = std::thread([&] {
+      while (!stop_reaper.load(std::memory_order_acquire)) {
+        int status = 0;
+        const auto child = ::waitpid(-1, &status, WNOHANG);
+        reaper_armed.store(true, std::memory_order_release);
+        if (child == owner) {
+          reaped_owner.store(child, std::memory_order_release);
+          return;
+        }
+        if (child == 0 || (child < 0 && errno == ECHILD)) {
+          std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
       }
     });
-    const auto owner =
-        wait_for_descendant(::getpid(), std::chrono::steady_clock::now() + std::chrono::seconds(2),
-                            "--reco-video-probe-owner");
-    expect_true(owner.has_value(), "competing waitpid reaper observes the probe owner");
-    if (owner.has_value()) {
-      std::lock_guard lock(owner_mutex);
-      owner_processes.push_back(*owner);
-    }
-    probe.join();
-    if (!failure.empty()) {
-      std::cerr << "FAIL: competing waitpid reaper probe threw: " << failure << '\n';
-      ++failures;
-    }
-    probes_succeeded = probes_succeeded && result.has_value() && result->width == 854U;
   }
+  const auto arm_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!reaper_armed.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < arm_deadline) {
+    std::this_thread::sleep_for(std::chrono::microseconds(50));
+  }
+  expect_true(reaper_armed.load(std::memory_order_acquire),
+              "competing waitpid reaper is armed before owner release");
+  ssize_t released = -1;
+  do {
+    released = ::write(owner_release_pipe[1], "G", 1);
+  } while (released < 0 && errno == EINTR);
+  expect_true(released == 1, "competing waitpid reaper releases the armed probe owner");
+  (void)::close(owner_release_pipe[1]);
+  owner_release_pipe[1] = -1;
+  probe.join();
   stop_reaper.store(true, std::memory_order_release);
-  reaper.join();
+  if (reaper.joinable()) {
+    reaper.join();
+  }
 
-  expect_true(probes_succeeded, "competing waitpid reaper preserves every probe result");
-  expect_true(reaped_children.load(std::memory_order_acquire) > 0,
-              "competing waitpid reaper steals at least one host child");
-  expect_true(reaped_owners.load(std::memory_order_acquire) > 0,
-              "competing waitpid reaper steals an exact probe owner");
+  if (!failure.empty()) {
+    std::cerr << "FAIL: competing waitpid reaper probe threw: " << failure << '\n';
+    ++failures;
+  }
+  expect_true(result.has_value() && result->width == 854U,
+              "competing waitpid reaper preserves the probe result");
+  expect_true(owner_published && reaped_owner.load(std::memory_order_acquire) == owner,
+              "competing waitpid reaper deterministically steals the exact probe owner");
   expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
             "competing waitpid reaper cannot retain aggregate admission");
+  (void)::close(owner_pid_pipe[0]);
+  (void)::close(owner_pid_pipe[1]);
+  (void)::close(owner_release_pipe[0]);
+  (void)::close(owner_release_pipe[1]);
 #else
   (void)video_path;
 #endif
@@ -2859,9 +2912,6 @@ void mac_owner_reclaims_stalled_guardian_session(const std::filesystem::path& vi
   expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
             "Darwin owner certifies only after its private session is empty");
 
-  if (supervisor.has_value()) {
-    (void)::kill(*supervisor, SIGCONT);
-  }
   if (guardian.has_value() && !guardian_exited) {
     (void)::kill(*guardian, SIGKILL);
   }
@@ -3324,40 +3374,94 @@ void mac_maximum_concurrent_probes_fit_descriptor_registry(
   constexpr std::size_t probe_count = 4;
   std::array<std::optional<GpuVideoProbe>, probe_count> results;
   std::array<std::exception_ptr, probe_count> errors;
-  std::array<std::filesystem::path, probe_count> markers;
   std::vector<std::thread> probes;
   probes.reserve(probe_count);
+  int ready[2] = {-1, -1};
+  int release[2] = {-1, -1};
+  if (::pipe(ready) != 0 || ::pipe(release) != 0) {
+    (void)::close(ready[0]);
+    (void)::close(ready[1]);
+    (void)::close(release[0]);
+    (void)::close(release[1]);
+    expect_true(false, "macOS descriptor-peak fixture creates its barriers");
+    return;
+  }
+  const auto ready_flags = ::fcntl(ready[0], F_GETFL);
+  if (ready_flags < 0 || ::fcntl(ready[0], F_SETFL, ready_flags | O_NONBLOCK) != 0) {
+    (void)::close(ready[0]);
+    (void)::close(ready[1]);
+    (void)::close(release[0]);
+    (void)::close(release[1]);
+    expect_true(false, "macOS descriptor-peak readiness is nonblocking");
+    return;
+  }
   set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
   try {
     for (std::size_t index = 0; index < probe_count; ++index) {
-      markers[index] = video_path.parent_path() / (video_path.filename().string() +
-                                                   ".maximum-concurrent-" + std::to_string(index));
-      std::filesystem::remove(markers[index]);
       probes.emplace_back([&, index] {
         try {
-          results[index] = reco::io::detail::probe_gpu_video_with_pre_supervisor_arm_delay_for_test(
-              container_config(video_path), fake_probe_worker_path, 10'000'000'000ULL,
-              2'000'000'000ULL, markers[index]);
+          results[index] = reco::io::detail::probe_gpu_video_with_pre_owner_fork_barrier_for_test(
+              container_config(video_path), fake_probe_worker_path, 10'000'000'000ULL, ready[1],
+              release[0]);
         } catch (...) {
           errors[index] = std::current_exception();
         }
       });
     }
   } catch (...) {
+    for (std::size_t index = 0; index < probes.size(); ++index) {
+      (void)::write(release[1], "G", 1);
+    }
     for (auto& probe : probes) {
       probe.join();
     }
+    (void)::close(ready[0]);
+    (void)::close(ready[1]);
+    (void)::close(release[0]);
+    (void)::close(release[1]);
     expect_true(false, "four concurrent macOS probe threads are created");
     return;
   }
+
+  std::size_t ready_count = 0;
+  const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (ready_count < probe_count && std::chrono::steady_clock::now() < ready_deadline) {
+    char value = '\0';
+    const auto received = ::read(ready[0], &value, 1);
+    if (received == 1 && value == 'R') {
+      ++ready_count;
+    } else if (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+      break;
+    } else {
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+  }
+  expect_eq(ready_count, probe_count,
+            "all four macOS probes hold the protected-descriptor allocation peak");
+  std::size_t release_count = 0;
+  for (std::size_t index = 0; index < ready_count; ++index) {
+    ssize_t written = -1;
+    do {
+      written = ::write(release[1], "G", 1);
+    } while (written < 0 && errno == EINTR);
+    if (written == 1) {
+      ++release_count;
+    }
+  }
+  expect_eq(release_count, ready_count, "macOS descriptor-peak barriers are released");
+  (void)::close(release[1]);
+  release[1] = -1;
   for (auto& probe : probes) {
     probe.join();
   }
+  (void)::close(ready[0]);
+  (void)::close(ready[1]);
+  (void)::close(release[0]);
+  (void)::close(release[1]);
   for (std::size_t index = 0; index < probe_count; ++index) {
     expect_true(errors[index] == nullptr && results[index].has_value() &&
                     results[index]->width == 854U,
                 "all four admitted macOS probes fit the protected descriptor registry");
-    std::filesystem::remove(markers[index]);
   }
 #else
   (void)video_path;
@@ -4465,6 +4569,7 @@ int main(int argc, char** argv) {
   no_child_wait_workers_are_supported(video_path);
   post_admission_sigchld_change_is_supported(video_path);
   owner_pre_main_startup_uses_probe_deadline(video_path);
+  partial_owner_launch_report_respects_probe_deadline(video_path);
   competing_waitpid_reaper_cannot_steal_cleanup_authority(video_path);
   windows_job_reclaims_worker_descendants(video_path);
   guardian_death_after_worker_release_reclaims_group(video_path);

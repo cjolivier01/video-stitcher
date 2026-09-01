@@ -47,6 +47,15 @@ void hold_probe_worker_memory_reservation_for_test(std::uint64_t hold_ns);
 void hold_probe_worker_admission_lock_for_test(std::uint64_t hold_ns, int ready_descriptor);
 void hold_probe_fork_descriptor_registry_for_test(int ready_descriptor, int release_descriptor);
 
+[[nodiscard]] GpuVideoProbe probe_gpu_video_with_pre_owner_fork_barrier_for_test(
+    const GpuFileDecodeConfig& config, const std::filesystem::path& worker_path,
+    std::uint64_t timeout_ns, int ready_descriptor, int release_descriptor);
+
+[[nodiscard]] GpuVideoProbe probe_gpu_video_with_reaper_barrier_for_test(
+    const GpuFileDecodeConfig& config, const std::filesystem::path& worker_path,
+    std::uint64_t timeout_ns, int owner_pid_descriptor, int owner_release_descriptor,
+    std::uint64_t pre_owner_wait_delay_ns);
+
 [[nodiscard]] GpuVideoProbe probe_gpu_video_with_pre_guardian_exec_delay_for_test(
     const GpuFileDecodeConfig& config, const std::filesystem::path& worker_path,
     std::uint64_t timeout_ns, std::uint64_t pre_guardian_exec_delay_ns,
