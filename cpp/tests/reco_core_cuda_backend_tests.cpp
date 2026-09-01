@@ -1,4 +1,5 @@
 #include "reco/core/cuda_backend.hpp"
+#include "reco/core/path.hpp"
 #include "reco/core/windows_runtime_library.hpp"
 
 #include "rules_cc/cc/runfiles/runfiles.h"
@@ -10,6 +11,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -90,6 +92,86 @@ template <typename Fn> void expect_runtime_error(Fn&& fn, std::string_view messa
   }
 }
 
+struct BazelRunfilesManifestEntry {
+  std::string logical_path;
+  std::string physical_path;
+};
+
+std::string decode_bazel_manifest_field(std::string_view encoded) {
+  std::string decoded;
+  decoded.reserve(encoded.size());
+  for (std::size_t index = 0; index < encoded.size(); ++index) {
+    if (encoded[index] != '\\' || index + 1 == encoded.size()) {
+      decoded.push_back(encoded[index]);
+      continue;
+    }
+    ++index;
+    switch (encoded[index]) {
+    case 's':
+      decoded.push_back(' ');
+      break;
+    case 'n':
+      decoded.push_back('\n');
+      break;
+    case 'b':
+      decoded.push_back('\\');
+      break;
+    default:
+      decoded.push_back('\\');
+      decoded.push_back(encoded[index]);
+      break;
+    }
+  }
+  return decoded;
+}
+
+std::optional<BazelRunfilesManifestEntry> parse_bazel_manifest_entry(std::string_view line) {
+  const bool escaped = line.starts_with(' ');
+  if (escaped) {
+    line.remove_prefix(1);
+  }
+  const auto separator = line.find(' ');
+  if (separator == std::string_view::npos) {
+    return std::nullopt;
+  }
+  const auto logical = line.substr(0, separator);
+  const auto physical = line.substr(separator + 1);
+  if (logical.empty() || physical.empty()) {
+    return std::nullopt;
+  }
+  if (!escaped) {
+    return BazelRunfilesManifestEntry{std::string(logical), std::string(physical)};
+  }
+  return BazelRunfilesManifestEntry{decode_bazel_manifest_field(logical),
+                                    decode_bazel_manifest_field(physical)};
+}
+
+void bazel_runfiles_manifest_entries_decode_escaped_paths() {
+  const auto plain = parse_bazel_manifest_entry("repo/pkg/dep.dll C:/root/dep.dll");
+  expect_true(plain.has_value(), "plain Bazel manifest entry parses");
+  if (plain.has_value()) {
+    expect_eq(plain->logical_path, std::string("repo/pkg/dep.dll"),
+              "plain Bazel manifest logical path");
+    expect_eq(plain->physical_path, std::string("C:/root/dep.dll"),
+              "plain Bazel manifest physical path");
+  }
+
+  const auto escaped = parse_bazel_manifest_entry(" repo/pkg\\sname.dll C:\\bsdk\\sroot\\bdep.dll");
+  expect_true(escaped.has_value(), "escaped Bazel manifest entry parses");
+  if (escaped.has_value()) {
+    expect_eq(escaped->logical_path, std::string("repo/pkg name.dll"),
+              "escaped Bazel manifest logical path");
+    expect_eq(escaped->physical_path, std::string("C:\\sdk root\\dep.dll"),
+              "escaped Bazel manifest physical path");
+  }
+  const auto unknown_escape = parse_bazel_manifest_entry(" repo/bad\\xname.dll C:/root/dep.dll");
+  expect_true(unknown_escape.has_value(), "unknown Bazel manifest escape parses");
+  if (unknown_escape.has_value()) {
+    expect_eq(unknown_escape->logical_path, std::string("repo/bad\\xname.dll"),
+              "unknown Bazel manifest escape remains literal");
+  }
+}
+
 #if defined(_WIN32)
 std::filesystem::path resolve_windows_runtime_runfile(std::string_view path) {
   const char* workspace = std::getenv("TEST_WORKSPACE");
@@ -127,17 +209,16 @@ find_windows_runtime_fixtures_containing(std::string_view target_name) {
   std::vector<std::filesystem::path> fixtures;
   std::string entry;
   while (std::getline(input, entry)) {
-    const auto separator = entry.find(' ');
-    if (separator == std::string::npos) {
+    const auto parsed = parse_bazel_manifest_entry(entry);
+    if (!parsed.has_value()) {
       continue;
     }
-    const auto logical_path = std::string_view(entry).substr(0, separator);
-    const auto filename = std::filesystem::path(logical_path).filename().string();
+    const auto filename = std::filesystem::path(parsed->logical_path).filename().string();
     if (filename.find(target_name) == std::string::npos ||
         (std::filesystem::path(filename).extension() != ".dll" && !filename.ends_with(".so"))) {
       continue;
     }
-    const auto physical_path = std::filesystem::path(entry.substr(separator + 1));
+    const auto physical_path = std::filesystem::path(parsed->physical_path);
     if (std::filesystem::is_regular_file(physical_path)) {
       fixtures.push_back(physical_path);
     }
@@ -225,8 +306,9 @@ void windows_runtime_loader_rejects_current_directory_planting() {
   const auto fixture = find_windows_runtime_fixture("fake_cuda_driver");
   std::error_code error;
   const auto original_directory = std::filesystem::current_path();
-  const auto directory = std::filesystem::temp_directory_path() /
-                         ("reco-dll-plant-" + std::to_string(GetCurrentProcessId()));
+  const auto directory =
+      std::filesystem::temp_directory_path() /
+      path_from_utf8("reco-dll-\xCE\xA9-\xE4\xBE\x8B-" + std::to_string(GetCurrentProcessId()));
   std::filesystem::remove_all(directory, error);
   std::filesystem::create_directories(directory);
   const auto planted = directory / "reco-current-directory-plant.dll";
@@ -246,8 +328,9 @@ void windows_runtime_loader_rejects_current_directory_planting() {
   if (relative != nullptr) {
     FreeLibrary(static_cast<HMODULE>(relative));
   }
-  auto* absolute = reco::core::detail::load_windows_runtime_library(planted.string());
-  expect_true(absolute != nullptr, "Windows runtime loading accepts an explicit absolute path");
+  auto* absolute = reco::core::detail::load_windows_runtime_library(planted);
+  expect_true(absolute != nullptr,
+              "Windows runtime loading accepts a native Unicode absolute path");
   if (absolute != nullptr) {
     FreeLibrary(static_cast<HMODULE>(absolute));
   }
@@ -309,9 +392,34 @@ int windows_runtime_loader_dependent_path_helper() {
   FreeLibrary(static_cast<HMODULE>(library));
   return result;
 }
+
+DWORD run_windows_runtime_dependency_helper(const std::filesystem::path& helper,
+                                            const std::wstring& path_value) {
+  ScopedWindowsEnvironment path(L"PATH", path_value);
+  std::wstring command = L"\"" + helper.native() + L"\" --windows-runtime-dependent-path-helper";
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process{};
+  if (CreateProcessW(helper.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr,
+                     &startup, &process) == 0) {
+    throw std::runtime_error("failed to start Windows runtime loader dependency helper");
+  }
+  CloseHandle(process.hThread);
+  const auto waited = WaitForSingleObject(process.hProcess, 10'000);
+  if (waited != WAIT_OBJECT_0) {
+    TerminateProcess(process.hProcess, 4);
+    WaitForSingleObject(process.hProcess, 10'000);
+  }
+  DWORD exit_code = std::numeric_limits<DWORD>::max();
+  if (GetExitCodeProcess(process.hProcess, &exit_code) == 0) {
+    exit_code = std::numeric_limits<DWORD>::max();
+  }
+  CloseHandle(process.hProcess);
+  return exit_code;
+}
 #endif
 
-void windows_runtime_loader_resolves_dependencies_from_absolute_path() {
+void windows_runtime_loader_requires_colocated_path_dependencies() {
 #if defined(_WIN32)
   const auto primary_fixture = find_windows_runtime_fixture("fake_windows_runtime_primary");
   const auto dependency_fixtures = find_windows_runtime_fixtures_containing("recowindepsplit");
@@ -342,30 +450,16 @@ void windows_runtime_loader_resolves_dependencies_from_absolute_path() {
   std::filesystem::copy_file(executable, helper, std::filesystem::copy_options::overwrite_existing);
 
   const auto path_value = primary_directory.native() + L";" + dependency_directory.native();
-  DWORD exit_code = std::numeric_limits<DWORD>::max();
-  {
-    ScopedWindowsEnvironment path(L"PATH", path_value);
-    std::wstring command = L"\"" + helper.native() + L"\" --windows-runtime-dependent-path-helper";
-    STARTUPINFOW startup{};
-    startup.cb = sizeof(startup);
-    PROCESS_INFORMATION process{};
-    if (CreateProcessW(helper.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr,
-                       &startup, &process) == 0) {
-      throw std::runtime_error("failed to start Windows runtime loader dependency helper");
-    }
-    CloseHandle(process.hThread);
-    const auto waited = WaitForSingleObject(process.hProcess, 10'000);
-    if (waited != WAIT_OBJECT_0) {
-      TerminateProcess(process.hProcess, 4);
-      WaitForSingleObject(process.hProcess, 10'000);
-    }
-    if (GetExitCodeProcess(process.hProcess, &exit_code) == 0) {
-      exit_code = std::numeric_limits<DWORD>::max();
-    }
-    CloseHandle(process.hProcess);
+  expect_eq(run_windows_runtime_dependency_helper(helper, path_value), DWORD{2},
+            "Windows runtime loading rejects dependencies found only in a later PATH entry");
+
+  for (const auto& dependency_fixture : dependency_fixtures) {
+    std::filesystem::copy_file(dependency_fixture,
+                               primary_directory / dependency_fixture.filename(),
+                               std::filesystem::copy_options::overwrite_existing);
   }
-  expect_eq(exit_code, DWORD{0},
-            "Windows runtime loading resolves dependencies from other absolute PATH entries");
+  expect_eq(run_windows_runtime_dependency_helper(helper, path_value), DWORD{0},
+            "Windows runtime loading resolves dependencies colocated with the selected DLL");
   std::filesystem::remove_all(root, error);
 #endif
 }
@@ -542,10 +636,11 @@ int main(int argc, char** argv) {
   (void)argc;
   (void)argv;
 #endif
+  bazel_runfiles_manifest_entries_decode_escaped_paths();
   try {
     windows_runtime_loader_rejects_current_directory_planting();
     windows_runtime_loader_prefers_default_search_to_path();
-    windows_runtime_loader_resolves_dependencies_from_absolute_path();
+    windows_runtime_loader_requires_colocated_path_dependencies();
   } catch (const std::exception& error) {
     std::cerr << "FAIL: Windows runtime loader regression threw: " << error.what() << '\n';
     ++failures;

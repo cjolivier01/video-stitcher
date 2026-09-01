@@ -1,5 +1,6 @@
 #include "reco/detect/ort_session.hpp"
 
+#include "reco/core/path.hpp"
 #include "reco/core/windows_runtime_library.hpp"
 
 #include "reco/detect/detectors.hpp"
@@ -224,9 +225,9 @@ struct OrtApi {
 
 class DynamicLibrary {
 public:
-  explicit DynamicLibrary(const std::filesystem::path& path) : path_(path.string()) {
+  explicit DynamicLibrary(const std::filesystem::path& path) : path_(core::path_to_utf8(path)) {
 #if defined(_WIN32)
-    handle_ = static_cast<HMODULE>(core::detail::load_windows_runtime_library(path_));
+    handle_ = static_cast<HMODULE>(core::detail::load_windows_runtime_library(path));
 #else
     handle_ = dlopen(path_.c_str(), RTLD_NOW | RTLD_LOCAL);
 #endif
