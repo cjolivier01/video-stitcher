@@ -740,7 +740,7 @@ void publish_windows_output(HANDLE directory, const std::filesystem::path& resol
                             HANDLE temporary_handle, const std::filesystem::path& destination,
                             bool& destination_published,
                             std::optional<WindowsDisplacedOutput>& displaced_output,
-                            const std::function<void()>& before_replace) {
+                            const std::function<void(const std::filesystem::path&)>& before_replace) {
   constexpr ACCESS_MASK access = DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
   constexpr ULONG sharing = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
   constexpr ULONG options =
@@ -788,7 +788,7 @@ void publish_windows_output(HANDLE directory, const std::filesystem::path& resol
           "temporary output identity changed before Windows publication");
     }
     if (before_replace) {
-      before_replace();
+      before_replace(resolved_directory / temporary_name);
     }
     if (!path_identifies_windows_handle(resolved_directory, directory, true) ||
         !relative_path_identifies_windows_handle(directory, temporary_name, temporary_handle,
@@ -2095,7 +2095,7 @@ void write_calibration_json_atomically_impl(
     const std::function<void()>& before_commit, bool force_rename_fallback,
     const std::function<void()>& after_publish, const std::function<void()>& on_lock_contention,
     std::chrono::milliseconds lock_timeout,
-    const std::function<void()>& before_windows_publish_replace,
+    const std::function<void(const std::filesystem::path&)>& before_windows_publish_replace,
     const std::function<void()>& before_windows_rollback_replace) {
   std::string contents(json);
   contents.push_back('\n');
@@ -3905,7 +3905,7 @@ void write_calibration_json_atomically(
     const std::function<void()>& before_commit, bool force_rename_fallback,
     const std::function<void()>& after_publish, const std::function<void()>& on_lock_contention,
     std::chrono::milliseconds lock_timeout,
-    const std::function<void()>& before_windows_publish_replace,
+    const std::function<void(const std::filesystem::path&)>& before_windows_publish_replace,
     const std::function<void()>& before_windows_rollback_replace) {
   write_calibration_json_atomically_impl(
       json, destination, left_input, right_input, before_publish, lens_profiles, before_commit,

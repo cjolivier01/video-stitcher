@@ -2159,7 +2159,8 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
   try {
     detail::write_calibration_json_atomically(
         R"json({"writer":"windows-replace-race"})json", windows_replace_race_destination,
-        left_input, right_input, {}, {}, {}, false, {}, {}, std::chrono::seconds(2), [&] {
+        left_input, right_input, {}, {}, {}, false, {}, {}, std::chrono::seconds(2),
+        [&](const std::filesystem::path&) {
           std::filesystem::rename(windows_replace_race_destination, windows_replace_race_retained);
           write_text_file(windows_replace_race_destination, "Windows concurrent replacement\n");
           windows_replace_race_hook_ran = true;
@@ -2186,17 +2187,12 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
   try {
     detail::write_calibration_json_atomically(
         R"json({"writer":"windows-source-race"})json", windows_source_race_destination, left_input,
-        right_input, {}, {}, {}, false, {}, {}, std::chrono::seconds(2), [&] {
-          for (const auto& entry : std::filesystem::directory_iterator(root.path())) {
-            if (entry.path().filename().string().starts_with("windows-source-race.json.tmp.")) {
-              windows_source_race_substitute = entry.path();
-              std::filesystem::rename(entry.path(), windows_source_race_retained);
-              write_text_file(windows_source_race_substitute,
-                              "Windows source concurrent replacement\n");
-              return;
-            }
-          }
-          throw std::runtime_error("Windows source-race temporary fixture was not found");
+        right_input, {}, {}, {}, false, {}, {}, std::chrono::seconds(2),
+        [&](const std::filesystem::path& temporary) {
+          windows_source_race_substitute = temporary;
+          std::filesystem::rename(temporary, windows_source_race_retained);
+          write_text_file(windows_source_race_substitute,
+                          "Windows source concurrent replacement\n");
         });
   } catch (const std::exception& error) {
     windows_source_race_rejected =
