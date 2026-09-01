@@ -707,7 +707,7 @@ void prepare_fork_descriptors() {
   sigset_t blocked{};
   sigset_t previous{};
   const auto mask_error =
-      ::sigfillset(&blocked) == 0 ? ::pthread_sigmask(SIG_SETMASK, &blocked, &previous) : errno;
+      sigfillset(&blocked) == 0 ? ::pthread_sigmask(SIG_SETMASK, &blocked, &previous) : errno;
   (void)::pthread_mutex_lock(&fork_descriptor_mutex);
   prepared_fork_signal_mask = previous;
   prepared_fork_signal_mask_valid = mask_error == 0;
@@ -756,7 +756,7 @@ class ForkDescriptorSignalMask {
 public:
   ForkDescriptorSignalMask() noexcept {
     sigset_t blocked{};
-    if (::sigfillset(&blocked) != 0) {
+    if (sigfillset(&blocked) != 0) {
       error_ = errno;
       return;
     }
