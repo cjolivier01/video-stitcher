@@ -2163,7 +2163,7 @@ void guardian_death_before_pid_report_reclaims_worker(const std::filesystem::pat
 #endif
 }
 
-void auto_reaped_workers_are_supported(const std::filesystem::path& video_path) {
+void auto_reaped_workers_are_rejected(const std::filesystem::path& video_path) {
 #if !defined(_WIN32)
   struct sigaction ignore_action{};
   struct sigaction previous_action{};
@@ -2174,20 +2174,64 @@ void auto_reaped_workers_are_supported(const std::filesystem::path& video_path) 
     return;
   }
 
-  bool probe_succeeded = false;
+  bool probe_rejected = false;
   try {
     set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
-    probe_succeeded = reco::io::probe_gpu_video(container_config(video_path),
-                                                fake_probe_worker_path, 5'000'000'000ULL)
-                          .width == 854U;
+    (void)reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
+                                    5'000'000'000ULL);
+  } catch (const reco::io::GpuVideoProbeError& error) {
+    probe_rejected = std::string_view(error.what()) ==
+                     "video probe launch requires a waitable SIGCHLD disposition";
   } catch (const std::exception& error) {
-    std::cerr << "FAIL: auto-reaped worker probe threw: " << error.what() << '\n';
+    std::cerr << "FAIL: auto-reaped worker probe returned the wrong error: " << error.what()
+              << '\n';
     ++failures;
   }
+  struct sigaction current_action{};
+  const bool disposition_preserved =
+      sigaction(SIGCHLD, nullptr, &current_action) == 0 && current_action.sa_handler == SIG_IGN;
   if (sigaction(SIGCHLD, &previous_action, nullptr) != 0) {
     expect_true(false, "SIGCHLD policy restores");
   }
-  expect_true(probe_succeeded, "auto-reaped worker returns its framed response");
+  expect_true(probe_rejected, "auto-reaped worker policy is rejected before launch");
+  expect_true(disposition_preserved, "rejected auto-reap policy remains installed");
+#else
+  (void)video_path;
+#endif
+}
+
+void no_child_wait_workers_are_rejected(const std::filesystem::path& video_path) {
+#if !defined(_WIN32) && defined(SA_NOCLDWAIT)
+  struct sigaction no_wait_action{};
+  struct sigaction previous_action{};
+  no_wait_action.sa_handler = SIG_DFL;
+  no_wait_action.sa_flags = SA_NOCLDWAIT;
+  sigemptyset(&no_wait_action.sa_mask);
+  if (sigaction(SIGCHLD, &no_wait_action, &previous_action) != 0) {
+    expect_true(false, "SIGCHLD no-wait policy installs");
+    return;
+  }
+
+  bool probe_rejected = false;
+  try {
+    set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+    (void)reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
+                                    5'000'000'000ULL);
+  } catch (const reco::io::GpuVideoProbeError& error) {
+    probe_rejected = std::string_view(error.what()) ==
+                     "video probe launch requires a waitable SIGCHLD disposition";
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: no-wait worker probe returned the wrong error: " << error.what() << '\n';
+    ++failures;
+  }
+  struct sigaction current_action{};
+  const bool disposition_preserved = sigaction(SIGCHLD, nullptr, &current_action) == 0 &&
+                                     (current_action.sa_flags & SA_NOCLDWAIT) != 0;
+  if (sigaction(SIGCHLD, &previous_action, nullptr) != 0) {
+    expect_true(false, "SIGCHLD no-wait policy restores");
+  }
+  expect_true(probe_rejected, "no-wait worker policy is rejected before launch");
+  expect_true(disposition_preserved, "rejected no-wait policy remains installed");
 #else
   (void)video_path;
 #endif
@@ -4156,7 +4200,8 @@ int main(int argc, char** argv) {
   delayed_supervision_cannot_launch_worker(video_path);
   launch_gate_prevents_post_timeout_process_start(video_path);
   guardian_death_before_pid_report_reclaims_worker(video_path);
-  auto_reaped_workers_are_supported(video_path);
+  auto_reaped_workers_are_rejected(video_path);
+  no_child_wait_workers_are_rejected(video_path);
   windows_job_reclaims_worker_descendants(video_path);
   guardian_death_after_worker_release_reclaims_group(video_path);
   unrelated_descriptors_are_not_inherited(video_path);

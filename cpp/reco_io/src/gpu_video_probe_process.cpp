@@ -2478,6 +2478,20 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
                                       std::chrono::nanoseconds pre_guardian_exec_delay,
                                       const std::filesystem::path& pre_guardian_exec_marker,
                                       std::shared_ptr<SupervisorSlot>* reservation) {
+  struct sigaction child_action{};
+  if (::sigaction(SIGCHLD, nullptr, &child_action) != 0) {
+    throw GpuVideoProbeError("failed to inspect SIGCHLD before video probe launch: " +
+                             std::string(std::strerror(errno)));
+  }
+  bool children_are_auto_reaped = child_action.sa_handler == SIG_IGN;
+#if defined(SA_NOCLDWAIT)
+  children_are_auto_reaped =
+      children_are_auto_reaped || (child_action.sa_flags & SA_NOCLDWAIT) != 0;
+#endif
+  if (children_are_auto_reaped) {
+    throw GpuVideoProbeError("video probe launch requires a waitable SIGCHLD disposition");
+  }
+
   const auto maximum_descriptor = descriptor_scan_limit();
   if (maximum_descriptor < kSupervisorFirstUnusedDescriptor) {
     throw GpuVideoProbeError("failed to determine video probe guardian descriptor limit");
