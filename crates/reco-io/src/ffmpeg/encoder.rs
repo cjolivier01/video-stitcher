@@ -485,6 +485,7 @@ type OpenedVideoEncoder = (
 /// ```
 pub struct VideoEncoder {
     octx: format::context::Output,
+    container: Container,
     encoder: ffmpeg::encoder::video::Encoder,
     scaler: ScalingContext,
     stream_index: usize,
@@ -738,6 +739,7 @@ impl VideoEncoder {
 
                     return Ok(Self {
                         octx,
+                        container: config.container,
                         encoder: enc_opened,
                         scaler,
                         stream_index,
@@ -1409,20 +1411,41 @@ impl VideoEncoder {
     /// they've actually hit disk. Call periodically (e.g. every
     /// keyframe) from the stacked-video replay path.
     ///
-    /// `av_write_frame(ctx, NULL)` prompts the muxer to emit any
-    /// queued packets; `avio_flush` then forces the AVIO layer to
-    /// write its buffer to the OS. Both are safe to call multiple
-    /// times and at any point after `write_header`.
+    /// For Matroska, `av_write_frame(ctx, NULL)` closes the active
+    /// cluster. `avio_flush` then forces the AVIO layer to write its
+    /// buffer to the OS. Both are safe to call multiple times and at
+    /// any point after `write_header`.
     pub fn flush_to_disk(&mut self) -> Result<(), EncodeError> {
-        // SAFETY: `octx` is a live output context (created in
-        // `new`, never dropped until `Drop` runs). `avio_flush` is
-        // safe on any live AVIO and doesn't alter muxer state -
-        // just forces the output-layer buffer to the file
-        // descriptor. We intentionally avoid
-        // `av_write_frame(ctx, NULL)` because fMP4's
-        // `frag_keyframe` mode treats that as "close current
-        // fragment" which clashes with the subsequent
-        // `write_trailer` on finish (observed as AVERROR -105).
+        // Matroska assembles each cluster in a dynamic buffer and
+        // copies it to the output only when the cluster closes. An
+        // AVIO flush alone therefore exposes just the file header to
+        // a concurrent reader. The Matroska muxer explicitly supports
+        // a null packet for closing the active cluster. Keep fMP4 on
+        // the AVIO-only path: closing an fMP4 fragment this way clashes
+        // with its later write_trailer call (observed as AVERROR -105).
+        if self.container == Container::Matroska {
+            // SAFETY: `octx` is a live output context created in `new`.
+            // First drain packets retained by the interleaver, then issue
+            // the muxer flush that Matroska implements by ending its current
+            // cluster without finalizing the container.
+            for result in unsafe {
+                [
+                    ffmpeg::sys::av_interleaved_write_frame(
+                        self.octx.as_mut_ptr(),
+                        std::ptr::null_mut(),
+                    ),
+                    ffmpeg::sys::av_write_frame(self.octx.as_mut_ptr(), std::ptr::null_mut()),
+                ]
+            } {
+                if result < 0 {
+                    return Err(ffmpeg::Error::from(result).into());
+                }
+            }
+        }
+
+        // SAFETY: `octx` remains live until `Drop`. `avio_flush` does
+        // not alter muxer state; it only pushes the AVIO buffer to the
+        // underlying file descriptor.
         unsafe {
             let pb = (*self.octx.as_mut_ptr()).pb;
             if !pb.is_null() {

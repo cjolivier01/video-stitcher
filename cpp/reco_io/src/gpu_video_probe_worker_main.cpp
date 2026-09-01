@@ -1,8 +1,10 @@
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <charconv>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <string_view>
@@ -16,6 +18,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
@@ -27,12 +30,53 @@ int run_gpu_video_probe_worker();
 #if defined(_WIN32)
 int run_gpu_video_probe_guardian();
 #else
+int run_gpu_video_probe_owner(const char* executable, std::uint64_t pre_worker_report_delay_ns,
+                              std::uint64_t pre_guardian_exec_delay_ns, bool has_marker,
+                              bool stop_supervisor_after_guardian_launch);
+int run_gpu_video_probe_supervisor(const char* executable, std::uint64_t pre_worker_report_delay_ns,
+                                   std::uint64_t pre_guardian_exec_delay_ns,
+                                   std::uint64_t caller_pid, bool has_marker,
+                                   bool stop_after_guardian_launch);
 int run_gpu_video_probe_guardian(const char* executable, std::uint64_t pre_worker_report_delay_ns);
 #endif
 } // namespace reco::io::detail
 
 #if !defined(_WIN32)
 namespace {
+
+constexpr int kWorkerExecutable = 3;
+
+#if defined(RECO_PROBE_TEST_WORKER_DESCRIPTOR_REUSE)
+int reused_worker_descriptor = -1;
+
+class WorkerDescriptorReuseFixture {
+public:
+  WorkerDescriptorReuseFixture() {
+    const char* path = std::getenv("RECO_FAKE_PROBE_WORKER_DESCRIPTOR_REUSE_PATH");
+    if (path != nullptr && path[0] != '\0') {
+      reused_worker_descriptor =
+          ::open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, S_IRUSR | S_IWUSR);
+    }
+  }
+};
+
+WorkerDescriptorReuseFixture worker_descriptor_reuse_fixture;
+
+bool audit_reused_worker_descriptor() {
+  const char* path = std::getenv("RECO_FAKE_PROBE_WORKER_DESCRIPTOR_REUSE_PATH");
+  if (path == nullptr || path[0] == '\0') {
+    return true;
+  }
+  const char marker = '1';
+  const bool valid = reused_worker_descriptor == kWorkerExecutable &&
+                     ::write(reused_worker_descriptor, &marker, 1) == 1;
+  if (reused_worker_descriptor >= 0) {
+    (void)::close(reused_worker_descriptor);
+    reused_worker_descriptor = -1;
+  }
+  return valid;
+}
+#endif
 
 long descriptor_scan_limit() {
   long maximum = ::sysconf(_SC_OPEN_MAX);
@@ -106,6 +150,40 @@ int main(int argc, char** argv) {
     return reco::io::detail::run_gpu_video_probe_guardian();
   }
 #else
+  if (argc == 6 && std::strcmp(argv[1], "--reco-video-probe-owner") == 0) {
+    std::array<std::uint64_t, 2> values{};
+    for (std::size_t index = 0; index < values.size(); ++index) {
+      const std::string_view value(argv[index + 2U]);
+      const auto [end, error] =
+          std::from_chars(value.data(), value.data() + value.size(), values[index]);
+      if (error != std::errc{} || end != value.data() + value.size()) {
+        return 2;
+      }
+    }
+    if (argv[4][0] == '\0' || argv[4][1] != '\0' || (argv[4][0] != '0' && argv[4][0] != '1') ||
+        argv[5][0] == '\0' || argv[5][1] != '\0' || (argv[5][0] != '0' && argv[5][0] != '1')) {
+      return 2;
+    }
+    return reco::io::detail::run_gpu_video_probe_owner(argv[0], values[0], values[1],
+                                                       argv[4][0] == '1', argv[5][0] == '1');
+  }
+  if (argc == 7 && std::strcmp(argv[1], "--reco-video-probe-supervisor") == 0) {
+    std::array<std::uint64_t, 3> values{};
+    for (std::size_t index = 0; index < values.size(); ++index) {
+      const std::string_view value(argv[index + 2U]);
+      const auto [end, error] =
+          std::from_chars(value.data(), value.data() + value.size(), values[index]);
+      if (error != std::errc{} || end != value.data() + value.size()) {
+        return 2;
+      }
+    }
+    if (argv[5][0] == '\0' || argv[5][1] != '\0' || (argv[5][0] != '0' && argv[5][0] != '1') ||
+        argv[6][0] == '\0' || argv[6][1] != '\0' || (argv[6][0] != '0' && argv[6][0] != '1')) {
+      return 2;
+    }
+    return reco::io::detail::run_gpu_video_probe_supervisor(
+        argv[0], values[0], values[1], values[2], argv[5][0] == '1', argv[6][0] == '1');
+  }
   if (argc == 3 && std::strcmp(argv[1], "--reco-video-probe-guardian") == 0) {
     const std::string_view delay_value(argv[2]);
     std::uint64_t delay_ns = 0;
@@ -135,9 +213,19 @@ int main(int argc, char** argv) {
   const std::string_view value(argv[2]);
   const auto separator = value.find(':');
   if (separator == std::string_view::npos || separator + 2 != value.size() ||
-      (value[separator + 1] != '0' && value[separator + 1] != '1')) {
+      (value[separator + 1] != '0' && value[separator + 1] != '1' && value[separator + 1] != '2')) {
     return 2;
   }
+  // TSan re-executes a descriptor-backed PIE once during runtime startup. Only
+  // that explicitly identified launch retains descriptor 3 through exec.
+  if (value[separator + 1] == '2') {
+    (void)::close(kWorkerExecutable);
+  }
+#if defined(RECO_PROBE_TEST_WORKER_DESCRIPTOR_REUSE)
+  if (!audit_reused_worker_descriptor()) {
+    return 2;
+  }
+#endif
   const auto pid_value = value.substr(0, separator);
   std::uint64_t expected_parent_pid = 0;
   const auto [end, error] =

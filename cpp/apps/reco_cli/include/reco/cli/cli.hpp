@@ -1,8 +1,12 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
+#include <filesystem>
+#include <functional>
 #include <iosfwd>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -161,6 +165,34 @@ using Command = std::variant<StitchCommand, PreviewCommand, CalibrateCommand, Ca
 [[nodiscard]] std::variant<Command, ParseError> parse_args(const std::vector<std::string>& args);
 [[nodiscard]] std::string_view command_name(const Command& command);
 [[nodiscard]] std::string help_text();
-int run_command(const Command& command, std::ostream& out, std::ostream& err);
+int run_command(const Command& command, std::ostream& out, std::ostream& err,
+                const std::filesystem::path& executable_path = {});
+
+namespace detail {
+
+/// Resolves the deployed video probe worker for CLI startup and hardening tests.
+[[nodiscard]] std::optional<std::filesystem::path>
+resolve_video_probe_worker(const std::filesystem::path& executable_path);
+
+/// Resolves the deployed calibration worker for CLI startup and hardening tests.
+[[nodiscard]] std::optional<std::filesystem::path>
+resolve_calibration_worker(const std::filesystem::path& executable_path);
+
+/// Publishes serialized calibration JSON after rechecking that it cannot replace an input or
+/// selected lens profile. The trailing controls are deterministic race hooks for publication
+/// tests; production callers leave them at their defaults.
+void write_calibration_json_atomically(
+    std::string_view json, const std::filesystem::path& destination,
+    const std::filesystem::path& left_input, const std::filesystem::path& right_input,
+    const std::function<void()>& before_publish = {},
+    std::span<const std::filesystem::path> lens_profiles = {},
+    const std::function<void()>& before_commit = {}, bool force_rename_fallback = false,
+    const std::function<void()>& after_publish = {},
+    const std::function<void()>& on_lock_contention = {},
+    std::chrono::milliseconds lock_timeout = std::chrono::seconds(2),
+    const std::function<void(const std::filesystem::path&)>& before_windows_publish_replace = {},
+    const std::function<void(const std::filesystem::path&)>& before_windows_rollback_replace = {});
+
+} // namespace detail
 
 } // namespace reco::cli

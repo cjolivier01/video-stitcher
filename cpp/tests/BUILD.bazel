@@ -1,4 +1,4 @@
-load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_test")
+load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
 
 cc_test(
     name = "reco_control_tests",
@@ -59,8 +59,15 @@ cc_test(
     name = "reco_core_cuda_backend_tests",
     size = "small",
     srcs = ["reco_core_cuda_backend_tests.cpp"],
+    data = [
+        ":libfake_cuda_driver.so",
+        ":libfake_cuda_driver_path.so",
+        ":libfake_windows_runtime_primary.so",
+        ":recowindepsplit",
+    ],
     deps = [
         "//cpp/reco_core",
+        "@rules_cc//cc/runfiles",
     ],
 )
 
@@ -82,6 +89,7 @@ cc_test(
         "fixture_gpu_decode_source.hpp",
         "reco_io_gstreamer_tests.cpp",
     ],
+    data = [":libfake_nvbufsurface.so"],
     deps = [
         "//cpp/reco_io",
     ],
@@ -105,11 +113,24 @@ cc_binary(
     ],
 )
 
+cc_binary(
+    name = "fake_video_probe_worker_fallback",
+    testonly = True,
+    srcs = ["fake_video_probe_worker.cpp"],
+    deps = [
+        "//cpp/reco_io:reco_io_forced_guardian_fallbacks",
+        "@nlohmann_json//:json",
+    ],
+)
+
 cc_test(
     name = "reco_io_gpu_decode_runtime_tests",
     size = "small",
     srcs = ["reco_io_gpu_decode_runtime_tests.cpp"],
-    data = [":libfake_gstreamer_runtime.so"],
+    data = [
+        ":libfake_gstreamer_runtime.so",
+        ":libfake_nvbufsurface.so",
+    ],
     deps = ["//cpp/reco_io"],
 )
 
@@ -120,11 +141,13 @@ cc_test(
     data = [
         ":fake_video_probe_worker",
         ":libfake_gstreamer_runtime.so",
+        ":libfake_nvbufsurface.so",
         "//cpp/reco_io:reco_video_probe_worker",
     ],
     deps = [
-        "//cpp/reco_io:gpu_video_probe_test_support",
+        "//cpp/reco_core",
         "//cpp/reco_io",
+        "//cpp/reco_io:gpu_video_probe_test_support",
         "@rules_cc//cc/runfiles",
     ],
 )
@@ -134,11 +157,14 @@ cc_test(
     size = "medium",
     srcs = ["reco_io_gpu_video_probe_tests.cpp"],
     data = [
-        ":fake_video_probe_worker",
+        ":fake_video_probe_worker_fallback",
         ":libfake_gstreamer_runtime.so",
-        "//cpp/reco_io:reco_video_probe_worker",
+        ":libfake_nvbufsurface.so",
+        "//cpp/reco_io:reco_video_probe_worker_fallback",
     ],
+    local_defines = ["RECO_PROBE_TEST_FORCE_GUARDIAN_FALLBACKS"],
     deps = [
+        "//cpp/reco_core",
         "//cpp/reco_io:gpu_video_probe_fallback_test_support",
         "//cpp/reco_io:reco_io_forced_guardian_fallbacks",
         "@rules_cc//cc/runfiles",
@@ -163,10 +189,43 @@ cc_binary(
 )
 
 cc_binary(
+    name = "libfake_nvbufsurface_7_1.so",
+    testonly = True,
+    srcs = ["fake_nvbufsurface.cpp"],
+    linkshared = True,
+    local_defines = ["RECO_FAKE_NVBUFSURFACE_7_1"],
+    deps = ["//cpp/reco_io"],
+)
+
+cc_binary(
     name = "libfake_cuda_driver.so",
     testonly = True,
     srcs = ["fake_cuda_driver.cpp"],
     linkshared = True,
+)
+
+cc_binary(
+    name = "libfake_cuda_driver_path.so",
+    testonly = True,
+    srcs = ["fake_cuda_driver.cpp"],
+    linkshared = True,
+    local_defines = ["RECO_FAKE_CUDA_DRIVER_MARKER=2"],
+)
+
+cc_library(
+    name = "recowindepsplit",
+    testonly = True,
+    srcs = ["fake_windows_runtime_dependency.cpp"],
+    linkstatic = False,
+)
+
+cc_binary(
+    name = "libfake_windows_runtime_primary.so",
+    testonly = True,
+    srcs = ["fake_windows_runtime_primary.cpp"],
+    linkshared = True,
+    linkstatic = False,
+    deps = [":recowindepsplit"],
 )
 
 cc_test(
@@ -176,6 +235,7 @@ cc_test(
     data = [
         ":libfake_cuda_driver.so",
         ":libfake_nvbufsurface.so",
+        ":libfake_nvbufsurface_7_1.so",
     ],
     deps = ["//cpp/reco_io"],
 )
@@ -316,6 +376,90 @@ cc_test(
 )
 
 cc_test(
+    name = "reco_calibrate_stable_media_tests",
+    size = "small",
+    srcs = ["reco_calibrate_stable_media_tests.cpp"],
+    deps = [
+        "//cpp/reco_calibrate",
+        "//cpp/reco_calibrate:calibration_worker_test_support",
+    ],
+)
+
+cc_test(
+    name = "reco_calibrate_worker_protocol_tests",
+    size = "small",
+    srcs = ["reco_calibrate_worker_protocol_tests.cpp"],
+    deps = [
+        "//cpp/reco_calibrate:calibration_worker_test_support",
+        "//cpp/reco_core",
+    ],
+)
+
+cc_binary(
+    name = "fake_calibration_worker",
+    testonly = True,
+    srcs = ["fake_calibration_worker.cpp"],
+    deps = [
+        "//cpp/reco_calibrate:calibration_worker_test_support",
+    ],
+)
+
+cc_test(
+    name = "reco_calibrate_supervisor_tests",
+    size = "medium",
+    srcs = ["reco_calibrate_supervisor_tests.cpp"],
+    data = [
+        ":fake_calibration_worker",
+        "//cpp/reco_calibrate:reco_calibration_worker",
+    ],
+    env = {
+        "ASAN_OPTIONS": "detect_leaks=0",
+        "TSAN_OPTIONS": "atexit_sleep_ms=0",
+    },
+    tags = [
+        "exclusive",
+        "no-sandbox",
+    ],
+    deps = [
+        "//cpp/reco_calibrate",
+        "//cpp/reco_calibrate:calibration_worker_test_support",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
+cc_test(
+    name = "reco_calibrate_gpu_pipeline_tests",
+    size = "medium",
+    srcs = ["reco_calibrate_gpu_pipeline_tests.cpp"],
+    deps = [
+        "//cpp/reco_calibrate",
+        "//cpp/reco_core",
+    ],
+)
+
+cc_test(
+    name = "reco_calibrate_gpu_video_parity_tests",
+    size = "large",
+    srcs = ["reco_calibrate_gpu_video_parity_tests.cpp"],
+    data = [
+        "fixtures/calibration_video_parity/left.mp4",
+        "fixtures/calibration_video_parity/right.mp4",
+        "fixtures/calibration_video_parity/rust_golden.json",
+    ],
+    tags = [
+        "exclusive",
+        "no-sandbox",
+    ],
+    deps = [
+        "//cpp/reco_calibrate",
+        "//cpp/reco_core",
+        "//cpp/reco_io",
+        "@nlohmann_json//:json",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
+cc_test(
     name = "reco_detect_postprocess_tests",
     size = "small",
     srcs = ["reco_detect_postprocess_tests.cpp"],
@@ -409,6 +553,12 @@ cc_test(
     name = "reco_cli_tests",
     size = "small",
     srcs = ["reco_cli_tests.cpp"],
+    data = [
+        ":libfake_nvbufsurface.so",
+        "//cpp/apps/reco_cli:reco",
+        "//cpp/reco_calibrate:reco_calibration_worker",
+        "//cpp/reco_io:reco_video_probe_worker",
+    ],
     deps = [
         "//cpp/apps/reco_cli:reco_cli_lib",
     ],

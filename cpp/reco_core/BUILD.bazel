@@ -11,6 +11,7 @@ cc_library(
     srcs = [
         "src/calibration.cpp",
         "src/cuda_backend.cpp",
+        "src/path.cpp",
         "src/pipeline_event.cpp",
         "src/performance.cpp",
         "src/projection.cpp",
@@ -20,10 +21,12 @@ cc_library(
         "src/shader_catalog.cpp",
         "src/source.cpp",
         "src/telemetry.cpp",
+        "src/windows_runtime_library.cpp",
     ],
     hdrs = [
         "include/reco/core/calibration.hpp",
         "include/reco/core/cuda_backend.hpp",
+        "include/reco/core/path.hpp",
         "include/reco/core/pipeline_event.hpp",
         "include/reco/core/performance.hpp",
         "include/reco/core/projection.hpp",
@@ -35,6 +38,7 @@ cc_library(
         "include/reco/core/telemetry.hpp",
         "include/reco/core/video_format.hpp",
         "include/reco/core/viewport_position.hpp",
+        "include/reco/core/windows_runtime_library.hpp",
     ],
     includes = ["include"],
     visibility = ["//visibility:public"],

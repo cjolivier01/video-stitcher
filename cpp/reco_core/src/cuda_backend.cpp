@@ -1,4 +1,5 @@
 #include "reco/core/cuda_backend.hpp"
+#include "reco/core/windows_runtime_library.hpp"
 
 #include <algorithm>
 #include <array>
@@ -87,7 +88,7 @@ class DynamicLibrary {
 public:
   explicit DynamicLibrary(const char* name) {
 #if defined(_WIN32)
-    handle_ = LoadLibraryA(name);
+    handle_ = detail::load_windows_runtime_library(name);
 #else
     handle_ = dlopen(name, RTLD_NOW | RTLD_LOCAL);
 #endif
@@ -235,6 +236,8 @@ struct CudaBackend::Impl {
     cu_device_get_uuid = driver.symbol<decltype(cu_device_get_uuid)>("cuDeviceGetUuid");
     cu_device_primary_ctx_retain =
         driver.symbol<decltype(cu_device_primary_ctx_retain)>("cuDevicePrimaryCtxRetain");
+    cu_device_primary_ctx_release =
+        driver.symbol<decltype(cu_device_primary_ctx_release)>("cuDevicePrimaryCtxRelease_v2");
     cu_ctx_get_current = driver.symbol<decltype(cu_ctx_get_current)>("cuCtxGetCurrent");
     cu_ctx_get_device = driver.symbol<decltype(cu_ctx_get_device)>("cuCtxGetDevice");
     cu_ctx_set_current = driver.symbol<decltype(cu_ctx_set_current)>("cuCtxSetCurrent");
@@ -264,6 +267,16 @@ struct CudaBackend::Impl {
     check_cuda("cuInit", cu_init(0));
   }
 
+  ~Impl() {
+    for (const auto& [ordinal, context] : retained_contexts) {
+      (void)context;
+      CUdevice retained_device = 0;
+      if (cu_device_get(&retained_device, ordinal) == kCudaSuccess) {
+        (void)cu_device_primary_ctx_release(retained_device);
+      }
+    }
+  }
+
   CUdevice device(int ordinal) const {
     CUdevice device = 0;
     check_cuda("cuDeviceGet", cu_device_get(&device, ordinal));
@@ -272,16 +285,6 @@ struct CudaBackend::Impl {
 
   void ensure_primary_context(int ordinal) {
     const CUdevice requested_device = device(ordinal);
-    CUcontext current = nullptr;
-    check_cuda("cuCtxGetCurrent", cu_ctx_get_current(&current));
-    if (current != nullptr) {
-      CUdevice current_device = 0;
-      check_cuda("cuCtxGetDevice", cu_ctx_get_device(&current_device));
-      if (current_device == requested_device) {
-        return;
-      }
-    }
-
     CUcontext context = nullptr;
     {
       std::lock_guard<std::mutex> lock(context_mutex);
@@ -294,17 +297,15 @@ struct CudaBackend::Impl {
         context = it->second;
       }
     }
+    CUcontext current = nullptr;
+    check_cuda("cuCtxGetCurrent", cu_ctx_get_current(&current));
+    if (current == context) {
+      return;
+    }
     check_cuda("cuCtxSetCurrent", cu_ctx_set_current(context));
   }
 
-  void ensure_current_context_for_copy() {
-    CUcontext current = nullptr;
-    check_cuda("cuCtxGetCurrent", cu_ctx_get_current(&current));
-    if (current != nullptr) {
-      return;
-    }
-    ensure_primary_context(0);
-  }
+  void ensure_current_context_for_copy() { ensure_primary_context(0); }
 
   CUcontext current_context() {
     CUcontext current = nullptr;
@@ -325,6 +326,7 @@ struct CudaBackend::Impl {
   CUresult (*cu_device_get_name)(char*, int, CUdevice) = nullptr;
   CUresult (*cu_device_get_uuid)(CUuuid*, CUdevice) = nullptr;
   CUresult (*cu_device_primary_ctx_retain)(CUcontext*, CUdevice) = nullptr;
+  CUresult (*cu_device_primary_ctx_release)(CUdevice) = nullptr;
   CUresult (*cu_ctx_get_current)(CUcontext*) = nullptr;
   CUresult (*cu_ctx_get_device)(CUdevice*) = nullptr;
   CUresult (*cu_ctx_set_current)(CUcontext) = nullptr;
@@ -665,13 +667,20 @@ CudaDeviceBuffer CudaBackend::allocate(std::size_t bytes) const {
     throw std::invalid_argument("CUDA allocation size must be non-zero");
   }
   auto impl = impl_;
-  std::function<void(CudaDevicePtr)> deleter = [impl](CudaDevicePtr ptr) {
+  auto trace_sink = trace_sink_;
+  std::function<void(CudaDevicePtr)> deleter = [impl, trace_sink, bytes](CudaDevicePtr ptr) {
     impl->ensure_primary_context(0);
     check_cuda("cuMemFree_v2", impl->cu_mem_free(ptr));
+    if (trace_sink) {
+      trace_sink->device_allocation_released(bytes);
+    }
   };
   impl_->ensure_primary_context(0);
   CUdeviceptr ptr = 0;
   check_cuda("cuMemAlloc_v2", impl_->cu_mem_alloc(&ptr, bytes));
+  if (trace_sink_) {
+    trace_sink_->device_allocation_created(bytes);
+  }
   return CudaDeviceBuffer(ptr, bytes, std::move(deleter));
 }
 
@@ -687,11 +696,6 @@ CudaPitchedAllocation CudaBackend::allocate_pitched(std::size_t width_bytes, std
     throw std::overflow_error("CUDA pitched allocation size overflow");
   }
 
-  auto impl = impl_;
-  std::function<void(CudaDevicePtr)> deleter = [impl](CudaDevicePtr allocation) {
-    impl->ensure_primary_context(0);
-    check_cuda("cuMemFree_v2", impl->cu_mem_free(allocation));
-  };
   impl_->ensure_primary_context(0);
   CUdeviceptr ptr = 0;
   std::size_t pitch = 0;
@@ -704,7 +708,26 @@ CudaPitchedAllocation CudaBackend::allocate_pitched(std::size_t width_bytes, std
   }
 
   const std::size_t size = pitch * height;
-  return {.buffer = CudaDeviceBuffer(ptr, size, std::move(deleter)), .pitch = pitch};
+  try {
+    auto impl = impl_;
+    auto trace_sink = trace_sink_;
+    std::function<void(CudaDevicePtr)> deleter = [impl, trace_sink,
+                                                  size](CudaDevicePtr allocation) {
+      impl->ensure_primary_context(0);
+      check_cuda("cuMemFree_v2", impl->cu_mem_free(allocation));
+      if (trace_sink) {
+        trace_sink->device_allocation_released(size);
+      }
+    };
+    if (trace_sink_) {
+      trace_sink_->device_allocation_created(size);
+    }
+    return {.buffer = CudaDeviceBuffer(ptr, size, std::move(deleter)), .pitch = pitch};
+  } catch (...) {
+    const auto free_result = impl_->cu_mem_free(ptr);
+    (void)free_result;
+    throw;
+  }
 }
 
 CudaSharedMemory CudaBackend::allocate_shared_memory(std::size_t bytes) const {
@@ -788,6 +811,9 @@ std::vector<std::uint8_t> CudaBackend::copy_to_host(const CudaDeviceBuffer& buff
   impl_->ensure_primary_context(0);
   std::vector<std::uint8_t> out(buffer.size());
   check_cuda("cuMemcpyDtoH_v2", impl_->cu_memcpy_dtoh(out.data(), buffer.ptr(), buffer.size()));
+  if (trace_sink_) {
+    trace_sink_->device_to_host_copy_submitted(buffer.size(), 1);
+  }
   return out;
 }
 
@@ -849,6 +875,9 @@ void CudaBackend::copy_device_to_host_2d(const CudaDeviceToHost2DCopy& copy) con
       .height = copy.height,
   };
   check_cuda("cuMemcpy2D_v2 (DtoH)", impl_->cu_memcpy_2d(&desc));
+  if (trace_sink_) {
+    trace_sink_->device_to_host_copy_submitted(copy.width_bytes, copy.height);
+  }
 }
 
 CudaModule CudaBackend::load_module_from_ptx(std::string_view ptx) const {

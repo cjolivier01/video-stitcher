@@ -11,6 +11,13 @@
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 using namespace reco::detect;
 
 namespace {
@@ -45,9 +52,15 @@ template <typename Fn> void expect_trt_error(Fn&& fn, std::string_view message) 
 
 void set_env(const char* name, const std::filesystem::path& value) {
 #if defined(_WIN32)
-  _putenv_s(name, value.string().c_str());
+  std::wstring wide_name;
+  for (const unsigned char character : std::string_view(name)) {
+    wide_name.push_back(static_cast<wchar_t>(character));
+  }
+  if (SetEnvironmentVariableW(wide_name.c_str(), value.c_str()) == 0) {
+    throw TrtError("failed to set native TensorRT runtime path");
+  }
 #else
-  setenv(name, value.string().c_str(), 1);
+  setenv(name, value.c_str(), 1);
 #endif
 }
 
@@ -88,6 +101,21 @@ std::filesystem::path find_fake_runtime_runfile() {
   throw TrtError("fake TensorRT runtime runfile not found");
 }
 
+std::filesystem::path native_fake_runtime_path() {
+  const auto source = find_fake_runtime_runfile();
+#if defined(_WIN32)
+  const auto directory = std::filesystem::temp_directory_path() /
+                         std::filesystem::path(std::u8string(u8"reco-trt-\u5f55\u50cf"));
+  std::filesystem::create_directories(directory);
+  const auto destination = directory / source.filename();
+  std::filesystem::copy_file(source, destination,
+                             std::filesystem::copy_options::overwrite_existing);
+  return destination;
+#else
+  return source;
+#endif
+}
+
 std::filesystem::path write_engine(std::string_view marker) {
   const auto path = std::filesystem::temp_directory_path() /
                     ("reco-fake-trt-" + std::string(marker) + ".engine");
@@ -97,7 +125,7 @@ std::filesystem::path write_engine(std::string_view marker) {
 }
 
 void fake_runtime_engine_contract() {
-  const auto fake_runtime = find_fake_runtime_runfile();
+  const auto fake_runtime = native_fake_runtime_path();
   set_env("TRT_DYLIB_PATH", fake_runtime);
 
   expect_true(trt_runtime_available(), "TensorRT fake runtime is available");

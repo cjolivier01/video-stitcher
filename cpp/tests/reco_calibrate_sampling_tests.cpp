@@ -54,6 +54,33 @@ void select_frame_indices_match_rust() {
   expect_eq(skipped_all[0], 50U, "empty usable midpoint");
 }
 
+void synchronized_indices_stay_in_stream_bounds() {
+  const auto [positive_left, positive_right] =
+      select_synchronized_frame_indices(100, 80, 10.0, 3, 0.0, 0.0, 7);
+  expect_eq(positive_left.size(), 3U, "positive sync pair count");
+  expect_eq(positive_right.size(), positive_left.size(), "positive sync vectors align");
+  for (std::size_t index = 0; index < positive_left.size(); ++index) {
+    expect_eq(positive_right[index], positive_left[index] + 7U,
+              "positive sync offsets right indices");
+    expect_true(positive_left[index] < 100U, "positive sync left index in range");
+    expect_true(positive_right[index] < 80U, "positive sync right index in range");
+  }
+
+  const auto [negative_left, negative_right] =
+      select_synchronized_frame_indices(60, 100, 10.0, 3, 0.0, 0.0, -9);
+  expect_eq(negative_left.size(), 3U, "negative sync pair count");
+  for (std::size_t index = 0; index < negative_left.size(); ++index) {
+    expect_eq(negative_left[index], negative_right[index] + 9U,
+              "negative sync offsets left indices");
+    expect_true(negative_left[index] < 60U, "negative sync left index in range");
+    expect_true(negative_right[index] < 100U, "negative sync right index in range");
+  }
+
+  const auto [empty_left, empty_right] =
+      select_synchronized_frame_indices(5, 7, 30.0, 2, 0.0, 0.0, 7);
+  expect_true(empty_left.empty() && empty_right.empty(), "offset beyond stream has no pairs");
+}
+
 void downscale_matches_rust() {
   GrayFrame small{.data = std::vector<std::uint8_t>(100 * 100, 128), .width = 100, .height = 100};
   const auto identity = downscale_if_needed(small, 1920);
@@ -62,8 +89,7 @@ void downscale_matches_rust() {
   expect_eq(identity.data.size(), 10000U, "identity data size");
   expect_eq(identity.data[0], 128U, "identity data value");
 
-  GrayFrame frame{.data = {0, 10, 20, 30, 40, 50, 60, 70,
-                           80, 90, 100, 110, 120, 130, 140, 150},
+  GrayFrame frame{.data = {0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150},
                   .width = 4,
                   .height = 4};
   const auto scaled = downscale_if_needed(frame, 2);
@@ -108,10 +134,42 @@ void downscale_matches_rust() {
   expect_true(identity_short_buffer_threw, "identity path short buffer throws");
 }
 
+void applied_rotation_transforms_off_center_intrinsics() {
+  const reco::core::CameraParams camera{.width = 1920,
+                                        .height = 1080,
+                                        .fx = 970.0,
+                                        .fy = 965.0,
+                                        .cx = 931.25,
+                                        .cy = 517.75,
+                                        .d = {0.1, -0.02, 0.003, -0.0004}};
+  const auto unchanged = camera_params_after_applied_rotation(camera, 0);
+  expect_eq(unchanged.cx, camera.cx, "zero rotation preserves cx");
+  expect_eq(unchanged.cy, camera.cy, "zero rotation preserves cy");
+
+  const auto rotated = camera_params_after_applied_rotation(camera, 180);
+  expect_eq(rotated.width, camera.width, "180-degree rotation preserves width");
+  expect_eq(rotated.height, camera.height, "180-degree rotation preserves height");
+  expect_eq(rotated.fx, camera.fx, "180-degree rotation preserves fx");
+  expect_eq(rotated.fy, camera.fy, "180-degree rotation preserves fy");
+  expect_eq(rotated.cx, 988.75, "180-degree rotation mirrors cx about the image center");
+  expect_eq(rotated.cy, 562.25, "180-degree rotation mirrors cy about the image center");
+  expect_true(rotated.d == camera.d, "180-degree rotation preserves radial distortion");
+
+  bool unsupported_threw = false;
+  try {
+    (void)camera_params_after_applied_rotation(camera, 90);
+  } catch (const std::invalid_argument&) {
+    unsupported_threw = true;
+  }
+  expect_true(unsupported_threw, "dimension-swapping camera rotation fails closed");
+}
+
 } // namespace
 
 int main() {
   select_frame_indices_match_rust();
+  synchronized_indices_stay_in_stream_bounds();
   downscale_matches_rust();
+  applied_rotation_transforms_off_center_intrinsics();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

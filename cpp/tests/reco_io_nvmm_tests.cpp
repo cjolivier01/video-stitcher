@@ -57,7 +57,7 @@ template <typename Fn> void expect_nvmm_error(Fn&& fn, std::string_view message)
 }
 
 template <typename Params> Params make_params_as() {
-  Params params;
+  Params params{};
   params.width = 1920;
   params.height = 1080;
   params.pitch = 2048;
@@ -84,7 +84,7 @@ template <typename Params> Params make_params_as() {
 abi::SurfaceParams make_params() { return make_params_as<abi::SurfaceParams>(); }
 
 template <typename Surface, typename Params> Surface make_surface_as(Params& params) {
-  Surface surface;
+  Surface surface{};
   surface.gpu_id = 0;
   surface.batch_size = 1;
   surface.num_filled = 1;

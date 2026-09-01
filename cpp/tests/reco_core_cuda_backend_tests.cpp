@@ -1,10 +1,17 @@
 #include "reco/core/cuda_backend.hpp"
+#include "reco/core/path.hpp"
+#include "reco/core/windows_runtime_library.hpp"
+
+#include "rules_cc/cc/runfiles/runfiles.h"
 
 #include <atomic>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -16,6 +23,7 @@
 #if defined(_WIN32)
 #include <windows.h>
 #else
+#include <dlfcn.h>
 #include <unistd.h>
 #endif
 
@@ -84,6 +92,196 @@ template <typename Fn> void expect_runtime_error(Fn&& fn, std::string_view messa
   }
 }
 
+struct BazelRunfilesManifestEntry {
+  std::string logical_path;
+  std::string physical_path;
+};
+
+std::string decode_bazel_manifest_field(std::string_view encoded) {
+  std::string decoded;
+  decoded.reserve(encoded.size());
+  for (std::size_t index = 0; index < encoded.size(); ++index) {
+    if (encoded[index] != '\\' || index + 1 == encoded.size()) {
+      decoded.push_back(encoded[index]);
+      continue;
+    }
+    ++index;
+    switch (encoded[index]) {
+    case 's':
+      decoded.push_back(' ');
+      break;
+    case 'n':
+      decoded.push_back('\n');
+      break;
+    case 'b':
+      decoded.push_back('\\');
+      break;
+    default:
+      decoded.push_back('\\');
+      decoded.push_back(encoded[index]);
+      break;
+    }
+  }
+  return decoded;
+}
+
+std::optional<BazelRunfilesManifestEntry> parse_bazel_manifest_entry(std::string_view line) {
+  const bool escaped = line.starts_with(' ');
+  if (escaped) {
+    line.remove_prefix(1);
+  }
+  const auto separator = line.find(' ');
+  if (separator == std::string_view::npos) {
+    return std::nullopt;
+  }
+  const auto logical = line.substr(0, separator);
+  const auto physical = line.substr(separator + 1);
+  if (logical.empty() || physical.empty()) {
+    return std::nullopt;
+  }
+  if (!escaped) {
+    return BazelRunfilesManifestEntry{std::string(logical), std::string(physical)};
+  }
+  return BazelRunfilesManifestEntry{decode_bazel_manifest_field(logical),
+                                    decode_bazel_manifest_field(physical)};
+}
+
+void bazel_runfiles_manifest_entries_decode_escaped_paths() {
+  const auto plain = parse_bazel_manifest_entry("repo/pkg/dep.dll C:/root/dep.dll");
+  expect_true(plain.has_value(), "plain Bazel manifest entry parses");
+  if (plain.has_value()) {
+    expect_eq(plain->logical_path, std::string("repo/pkg/dep.dll"),
+              "plain Bazel manifest logical path");
+    expect_eq(plain->physical_path, std::string("C:/root/dep.dll"),
+              "plain Bazel manifest physical path");
+  }
+
+  const auto escaped = parse_bazel_manifest_entry(" repo/pkg\\sname.dll C:\\bsdk\\sroot\\bdep.dll");
+  expect_true(escaped.has_value(), "escaped Bazel manifest entry parses");
+  if (escaped.has_value()) {
+    expect_eq(escaped->logical_path, std::string("repo/pkg name.dll"),
+              "escaped Bazel manifest logical path");
+    expect_eq(escaped->physical_path, std::string("C:\\sdk root\\dep.dll"),
+              "escaped Bazel manifest physical path");
+  }
+  const auto unknown_escape = parse_bazel_manifest_entry(" repo/bad\\xname.dll C:/root/dep.dll");
+  expect_true(unknown_escape.has_value(), "unknown Bazel manifest escape parses");
+  if (unknown_escape.has_value()) {
+    expect_eq(unknown_escape->logical_path, std::string("repo/bad\\xname.dll"),
+              "unknown Bazel manifest escape remains literal");
+  }
+}
+
+#if defined(_WIN32)
+std::filesystem::path resolve_windows_runtime_runfile(std::string_view path) {
+  const char* workspace = std::getenv("TEST_WORKSPACE");
+  if (workspace == nullptr || workspace[0] == '\0') {
+    throw std::runtime_error("TEST_WORKSPACE is not set");
+  }
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(&error));
+  if (!runfiles) {
+    throw std::runtime_error("failed to initialize Bazel runfiles: " + error);
+  }
+  const auto logical_path = std::string(workspace) + "/" + std::string(path);
+  const auto resolved = std::filesystem::path(runfiles->Rlocation(logical_path));
+  if (resolved.empty() || !std::filesystem::is_regular_file(resolved)) {
+    throw std::runtime_error("Windows runtime runfile not found: " + std::string(path));
+  }
+  return resolved;
+}
+
+std::filesystem::path find_windows_runtime_fixture(std::string_view target_name) {
+  return resolve_windows_runtime_runfile("cpp/tests/lib" + std::string(target_name) + ".so");
+}
+
+std::vector<std::filesystem::path>
+find_windows_runtime_fixtures_containing(std::string_view target_name) {
+  const char* manifest = std::getenv("RUNFILES_MANIFEST_FILE");
+  if (manifest == nullptr || manifest[0] == '\0') {
+    throw std::runtime_error("Bazel runfiles manifest is not available");
+  }
+  std::ifstream input(manifest);
+  if (!input) {
+    throw std::runtime_error("failed to open the Bazel runfiles manifest");
+  }
+  std::vector<std::filesystem::path> fixtures;
+  std::string entry;
+  while (std::getline(input, entry)) {
+    const auto parsed = parse_bazel_manifest_entry(entry);
+    if (!parsed.has_value()) {
+      continue;
+    }
+    const auto filename = std::filesystem::path(parsed->logical_path).filename().string();
+    if (filename.find(target_name) == std::string::npos ||
+        (std::filesystem::path(filename).extension() != ".dll" && !filename.ends_with(".so"))) {
+      continue;
+    }
+    const auto physical_path = std::filesystem::path(parsed->physical_path);
+    if (std::filesystem::is_regular_file(physical_path)) {
+      fixtures.push_back(physical_path);
+    }
+  }
+  if (fixtures.empty()) {
+    throw std::runtime_error("Windows runtime DLL fixtures not found: " + std::string(target_name));
+  }
+  return fixtures;
+}
+
+class ScopedWindowsEnvironment final {
+public:
+  ScopedWindowsEnvironment(std::wstring name, const std::wstring& value) : name_(std::move(name)) {
+    SetLastError(ERROR_SUCCESS);
+    const auto required = GetEnvironmentVariableW(name_.c_str(), nullptr, 0);
+    if (required != 0) {
+      previous_.resize(required);
+      const auto written = GetEnvironmentVariableW(name_.c_str(), previous_.data(), required);
+      if (written >= required) {
+        throw std::runtime_error("failed to read Windows environment variable");
+      }
+      previous_.resize(written);
+      existed_ = true;
+    } else if (GetLastError() != ERROR_ENVVAR_NOT_FOUND) {
+      existed_ = true;
+    }
+    if (SetEnvironmentVariableW(name_.c_str(), value.c_str()) == 0) {
+      throw std::runtime_error("failed to set Windows environment variable");
+    }
+  }
+
+  ~ScopedWindowsEnvironment() {
+    SetEnvironmentVariableW(name_.c_str(), existed_ ? previous_.c_str() : nullptr);
+  }
+
+  ScopedWindowsEnvironment(const ScopedWindowsEnvironment&) = delete;
+  ScopedWindowsEnvironment& operator=(const ScopedWindowsEnvironment&) = delete;
+
+private:
+  std::wstring name_;
+  std::wstring previous_;
+  bool existed_ = false;
+};
+
+class ScopedWindowsDllDirectory final {
+public:
+  explicit ScopedWindowsDllDirectory(const std::filesystem::path& directory)
+      : cookie_(AddDllDirectory(directory.c_str())) {
+    if (cookie_ == nullptr) {
+      throw std::runtime_error("failed to add Windows DLL directory");
+    }
+  }
+
+  ~ScopedWindowsDllDirectory() { RemoveDllDirectory(cookie_); }
+
+  ScopedWindowsDllDirectory(const ScopedWindowsDllDirectory&) = delete;
+  ScopedWindowsDllDirectory& operator=(const ScopedWindowsDllDirectory&) = delete;
+
+private:
+  DLL_DIRECTORY_COOKIE cookie_ = nullptr;
+};
+#endif
+
 bool require_cuda() {
   const char* value = std::getenv("RECO_REQUIRE_CUDA_TEST");
   return value != nullptr && std::string_view(value) == "1";
@@ -103,6 +301,169 @@ bool address_sanitizer_build() {
 #endif
 }
 
+void windows_runtime_loader_rejects_current_directory_planting() {
+#if defined(_WIN32)
+  const auto fixture = find_windows_runtime_fixture("fake_cuda_driver");
+  std::error_code error;
+  const auto original_directory = std::filesystem::current_path();
+  const auto directory =
+      std::filesystem::temp_directory_path() /
+      path_from_utf8("reco-dll-\xCE\xA9-\xE4\xBE\x8B-" + std::to_string(GetCurrentProcessId()));
+  std::filesystem::remove_all(directory, error);
+  std::filesystem::create_directories(directory);
+  const auto planted = directory / "reco-current-directory-plant.dll";
+  std::filesystem::copy_file(fixture, planted, std::filesystem::copy_options::overwrite_existing);
+  std::filesystem::current_path(directory);
+
+  auto* current_directory =
+      reco::core::detail::load_windows_runtime_library("reco-current-directory-plant.dll");
+  expect_true(current_directory == nullptr,
+              "Windows runtime loading excludes the process current directory");
+  if (current_directory != nullptr) {
+    FreeLibrary(static_cast<HMODULE>(current_directory));
+  }
+  auto* relative =
+      reco::core::detail::load_windows_runtime_library(".\\reco-current-directory-plant.dll");
+  expect_true(relative == nullptr, "Windows runtime loading rejects relative override paths");
+  if (relative != nullptr) {
+    FreeLibrary(static_cast<HMODULE>(relative));
+  }
+  auto* absolute = reco::core::detail::load_windows_runtime_library(planted);
+  expect_true(absolute != nullptr,
+              "Windows runtime loading accepts a native Unicode absolute path");
+  if (absolute != nullptr) {
+    FreeLibrary(static_cast<HMODULE>(absolute));
+  }
+
+  std::filesystem::current_path(original_directory);
+  std::filesystem::remove_all(directory, error);
+#endif
+}
+
+void windows_runtime_loader_prefers_default_search_to_path() {
+#if defined(_WIN32)
+  const auto default_fixture = find_windows_runtime_fixture("fake_cuda_driver");
+  const auto path_fixture = find_windows_runtime_fixture("fake_cuda_driver_path");
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("reco-dll-precedence-" + std::to_string(GetCurrentProcessId()));
+  const auto default_directory = root / "default";
+  const auto path_directory = root / "path";
+  constexpr auto library_name = L"reco-runtime-precedence.dll";
+  std::error_code error;
+  std::filesystem::remove_all(root, error);
+  std::filesystem::create_directories(default_directory);
+  std::filesystem::create_directories(path_directory);
+  std::filesystem::copy_file(default_fixture, default_directory / library_name,
+                             std::filesystem::copy_options::overwrite_existing);
+  std::filesystem::copy_file(path_fixture, path_directory / library_name,
+                             std::filesystem::copy_options::overwrite_existing);
+
+  {
+    ScopedWindowsEnvironment path(L"PATH", path_directory.native());
+    ScopedWindowsDllDirectory default_search(default_directory);
+    auto* library = reco::core::detail::load_windows_runtime_library("reco-runtime-precedence.dll");
+    expect_true(library != nullptr,
+                "Windows runtime loading searches safe default directories before PATH");
+    if (library != nullptr) {
+      using Marker = int (*)();
+      const auto marker = reinterpret_cast<Marker>(
+          GetProcAddress(static_cast<HMODULE>(library), "recoFakeRuntimeMarker"));
+      expect_true(marker != nullptr, "Windows runtime precedence fixture exports its marker");
+      if (marker != nullptr) {
+        expect_eq(marker(), 1, "Windows safe default directory takes precedence over PATH");
+      }
+      FreeLibrary(static_cast<HMODULE>(library));
+    }
+  }
+  std::filesystem::remove_all(root, error);
+#endif
+}
+
+#if defined(_WIN32)
+int windows_runtime_loader_dependent_path_helper() {
+  auto* library = reco::core::detail::load_windows_runtime_library("reco-runtime-dependent.dll");
+  if (library == nullptr) {
+    return 2;
+  }
+  using Marker = int (*)();
+  const auto marker = reinterpret_cast<Marker>(
+      GetProcAddress(static_cast<HMODULE>(library), "recoFakeWindowsRuntimeDependentMarker"));
+  const auto result = marker != nullptr && marker() == 42 ? 0 : 3;
+  FreeLibrary(static_cast<HMODULE>(library));
+  return result;
+}
+
+DWORD run_windows_runtime_dependency_helper(const std::filesystem::path& helper,
+                                            const std::wstring& path_value) {
+  ScopedWindowsEnvironment path(L"PATH", path_value);
+  std::wstring command = L"\"" + helper.native() + L"\" --windows-runtime-dependent-path-helper";
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION process{};
+  if (CreateProcessW(helper.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr,
+                     &startup, &process) == 0) {
+    throw std::runtime_error("failed to start Windows runtime loader dependency helper");
+  }
+  CloseHandle(process.hThread);
+  const auto waited = WaitForSingleObject(process.hProcess, 10'000);
+  if (waited != WAIT_OBJECT_0) {
+    TerminateProcess(process.hProcess, 4);
+    WaitForSingleObject(process.hProcess, 10'000);
+  }
+  DWORD exit_code = std::numeric_limits<DWORD>::max();
+  if (GetExitCodeProcess(process.hProcess, &exit_code) == 0) {
+    exit_code = std::numeric_limits<DWORD>::max();
+  }
+  CloseHandle(process.hProcess);
+  return exit_code;
+}
+#endif
+
+void windows_runtime_loader_requires_colocated_path_dependencies() {
+#if defined(_WIN32)
+  const auto primary_fixture = find_windows_runtime_fixture("fake_windows_runtime_primary");
+  const auto dependency_fixtures = find_windows_runtime_fixtures_containing("recowindepsplit");
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("reco-dll-dependency-" + std::to_string(GetCurrentProcessId()));
+  const auto primary_directory = root / "primary";
+  const auto dependency_directory = root / "dependency";
+  const auto helper = root / "reco-runtime-loader-helper.exe";
+  std::error_code error;
+  std::filesystem::remove_all(root, error);
+  std::filesystem::create_directories(primary_directory);
+  std::filesystem::create_directories(dependency_directory);
+  std::filesystem::copy_file(primary_fixture, primary_directory / "reco-runtime-dependent.dll",
+                             std::filesystem::copy_options::overwrite_existing);
+  for (const auto& dependency_fixture : dependency_fixtures) {
+    std::filesystem::copy_file(dependency_fixture,
+                               dependency_directory / dependency_fixture.filename(),
+                               std::filesystem::copy_options::overwrite_existing);
+  }
+
+  std::wstring executable(32'768, L'\0');
+  const auto executable_size =
+      GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+  if (executable_size == 0 || executable_size >= executable.size()) {
+    throw std::runtime_error("failed to locate Windows runtime loader test executable");
+  }
+  executable.resize(executable_size);
+  std::filesystem::copy_file(executable, helper, std::filesystem::copy_options::overwrite_existing);
+
+  const auto path_value = primary_directory.native() + L";" + dependency_directory.native();
+  expect_eq(run_windows_runtime_dependency_helper(helper, path_value), DWORD{2},
+            "Windows runtime loading rejects dependencies found only in a later PATH entry");
+
+  for (const auto& dependency_fixture : dependency_fixtures) {
+    std::filesystem::copy_file(dependency_fixture,
+                               primary_directory / dependency_fixture.filename(),
+                               std::filesystem::copy_options::overwrite_existing);
+  }
+  expect_eq(run_windows_runtime_dependency_helper(helper, path_value), DWORD{0},
+            "Windows runtime loading resolves dependencies colocated with the selected DLL");
+  std::filesystem::remove_all(root, error);
+#endif
+}
+
 bool valid_shareable_handle(CudaShareableHandle handle) {
 #if defined(_WIN32)
   return handle != nullptr;
@@ -116,6 +477,64 @@ void close_released_handle(CudaShareableHandle handle) {
   CloseHandle(handle);
 #else
   close(handle);
+#endif
+}
+
+void primary_context_replaces_same_device_secondary(const CudaBackend& backend) {
+#if defined(__linux__)
+  void* driver = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+  if (driver == nullptr) {
+    throw std::runtime_error("failed to load CUDA driver for context ownership test");
+  }
+  struct DriverCloser {
+    void* driver;
+    ~DriverCloser() { dlclose(driver); }
+  } closer{driver};
+  const auto symbol = [driver](const char* name) {
+    auto* value = dlsym(driver, name);
+    if (value == nullptr) {
+      throw std::runtime_error(std::string("missing CUDA test symbol ") + name);
+    }
+    return value;
+  };
+  using Result = int;
+  using Device = int;
+  using Context = void*;
+  const auto device_get = reinterpret_cast<Result (*)(Device*, int)>(symbol("cuDeviceGet"));
+  const auto context_create =
+      reinterpret_cast<Result (*)(Context*, unsigned int, Device)>(symbol("cuCtxCreate_v2"));
+  const auto context_destroy = reinterpret_cast<Result (*)(Context)>(symbol("cuCtxDestroy_v2"));
+  const auto context_get_current =
+      reinterpret_cast<Result (*)(Context*)>(symbol("cuCtxGetCurrent"));
+  const auto context_set_current = reinterpret_cast<Result (*)(Context)>(symbol("cuCtxSetCurrent"));
+  Device device = 0;
+  Context secondary = nullptr;
+  if (device_get(&device, 0) != 0 || context_create(&secondary, 0, device) != 0 ||
+      secondary == nullptr) {
+    throw std::runtime_error("failed to create CUDA secondary context for ownership test");
+  }
+  try {
+    backend.ensure_primary_context(0);
+    Context observed = nullptr;
+    if (context_get_current(&observed) != 0) {
+      throw std::runtime_error("failed to inspect CUDA context after primary selection");
+    }
+    expect_true(observed != secondary,
+                "primary context replaces a current same-device secondary context");
+    if (context_set_current(secondary) != 0 || context_destroy(secondary) != 0) {
+      throw std::runtime_error("failed to destroy CUDA secondary context");
+    }
+    secondary = nullptr;
+    backend.ensure_primary_context(0);
+  } catch (...) {
+    if (secondary != nullptr) {
+      (void)context_set_current(secondary);
+      (void)context_destroy(secondary);
+    }
+    throw;
+  }
+#else
+  (void)backend;
 #endif
 }
 
@@ -180,19 +599,55 @@ INCREMENT_DONE:
 )ptx";
 
 struct CountingCudaTrace final : CudaBackendTraceSink {
+  void device_allocation_created(std::size_t bytes) noexcept override {
+    ++allocations;
+    allocated_bytes += bytes;
+  }
+  void device_allocation_released(std::size_t bytes) noexcept override {
+    ++releases;
+    released_bytes += bytes;
+  }
   void device_to_device_copy_submitted() noexcept override { ++copies; }
+  void device_to_host_copy_submitted(std::size_t width_bytes,
+                                     std::size_t height) noexcept override {
+    ++host_copies;
+    host_copy_bytes += width_bytes * height;
+  }
   void context_synchronized() noexcept override { ++synchronizations; }
 
+  std::size_t allocations = 0;
+  std::size_t releases = 0;
+  std::size_t allocated_bytes = 0;
+  std::size_t released_bytes = 0;
   std::size_t copies = 0;
+  std::size_t host_copies = 0;
+  std::size_t host_copy_bytes = 0;
   std::size_t synchronizations = 0;
 };
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+#if defined(_WIN32)
+  if (argc == 2 && std::string_view(argv[1]) == "--windows-runtime-dependent-path-helper") {
+    return windows_runtime_loader_dependent_path_helper();
+  }
+#else
+  (void)argc;
+  (void)argv;
+#endif
+  bazel_runfiles_manifest_entries_decode_escaped_paths();
+  try {
+    windows_runtime_loader_rejects_current_directory_planting();
+    windows_runtime_loader_prefers_default_search_to_path();
+    windows_runtime_loader_requires_colocated_path_dependencies();
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: Windows runtime loader regression threw: " << error.what() << '\n';
+    ++failures;
+  }
   if (address_sanitizer_build() && !require_cuda()) {
     std::cerr << "SKIP: CUDA driver smoke test is skipped under ASan unless explicitly required\n";
-    return EXIT_SUCCESS;
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
 
   if (!CudaBackend::is_available()) {
@@ -202,7 +657,7 @@ int main() {
       return EXIT_FAILURE;
     }
     std::cerr << "SKIP: CUDA unavailable: " << error << '\n';
-    return EXIT_SUCCESS;
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
 
   try {
@@ -218,6 +673,7 @@ int main() {
 
     backend.ensure_primary_context(0);
     backend.ensure_primary_context(0);
+    primary_context_replaces_same_device_secondary(backend);
     const auto before = backend.memory_info();
     expect_true(before.total_bytes > 0, "total device memory");
     expect_true(before.free_bytes > 0, "free device memory");
@@ -258,10 +714,18 @@ int main() {
         "null CUDA trace sink validation");
     auto trace = std::make_shared<CountingCudaTrace>();
     auto observed_backend = backend.with_trace_sink(trace);
+    auto observed_buffer = observed_backend.allocate(257);
+    expect_eq(trace->allocations, 1U, "successful CUDA allocation observed");
+    expect_eq(trace->allocated_bytes, 257U, "CUDA allocation byte count observed");
+    observed_buffer.reset();
+    expect_eq(trace->releases, 1U, "successful CUDA allocation release observed");
+    expect_eq(trace->released_bytes, 257U, "CUDA release byte count observed");
     observed_backend.synchronize();
     expect_eq(trace->synchronizations, 1U, "successful CUDA synchronization observed");
-    const auto host = backend.copy_to_host(buffer);
+    const auto host = observed_backend.copy_to_host(buffer);
     expect_eq(host.size(), 4096U, "host copy size");
+    expect_eq(trace->host_copies, 1U, "successful CUDA D2H submission observed");
+    expect_eq(trace->host_copy_bytes, 4096U, "linear CUDA D2H byte count observed");
     for (const auto byte : host) {
       if (byte != 0xA5) {
         expect_true(false, "device memset byte pattern");
@@ -565,12 +1029,15 @@ int main() {
                                                .height = height});
     expect_eq(trace->copies, 1U, "successful CUDA D2D submission observed");
     std::vector<std::uint8_t> host_dst(dst_pitch * height, 0xCD);
-    backend.copy_device_to_host_2d({.dst = host_dst.data(),
-                                    .dst_pitch = dst_pitch,
-                                    .src = dst_device.ptr(),
-                                    .src_pitch = device_dst_pitch,
-                                    .width_bytes = width,
-                                    .height = height});
+    observed_backend.copy_device_to_host_2d({.dst = host_dst.data(),
+                                             .dst_pitch = dst_pitch,
+                                             .src = dst_device.ptr(),
+                                             .src_pitch = device_dst_pitch,
+                                             .width_bytes = width,
+                                             .height = height});
+    expect_eq(trace->host_copies, 2U, "2D CUDA D2H submission observed");
+    expect_eq(trace->host_copy_bytes, 4096U + width * height,
+              "2D CUDA D2H payload byte count observed");
     backend.synchronize();
     for (std::size_t row = 0; row < height; ++row) {
       for (std::size_t col = 0; col < width; ++col) {

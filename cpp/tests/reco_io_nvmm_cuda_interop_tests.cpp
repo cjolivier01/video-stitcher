@@ -13,6 +13,10 @@
 #include <thread>
 #include <vector>
 
+#if defined(__linux__)
+#include <dlfcn.h>
+#endif
+
 using namespace reco::io;
 namespace abi = reco::io::detail::nvbufsurface_9_1;
 namespace abi7 = reco::io::detail::nvbufsurface_7_1;
@@ -79,8 +83,103 @@ void set_runtime_path(const char* name, const std::filesystem::path& path) {
 #endif
 }
 
+void set_environment(const char* name, std::string_view value) {
+#if defined(_WIN32)
+  _putenv_s(name, std::string(value).c_str());
+#else
+  setenv(name, std::string(value).c_str(), 1);
+#endif
+}
+
+template <typename Fn>
+void expect_nvmm_error_contains(Fn&& fn, std::string_view fragment, std::string_view message) {
+  try {
+    fn();
+    std::cerr << "FAIL: " << message << " did not throw\n";
+    ++failures;
+  } catch (const NvmmError& error) {
+    if (std::string_view(error.what()).find(fragment) == std::string_view::npos) {
+      std::cerr << "FAIL: " << message << " missing error fragment: " << error.what() << '\n';
+      ++failures;
+    }
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: " << message << " threw unexpected exception: " << error.what() << '\n';
+    ++failures;
+  }
+}
+
+void runtime_abi_discovery_is_fail_closed() {
+#if defined(__linux__)
+  const auto nvbufsurface = find_fake_runtime_runfile("fake_nvbufsurface.so");
+  const auto nvbufsurface_7_1 = find_fake_runtime_runfile("fake_nvbufsurface_7_1");
+  const auto no_version_api = find_fake_runtime_runfile("fake_cuda_driver");
+  set_environment("RECO_FAKE_DEEPSTREAM_VERSION", "9.1");
+
+  set_runtime_path("RECO_NVBUFSURFACE_DYLIB_PATH", nvbufsurface_7_1);
+  set_runtime_path("RECO_NVDS_UTILS_DYLIB_PATH", nvbufsurface_7_1);
+  expect_true(discover_nvbufsurface_abi() == NvbufSurfaceAbi::DeepStream7_1,
+              "DeepStream 7.1 runtime selects the 7.1 NvBufSurface ABI");
+
+  set_runtime_path("RECO_NVBUFSURFACE_DYLIB_PATH", nvbufsurface);
+  set_runtime_path("RECO_NVDS_UTILS_DYLIB_PATH", nvbufsurface);
+  expect_true(discover_nvbufsurface_abi() == NvbufSurfaceAbi::DeepStream9_1,
+              "DeepStream 9.1 runtime selects the 9.1 NvBufSurface ABI");
+
+  set_runtime_path("RECO_NVDS_UTILS_DYLIB_PATH", nvbufsurface_7_1);
+  expect_nvmm_error_contains([] { (void)discover_nvbufsurface_abi(); }, "forbidden for the 7.1 ABI",
+                             "7.1 metadata with a 9.1 NvBufSurface runtime fails closed");
+
+  set_runtime_path("RECO_NVBUFSURFACE_DYLIB_PATH", nvbufsurface_7_1);
+  set_runtime_path("RECO_NVDS_UTILS_DYLIB_PATH", nvbufsurface);
+  expect_nvmm_error_contains([] { (void)discover_nvbufsurface_abi(); }, "required for the 9.1 ABI",
+                             "9.1 metadata with a 7.1 NvBufSurface runtime fails closed");
+
+  set_runtime_path("RECO_NVBUFSURFACE_DYLIB_PATH", nvbufsurface);
+  set_runtime_path("RECO_NVDS_UTILS_DYLIB_PATH", nvbufsurface);
+  set_environment("RECO_FAKE_DEEPSTREAM_VERSION", "8.0");
+  expect_nvmm_error_contains([] { (void)discover_nvbufsurface_abi(); }, "supported versions",
+                             "unadapted DeepStream runtime version fails closed");
+
+  set_runtime_path("RECO_NVDS_UTILS_DYLIB_PATH", no_version_api);
+  expect_nvmm_error_contains([] { (void)discover_nvbufsurface_abi(); }, "nvds_version",
+                             "runtime without version capability fails closed");
+
+  set_runtime_path("RECO_NVDS_UTILS_DYLIB_PATH", nvbufsurface);
+  set_runtime_path("RECO_NVBUFSURFACE_DYLIB_PATH", no_version_api);
+  expect_nvmm_error_contains([] { (void)discover_nvbufsurface_abi(); }, "NvBufSurfaceMapEglImage",
+                             "versioned runtime without NvBufSurface capability fails closed");
+
+  set_runtime_path("RECO_NVBUFSURFACE_DYLIB_PATH", nvbufsurface);
+  set_environment("RECO_FAKE_DEEPSTREAM_VERSION", "9.1");
+  const auto retained_runtime = discover_nvbufsurface_runtime();
+  expect_true(retained_runtime->abi() == NvbufSurfaceAbi::DeepStream9_1,
+              "retained runtime exposes its selected ABI");
+  expect_true(!retained_runtime->library().empty(),
+              "retained runtime identifies its NvBufSurface provider");
+  expect_true(!validate_nvbufsurface_runtime_provenance(retained_runtime).has_value(),
+              "single retained NvBufSurface provider passes provenance validation");
+  expect_true(retained_runtime->provenance_validated(),
+              "successful provenance validation certifies the retained runtime once");
+  void* mixed_runtime = dlopen(nvbufsurface_7_1.c_str(), RTLD_NOW | RTLD_LOCAL);
+  expect_true(mixed_runtime != nullptr, "mixed-runtime provenance fixture loads");
+  if (mixed_runtime != nullptr) {
+    const auto provenance_error = validate_nvbufsurface_runtime_provenance(retained_runtime);
+    expect_true(provenance_error.has_value() &&
+                    provenance_error->find("multiple NvBufSurface runtime providers") !=
+                        std::string::npos,
+                "a second NvBufSurface provider fails provenance validation");
+    expect_true(!retained_runtime->provenance_validated(),
+                "failed provenance revalidation revokes the retained certification");
+    (void)dlclose(mixed_runtime);
+  }
+#else
+  expect_nvmm_error_contains([] { (void)discover_nvbufsurface_abi(); }, "only supported on Linux",
+                             "non-Linux ABI discovery fails closed");
+#endif
+}
+
 template <typename Params> Params make_params_as() {
-  Params params;
+  Params params{};
   params.width = 1280;
   params.height = 720;
   params.pitch = 1280;
@@ -107,7 +206,7 @@ template <typename Params> Params make_params_as() {
 abi::SurfaceParams make_params() { return make_params_as<abi::SurfaceParams>(); }
 
 template <typename Surface, typename Params> Surface make_surface_as(Params& params) {
-  Surface surface;
+  Surface surface{};
   surface.gpu_id = 0;
   surface.batch_size = 1;
   surface.num_filled = 1;
@@ -122,16 +221,24 @@ abi::Surface make_surface(abi::SurfaceParams& params) {
 
 void surface_array_mapping_retains_and_unmaps_owner() {
 #if defined(__linux__)
-  set_runtime_path("RECO_NVBUFSURFACE_DYLIB_PATH", find_fake_runtime_runfile("fake_nvbufsurface"));
+  set_runtime_path("RECO_NVBUFSURFACE_DYLIB_PATH",
+                   find_fake_runtime_runfile("fake_nvbufsurface.so"));
   set_runtime_path("RECO_CUDA_DRIVER_DYLIB_PATH", find_fake_runtime_runfile("fake_cuda_driver"));
   expect_true(is_nvmm_cuda_interop_available(), "fake CUDA interop runtime available");
   expect_true(nvmm_cuda_interop_availability_error().empty(), "interop probe has no error");
 
   auto params = make_params();
   auto surface = make_surface(params);
-  const auto info = extract_info(&surface);
-  auto decoder_owner = std::make_shared<int>(9);
-  std::weak_ptr<int> decoder_lifetime = decoder_owner;
+  auto info = extract_info(&surface);
+  auto runtime = discover_nvbufsurface_runtime();
+  std::weak_ptr<const NvbufSurfaceRuntime> runtime_lifetime = runtime;
+  info.runtime = runtime;
+  bool runtime_alive_during_decoder_release = false;
+  std::shared_ptr<void> decoder_owner(new int(9), [&](void* value) {
+    runtime_alive_during_decoder_release = !runtime_lifetime.expired();
+    delete static_cast<int*>(value);
+  });
+  std::weak_ptr<void> decoder_lifetime = decoder_owner;
 
   GpuDecodedFrame decoded{.nvmm = info,
                           .visible_width = info.width - 2,
@@ -154,16 +261,31 @@ void surface_array_mapping_retains_and_unmaps_owner() {
   expect_true(params.mapped_addr.cuda_ptr != nullptr, "runtime CUDA mapping remains live");
   expect_nvmm_error([&] { (void)map_nvmm_frame_to_cuda(info, std::make_shared<int>(10)); },
                     "duplicate map with different owner rejected");
+  params.color_format = abi::kColorNv12;
+  auto changed_while_mapped = extract_info(&surface);
+  changed_while_mapped.runtime = runtime;
+  expect_nvmm_error_contains(
+      [&] { (void)map_nvmm_frame_to_cuda(changed_while_mapped, decoder_owner); },
+      "metadata changed", "duplicate mapping with changed surface metadata rejected");
+  changed_while_mapped.runtime.reset();
+  params.color_format = abi::kColorNv12_709;
 
   decoder_owner.reset();
   decoded.owner.reset();
+  decoded.nvmm.runtime.reset();
+  info.runtime.reset();
+  runtime.reset();
   expect_true(!decoder_lifetime.expired(), "mapping retains decoder buffer owner");
+  expect_true(!runtime_lifetime.expired(), "mapping retains NvBufSurface runtime");
   mapped.owner.reset();
   expect_true(!decoder_lifetime.expired(), "duplicate mapping keeps decoder owner alive");
   expect_true(params.mapped_addr.cuda_ptr != nullptr,
               "duplicate mapping keeps runtime CUDA map live");
   mapped_again.owner.reset();
   expect_true(decoder_lifetime.expired(), "mapping releases decoder owner");
+  expect_true(runtime_alive_during_decoder_release,
+              "mapped runtime outlives decoder-owner destruction");
+  expect_true(runtime_lifetime.expired(), "mapping releases NvBufSurface runtime");
   expect_true(params.mapped_addr.cuda_ptr == nullptr, "mapping owner unmaps CUDA buffer");
 
   params = make_params();
@@ -292,12 +414,27 @@ void cuda_device_mapping_retains_context_and_owner() {
   params.data_ptr = reinterpret_cast<void*>(0x40000000);
   auto surface = make_surface(params);
   surface.mem_type = abi::kMemCudaDevice;
-  const auto info = extract_info(&surface);
-  auto decoder_owner = std::make_shared<int>(5);
+  auto info = extract_info(&surface);
+  auto runtime = discover_nvbufsurface_runtime();
+  std::weak_ptr<const NvbufSurfaceRuntime> runtime_lifetime = runtime;
+  info.runtime = runtime;
+  bool runtime_alive_during_decoder_release = false;
+  std::shared_ptr<void> decoder_owner(new int(5), [&](void* value) {
+    runtime_alive_during_decoder_release = !runtime_lifetime.expired();
+    delete static_cast<int*>(value);
+  });
   auto mapped = map_nvmm_frame_to_cuda(info, decoder_owner);
+  runtime.reset();
+  info.runtime.reset();
+  decoder_owner.reset();
   expect_eq(mapped.y_ptr, 0x40000000U, "direct CUDA Y pointer");
   expect_eq(mapped.uv_ptr, 0x40000000U + 1280U * 720U, "direct CUDA UV pointer");
   expect_true(mapped.owner.use_count() == 1, "direct CUDA view owns context wrapper");
+  expect_true(!runtime_lifetime.expired(), "direct CUDA view retains NvBufSurface runtime");
+  mapped.owner.reset();
+  expect_true(runtime_alive_during_decoder_release,
+              "direct CUDA runtime outlives decoder-owner destruction");
+  expect_true(runtime_lifetime.expired(), "direct CUDA view releases NvBufSurface runtime");
 
   params = make_params();
   params.data_ptr = reinterpret_cast<void*>(9);
@@ -477,6 +614,7 @@ void failed_cleanup_poisoning_retains_surface_owners() {
 } // namespace
 
 int main() {
+  runtime_abi_discovery_is_fail_closed();
   surface_array_mapping_retains_and_unmaps_owner();
   deepstream_7_1_egl_mapping_is_gpu_resident();
   cuda_device_mapping_retains_context_and_owner();

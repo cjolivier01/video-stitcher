@@ -11,6 +11,15 @@
 
 namespace reco::calibrate {
 
+/// Hard upper bound for detector output and matcher input capacities.
+inline constexpr std::uint32_t kMaxGpuAkazeFeatures = 8'192;
+
+/// Hard ceiling for one AKAZE detection workspace, including allocation accounting margin.
+inline constexpr std::size_t kMaxGpuAkazeWorkspaceBytes = std::size_t{2} * 1'024U * 1'024U * 1'024U;
+
+/// Device memory left unused when admitting an AKAZE detection workspace.
+inline constexpr std::size_t kGpuAkazeMemoryHeadroomBytes = std::size_t{256} * 1'024U * 1'024U;
+
 /// Device ABI for an AKAZE keypoint. Descriptors are stored separately.
 struct GpuFeaturePoint {
   /// Source-image x coordinate.
@@ -51,7 +60,7 @@ struct GpuMatchedPoint {
 
 /// Explicit AKAZE detection and matching limits.
 struct GpuAkazeConfig {
-  /// Maximum number of retained keypoints.
+  /// Maximum number of retained keypoints, in `[1, kMaxGpuAkazeFeatures]`.
   std::uint32_t max_keypoints = 2'000;
   /// Maximum detector-space width before luma downscaling.
   std::uint32_t max_detection_width = 1'920;
@@ -70,6 +79,25 @@ struct GpuAkazeConfig {
   /// Maximum number of scale-space octaves.
   std::uint32_t max_octaves = 4;
 };
+
+/// Returns a conservative peak CUDA workspace bound without allocating device memory.
+///
+/// The bound includes worst-case candidate selection, retained scale-space images, detector
+/// output, scan scratch, and allocation accounting margin. Invalid dimensions or configuration
+/// values throw `std::invalid_argument`; arithmetic overflow throws `std::overflow_error`.
+[[nodiscard]] std::size_t gpu_akaze_peak_workspace_bytes(std::uint32_t frame_width,
+                                                         std::uint32_t frame_height,
+                                                         const GpuAkazeConfig& config);
+
+/// Reduces only `max_detection_width` to the largest GPU geometry that fits `workspace_limit`.
+///
+/// Full-resolution input and undistortion remain unchanged; the existing CUDA resize feeds the
+/// fitted detector geometry. Invalid input/configuration or a limit too small for a usable AKAZE
+/// scale space throws `std::invalid_argument`.
+[[nodiscard]] GpuAkazeConfig
+fit_gpu_akaze_workspace(std::uint32_t frame_width, std::uint32_t frame_height,
+                        const GpuAkazeConfig& config,
+                        std::size_t workspace_limit = kMaxGpuAkazeWorkspaceBytes);
 
 /// Owning device-resident AKAZE feature set.
 class GpuFeatureSet {
@@ -106,6 +134,8 @@ public:
   /// Runs bidirectional Hamming/Lowe matching and reads back only accepted point pairs.
   [[nodiscard]] std::vector<GpuMatchedPoint>
   match(const GpuFeatureView& left, const GpuFeatureView& right, double lowe_ratio) const;
+  /// Reads back the bounded scalar feature count, never descriptor or image data.
+  [[nodiscard]] std::uint32_t feature_count(const GpuFeatureView& features) const;
   [[nodiscard]] std::vector<GpuMatchedPoint> detect_and_match(const GpuGrayFrame& left,
                                                               const GpuGrayFrame& right,
                                                               const GpuAkazeConfig& config) const;

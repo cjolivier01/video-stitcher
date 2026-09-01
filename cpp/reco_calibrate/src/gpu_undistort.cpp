@@ -40,15 +40,18 @@ extern "C" __global__ void undistort_y_plane(
     float k0,
     float k1,
     float k2,
-    float k3) {
+    float k3,
+    unsigned int black_level) {
   const unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
   const unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
   if (x >= dst_width || y >= dst_height) {
     return;
   }
 
-  const float nx = ((float)x - out_cx) / out_fx;
-  const float ny = ((float)y - out_cy) / out_fy;
+  // Match WebGPU fragment-center interpolation: the shader evaluates the
+  // remapped UV at the center of each destination pixel.
+  const float nx = ((float)x + 0.5f - out_cx) / out_fx;
+  const float ny = ((float)y + 0.5f - out_cy) / out_fy;
   const float r = sqrtf(nx * nx + ny * ny);
 
   float scale = 1.0f;
@@ -62,18 +65,23 @@ extern "C" __global__ void undistort_y_plane(
         theta * (1.0f + k0 * theta2 + k1 * theta4 + k2 * theta6 + k3 * theta8);
     scale = theta_d / r;
   }
-  const float sx = src_fx * nx * scale + src_cx;
-  const float sy = src_fy * ny * scale + src_cy;
+  // A normalized texture coordinate maps to texel space as uv * size - 0.5.
+  const float sx = src_fx * nx * scale + src_cx - 0.5f;
+  const float sy = src_fy * ny * scale + src_cy - 0.5f;
 
-  unsigned char value = 0;
-  if (sx >= 0.0f && sy >= 0.0f && sx < (float)(src_width - 1) &&
-      sy < (float)(src_height - 1)) {
-    const unsigned int x0 = (unsigned int)floorf(sx);
-    const unsigned int y0 = (unsigned int)floorf(sy);
+  unsigned char value = (unsigned char)black_level;
+  // The shader bounds-checks normalized coordinates in [0, 1], then its
+  // clamp-to-edge sampler extends the edge texels by half a pixel.
+  if (sx >= -0.5f && sy >= -0.5f && sx <= (float)src_width - 0.5f &&
+      sy <= (float)src_height - 0.5f) {
+    const float clamped_x = fminf(fmaxf(sx, 0.0f), (float)(src_width - 1U));
+    const float clamped_y = fminf(fmaxf(sy, 0.0f), (float)(src_height - 1U));
+    const unsigned int x0 = (unsigned int)floorf(clamped_x);
+    const unsigned int y0 = (unsigned int)floorf(clamped_y);
     const unsigned int x1 = x0 + 1U < src_width ? x0 + 1U : x0;
     const unsigned int y1 = y0 + 1U < src_height ? y0 + 1U : y0;
-    const float tx = sx - (float)x0;
-    const float ty = sy - (float)y0;
+    const float tx = clamped_x - (float)x0;
+    const float ty = clamped_y - (float)y0;
     const unsigned char* row0 = src + (unsigned long long)y0 * src_pitch;
     const unsigned char* row1 = src + (unsigned long long)y1 * src_pitch;
     const float a = (1.0f - tx) * (float)row0[x0] + tx * (float)row0[x1];
@@ -249,11 +257,12 @@ void GpuCalibrationUndistorter::undistort_y(const GpuGrayFrame& src,
   auto k1 = static_cast<float>(config.camera.d[1]);
   auto k2 = static_cast<float>(config.camera.d[2]);
   auto k3 = static_cast<float>(config.camera.d[3]);
+  std::uint32_t black_level = src.color_range == reco::core::YuvColorRange::Limited ? 16U : 0U;
 
-  std::array<void*, 20> args{
+  std::array<void*, 21> args{
       &src_ptr,    &src_pitch, &src_width, &src_height, &dst_ptr, &dst_pitch, &dst_width,
       &dst_height, &src_fx,    &src_fy,    &src_cx,     &src_cy,  &out_fx,    &out_fy,
-      &out_cx,     &out_cy,    &k0,        &k1,         &k2,      &k3,
+      &out_cx,     &out_cy,    &k0,        &k1,         &k2,      &k3,        &black_level,
   };
   impl_->kernel.launch({.grid = {.x = (dst.width + 15U) / 16U, .y = (dst.height + 15U) / 16U},
                         .block = {.x = 16, .y = 16}},

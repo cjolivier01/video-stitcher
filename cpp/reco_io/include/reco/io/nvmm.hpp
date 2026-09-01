@@ -10,6 +10,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace reco::io {
@@ -74,6 +75,52 @@ enum class NvbufSurfaceAbi : std::uint32_t {
   DeepStream9_1 = 901,
 };
 
+struct NvmmFrameInfo;
+struct NvmmCudaFrame;
+
+/// Retains the exact NvBufSurface and DeepStream-version libraries used to
+/// select an ABI and to map frames produced by a decoder.
+class NvbufSurfaceRuntime final {
+public:
+  ~NvbufSurfaceRuntime();
+
+  NvbufSurfaceRuntime(const NvbufSurfaceRuntime&) = delete;
+  NvbufSurfaceRuntime& operator=(const NvbufSurfaceRuntime&) = delete;
+
+  /// Returns the ABI proven by this runtime binding.
+  [[nodiscard]] NvbufSurfaceAbi abi() const noexcept;
+  /// Returns the loaded object that provides NvBufSurface mapping.
+  [[nodiscard]] std::string_view library() const noexcept;
+  /// Returns whether the retained provider has passed an explicit loader-wide
+  /// provenance check since the most recent validation attempt.
+  [[nodiscard]] bool provenance_validated() const noexcept;
+
+private:
+  struct State;
+  explicit NvbufSurfaceRuntime(std::unique_ptr<State> state);
+
+  std::unique_ptr<State> state_;
+
+  friend std::shared_ptr<const NvbufSurfaceRuntime> discover_nvbufsurface_runtime();
+  friend std::optional<std::string> validate_nvbufsurface_runtime_provenance(
+      const std::shared_ptr<const NvbufSurfaceRuntime>& runtime);
+  friend NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info,
+                                              std::shared_ptr<void> owner);
+};
+
+/// Discovers the installed DeepStream NvBufSurface ABI from the runtime
+/// `nvds_version` API and verifies the symbols required by that ABI.
+///
+/// Only the explicitly adapted DeepStream 7.1 and 9.1 layouts are accepted.
+/// Missing, mixed, or unsupported runtimes throw `NvmmError` rather than
+/// selecting a compatibility layout implicitly.
+[[nodiscard]] NvbufSurfaceAbi discover_nvbufsurface_abi();
+/// Discovers and retains the exact runtime objects that establish the ABI.
+[[nodiscard]] std::shared_ptr<const NvbufSurfaceRuntime> discover_nvbufsurface_runtime();
+/// Rejects a second loaded NvBufSurface provider that could own decoded frames.
+[[nodiscard]] std::optional<std::string>
+validate_nvbufsurface_runtime_provenance(const std::shared_ptr<const NvbufSurfaceRuntime>& runtime);
+
 enum class NvmmMemoryType : std::uint32_t {
   CudaDevice = 2,
   SurfaceArray = 4,
@@ -98,6 +145,7 @@ struct NvmmFrameInfo {
   core::CudaDevicePtr cuda_base_ptr = 0;
   Nv12ColorMatrix color_matrix = Nv12ColorMatrix::Bt601;
   Nv12ColorRange color_range = Nv12ColorRange::Limited;
+  std::shared_ptr<const NvbufSurfaceRuntime> runtime;
 };
 
 struct NvmmCudaFrame {

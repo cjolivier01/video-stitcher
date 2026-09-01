@@ -75,7 +75,7 @@ void expect_bytes(CudaBackend& backend, const CudaDeviceBuffer& buffer,
   expect_eq(actual.size(), expected.size(), label);
   const auto n = std::min(actual.size(), expected.size());
   for (std::size_t i = 0; i < n; ++i) {
-    expect_eq(actual[i], expected[i], label);
+    expect_eq(static_cast<unsigned int>(actual[i]), static_cast<unsigned int>(expected[i]), label);
   }
 }
 
@@ -90,6 +90,9 @@ int main() {
   expect_invalid_argument([] { npp_nv12_to_rgb(1, 8, 3, 4, 4, 4, 4); }, "nv12 mismatched pitch");
   expect_invalid_argument([] { npp_resize_c3(0, 2, 2, 1, 2, 2, {0, 0, 2, 2}); },
                           "resize c3 null src");
+  expect_invalid_argument([] { npp_resize_c1(0, 2, 2, 2, 1, 2, 2, 2); }, "resize c1 null src");
+  expect_invalid_argument([] { npp_resize_c1(1, 1, 2, 2, 3, 2, 2, 2); },
+                          "resize c1 narrow source pitch");
   expect_invalid_argument([] { npp_resize_c3(1, 2, 2, 0, 2, 2, {0, 0, 2, 2}); },
                           "resize c3 null dst");
   expect_invalid_argument([] { npp_resize_c4(1, 2, 2, 3, 2, 2, {1, 0, 2, 2}); },
@@ -133,6 +136,89 @@ int main() {
     npp_resize_c3(rgb_src.ptr(), width, height, rgb_dst.ptr(), width, height, {0, 0, 2, 2});
     backend.synchronize();
     expect_bytes(backend, rgb_dst, rgb, "resize c3 identity");
+
+    const std::vector<std::uint8_t> gray{1, 2, 3, 4};
+    auto gray_src = backend.allocate(gray.size());
+    auto gray_dst = backend.allocate(gray.size());
+    upload_bytes(backend, gray, gray_src);
+    npp_resize_c1(gray_src.ptr(), width, width, height, gray_dst.ptr(), width, width, height);
+    backend.synchronize();
+    expect_bytes(backend, gray_dst, gray, "resize c1 identity");
+
+    const std::vector<std::uint8_t> gray_large{
+        10, 10, 20, 20, 10, 10, 20, 20, 30, 30, 40, 40, 30, 30, 40, 40,
+    };
+    auto gray_large_src = backend.allocate(gray_large.size());
+    auto gray_small_dst = backend.allocate(4);
+    upload_bytes(backend, gray_large, gray_large_src);
+    npp_resize_c1(gray_large_src.ptr(), 4, 4, 4, gray_small_dst.ptr(), 2, 2, 2);
+    backend.synchronize();
+    expect_bytes(backend, gray_small_dst, {10, 20, 30, 40}, "resize c1 area downscale");
+
+    const std::vector<std::uint8_t> gray_nonuniform{0, 64, 128, 255};
+    auto gray_nonuniform_src = backend.allocate(gray_nonuniform.size());
+    auto gray_upsampled_dst = backend.allocate(16);
+    upload_bytes(backend, gray_nonuniform, gray_nonuniform_src);
+    npp_resize_c1(gray_nonuniform_src.ptr(), 2, 2, 2, gray_upsampled_dst.ptr(), 4, 4, 4);
+    backend.synchronize();
+    expect_bytes(backend, gray_upsampled_dst,
+                 {
+                     0,
+                     16,
+                     48,
+                     64,
+                     32,
+                     52,
+                     92,
+                     112,
+                     96,
+                     124,
+                     179,
+                     207,
+                     128,
+                     160,
+                     223,
+                     255,
+                 },
+                 "resize c1 nonuniform linear upsample");
+
+    const std::vector<std::uint8_t> gray_mixed{
+        0, 64, 32, 96, 128, 192, 160, 224,
+    };
+    auto gray_mixed_src = backend.allocate(gray_mixed.size());
+    auto gray_mixed_dst = backend.allocate(8);
+    upload_bytes(backend, gray_mixed, gray_mixed_src);
+    npp_resize_c1(gray_mixed_src.ptr(), 2, 2, 4, gray_mixed_dst.ptr(), 4, 4, 2);
+    backend.synchronize();
+    expect_bytes(backend, gray_mixed_dst,
+                 {
+                     0,
+                     16,
+                     48,
+                     64,
+                     128,
+                     144,
+                     176,
+                     192,
+                 },
+                 "resize c1 nonuniform mixed-axis linear");
+
+    const auto expect_mixed_axis_resize = [&](std::uint32_t src_width, std::uint32_t src_height,
+                                              std::uint32_t dst_width, std::uint32_t dst_height,
+                                              std::uint8_t value, std::string_view label) {
+      const std::vector<std::uint8_t> src(src_width * src_height, value);
+      auto src_buffer = backend.allocate(src.size());
+      auto dst_buffer = backend.allocate(dst_width * dst_height);
+      upload_bytes(backend, src, src_buffer);
+      npp_resize_c1(src_buffer.ptr(), src_width, src_width, src_height, dst_buffer.ptr(), dst_width,
+                    dst_width, dst_height);
+      backend.synchronize();
+      expect_bytes(backend, dst_buffer, std::vector<std::uint8_t>(dst_width * dst_height, value),
+                   label);
+    };
+    expect_mixed_axis_resize(4, 2, 2, 4, 17, "resize c1 width shrink height grow");
+    expect_mixed_axis_resize(2, 4, 4, 2, 31, "resize c1 width grow height shrink");
+    expect_mixed_axis_resize(4, 2, 2, 2, 47, "resize c1 width shrink height unchanged");
 
     auto mirror_dst = backend.allocate(rgb.size());
     npp_mirror_c3(rgb_src.ptr(), mirror_dst.ptr(), width, height);

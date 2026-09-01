@@ -1,5 +1,7 @@
 #include "nvrtc_compiler.hpp"
 
+#include "reco/core/windows_runtime_library.hpp"
+
 #include <algorithm>
 #include <memory>
 #include <stdexcept>
@@ -25,7 +27,7 @@ public:
     std::string attempted;
     for (const char* name : names) {
 #if defined(_WIN32)
-      handle_ = LoadLibraryA(name);
+      handle_ = core::detail::load_windows_runtime_library(name);
 #else
       handle_ = dlopen(name, RTLD_NOW | RTLD_LOCAL);
 #endif

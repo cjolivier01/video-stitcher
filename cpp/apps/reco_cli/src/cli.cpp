@@ -3,26 +3,2933 @@
 #include "reco/calibrate/pipeline.hpp"
 #include "reco/core/calibration.hpp"
 #include "reco/core/cuda_backend.hpp"
+#include "reco/core/path.hpp"
 #include "reco/detect/coreml_session.hpp"
 #include "reco/detect/npp_interop.hpp"
 #include "reco/detect/ort_session.hpp"
 #include "reco/detect/probe.hpp"
 #include "reco/io/gpu_decode.hpp"
 #include "reco/io/gstreamer.hpp"
+#include "rules_cc/cc/runfiles/runfiles.h"
 
 #include <algorithm>
+#include <array>
+#include <cerrno>
 #include <charconv>
+#include <chrono>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <optional>
+#include <random>
 #include <sstream>
+#include <system_error>
+#include <thread>
 #include <type_traits>
+#include <utility>
 #include <vector>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <winternl.h>
+#elif defined(__linux__)
+#include <fcntl.h>
+#include <linux/fs.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#else
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#if defined(__APPLE__)
+#include <stdio.h>
+#endif
+#endif
 
 namespace reco::cli {
 namespace {
+
+using rules_cc::cc::runfiles::Runfiles;
+
+#if defined(_WIN32)
+constexpr std::string_view probe_worker_name = "reco_video_probe_worker.exe";
+constexpr std::string_view calibration_worker_name = "reco_calibration_worker.exe";
+constexpr std::filesystem::path::value_type path_separator = L';';
+#else
+constexpr std::string_view probe_worker_name = "reco_video_probe_worker";
+constexpr std::string_view calibration_worker_name = "reco_calibration_worker";
+constexpr std::filesystem::path::value_type path_separator = ':';
+#endif
+
+std::optional<std::filesystem::path>
+existing_absolute_executable(const std::filesystem::path& path) {
+  std::error_code error;
+  if (path.empty() || !std::filesystem::is_regular_file(path, error) || error) {
+    return std::nullopt;
+  }
+#if !defined(_WIN32)
+  if (::access(path.c_str(), X_OK) != 0) {
+    return std::nullopt;
+  }
+#endif
+  auto absolute = std::filesystem::absolute(path, error);
+  if (error) {
+    return std::nullopt;
+  }
+  return absolute.lexically_normal();
+}
+
+std::optional<std::filesystem::path>
+resolve_path_invocation(const std::filesystem::path& executable_path) {
+  if (executable_path.empty()) {
+    return std::nullopt;
+  }
+  if (executable_path.is_absolute() || executable_path.has_parent_path()) {
+    return existing_absolute_executable(executable_path);
+  }
+
+  const auto path_value = reco::core::path_from_environment("PATH");
+  if (!path_value.has_value()) {
+    return std::nullopt;
+  }
+  const auto& path = path_value->native();
+  std::size_t begin = 0;
+  while (begin <= path.size()) {
+    const auto end = path.find(path_separator, begin);
+    const auto component = path.substr(begin, end - begin);
+    const auto directory =
+        component.empty() ? std::filesystem::path(".") : std::filesystem::path(component);
+    if (auto resolved = existing_absolute_executable(directory / executable_path);
+        resolved.has_value()) {
+      return resolved;
+    }
+#if defined(_WIN32)
+    if (!executable_path.has_extension()) {
+      auto with_extension = executable_path;
+      with_extension += ".exe";
+      if (auto resolved = existing_absolute_executable(directory / with_extension);
+          resolved.has_value()) {
+        return resolved;
+      }
+    }
+#endif
+    if (end == std::filesystem::path::string_type::npos) {
+      break;
+    }
+    begin = end + 1;
+  }
+  return std::nullopt;
+}
+
+std::optional<std::filesystem::path>
+resolve_worker_impl(const std::filesystem::path& executable_path, const char* environment_name,
+                    std::string_view name, std::string_view runfiles_directory,
+                    std::string_view output_directory) {
+  if (const auto configured = reco::core::path_from_environment(environment_name);
+      configured.has_value()) {
+    return existing_absolute_executable(*configured);
+  }
+
+  const auto resolved_executable = resolve_path_invocation(executable_path);
+  if (resolved_executable.has_value()) {
+    if (auto sibling = existing_absolute_executable(resolved_executable->parent_path() / name);
+        sibling.has_value()) {
+      return sibling;
+    }
+  }
+
+  std::string runfiles_error;
+  const auto runfiles_argv0 =
+      reco::core::path_to_utf8(resolved_executable.value_or(executable_path));
+  std::unique_ptr<Runfiles> runfiles(
+      Runfiles::Create(runfiles_argv0, BAZEL_CURRENT_REPOSITORY, &runfiles_error));
+  if (runfiles != nullptr) {
+    const auto logical_path = std::string("reco_video_stitcher/") +
+                              std::string(runfiles_directory) + "/" + std::string(name);
+    if (auto resolved = existing_absolute_executable(
+            reco::core::path_from_utf8(runfiles->Rlocation(logical_path)));
+        resolved.has_value()) {
+      return resolved;
+    }
+  }
+
+  if (resolved_executable.has_value()) {
+    if (auto output_tree_worker = existing_absolute_executable(
+            resolved_executable->parent_path() / ".." / ".." / output_directory / name);
+        output_tree_worker.has_value()) {
+      return output_tree_worker;
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<std::filesystem::path>
+resolve_video_probe_worker_impl(const std::filesystem::path& executable_path) {
+  return resolve_worker_impl(executable_path, "RECO_VIDEO_PROBE_WORKER", probe_worker_name,
+                             "cpp/reco_io", "reco_io");
+}
+
+std::optional<std::filesystem::path>
+resolve_calibration_worker_impl(const std::filesystem::path& executable_path) {
+  return resolve_worker_impl(executable_path, "RECO_CALIBRATION_WORKER", calibration_worker_name,
+                             "cpp/reco_calibrate", "reco_calibrate");
+}
+
+[[noreturn]] void throw_file_error(std::string_view operation, const std::filesystem::path& path,
+                                   int error) {
+  const auto utf8_path = path.u8string();
+  throw std::system_error(
+      error, std::system_category(),
+      std::string(operation) + " " +
+          std::string(reinterpret_cast<const char*>(utf8_path.data()), utf8_path.size()));
+}
+
+#if defined(_WIN32)
+class UniqueWindowsHandle {
+public:
+  UniqueWindowsHandle() = default;
+  explicit UniqueWindowsHandle(HANDLE handle) : handle_(handle) {}
+  ~UniqueWindowsHandle() {
+    if (handle_ != INVALID_HANDLE_VALUE) {
+      (void)CloseHandle(handle_);
+    }
+  }
+
+  UniqueWindowsHandle(const UniqueWindowsHandle&) = delete;
+  UniqueWindowsHandle& operator=(const UniqueWindowsHandle&) = delete;
+  UniqueWindowsHandle(UniqueWindowsHandle&& other) noexcept
+      : handle_(std::exchange(other.handle_, INVALID_HANDLE_VALUE)) {}
+  UniqueWindowsHandle& operator=(UniqueWindowsHandle&& other) noexcept {
+    if (this != &other) {
+      if (handle_ != INVALID_HANDLE_VALUE) {
+        (void)CloseHandle(handle_);
+      }
+      handle_ = std::exchange(other.handle_, INVALID_HANDLE_VALUE);
+    }
+    return *this;
+  }
+
+  [[nodiscard]] HANDLE get() const noexcept { return handle_; }
+  [[nodiscard]] HANDLE release() noexcept { return std::exchange(handle_, INVALID_HANDLE_VALUE); }
+
+private:
+  HANDLE handle_ = INVALID_HANDLE_VALUE;
+};
+
+struct PinnedWindowsPath {
+  UniqueWindowsHandle target;
+  UniqueWindowsHandle directory_entry;
+
+  void verify_unchanged(const std::filesystem::path& path, std::string_view label) const;
+};
+
+struct PinnedWindowsDirectory {
+  std::filesystem::path path;
+  std::filesystem::path resolved_path;
+  UniqueWindowsHandle handle;
+};
+
+using NtCreateFileFunction = NTSTATUS(NTAPI*)(PHANDLE, ACCESS_MASK, POBJECT_ATTRIBUTES,
+                                              PIO_STATUS_BLOCK, PLARGE_INTEGER, ULONG, ULONG, ULONG,
+                                              ULONG, PVOID, ULONG);
+using NtSetInformationFileFunction = NTSTATUS(NTAPI*)(HANDLE, PIO_STATUS_BLOCK, PVOID, ULONG,
+                                                      ULONG);
+using RtlNtStatusToDosErrorFunction = ULONG(WINAPI*)(NTSTATUS);
+
+struct NativeWindowsFunctions {
+  NtCreateFileFunction create_file = nullptr;
+  NtSetInformationFileFunction set_information_file = nullptr;
+  RtlNtStatusToDosErrorFunction status_to_error = nullptr;
+};
+
+using ConvertSecurityDescriptorFunction = BOOL(WINAPI*)(LPCWSTR, DWORD, PSECURITY_DESCRIPTOR*,
+                                                        PULONG);
+
+class UniqueLocalMemory {
+public:
+  explicit UniqueLocalMemory(HLOCAL memory) : memory_(memory) {}
+  ~UniqueLocalMemory() {
+    if (memory_ != nullptr) {
+      (void)LocalFree(memory_);
+    }
+  }
+
+  UniqueLocalMemory(const UniqueLocalMemory&) = delete;
+  UniqueLocalMemory& operator=(const UniqueLocalMemory&) = delete;
+
+  [[nodiscard]] HLOCAL get() const noexcept { return memory_; }
+
+private:
+  HLOCAL memory_ = nullptr;
+};
+
+[[nodiscard]] UniqueLocalMemory make_publication_mutex_security_descriptor() {
+  static const ConvertSecurityDescriptorFunction convert = [] {
+    HMODULE advapi = GetModuleHandleW(L"advapi32.dll");
+    if (advapi == nullptr) {
+      advapi = LoadLibraryExW(L"advapi32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }
+    return advapi == nullptr ? nullptr
+                             : reinterpret_cast<ConvertSecurityDescriptorFunction>(GetProcAddress(
+                                   advapi, "ConvertStringSecurityDescriptorToSecurityDescriptorW"));
+  }();
+  if (convert == nullptr) {
+    throw std::runtime_error("cannot load Windows security descriptor APIs");
+  }
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  constexpr DWORD kSddlRevision1 = 1;
+  // Restrict the global mutex to its owner, administrators, and LocalSystem.
+  if (convert(L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)", kSddlRevision1, &descriptor, nullptr) ==
+          0 ||
+      descriptor == nullptr) {
+    throw std::system_error(static_cast<int>(GetLastError()), std::system_category(),
+                            "cannot create Windows publication lock security descriptor");
+  }
+  return UniqueLocalMemory(static_cast<HLOCAL>(descriptor));
+}
+
+[[nodiscard]] const NativeWindowsFunctions& native_windows_functions() {
+  static const NativeWindowsFunctions functions = [] {
+    const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (ntdll == nullptr) {
+      throw std::runtime_error("cannot load Windows native file APIs");
+    }
+    NativeWindowsFunctions loaded{
+        .create_file =
+            reinterpret_cast<NtCreateFileFunction>(GetProcAddress(ntdll, "NtCreateFile")),
+        .set_information_file = reinterpret_cast<NtSetInformationFileFunction>(
+            GetProcAddress(ntdll, "NtSetInformationFile")),
+        .status_to_error = reinterpret_cast<RtlNtStatusToDosErrorFunction>(
+            GetProcAddress(ntdll, "RtlNtStatusToDosError")),
+    };
+    if (loaded.create_file == nullptr || loaded.set_information_file == nullptr ||
+        loaded.status_to_error == nullptr) {
+      throw std::runtime_error("Windows native relative file APIs are unavailable");
+    }
+    return loaded;
+  }();
+  return functions;
+}
+
+[[nodiscard]] HANDLE open_windows_file_relative(HANDLE directory, std::wstring_view name,
+                                                ACCESS_MASK access, ULONG share_access,
+                                                ULONG disposition, ULONG options,
+                                                DWORD& windows_error) {
+  if (name.size() > std::numeric_limits<USHORT>::max() / sizeof(wchar_t)) {
+    windows_error = ERROR_FILENAME_EXCED_RANGE;
+    return INVALID_HANDLE_VALUE;
+  }
+  UNICODE_STRING unicode_name{
+      .Length = static_cast<USHORT>(name.size() * sizeof(wchar_t)),
+      .MaximumLength = static_cast<USHORT>(name.size() * sizeof(wchar_t)),
+      .Buffer = const_cast<PWSTR>(name.data()),
+  };
+  OBJECT_ATTRIBUTES attributes{};
+  InitializeObjectAttributes(&attributes, &unicode_name, OBJ_CASE_INSENSITIVE, directory, nullptr);
+  IO_STATUS_BLOCK io_status{};
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  const auto& functions = native_windows_functions();
+  const NTSTATUS status =
+      functions.create_file(&handle, access, &attributes, &io_status, nullptr,
+                            FILE_ATTRIBUTE_NORMAL, share_access, disposition, options, nullptr, 0);
+  if (status < 0) {
+    windows_error = functions.status_to_error(status);
+    return INVALID_HANDLE_VALUE;
+  }
+  windows_error = ERROR_SUCCESS;
+  return handle;
+}
+
+[[nodiscard]] DWORD set_windows_file_information(HANDLE handle, void* information,
+                                                 ULONG information_size, ULONG information_class) {
+  IO_STATUS_BLOCK io_status{};
+  const auto& functions = native_windows_functions();
+  NTSTATUS status = functions.set_information_file(handle, &io_status, information,
+                                                   information_size, information_class);
+  constexpr NTSTATUS kStatusPending = 0x00000103L;
+  if (status == kStatusPending) {
+    if (WaitForSingleObject(handle, INFINITE) != WAIT_OBJECT_0) {
+      return GetLastError();
+    }
+    status = io_status.Status;
+  }
+  return status < 0 ? functions.status_to_error(status) : ERROR_SUCCESS;
+}
+
+class WindowsPublicationLock {
+public:
+  WindowsPublicationLock(HANDLE mutex, bool owned) : mutex_(mutex), owned_(owned) {}
+  ~WindowsPublicationLock() {
+    if (owned_) {
+      (void)ReleaseMutex(mutex_.get());
+    }
+  }
+
+  WindowsPublicationLock(const WindowsPublicationLock&) = delete;
+  WindowsPublicationLock& operator=(const WindowsPublicationLock&) = delete;
+  WindowsPublicationLock(WindowsPublicationLock&& other) noexcept
+      : mutex_(std::move(other.mutex_)), owned_(std::exchange(other.owned_, false)) {}
+
+private:
+  UniqueWindowsHandle mutex_;
+  bool owned_ = false;
+};
+
+[[nodiscard]] WindowsPublicationLock
+lock_windows_output_directory(HANDLE directory, const std::filesystem::path& path,
+                              const std::function<void()>& on_contention,
+                              std::chrono::milliseconds lock_timeout) {
+  BY_HANDLE_FILE_INFORMATION identity{};
+  if (GetFileInformationByHandle(directory, &identity) == 0) {
+    throw_file_error("cannot inspect calibration output directory lock", path,
+                     static_cast<int>(GetLastError()));
+  }
+  const auto name = L"Global\\RecoCalibrationPublication-v1-" +
+                    std::to_wstring(identity.dwVolumeSerialNumber) + L"-" +
+                    std::to_wstring(identity.nFileIndexHigh) + L"-" +
+                    std::to_wstring(identity.nFileIndexLow);
+  auto security_descriptor = make_publication_mutex_security_descriptor();
+  SECURITY_ATTRIBUTES security_attributes{
+      .nLength = sizeof(SECURITY_ATTRIBUTES),
+      .lpSecurityDescriptor = security_descriptor.get(),
+      .bInheritHandle = FALSE,
+  };
+  const HANDLE mutex = CreateMutexW(&security_attributes, FALSE, name.c_str());
+  if (mutex == nullptr) {
+    throw_file_error("cannot create calibration output directory lock", path,
+                     static_cast<int>(GetLastError()));
+  }
+  UniqueWindowsHandle retained_mutex(mutex);
+  const auto deadline = std::chrono::steady_clock::now() + lock_timeout;
+  DWORD wait_result = WaitForSingleObject(mutex, 0);
+  if (wait_result == WAIT_TIMEOUT) {
+    if (on_contention) {
+      on_contention();
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      throw_file_error("timed out locking calibration output directory", path, ERROR_TIMEOUT);
+    }
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+    const auto bounded_timeout =
+        std::clamp<std::int64_t>(remaining, 1, static_cast<std::int64_t>(INFINITE) - 1);
+    wait_result = WaitForSingleObject(mutex, static_cast<DWORD>(bounded_timeout));
+  }
+  if (wait_result == WAIT_TIMEOUT) {
+    throw_file_error("timed out locking calibration output directory", path, ERROR_TIMEOUT);
+  }
+  if (wait_result != WAIT_OBJECT_0 && wait_result != WAIT_ABANDONED) {
+    throw_file_error("cannot lock calibration output directory", path,
+                     static_cast<int>(GetLastError()));
+  }
+  if (std::chrono::steady_clock::now() >= deadline) {
+    (void)ReleaseMutex(mutex);
+    throw_file_error("timed out locking calibration output directory", path, ERROR_TIMEOUT);
+  }
+  return WindowsPublicationLock(retained_mutex.release(), true);
+}
+
+[[nodiscard]] PinnedWindowsDirectory
+pin_windows_output_directory(const std::filesystem::path& destination) {
+  const auto parent =
+      destination.has_parent_path() ? destination.parent_path() : std::filesystem::path(".");
+  const HANDLE directory =
+      CreateFileW(parent.c_str(), FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                  FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  if (directory == INVALID_HANDLE_VALUE) {
+    throw_file_error("cannot retain calibration output directory", parent,
+                     static_cast<int>(GetLastError()));
+  }
+  const DWORD required =
+      GetFinalPathNameByHandleW(directory, nullptr, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+  if (required == 0) {
+    const int path_error = static_cast<int>(GetLastError());
+    (void)CloseHandle(directory);
+    throw_file_error("cannot resolve calibration output directory", parent, path_error);
+  }
+  std::wstring resolved(required, L'\0');
+  const DWORD written = GetFinalPathNameByHandleW(directory, resolved.data(), required,
+                                                  FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+  if (written == 0 || written >= required) {
+    const int path_error = static_cast<int>(GetLastError());
+    (void)CloseHandle(directory);
+    throw_file_error("cannot resolve calibration output directory", parent, path_error);
+  }
+  resolved.resize(written);
+  return {.path = parent,
+          .resolved_path = std::filesystem::path(std::move(resolved)),
+          .handle = UniqueWindowsHandle(directory)};
+}
+
+[[nodiscard]] bool path_identifies_windows_handle(const std::filesystem::path& path, HANDLE source,
+                                                  bool open_reparse_point) {
+  DWORD flags = FILE_FLAG_BACKUP_SEMANTICS;
+  if (open_reparse_point) {
+    flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+  }
+  const HANDLE current = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES,
+                                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                     nullptr, OPEN_EXISTING, flags, nullptr);
+  if (current == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+  UniqueWindowsHandle retained_current(current);
+  BY_HANDLE_FILE_INFORMATION source_identity{};
+  BY_HANDLE_FILE_INFORMATION current_identity{};
+  return GetFileInformationByHandle(source, &source_identity) != 0 &&
+         GetFileInformationByHandle(current, &current_identity) != 0 &&
+         source_identity.dwVolumeSerialNumber == current_identity.dwVolumeSerialNumber &&
+         source_identity.nFileIndexHigh == current_identity.nFileIndexHigh &&
+         source_identity.nFileIndexLow == current_identity.nFileIndexLow;
+}
+
+void PinnedWindowsPath::verify_unchanged(const std::filesystem::path& path,
+                                         std::string_view label) const {
+  if (!path_identifies_windows_handle(path, directory_entry.get(), true) ||
+      !path_identifies_windows_handle(path, target.get(), false)) {
+    throw std::runtime_error(std::string(label) + " path identity changed before publication");
+  }
+}
+
+[[nodiscard]] PinnedWindowsPath pin_windows_path_for_publication(const std::filesystem::path& path,
+                                                                 std::string_view label) {
+  constexpr DWORD kReadOnlySharing = FILE_SHARE_READ;
+  const HANDLE directory_entry =
+      CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, kReadOnlySharing, nullptr, OPEN_EXISTING,
+                  FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+  if (directory_entry == INVALID_HANDLE_VALUE) {
+    throw_file_error("cannot retain " + std::string(label) + " path", path,
+                     static_cast<int>(GetLastError()));
+  }
+  PinnedWindowsPath pinned{.directory_entry = UniqueWindowsHandle(directory_entry)};
+  const HANDLE target =
+      CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, kReadOnlySharing, nullptr, OPEN_EXISTING,
+                  FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  if (target == INVALID_HANDLE_VALUE) {
+    throw_file_error("cannot retain " + std::string(label), path, static_cast<int>(GetLastError()));
+  }
+  pinned.target = UniqueWindowsHandle(target);
+  return pinned;
+}
+
+std::filesystem::path create_exclusive_temporary(const std::filesystem::path& destination,
+                                                 HANDLE directory, HANDLE& handle) {
+  std::random_device random;
+  constexpr char hex[] = "0123456789abcdef";
+  for (int attempt = 0; attempt < 128; ++attempt) {
+    std::array<char, 32> token{};
+    for (auto& digit : token) {
+      digit = hex[random() & 0x0fU];
+    }
+    auto filename = destination.filename();
+    filename += ".tmp." + std::string(token.begin(), token.end());
+    auto temporary = destination.parent_path() / filename;
+    DWORD error = ERROR_SUCCESS;
+    handle = open_windows_file_relative(
+        directory, filename.wstring(), GENERIC_WRITE | DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT, error);
+    if (handle != INVALID_HANDLE_VALUE) {
+      return temporary;
+    }
+    if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS) {
+      throw_file_error("cannot create temporary calibration output", temporary,
+                       static_cast<int>(error));
+    }
+  }
+  throw std::runtime_error("cannot create unique temporary calibration output for " +
+                           destination.string());
+}
+
+void write_all(HANDLE handle, std::string_view contents, const std::filesystem::path& temporary) {
+  std::size_t offset = 0;
+  while (offset < contents.size()) {
+    const auto remaining = contents.size() - offset;
+    const auto chunk =
+        static_cast<DWORD>(std::min<std::size_t>(remaining, std::numeric_limits<DWORD>::max()));
+    DWORD written = 0;
+    if (WriteFile(handle, contents.data() + offset, chunk, &written, nullptr) == 0 ||
+        written == 0) {
+      throw_file_error("failed to write temporary calibration output", temporary,
+                       static_cast<int>(GetLastError()));
+    }
+    offset += written;
+  }
+}
+
+class WindowsPublicationIdentityError : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+
+[[nodiscard]] bool same_windows_file_identity(const BY_HANDLE_FILE_INFORMATION& left,
+                                              const BY_HANDLE_FILE_INFORMATION& right) {
+  return left.dwVolumeSerialNumber == right.dwVolumeSerialNumber &&
+         left.nFileIndexHigh == right.nFileIndexHigh && left.nFileIndexLow == right.nFileIndexLow;
+}
+
+[[nodiscard]] bool relative_path_identifies_windows_handle(HANDLE directory, std::wstring_view name,
+                                                           HANDLE source,
+                                                           bool allow_reparse_point) {
+  DWORD error = ERROR_SUCCESS;
+  const HANDLE destination_handle = open_windows_file_relative(
+      directory, name, FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN,
+      FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT, error);
+  if (destination_handle == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+  UniqueWindowsHandle retained_destination(destination_handle);
+  FILE_ATTRIBUTE_TAG_INFO attributes{};
+  BY_HANDLE_FILE_INFORMATION source_identity{};
+  BY_HANDLE_FILE_INFORMATION destination_identity{};
+  return GetFileInformationByHandleEx(destination_handle, FileAttributeTagInfo, &attributes,
+                                      sizeof(attributes)) != 0 &&
+         (allow_reparse_point || (attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0) &&
+         GetFileInformationByHandle(source, &source_identity) != 0 &&
+         GetFileInformationByHandle(destination_handle, &destination_identity) != 0 &&
+         same_windows_file_identity(source_identity, destination_identity);
+}
+
+[[nodiscard]] bool published_path_identifies_handle(HANDLE directory,
+                                                    std::wstring_view destination_name,
+                                                    HANDLE source) {
+  return relative_path_identifies_windows_handle(directory, destination_name, source, false);
+}
+
+void rename_open_file(HANDLE handle, HANDLE directory, std::wstring_view destination_name,
+                      const std::filesystem::path& destination, bool allow_reparse_point = false,
+                      bool replace_existing = true) {
+  const auto filename_bytes = destination_name.size() * sizeof(wchar_t);
+  struct ExtendedRenameInfo {
+    DWORD flags;
+    HANDLE root_directory;
+    DWORD filename_length;
+    wchar_t filename[1];
+  };
+  static_assert(offsetof(ExtendedRenameInfo, root_directory) ==
+                offsetof(FILE_RENAME_INFO, RootDirectory));
+  static_assert(offsetof(ExtendedRenameInfo, filename_length) ==
+                offsetof(FILE_RENAME_INFO, FileNameLength));
+  static_assert(offsetof(ExtendedRenameInfo, filename) == offsetof(FILE_RENAME_INFO, FileName));
+  constexpr DWORD kReplaceIfExists = 0x00000001;
+  constexpr DWORD kPosixSemantics = 0x00000002;
+  constexpr ULONG kFileRenameInformation = 10;
+  constexpr ULONG kFileRenameInformationEx = 65;
+  // SetFileInformationByHandle documents a complete FILE_RENAME_INFO followed by the
+  // variable-length name. Copying through filename[1] can trigger MSVC's object-size guard.
+  const auto info_bytes = sizeof(FILE_RENAME_INFO) + filename_bytes;
+  std::vector<std::max_align_t> storage(
+      (info_bytes + sizeof(std::max_align_t) - 1U) / sizeof(std::max_align_t), std::max_align_t{});
+  auto* raw = reinterpret_cast<std::byte*>(storage.data());
+  const DWORD flags = (replace_existing ? kReplaceIfExists : 0U) | kPosixSemantics;
+  const HANDLE root_directory = directory;
+  const auto filename_length = static_cast<DWORD>(filename_bytes);
+  std::memcpy(raw + offsetof(ExtendedRenameInfo, flags), &flags, sizeof(flags));
+  std::memcpy(raw + offsetof(ExtendedRenameInfo, root_directory), &root_directory,
+              sizeof(root_directory));
+  std::memcpy(raw + offsetof(ExtendedRenameInfo, filename_length), &filename_length,
+              sizeof(filename_length));
+  std::memcpy(raw + offsetof(ExtendedRenameInfo, filename), destination_name.data(),
+              filename_bytes);
+
+  constexpr DWORD retry_delay_ms = 10;
+  constexpr int maximum_replace_attempts = 200;
+  DWORD replace_error = ERROR_SUCCESS;
+  bool extended_rename_unsupported = false;
+  for (int attempt = 0; attempt < maximum_replace_attempts; ++attempt) {
+    replace_error = set_windows_file_information(
+        handle, storage.data(), static_cast<ULONG>(info_bytes), kFileRenameInformationEx);
+    if (replace_error == ERROR_SUCCESS) {
+      if (!relative_path_identifies_windows_handle(directory, destination_name, handle,
+                                                   allow_reparse_point)) {
+        throw WindowsPublicationIdentityError(
+            "published calibration output does not identify the temporary file");
+      }
+      return;
+    }
+    if (replace_error == ERROR_INVALID_FUNCTION || replace_error == ERROR_NOT_SUPPORTED ||
+        replace_error == ERROR_INVALID_PARAMETER) {
+      extended_rename_unsupported = true;
+      break;
+    }
+    if (replace_error != ERROR_SHARING_VIOLATION && replace_error != ERROR_ACCESS_DENIED) {
+      throw_file_error("failed to rename calibration output", destination,
+                       static_cast<int>(replace_error));
+    }
+    if (attempt + 1 < maximum_replace_attempts) {
+      Sleep(retry_delay_ms);
+    } else {
+      throw_file_error("failed to rename calibration output", destination,
+                       static_cast<int>(replace_error));
+    }
+  }
+
+  DWORD destination_error = ERROR_SUCCESS;
+  const HANDLE destination_handle = open_windows_file_relative(
+      directory, destination_name, FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN,
+      FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+      destination_error);
+  UniqueWindowsHandle retained_destination(destination_handle);
+  FILE_ATTRIBUTE_TAG_INFO destination_attributes{};
+  const bool destination_is_reparse_point =
+      destination_handle != INVALID_HANDLE_VALUE &&
+      GetFileInformationByHandleEx(destination_handle, FileAttributeTagInfo,
+                                   &destination_attributes, sizeof(destination_attributes)) != 0 &&
+      (destination_attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+  if (!extended_rename_unsupported || destination_is_reparse_point) {
+    throw_file_error(
+        "failed to rename calibration output", destination,
+        static_cast<int>(replace_error == ERROR_SUCCESS ? ERROR_NOT_SUPPORTED : replace_error));
+  }
+  const BOOLEAN replace_if_exists = replace_existing ? TRUE : FALSE;
+  std::memcpy(raw + offsetof(FILE_RENAME_INFO, ReplaceIfExists), &replace_if_exists,
+              sizeof(replace_if_exists));
+  for (int attempt = 0; attempt < maximum_replace_attempts; ++attempt) {
+    replace_error = set_windows_file_information(
+        handle, storage.data(), static_cast<ULONG>(info_bytes), kFileRenameInformation);
+    if (replace_error == ERROR_SUCCESS) {
+      if (!relative_path_identifies_windows_handle(directory, destination_name, handle,
+                                                   allow_reparse_point)) {
+        throw WindowsPublicationIdentityError(
+            "published calibration output does not identify the temporary file");
+      }
+      return;
+    }
+    if (replace_error != ERROR_SHARING_VIOLATION && replace_error != ERROR_ACCESS_DENIED) {
+      break;
+    }
+    if (attempt + 1 < maximum_replace_attempts) {
+      Sleep(retry_delay_ms);
+    }
+  }
+  throw_file_error("failed to rename calibration output", destination,
+                   static_cast<int>(replace_error));
+}
+
+[[nodiscard]] bool discard_open_file(HANDLE handle) noexcept {
+  FILE_DISPOSITION_INFO disposition{.DeleteFile = TRUE};
+  return SetFileInformationByHandle(handle, FileDispositionInfo, &disposition,
+                                    sizeof(disposition)) != 0;
+}
+
+struct WindowsDisplacedOutput {
+  std::wstring name;
+  UniqueWindowsHandle handle;
+};
+
+void publish_windows_output(HANDLE directory, const std::filesystem::path& resolved_directory,
+                            std::wstring_view destination_name, std::wstring_view temporary_name,
+                            HANDLE temporary_handle, const std::filesystem::path& destination,
+                            bool& destination_published,
+                            std::optional<WindowsDisplacedOutput>& displaced_output,
+                            const std::function<void(const std::filesystem::path&)>& before_replace) {
+  constexpr ACCESS_MASK access = DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+  constexpr ULONG sharing = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+  constexpr ULONG options =
+      FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT;
+  std::random_device random;
+  constexpr wchar_t hex[] = L"0123456789abcdef";
+  constexpr int maximum_replace_attempts = 200;
+  constexpr DWORD retry_delay_ms = 10;
+  for (int attempt = 0; attempt < maximum_replace_attempts; ++attempt) {
+    if (!path_identifies_windows_handle(resolved_directory, directory, true)) {
+      throw std::runtime_error("calibration output directory identity changed before replacement");
+    }
+    std::array<wchar_t, 32> token{};
+    for (auto& digit : token) {
+      digit = hex[random() & 0x0fU];
+    }
+    std::wstring rollback_name(destination_name);
+    rollback_name += L".rollback.";
+    rollback_name.append(token.begin(), token.end());
+    DWORD current_error = ERROR_SUCCESS;
+    const HANDLE current = open_windows_file_relative(directory, destination_name, access, sharing,
+                                                      FILE_OPEN, options, current_error);
+    UniqueWindowsHandle retained_current(current);
+    bool current_is_reparse_point = false;
+    if (current != INVALID_HANDLE_VALUE) {
+      FILE_ATTRIBUTE_TAG_INFO attributes{};
+      if (GetFileInformationByHandleEx(current, FileAttributeTagInfo, &attributes,
+                                       sizeof(attributes)) == 0) {
+        throw_file_error("cannot inspect calibration output reparse state", destination,
+                         static_cast<int>(GetLastError()));
+      }
+      current_is_reparse_point = (attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    } else if (current_error != ERROR_FILE_NOT_FOUND && current_error != ERROR_PATH_NOT_FOUND) {
+      if ((current_error == ERROR_SHARING_VIOLATION || current_error == ERROR_ACCESS_DENIED) &&
+          attempt + 1 < maximum_replace_attempts) {
+        Sleep(retry_delay_ms);
+        continue;
+      }
+      throw_file_error("cannot inspect calibration output before replacement", destination,
+                       static_cast<int>(current_error));
+    }
+    if (!relative_path_identifies_windows_handle(directory, temporary_name, temporary_handle,
+                                                 false)) {
+      throw WindowsPublicationIdentityError(
+          "temporary output identity changed before Windows publication");
+    }
+    if (before_replace) {
+      before_replace(resolved_directory / temporary_name);
+    }
+    if (!path_identifies_windows_handle(resolved_directory, directory, true) ||
+        !relative_path_identifies_windows_handle(directory, temporary_name, temporary_handle,
+                                                 false) ||
+        (current != INVALID_HANDLE_VALUE &&
+         !relative_path_identifies_windows_handle(directory, destination_name, current,
+                                                  current_is_reparse_point))) {
+      throw WindowsPublicationIdentityError(
+          "calibration output identity changed before Windows publication handoff");
+    }
+
+    if (current != INVALID_HANDLE_VALUE) {
+      displaced_output = WindowsDisplacedOutput{.name = std::move(rollback_name),
+                                                .handle = std::move(retained_current)};
+      try {
+        rename_open_file(displaced_output->handle.get(), directory, displaced_output->name,
+                         destination, current_is_reparse_point, false);
+      } catch (const std::system_error& error) {
+        if (error.code().value() != ERROR_FILE_EXISTS &&
+            error.code().value() != ERROR_ALREADY_EXISTS) {
+          throw;
+        }
+        if (!relative_path_identifies_windows_handle(directory, destination_name,
+                                                     displaced_output->handle.get(),
+                                                     current_is_reparse_point)) {
+          throw;
+        }
+        displaced_output.reset();
+        continue;
+      }
+      if (!relative_path_identifies_windows_handle(directory, displaced_output->name,
+                                                   displaced_output->handle.get(), true)) {
+        throw WindowsPublicationIdentityError(
+            "displaced calibration output changed during Windows publication handoff");
+      }
+    }
+
+    rename_open_file(temporary_handle, directory, destination_name, destination, false, false);
+    destination_published = true;
+    if (!path_identifies_windows_handle(resolved_directory, directory, true) ||
+        !published_path_identifies_handle(directory, destination_name, temporary_handle) ||
+        (displaced_output.has_value() &&
+         !relative_path_identifies_windows_handle(directory, displaced_output->name,
+                                                  displaced_output->handle.get(), true))) {
+      throw WindowsPublicationIdentityError(
+          "Windows calibration output handoff changed publication identity");
+    }
+    return;
+  }
+  throw std::runtime_error("cannot create unique displaced calibration output for " +
+                           destination.string());
+}
+#elif defined(__linux__)
+class UniqueFileDescriptor {
+public:
+  UniqueFileDescriptor() = default;
+  explicit UniqueFileDescriptor(int descriptor) : descriptor_(descriptor) {}
+  ~UniqueFileDescriptor() {
+    if (descriptor_ >= 0) {
+      (void)::close(descriptor_);
+    }
+  }
+
+  UniqueFileDescriptor(const UniqueFileDescriptor&) = delete;
+  UniqueFileDescriptor& operator=(const UniqueFileDescriptor&) = delete;
+  UniqueFileDescriptor(UniqueFileDescriptor&& other) noexcept
+      : descriptor_(std::exchange(other.descriptor_, -1)) {}
+  UniqueFileDescriptor& operator=(UniqueFileDescriptor&& other) noexcept {
+    if (this != &other) {
+      if (descriptor_ >= 0) {
+        (void)::close(descriptor_);
+      }
+      descriptor_ = std::exchange(other.descriptor_, -1);
+    }
+    return *this;
+  }
+
+  [[nodiscard]] int get() const { return descriptor_; }
+
+  void close_checked(const std::filesystem::path& path) {
+    const int descriptor = std::exchange(descriptor_, -1);
+    if (descriptor >= 0 && ::close(descriptor) != 0) {
+      throw_file_error("failed to close temporary calibration output", path, errno);
+    }
+  }
+
+private:
+  int descriptor_ = -1;
+};
+
+struct PinnedFileIdentity {
+  std::string label;
+  std::filesystem::path path;
+  UniqueFileDescriptor descriptor;
+  struct stat identity{};
+  struct stat path_identity{};
+
+  [[nodiscard]] std::filesystem::path retained_path() const {
+    return std::filesystem::path("/proc") / std::to_string(::getpid()) / "fd" /
+           std::to_string(descriptor.get());
+  }
+
+  [[nodiscard]] reco::calibrate::CalibrationFileIdentity portable_identity() const {
+    return {
+        .device = static_cast<std::uint64_t>(identity.st_dev),
+        .inode = static_cast<std::uint64_t>(identity.st_ino),
+        .size = static_cast<std::uint64_t>(identity.st_size),
+        .mode = static_cast<std::uint32_t>(identity.st_mode),
+        .modified_seconds = static_cast<std::int64_t>(identity.st_mtim.tv_sec),
+        .modified_nanoseconds = static_cast<std::int64_t>(identity.st_mtim.tv_nsec),
+        .changed_seconds = static_cast<std::int64_t>(identity.st_ctim.tv_sec),
+        .changed_nanoseconds = static_cast<std::int64_t>(identity.st_ctim.tv_nsec),
+    };
+  }
+
+  void verify_unchanged() const {
+    struct stat descriptor_identity{};
+    struct stat named_identity{};
+    struct stat followed_identity{};
+    if (::fstat(descriptor.get(), &descriptor_identity) != 0 ||
+        ::lstat(path.c_str(), &named_identity) != 0 ||
+        ::stat(path.c_str(), &followed_identity) != 0) {
+      throw std::runtime_error("cannot re-inspect " + label + " before publication");
+    }
+    const auto portable = [](const struct stat& value) {
+      return reco::calibrate::CalibrationFileIdentity{
+          .device = static_cast<std::uint64_t>(value.st_dev),
+          .inode = static_cast<std::uint64_t>(value.st_ino),
+          .size = static_cast<std::uint64_t>(value.st_size),
+          .mode = static_cast<std::uint32_t>(value.st_mode),
+          .modified_seconds = static_cast<std::int64_t>(value.st_mtim.tv_sec),
+          .modified_nanoseconds = static_cast<std::int64_t>(value.st_mtim.tv_nsec),
+          .changed_seconds = static_cast<std::int64_t>(value.st_ctim.tv_sec),
+          .changed_nanoseconds = static_cast<std::int64_t>(value.st_ctim.tv_nsec),
+      };
+    };
+    if (portable(descriptor_identity) != portable_identity() ||
+        portable(followed_identity) != portable_identity() ||
+        named_identity.st_dev != path_identity.st_dev ||
+        named_identity.st_ino != path_identity.st_ino ||
+        named_identity.st_mode != path_identity.st_mode) {
+      throw std::runtime_error(label + " changed before calibration output publication");
+    }
+  }
+};
+
+[[nodiscard]] PinnedFileIdentity pin_input_identity(const std::filesystem::path& path,
+                                                    std::string_view label) {
+  const int descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (descriptor < 0) {
+    throw_file_error("cannot open " + std::string(label), path, errno);
+  }
+  PinnedFileIdentity pinned{
+      .label = std::string(label), .path = path, .descriptor = UniqueFileDescriptor(descriptor)};
+  if (::fstat(descriptor, &pinned.identity) != 0) {
+    throw_file_error("cannot inspect " + std::string(label), path, errno);
+  }
+  if (::lstat(path.c_str(), &pinned.path_identity) != 0) {
+    throw_file_error("cannot inspect " + std::string(label) + " path", path, errno);
+  }
+  if (!S_ISREG(pinned.identity.st_mode) || pinned.identity.st_size <= 0) {
+    throw std::runtime_error(std::string(label) + " must be a regular file: " + path.string());
+  }
+  return pinned;
+}
+
+[[nodiscard]] bool same_file_identity(const struct stat& left, const struct stat& right) {
+  return left.st_dev == right.st_dev && left.st_ino == right.st_ino;
+}
+
+[[nodiscard]] std::optional<std::string>
+pinned_identity_alias_error(const struct stat& identity, const PinnedFileIdentity& left_input,
+                            const PinnedFileIdentity& right_input,
+                            const std::vector<PinnedFileIdentity>& lens_profiles) {
+  const auto alias_error = [](std::string_view label) {
+    return "output calibration path identifies the " + std::string(label);
+  };
+  if (same_file_identity(identity, left_input.identity)) {
+    return alias_error(left_input.label);
+  }
+  if (same_file_identity(identity, left_input.path_identity)) {
+    return alias_error(left_input.label);
+  }
+  if (same_file_identity(identity, right_input.identity)) {
+    return alias_error(right_input.label);
+  }
+  if (same_file_identity(identity, right_input.path_identity)) {
+    return alias_error(right_input.label);
+  }
+  for (const auto& profile : lens_profiles) {
+    if (same_file_identity(identity, profile.identity) ||
+        same_file_identity(identity, profile.path_identity)) {
+      return alias_error(profile.label);
+    }
+  }
+  return std::nullopt;
+}
+
+[[nodiscard]] bool temporary_name_identifies_descriptor(int directory_descriptor,
+                                                        std::string_view name,
+                                                        int temporary_descriptor) {
+  struct stat descriptor_identity{};
+  struct stat name_identity{};
+  const std::string filename(name);
+  return ::fstat(temporary_descriptor, &descriptor_identity) == 0 &&
+         ::fstatat(directory_descriptor, filename.c_str(), &name_identity, AT_SYMLINK_NOFOLLOW) ==
+             0 &&
+         S_ISREG(name_identity.st_mode) && same_file_identity(descriptor_identity, name_identity);
+}
+
+struct DirectoryEntrySnapshot {
+  UniqueFileDescriptor descriptor;
+  struct stat identity{};
+};
+
+[[nodiscard]] DirectoryEntrySnapshot capture_directory_entry_snapshot(int directory_descriptor,
+                                                                      std::string_view name) {
+  DirectoryEntrySnapshot snapshot;
+  const std::string filename(name);
+  const int descriptor =
+      ::openat(directory_descriptor, filename.c_str(), O_PATH | O_NOFOLLOW | O_CLOEXEC);
+  if (descriptor < 0) {
+    throw std::system_error(errno, std::system_category(),
+                            "cannot retain calibration output entry identity");
+  }
+  snapshot.descriptor = UniqueFileDescriptor(descriptor);
+  if (::fstat(snapshot.descriptor.get(), &snapshot.identity) != 0) {
+    throw std::system_error(errno, std::system_category(),
+                            "cannot inspect retained calibration output entry identity");
+  }
+  return snapshot;
+}
+
+[[nodiscard]] bool directory_entry_matches_snapshot(int directory_descriptor, std::string_view name,
+                                                    const DirectoryEntrySnapshot& snapshot) {
+  struct stat current{};
+  struct stat retained{};
+  const std::string filename(name);
+  return ::fstat(snapshot.descriptor.get(), &retained) == 0 &&
+         ::fstatat(directory_descriptor, filename.c_str(), &current, AT_SYMLINK_NOFOLLOW) == 0 &&
+         same_file_identity(retained, snapshot.identity) && same_file_identity(current, retained) &&
+         current.st_mode == retained.st_mode;
+}
+
+[[nodiscard]] bool unlink_directory_entry_if_unchanged(int directory_descriptor,
+                                                       std::string_view name,
+                                                       const DirectoryEntrySnapshot& snapshot,
+                                                       const std::filesystem::path& destination);
+
+[[nodiscard]] std::optional<std::string>
+validate_pinned_output_identity(int directory_descriptor, std::string_view destination_name,
+                                const PinnedFileIdentity& left_input,
+                                const PinnedFileIdentity& right_input,
+                                const std::vector<PinnedFileIdentity>& lens_profiles) {
+  left_input.verify_unchanged();
+  right_input.verify_unchanged();
+  for (const auto& profile : lens_profiles) {
+    profile.verify_unchanged();
+  }
+  struct stat destination_identity{};
+  const std::string name(destination_name);
+  if (::fstatat(directory_descriptor, name.c_str(), &destination_identity, AT_SYMLINK_NOFOLLOW) !=
+      0) {
+    if (errno == ENOENT) {
+      return std::nullopt;
+    }
+    throw std::system_error(errno, std::system_category(),
+                            "cannot inspect output calibration path identity");
+  }
+
+  if (const auto error =
+          pinned_identity_alias_error(destination_identity, left_input, right_input, lens_profiles);
+      error.has_value()) {
+    return error;
+  }
+
+  if (S_ISLNK(destination_identity.st_mode)) {
+    struct stat followed_identity{};
+    if (::fstatat(directory_descriptor, name.c_str(), &followed_identity, 0) != 0) {
+      if (errno == ENOENT || errno == ELOOP) {
+        return std::nullopt;
+      }
+      throw std::system_error(errno, std::system_category(),
+                              "cannot inspect output calibration symlink target identity");
+    }
+    return pinned_identity_alias_error(followed_identity, left_input, right_input, lens_profiles);
+  }
+  return std::nullopt;
+}
+
+[[nodiscard]] std::optional<std::string> displaced_output_removal_error(
+    int directory_descriptor, std::string_view name, const PinnedFileIdentity& left_input,
+    const PinnedFileIdentity& right_input, const std::vector<PinnedFileIdentity>& lens_profiles) {
+  struct stat identity{};
+  const std::string filename(name);
+  if (::fstatat(directory_descriptor, filename.c_str(), &identity, AT_SYMLINK_NOFOLLOW) != 0) {
+    throw std::system_error(errno, std::system_category(),
+                            "cannot inspect displaced calibration output");
+  }
+  if (const auto error =
+          pinned_identity_alias_error(identity, left_input, right_input, lens_profiles);
+      error.has_value()) {
+    return error;
+  }
+  if (S_ISDIR(identity.st_mode)) {
+    return "output calibration path identifies a directory";
+  }
+  if (S_ISLNK(identity.st_mode)) {
+    struct stat followed_identity{};
+    if (::fstatat(directory_descriptor, filename.c_str(), &followed_identity, 0) != 0) {
+      if (errno == ENOENT || errno == ELOOP) {
+        return std::nullopt;
+      }
+      throw std::system_error(errno, std::system_category(),
+                              "cannot inspect displaced calibration symlink target");
+    }
+    return pinned_identity_alias_error(followed_identity, left_input, right_input, lens_profiles);
+  }
+  return std::nullopt;
+}
+
+struct TemporaryOutput {
+  std::string name;
+  UniqueFileDescriptor descriptor;
+};
+
+[[nodiscard]] TemporaryOutput
+create_exclusive_temporary_at(int directory_descriptor, const std::filesystem::path& destination) {
+  std::random_device random;
+  constexpr char hex[] = "0123456789abcdef";
+  for (int attempt = 0; attempt < 128; ++attempt) {
+    std::array<char, 32> token{};
+    for (auto& digit : token) {
+      digit = hex[random() & 0x0fU];
+    }
+    const auto name =
+        destination.filename().string() + ".tmp." + std::string(token.begin(), token.end());
+    const int descriptor = ::openat(directory_descriptor, name.c_str(),
+                                    O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (descriptor >= 0) {
+      return TemporaryOutput{.name = name, .descriptor = UniqueFileDescriptor(descriptor)};
+    }
+    if (errno != EEXIST) {
+      throw_file_error("cannot create temporary calibration output", destination, errno);
+    }
+  }
+  throw std::runtime_error("cannot create unique temporary calibration output for " +
+                           destination.string());
+}
+
+enum class DescriptorLinkStatus { Linked, AlreadyExists, Unsupported };
+
+[[nodiscard]] bool descriptor_link_is_unsupported(int error) {
+  return error == EPERM || error == EACCES || error == EOPNOTSUPP || error == ENOSYS ||
+         error == EXDEV || error == EMLINK || error == EINVAL || error == ENOENT;
+}
+
+[[nodiscard]] DescriptorLinkStatus link_descriptor_at(int directory_descriptor,
+                                                      std::string_view name,
+                                                      int temporary_descriptor,
+                                                      bool force_rename_fallback) {
+  if (force_rename_fallback) {
+    return DescriptorLinkStatus::Unsupported;
+  }
+  const auto descriptor_path = std::filesystem::path("/proc") / std::to_string(::getpid()) / "fd" /
+                               std::to_string(temporary_descriptor);
+  const std::string filename(name);
+  if (::linkat(AT_FDCWD, descriptor_path.c_str(), directory_descriptor, filename.c_str(),
+               AT_SYMLINK_FOLLOW) == 0) {
+    return DescriptorLinkStatus::Linked;
+  }
+  if (errno == EEXIST) {
+    return DescriptorLinkStatus::AlreadyExists;
+  }
+  if (descriptor_link_is_unsupported(errno)) {
+    return DescriptorLinkStatus::Unsupported;
+  }
+  throw std::system_error(errno, std::system_category(),
+                          "cannot bind temporary calibration output");
+}
+
+[[nodiscard]] std::optional<std::string>
+create_descriptor_publication_link_at(int directory_descriptor,
+                                      const std::filesystem::path& destination,
+                                      int temporary_descriptor, bool force_rename_fallback) {
+  std::random_device random;
+  constexpr char hex[] = "0123456789abcdef";
+  for (int attempt = 0; attempt < 128; ++attempt) {
+    std::array<char, 32> token{};
+    for (auto& digit : token) {
+      digit = hex[random() & 0x0fU];
+    }
+    const auto name =
+        destination.filename().string() + ".publish." + std::string(token.begin(), token.end());
+    const auto status =
+        link_descriptor_at(directory_descriptor, name, temporary_descriptor, force_rename_fallback);
+    if (status == DescriptorLinkStatus::Linked) {
+      return std::optional<std::string>(name);
+    }
+    if (status == DescriptorLinkStatus::Unsupported) {
+      return std::nullopt;
+    }
+  }
+  throw std::runtime_error("cannot bind unique temporary calibration output for " +
+                           destination.string());
+}
+
+[[nodiscard]] bool directory_entry_exists_at(int directory_descriptor, std::string_view name) {
+  struct stat identity{};
+  const std::string filename(name);
+  if (::fstatat(directory_descriptor, filename.c_str(), &identity, AT_SYMLINK_NOFOLLOW) == 0) {
+    return true;
+  }
+  if (errno == ENOENT) {
+    return false;
+  }
+  throw std::system_error(errno, std::system_category(), "cannot inspect calibration output entry");
+}
+
+[[nodiscard]] UniqueFileDescriptor lock_output_directory(int directory_descriptor,
+                                                         const std::filesystem::path& directory,
+                                                         const std::function<void()>& on_contention,
+                                                         std::chrono::milliseconds lock_timeout) {
+  constexpr auto retry_delay = std::chrono::milliseconds(10);
+  const int raw_lock =
+      ::openat(directory_descriptor, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (raw_lock < 0) {
+    throw_file_error("cannot open calibration output directory lock", directory, errno);
+  }
+  UniqueFileDescriptor lock(raw_lock);
+  struct stat identity{};
+  if (::fstat(lock.get(), &identity) != 0) {
+    throw_file_error("cannot inspect calibration output directory lock", directory, errno);
+  }
+  if (!S_ISDIR(identity.st_mode)) {
+    throw std::runtime_error("calibration output lock is not a directory: " + directory.string());
+  }
+  const auto deadline = std::chrono::steady_clock::now() + lock_timeout;
+  bool contention_reported = false;
+  bool retrying = false;
+  for (;;) {
+    const auto attempt_time = std::chrono::steady_clock::now();
+    if (retrying && attempt_time >= deadline) {
+      throw std::runtime_error("timed out locking calibration output directory: " +
+                               directory.string());
+    }
+    if (::flock(lock.get(), LOCK_EX | LOCK_NB) == 0) {
+      return lock;
+    }
+    retrying = true;
+    const int lock_error = errno;
+    const bool contended = lock_error == EWOULDBLOCK || lock_error == EAGAIN;
+    if (lock_error == EINTR) {
+      continue;
+    }
+    if (contended) {
+      if (!contention_reported && on_contention) {
+        on_contention();
+        contention_reported = true;
+      }
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) {
+        continue;
+      }
+      std::this_thread::sleep_for(std::min(
+          retry_delay, std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)));
+      continue;
+    }
+    throw_file_error("cannot lock calibration output directory", directory, lock_error);
+  }
+}
+
+void exchange_directory_entries_at(int directory_descriptor, std::string_view left,
+                                   std::string_view right,
+                                   const std::filesystem::path& destination) {
+  const std::string left_name(left);
+  const std::string right_name(right);
+  if (::syscall(SYS_renameat2, directory_descriptor, left_name.c_str(), directory_descriptor,
+                right_name.c_str(), RENAME_EXCHANGE) != 0) {
+    throw_file_error("failed to exchange calibration output", destination, errno);
+  }
+}
+
+[[nodiscard]] bool rename_directory_entry_noreplace_at(int directory_descriptor,
+                                                       std::string_view source,
+                                                       std::string_view destination_name,
+                                                       const std::filesystem::path& destination) {
+  const std::string source_name(source);
+  const std::string target_name(destination_name);
+  if (::syscall(SYS_renameat2, directory_descriptor, source_name.c_str(), directory_descriptor,
+                target_name.c_str(), RENAME_NOREPLACE) == 0) {
+    return true;
+  }
+  if (errno == EEXIST) {
+    return false;
+  }
+  throw_file_error("failed to publish calibration output", destination, errno);
+}
+
+[[nodiscard]] bool
+move_directory_entry_noreplace_noexcept(int source_directory, std::string_view source,
+                                        int destination_directory,
+                                        std::string_view destination_name) noexcept {
+  const std::string source_name(source);
+  const std::string target_name(destination_name);
+  return ::syscall(SYS_renameat2, source_directory, source_name.c_str(), destination_directory,
+                   target_name.c_str(), RENAME_NOREPLACE) == 0;
+}
+
+class ProtectedPosixQuarantine {
+public:
+  ProtectedPosixQuarantine(int parent, const std::filesystem::path& destination) : parent_(parent) {
+    std::random_device random;
+    constexpr char hex[] = "0123456789abcdef";
+    for (int attempt = 0; attempt < 128; ++attempt) {
+      std::array<char, 32> token{};
+      for (auto& digit : token) {
+        digit = hex[random() & 0x0fU];
+      }
+      name_ = destination.filename().string() + ".quarantine." +
+              std::string(token.begin(), token.end());
+      if (::mkdirat(parent_, name_.c_str(), 0700) != 0) {
+        if (errno == EEXIST) {
+          continue;
+        }
+        throw_file_error("cannot create calibration output quarantine", destination, errno);
+      }
+      const int descriptor =
+          ::openat(parent_, name_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+      if (descriptor < 0) {
+        const int open_error = errno;
+        (void)::unlinkat(parent_, name_.c_str(), AT_REMOVEDIR);
+        throw_file_error("cannot open calibration output quarantine", destination, open_error);
+      }
+      directory_ = UniqueFileDescriptor(descriptor);
+      struct stat identity{};
+      if (::fstat(directory_.get(), &identity) != 0 || !S_ISDIR(identity.st_mode) ||
+          identity.st_uid != ::geteuid() || (identity.st_mode & 0077) != 0) {
+        directory_ = UniqueFileDescriptor();
+        (void)::unlinkat(parent_, name_.c_str(), AT_REMOVEDIR);
+        throw std::runtime_error("calibration output quarantine is not private");
+      }
+      return;
+    }
+    throw std::runtime_error("cannot create unique calibration output quarantine for " +
+                             destination.string());
+  }
+
+  ~ProtectedPosixQuarantine() {
+    directory_ = UniqueFileDescriptor();
+    if (!name_.empty()) {
+      (void)::unlinkat(parent_, name_.c_str(), AT_REMOVEDIR);
+    }
+  }
+
+  ProtectedPosixQuarantine(const ProtectedPosixQuarantine&) = delete;
+  ProtectedPosixQuarantine& operator=(const ProtectedPosixQuarantine&) = delete;
+
+  [[nodiscard]] int get() const { return directory_.get(); }
+
+private:
+  int parent_ = -1;
+  std::string name_;
+  UniqueFileDescriptor directory_;
+};
+
+[[nodiscard]] bool unlink_directory_entry_if_unchanged(int directory_descriptor,
+                                                       std::string_view name,
+                                                       const DirectoryEntrySnapshot& snapshot,
+                                                       const std::filesystem::path& destination) {
+  ProtectedPosixQuarantine quarantine(directory_descriptor, destination);
+  constexpr std::string_view retained_name = "displaced";
+  if (!move_directory_entry_noreplace_noexcept(directory_descriptor, name, quarantine.get(),
+                                               retained_name)) {
+    return false;
+  }
+  if (!directory_entry_matches_snapshot(quarantine.get(), retained_name, snapshot)) {
+    (void)move_directory_entry_noreplace_noexcept(quarantine.get(), retained_name,
+                                                  directory_descriptor, name);
+    return false;
+  }
+  return ::unlinkat(quarantine.get(), retained_name.data(), 0) == 0;
+}
+
+[[nodiscard]] bool
+rollback_new_directory_entry_safely(int directory_descriptor, std::string_view published_name,
+                                    std::string_view retained_name, int published_descriptor,
+                                    const std::filesystem::path& destination) noexcept {
+  try {
+    ProtectedPosixQuarantine quarantine(directory_descriptor, destination);
+    constexpr std::string_view quarantined_name = "published";
+    if (!move_directory_entry_noreplace_noexcept(directory_descriptor, published_name,
+                                                 quarantine.get(), quarantined_name)) {
+      return false;
+    }
+    if (!temporary_name_identifies_descriptor(quarantine.get(), quarantined_name,
+                                              published_descriptor)) {
+      (void)move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_name,
+                                                    directory_descriptor, published_name);
+      return false;
+    }
+    return move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_name,
+                                                   directory_descriptor, retained_name);
+  } catch (...) {
+    return false;
+  }
+}
+
+[[nodiscard]] bool rollback_exchanged_directory_entries_safely(
+    int directory_descriptor, std::string_view published_name, int published_descriptor,
+    std::string_view displaced_name, const DirectoryEntrySnapshot& displaced_snapshot,
+    const std::filesystem::path& destination) noexcept {
+  try {
+    ProtectedPosixQuarantine quarantine(directory_descriptor, destination);
+    constexpr std::string_view quarantined_published = "published";
+    constexpr std::string_view quarantined_displaced = "displaced";
+    if (!move_directory_entry_noreplace_noexcept(directory_descriptor, published_name,
+                                                 quarantine.get(), quarantined_published)) {
+      return false;
+    }
+    if (!move_directory_entry_noreplace_noexcept(directory_descriptor, displaced_name,
+                                                 quarantine.get(), quarantined_displaced)) {
+      (void)move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_published,
+                                                    directory_descriptor, published_name);
+      return false;
+    }
+    const bool identities_match =
+        temporary_name_identifies_descriptor(quarantine.get(), quarantined_published,
+                                             published_descriptor) &&
+        directory_entry_matches_snapshot(quarantine.get(), quarantined_displaced,
+                                         displaced_snapshot);
+    if (!identities_match) {
+      (void)move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_displaced,
+                                                    directory_descriptor, displaced_name);
+      (void)move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_published,
+                                                    directory_descriptor, published_name);
+      return false;
+    }
+    if (!move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_displaced,
+                                                 directory_descriptor, published_name)) {
+      return false;
+    }
+    if (!move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_published,
+                                                 directory_descriptor, displaced_name)) {
+      return false;
+    }
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+[[nodiscard]] bool
+unlink_descriptor_entry_safely(int directory_descriptor, std::string_view name, int descriptor,
+                               const std::filesystem::path& destination) noexcept {
+  try {
+    ProtectedPosixQuarantine quarantine(directory_descriptor, destination);
+    constexpr std::string_view retained_name = "temporary";
+    if (!move_directory_entry_noreplace_noexcept(directory_descriptor, name, quarantine.get(),
+                                                 retained_name)) {
+      return false;
+    }
+    if (!temporary_name_identifies_descriptor(quarantine.get(), retained_name, descriptor)) {
+      (void)move_directory_entry_noreplace_noexcept(quarantine.get(), retained_name,
+                                                    directory_descriptor, name);
+      return false;
+    }
+    return ::unlinkat(quarantine.get(), retained_name.data(), 0) == 0;
+  } catch (...) {
+    return false;
+  }
+}
+
+void write_all(int descriptor, std::string_view contents, const std::filesystem::path& temporary) {
+  std::size_t offset = 0;
+  while (offset < contents.size()) {
+    const auto written = ::write(descriptor, contents.data() + offset, contents.size() - offset);
+    if (written < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      throw_file_error("failed to write temporary calibration output", temporary, errno);
+    }
+    if (written == 0) {
+      throw_file_error("failed to write temporary calibration output", temporary, EIO);
+    }
+    offset += static_cast<std::size_t>(written);
+  }
+}
+#else
+[[nodiscard]] bool same_file_identity(const struct stat& left, const struct stat& right) {
+  return left.st_dev == right.st_dev && left.st_ino == right.st_ino;
+}
+
+#if defined(__APPLE__)
+[[nodiscard]] bool same_timestamp(const timespec& left, const timespec& right) {
+  return left.tv_sec == right.tv_sec && left.tv_nsec == right.tv_nsec;
+}
+
+[[nodiscard]] bool same_posix_snapshot(const struct stat& left, const struct stat& right) {
+  return same_file_identity(left, right) && left.st_size == right.st_size &&
+         left.st_mode == right.st_mode && same_timestamp(left.st_mtimespec, right.st_mtimespec) &&
+         same_timestamp(left.st_ctimespec, right.st_ctimespec);
+}
+#endif
+
+struct PinnedPosixPath {
+  std::string label;
+  std::filesystem::path path;
+  int descriptor = -1;
+  struct stat identity{};
+  struct stat path_identity{};
+
+  ~PinnedPosixPath() {
+    if (descriptor >= 0) {
+      (void)::close(descriptor);
+    }
+  }
+
+  PinnedPosixPath() = default;
+  PinnedPosixPath(const PinnedPosixPath&) = delete;
+  PinnedPosixPath& operator=(const PinnedPosixPath&) = delete;
+  PinnedPosixPath(PinnedPosixPath&& other) noexcept
+      : label(std::move(other.label)), path(std::move(other.path)),
+        descriptor(std::exchange(other.descriptor, -1)), identity(other.identity),
+        path_identity(other.path_identity) {}
+  PinnedPosixPath& operator=(PinnedPosixPath&& other) noexcept {
+    if (this != &other) {
+      if (descriptor >= 0) {
+        (void)::close(descriptor);
+      }
+      label = std::move(other.label);
+      path = std::move(other.path);
+      descriptor = std::exchange(other.descriptor, -1);
+      identity = other.identity;
+      path_identity = other.path_identity;
+    }
+    return *this;
+  }
+
+  void verify_unchanged() const {
+    struct stat descriptor_identity{};
+    struct stat named_identity{};
+    struct stat followed_identity{};
+    if (::fstat(descriptor, &descriptor_identity) != 0 ||
+        ::lstat(path.c_str(), &named_identity) != 0 ||
+        ::stat(path.c_str(), &followed_identity) != 0) {
+      throw std::runtime_error("cannot re-inspect " + label + " before publication");
+    }
+#if defined(__APPLE__)
+    if (!same_posix_snapshot(descriptor_identity, identity) ||
+        !same_posix_snapshot(followed_identity, identity) ||
+        !same_posix_snapshot(named_identity, path_identity)) {
+#else
+    if (!same_file_identity(descriptor_identity, identity) ||
+        descriptor_identity.st_size != identity.st_size ||
+        descriptor_identity.st_mode != identity.st_mode ||
+        !same_file_identity(followed_identity, identity) ||
+        !same_file_identity(named_identity, path_identity) ||
+        named_identity.st_mode != path_identity.st_mode) {
+#endif
+      throw std::runtime_error(label + " changed before calibration output publication");
+    }
+  }
+};
+
+#if defined(__APPLE__)
+class PosixDirectoryLock {
+public:
+  explicit PosixDirectoryLock(int descriptor) : descriptor_(descriptor) {}
+  ~PosixDirectoryLock() {
+    if (descriptor_ >= 0) {
+      (void)::close(descriptor_);
+    }
+  }
+
+  PosixDirectoryLock(const PosixDirectoryLock&) = delete;
+  PosixDirectoryLock& operator=(const PosixDirectoryLock&) = delete;
+  PosixDirectoryLock(PosixDirectoryLock&& other) noexcept
+      : descriptor_(std::exchange(other.descriptor_, -1)) {}
+
+  [[nodiscard]] int get() const noexcept { return descriptor_; }
+
+private:
+  int descriptor_ = -1;
+};
+
+[[nodiscard]] PosixDirectoryLock
+lock_posix_output_directory(const std::filesystem::path& destination,
+                            const std::function<void()>& on_contention,
+                            std::chrono::milliseconds lock_timeout) {
+  const auto parent =
+      destination.has_parent_path() ? destination.parent_path() : std::filesystem::path(".");
+  const int descriptor = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (descriptor < 0) {
+    throw_file_error("cannot open calibration output directory lock", parent, errno);
+  }
+  struct stat identity{};
+  if (::fstat(descriptor, &identity) != 0) {
+    const int error = errno;
+    (void)::close(descriptor);
+    throw_file_error("cannot inspect calibration output directory lock", parent, error);
+  }
+  if (!S_ISDIR(identity.st_mode)) {
+    (void)::close(descriptor);
+    throw_file_error("cannot inspect calibration output directory lock", parent, ENOTDIR);
+  }
+  const auto deadline = std::chrono::steady_clock::now() + lock_timeout;
+  bool contention_reported = false;
+  bool retrying = false;
+  for (;;) {
+    const auto attempt_time = std::chrono::steady_clock::now();
+    if (retrying && attempt_time >= deadline) {
+      (void)::close(descriptor);
+      throw_file_error("timed out locking calibration output directory", parent, ETIMEDOUT);
+    }
+    if (::flock(descriptor, LOCK_EX | LOCK_NB) == 0) {
+      return PosixDirectoryLock(descriptor);
+    }
+    retrying = true;
+    const int nonblocking_error = errno;
+    const bool contended = nonblocking_error == EWOULDBLOCK || nonblocking_error == EAGAIN;
+    if (nonblocking_error == EINTR) {
+      continue;
+    }
+    if (contended) {
+      if (!contention_reported && on_contention) {
+        try {
+          on_contention();
+        } catch (...) {
+          (void)::close(descriptor);
+          throw;
+        }
+        contention_reported = true;
+      }
+      const auto now = std::chrono::steady_clock::now();
+      if (now < deadline) {
+        std::this_thread::sleep_for(
+            std::min(std::chrono::milliseconds(10),
+                     std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)));
+      }
+      continue;
+    }
+    (void)::close(descriptor);
+    throw_file_error("cannot lock calibration output directory", parent, nonblocking_error);
+  }
+}
+#endif
+
+[[nodiscard]] PinnedPosixPath pin_posix_path_for_publication(const std::filesystem::path& path,
+                                                             std::string_view label) {
+  PinnedPosixPath pinned;
+  pinned.label = std::string(label);
+  pinned.path = path;
+  pinned.descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (pinned.descriptor < 0) {
+    throw_file_error("cannot open " + pinned.label, path, errno);
+  }
+  if (::fstat(pinned.descriptor, &pinned.identity) != 0) {
+    throw_file_error("cannot inspect " + pinned.label, path, errno);
+  }
+  if (::lstat(path.c_str(), &pinned.path_identity) != 0) {
+    throw_file_error("cannot inspect " + pinned.label + " path", path, errno);
+  }
+  if (!S_ISREG(pinned.identity.st_mode) || pinned.identity.st_size <= 0) {
+    throw std::runtime_error(pinned.label + " must be a regular file: " + path.string());
+  }
+  return pinned;
+}
+
+[[nodiscard]] std::optional<std::string>
+pinned_posix_alias_error(const struct stat& identity, const PinnedPosixPath& left_input,
+                         const PinnedPosixPath& right_input,
+                         const std::vector<PinnedPosixPath>& lens_profiles) {
+  const auto matches = [&](const PinnedPosixPath& input) {
+    return same_file_identity(identity, input.identity) ||
+           same_file_identity(identity, input.path_identity);
+  };
+  if (matches(left_input)) {
+    return "output calibration path identifies the " + left_input.label;
+  }
+  if (matches(right_input)) {
+    return "output calibration path identifies the " + right_input.label;
+  }
+  for (const auto& profile : lens_profiles) {
+    if (matches(profile)) {
+      return "output calibration path identifies the " + profile.label;
+    }
+  }
+  return std::nullopt;
+}
+
+#if defined(__APPLE__)
+[[nodiscard]] std::optional<std::string> validate_pinned_posix_output_identity_at(
+    int directory_descriptor, std::string_view destination_name, const PinnedPosixPath& left_input,
+    const PinnedPosixPath& right_input, const std::vector<PinnedPosixPath>& lens_profiles) {
+  left_input.verify_unchanged();
+  right_input.verify_unchanged();
+  for (const auto& profile : lens_profiles) {
+    profile.verify_unchanged();
+  }
+  const std::string name(destination_name);
+  struct stat identity{};
+  if (::fstatat(directory_descriptor, name.c_str(), &identity, AT_SYMLINK_NOFOLLOW) != 0) {
+    if (errno == ENOENT) {
+      return std::nullopt;
+    }
+    throw std::system_error(errno, std::system_category(),
+                            "cannot inspect calibration output identity");
+  }
+  if (const auto error = pinned_posix_alias_error(identity, left_input, right_input, lens_profiles);
+      error.has_value()) {
+    return error;
+  }
+  if (S_ISLNK(identity.st_mode)) {
+    struct stat followed_identity{};
+    if (::fstatat(directory_descriptor, name.c_str(), &followed_identity, 0) != 0) {
+      if (errno == ENOENT || errno == ELOOP) {
+        return std::nullopt;
+      }
+      throw std::system_error(errno, std::system_category(),
+                              "cannot inspect calibration output symlink target");
+    }
+    return pinned_posix_alias_error(followed_identity, left_input, right_input, lens_profiles);
+  }
+  return std::nullopt;
+}
+
+[[nodiscard]] std::optional<std::string> displaced_posix_output_removal_error_at(
+    int directory_descriptor, std::string_view name, const PinnedPosixPath& left_input,
+    const PinnedPosixPath& right_input, const std::vector<PinnedPosixPath>& lens_profiles) {
+  const std::string filename(name);
+  struct stat identity{};
+  if (::fstatat(directory_descriptor, filename.c_str(), &identity, AT_SYMLINK_NOFOLLOW) != 0) {
+    throw std::system_error(errno, std::system_category(),
+                            "cannot inspect displaced calibration output");
+  }
+  if (const auto error = pinned_posix_alias_error(identity, left_input, right_input, lens_profiles);
+      error.has_value()) {
+    return error;
+  }
+  if (S_ISDIR(identity.st_mode)) {
+    return "output calibration path identifies a directory";
+  }
+  if (S_ISLNK(identity.st_mode)) {
+    struct stat followed_identity{};
+    if (::fstatat(directory_descriptor, filename.c_str(), &followed_identity, 0) != 0) {
+      if (errno == ENOENT || errno == ELOOP) {
+        return std::nullopt;
+      }
+      throw std::system_error(errno, std::system_category(),
+                              "cannot inspect displaced calibration symlink target");
+    }
+    return pinned_posix_alias_error(followed_identity, left_input, right_input, lens_profiles);
+  }
+  return std::nullopt;
+}
+
+[[nodiscard]] bool path_identifies_descriptor_at(int directory_descriptor, std::string_view name,
+                                                 int descriptor) {
+  const std::string filename(name);
+  struct stat descriptor_identity{};
+  struct stat path_identity{};
+  return ::fstat(descriptor, &descriptor_identity) == 0 &&
+         ::fstatat(directory_descriptor, filename.c_str(), &path_identity, AT_SYMLINK_NOFOLLOW) ==
+             0 &&
+         S_ISREG(path_identity.st_mode) && same_file_identity(descriptor_identity, path_identity);
+}
+
+struct PosixDirectoryEntrySnapshot {
+  int descriptor = -1;
+  struct stat identity{};
+
+  ~PosixDirectoryEntrySnapshot() {
+    if (descriptor >= 0) {
+      (void)::close(descriptor);
+    }
+  }
+  PosixDirectoryEntrySnapshot() = default;
+  PosixDirectoryEntrySnapshot(const PosixDirectoryEntrySnapshot&) = delete;
+  PosixDirectoryEntrySnapshot& operator=(const PosixDirectoryEntrySnapshot&) = delete;
+  PosixDirectoryEntrySnapshot(PosixDirectoryEntrySnapshot&& other) noexcept
+      : descriptor(std::exchange(other.descriptor, -1)), identity(other.identity) {}
+  PosixDirectoryEntrySnapshot& operator=(PosixDirectoryEntrySnapshot&& other) noexcept {
+    if (this != &other) {
+      if (descriptor >= 0) {
+        (void)::close(descriptor);
+      }
+      descriptor = std::exchange(other.descriptor, -1);
+      identity = other.identity;
+    }
+    return *this;
+  }
+};
+
+[[nodiscard]] PosixDirectoryEntrySnapshot
+capture_posix_directory_entry_snapshot(int directory_descriptor, std::string_view name) {
+  PosixDirectoryEntrySnapshot snapshot;
+  const std::string filename(name);
+  snapshot.descriptor =
+      ::openat(directory_descriptor, filename.c_str(), O_EVTONLY | O_CLOEXEC | O_SYMLINK);
+  if (snapshot.descriptor < 0) {
+    throw std::system_error(errno, std::system_category(),
+                            "cannot retain calibration output entry identity");
+  }
+  if (::fstat(snapshot.descriptor, &snapshot.identity) != 0) {
+    throw std::system_error(errno, std::system_category(),
+                            "cannot inspect retained calibration output entry identity");
+  }
+  return snapshot;
+}
+
+[[nodiscard]] bool
+posix_directory_entry_matches_snapshot(int directory_descriptor, std::string_view name,
+                                       const PosixDirectoryEntrySnapshot& snapshot) {
+  struct stat current{};
+  struct stat retained{};
+  const std::string filename(name);
+  return ::fstat(snapshot.descriptor, &retained) == 0 &&
+         ::fstatat(directory_descriptor, filename.c_str(), &current, AT_SYMLINK_NOFOLLOW) == 0 &&
+         same_file_identity(retained, snapshot.identity) && same_file_identity(current, retained) &&
+         current.st_mode == retained.st_mode;
+}
+
+[[nodiscard]] bool
+unlink_posix_directory_entry_if_unchanged(int directory_descriptor, std::string_view name,
+                                          const PosixDirectoryEntrySnapshot& snapshot,
+                                          const std::filesystem::path& destination);
+
+[[nodiscard]] bool
+move_posix_directory_entry_noreplace_noexcept(int source_directory, std::string_view source,
+                                              int destination_directory,
+                                              std::string_view destination_name) noexcept {
+  const std::string source_name(source);
+  const std::string target_name(destination_name);
+  return ::renameatx_np(source_directory, source_name.c_str(), destination_directory,
+                        target_name.c_str(), RENAME_EXCL) == 0;
+}
+
+class ProtectedDarwinQuarantine {
+public:
+  ProtectedDarwinQuarantine(int parent, const std::filesystem::path& destination)
+      : parent_(parent) {
+    std::random_device random;
+    constexpr char hex[] = "0123456789abcdef";
+    for (int attempt = 0; attempt < 128; ++attempt) {
+      std::array<char, 32> token{};
+      for (auto& digit : token) {
+        digit = hex[random() & 0x0fU];
+      }
+      name_ = destination.filename().string() + ".quarantine." +
+              std::string(token.begin(), token.end());
+      if (::mkdirat(parent_, name_.c_str(), 0700) != 0) {
+        if (errno == EEXIST) {
+          continue;
+        }
+        throw_file_error("cannot create calibration output quarantine", destination, errno);
+      }
+      descriptor_ =
+          ::openat(parent_, name_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+      if (descriptor_ < 0) {
+        const int open_error = errno;
+        (void)::unlinkat(parent_, name_.c_str(), AT_REMOVEDIR);
+        throw_file_error("cannot open calibration output quarantine", destination, open_error);
+      }
+      struct stat identity{};
+      if (::fstat(descriptor_, &identity) != 0 || !S_ISDIR(identity.st_mode) ||
+          identity.st_uid != ::geteuid() || (identity.st_mode & 0077) != 0) {
+        (void)::close(descriptor_);
+        descriptor_ = -1;
+        (void)::unlinkat(parent_, name_.c_str(), AT_REMOVEDIR);
+        throw std::runtime_error("calibration output quarantine is not private");
+      }
+      return;
+    }
+    throw std::runtime_error("cannot create unique calibration output quarantine for " +
+                             destination.string());
+  }
+
+  ~ProtectedDarwinQuarantine() {
+    if (descriptor_ >= 0) {
+      (void)::close(descriptor_);
+    }
+    if (!name_.empty()) {
+      (void)::unlinkat(parent_, name_.c_str(), AT_REMOVEDIR);
+    }
+  }
+
+  ProtectedDarwinQuarantine(const ProtectedDarwinQuarantine&) = delete;
+  ProtectedDarwinQuarantine& operator=(const ProtectedDarwinQuarantine&) = delete;
+
+  [[nodiscard]] int get() const { return descriptor_; }
+
+private:
+  int parent_ = -1;
+  std::string name_;
+  int descriptor_ = -1;
+};
+
+[[nodiscard]] bool
+unlink_posix_directory_entry_if_unchanged(int directory_descriptor, std::string_view name,
+                                          const PosixDirectoryEntrySnapshot& snapshot,
+                                          const std::filesystem::path& destination) {
+  ProtectedDarwinQuarantine quarantine(directory_descriptor, destination);
+  constexpr std::string_view retained_name = "displaced";
+  if (!move_posix_directory_entry_noreplace_noexcept(directory_descriptor, name, quarantine.get(),
+                                                     retained_name)) {
+    return false;
+  }
+  if (!posix_directory_entry_matches_snapshot(quarantine.get(), retained_name, snapshot)) {
+    (void)move_posix_directory_entry_noreplace_noexcept(quarantine.get(), retained_name,
+                                                        directory_descriptor, name);
+    return false;
+  }
+  return ::unlinkat(quarantine.get(), retained_name.data(), 0) == 0;
+}
+
+[[nodiscard]] bool
+rollback_new_posix_directory_entry_safely(int directory_descriptor, std::string_view published_name,
+                                          std::string_view retained_name, int published_descriptor,
+                                          const std::filesystem::path& destination) noexcept {
+  try {
+    ProtectedDarwinQuarantine quarantine(directory_descriptor, destination);
+    constexpr std::string_view quarantined_name = "published";
+    if (!move_posix_directory_entry_noreplace_noexcept(directory_descriptor, published_name,
+                                                       quarantine.get(), quarantined_name)) {
+      return false;
+    }
+    if (!path_identifies_descriptor_at(quarantine.get(), quarantined_name, published_descriptor)) {
+      (void)move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_name,
+                                                          directory_descriptor, published_name);
+      return false;
+    }
+    return move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_name,
+                                                         directory_descriptor, retained_name);
+  } catch (...) {
+    return false;
+  }
+}
+
+[[nodiscard]] bool rollback_exchanged_posix_directory_entries_safely(
+    int directory_descriptor, std::string_view published_name, int published_descriptor,
+    std::string_view displaced_name, const PosixDirectoryEntrySnapshot& displaced_snapshot,
+    const std::filesystem::path& destination) noexcept {
+  try {
+    ProtectedDarwinQuarantine quarantine(directory_descriptor, destination);
+    constexpr std::string_view quarantined_published = "published";
+    constexpr std::string_view quarantined_displaced = "displaced";
+    if (!move_posix_directory_entry_noreplace_noexcept(directory_descriptor, published_name,
+                                                       quarantine.get(), quarantined_published)) {
+      return false;
+    }
+    if (!move_posix_directory_entry_noreplace_noexcept(directory_descriptor, displaced_name,
+                                                       quarantine.get(), quarantined_displaced)) {
+      (void)move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_published,
+                                                          directory_descriptor, published_name);
+      return false;
+    }
+    const bool identities_match =
+        path_identifies_descriptor_at(quarantine.get(), quarantined_published,
+                                      published_descriptor) &&
+        posix_directory_entry_matches_snapshot(quarantine.get(), quarantined_displaced,
+                                               displaced_snapshot);
+    if (!identities_match) {
+      (void)move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_displaced,
+                                                          directory_descriptor, displaced_name);
+      (void)move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_published,
+                                                          directory_descriptor, published_name);
+      return false;
+    }
+    if (!move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_displaced,
+                                                       directory_descriptor, published_name)) {
+      return false;
+    }
+    return move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_published,
+                                                         directory_descriptor, displaced_name);
+  } catch (...) {
+    return false;
+  }
+}
+
+[[nodiscard]] bool
+unlink_posix_descriptor_entry_safely(int directory_descriptor, std::string_view name,
+                                     int descriptor,
+                                     const std::filesystem::path& destination) noexcept {
+  try {
+    ProtectedDarwinQuarantine quarantine(directory_descriptor, destination);
+    constexpr std::string_view retained_name = "temporary";
+    if (!move_posix_directory_entry_noreplace_noexcept(directory_descriptor, name, quarantine.get(),
+                                                       retained_name)) {
+      return false;
+    }
+    if (!path_identifies_descriptor_at(quarantine.get(), retained_name, descriptor)) {
+      (void)move_posix_directory_entry_noreplace_noexcept(quarantine.get(), retained_name,
+                                                          directory_descriptor, name);
+      return false;
+    }
+    return ::unlinkat(quarantine.get(), retained_name.data(), 0) == 0;
+  } catch (...) {
+    return false;
+  }
+}
+
+[[nodiscard]] std::string create_exclusive_temporary_at(int directory_descriptor,
+                                                        const std::filesystem::path& destination,
+                                                        int& descriptor) {
+  std::random_device random;
+  constexpr char hex[] = "0123456789abcdef";
+  for (int attempt = 0; attempt < 128; ++attempt) {
+    std::array<char, 32> token{};
+    for (auto& digit : token) {
+      digit = hex[random() & 0x0fU];
+    }
+    const auto name =
+        destination.filename().string() + ".tmp." + std::string(token.begin(), token.end());
+    descriptor = ::openat(directory_descriptor, name.c_str(),
+                          O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (descriptor >= 0) {
+      return name;
+    }
+    if (errno != EEXIST) {
+      throw_file_error("cannot create temporary calibration output", destination, errno);
+    }
+  }
+  throw std::runtime_error("cannot create unique temporary calibration output for " +
+                           destination.string());
+}
+#endif
+
+#if !defined(__APPLE__)
+[[nodiscard]] std::optional<std::string> displaced_posix_output_removal_error(
+    const std::filesystem::path& path, const PinnedPosixPath& left_input,
+    const PinnedPosixPath& right_input, const std::vector<PinnedPosixPath>& lens_profiles) {
+  struct stat identity{};
+  if (::lstat(path.c_str(), &identity) != 0) {
+    throw_file_error("cannot inspect displaced calibration output", path, errno);
+  }
+  if (const auto error = pinned_posix_alias_error(identity, left_input, right_input, lens_profiles);
+      error.has_value()) {
+    return error;
+  }
+  if (S_ISDIR(identity.st_mode)) {
+    return "output calibration path identifies a directory";
+  }
+  if (S_ISLNK(identity.st_mode)) {
+    struct stat followed_identity{};
+    if (::stat(path.c_str(), &followed_identity) != 0) {
+      if (errno == ENOENT || errno == ELOOP) {
+        return std::nullopt;
+      }
+      throw_file_error("cannot inspect displaced calibration symlink target", path, errno);
+    }
+    return pinned_posix_alias_error(followed_identity, left_input, right_input, lens_profiles);
+  }
+  return std::nullopt;
+}
+
+[[nodiscard]] bool path_identifies_descriptor(const std::filesystem::path& path, int descriptor) {
+  struct stat descriptor_identity{};
+  struct stat path_identity{};
+  return ::fstat(descriptor, &descriptor_identity) == 0 &&
+         ::lstat(path.c_str(), &path_identity) == 0 && S_ISREG(path_identity.st_mode) &&
+         descriptor_identity.st_dev == path_identity.st_dev &&
+         descriptor_identity.st_ino == path_identity.st_ino;
+}
+
+std::filesystem::path create_exclusive_temporary(const std::filesystem::path& destination,
+                                                 int& descriptor) {
+  auto temporary = destination.parent_path() / (destination.filename().string() + ".tmp.XXXXXX");
+  auto mutable_path = temporary.string();
+  std::vector<char> buffer(mutable_path.begin(), mutable_path.end());
+  buffer.push_back('\0');
+  descriptor = ::mkstemp(buffer.data());
+  if (descriptor < 0) {
+    throw_file_error("cannot create temporary calibration output", temporary, errno);
+  }
+  return std::filesystem::path(buffer.data());
+}
+#endif
+
+void write_all(int descriptor, std::string_view contents, const std::filesystem::path& temporary) {
+  std::size_t offset = 0;
+  while (offset < contents.size()) {
+    const auto written = ::write(descriptor, contents.data() + offset, contents.size() - offset);
+    if (written < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      throw_file_error("failed to write temporary calibration output", temporary, errno);
+    }
+    if (written == 0) {
+      throw_file_error("failed to write temporary calibration output", temporary, EIO);
+    }
+    offset += static_cast<std::size_t>(written);
+  }
+}
+#endif
+
+void write_calibration_json_atomically_impl(
+    std::string_view json, const std::filesystem::path& destination,
+    const std::filesystem::path& left_input, const std::filesystem::path& right_input,
+    const std::function<void()>& before_publish,
+    std::span<const std::filesystem::path> lens_profiles,
+    const std::function<void()>& before_commit, bool force_rename_fallback,
+    const std::function<void()>& after_publish, const std::function<void()>& on_lock_contention,
+    std::chrono::milliseconds lock_timeout,
+    const std::function<void(const std::filesystem::path&)>& before_windows_publish_replace,
+    const std::function<void(const std::filesystem::path&)>& before_windows_rollback_replace) {
+  std::string contents(json);
+  contents.push_back('\n');
+#if defined(_WIN32)
+  (void)force_rename_fallback;
+  const auto destination_name = destination.filename().wstring();
+  if (destination_name.empty() || destination_name == L"." || destination_name == L"..") {
+    throw std::runtime_error("calibration output path must name a file: " + destination.string());
+  }
+  const auto output_directory = pin_windows_output_directory(destination);
+  const auto left_reservation = pin_windows_path_for_publication(left_input, "left video input");
+  const auto right_reservation = pin_windows_path_for_publication(right_input, "right video input");
+  std::vector<PinnedWindowsPath> profile_reservations;
+  profile_reservations.reserve(lens_profiles.size());
+  for (std::size_t index = 0; index < lens_profiles.size(); ++index) {
+    profile_reservations.push_back(pin_windows_path_for_publication(
+        lens_profiles[index], index == 0 ? "left lens profile" : "right lens profile"));
+  }
+  [[maybe_unused]] auto interprocess_publication_lock = lock_windows_output_directory(
+      output_directory.handle.get(), output_directory.path, on_lock_contention, lock_timeout);
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  std::filesystem::path temporary;
+  bool temporary_exists = false;
+  bool destination_published = false;
+  std::optional<WindowsDisplacedOutput> displaced_output;
+  try {
+    temporary = create_exclusive_temporary(destination, output_directory.handle.get(), handle);
+    temporary_exists = true;
+    write_all(handle, contents, temporary);
+    if (FlushFileBuffers(handle) == 0) {
+      throw_file_error("failed to flush temporary calibration output", temporary,
+                       static_cast<int>(GetLastError()));
+    }
+    if (before_publish) {
+      before_publish();
+    }
+    if (const auto error = reco::calibrate::validate_calibration_output_identity(
+            left_input, right_input, destination, lens_profiles);
+        error.has_value()) {
+      throw std::runtime_error("refusing to publish calibration output: " + *error);
+    }
+    if (before_commit) {
+      before_commit();
+    }
+    left_reservation.verify_unchanged(left_input, "left video input");
+    right_reservation.verify_unchanged(right_input, "right video input");
+    for (std::size_t index = 0; index < profile_reservations.size(); ++index) {
+      profile_reservations[index].verify_unchanged(
+          lens_profiles[index], index == 0 ? "left lens profile" : "right lens profile");
+    }
+    if (const auto error = reco::calibrate::validate_calibration_output_identity(
+            left_input, right_input, destination, lens_profiles);
+        error.has_value()) {
+      throw std::runtime_error("refusing to publish calibration output: " + *error);
+    }
+    const auto temporary_name = temporary.filename().wstring();
+    publish_windows_output(output_directory.handle.get(), output_directory.resolved_path,
+                           destination_name, temporary_name, handle, destination,
+                           destination_published, displaced_output, before_windows_publish_replace);
+    temporary_exists = false;
+    destination_published = true;
+    const auto rollback_publication = [&]() noexcept {
+      if (!destination_published) {
+        return false;
+      }
+      try {
+        if (displaced_output.has_value()) {
+          if (!published_path_identifies_handle(output_directory.handle.get(), destination_name,
+                                                handle) ||
+              !relative_path_identifies_windows_handle(output_directory.handle.get(),
+                                                       displaced_output->name,
+                                                       displaced_output->handle.get(), true)) {
+            return false;
+          }
+          if (before_windows_rollback_replace) {
+            before_windows_rollback_replace(output_directory.resolved_path /
+                                             displaced_output->name);
+          }
+          if (!published_path_identifies_handle(output_directory.handle.get(), destination_name,
+                                                handle) ||
+              !relative_path_identifies_windows_handle(output_directory.handle.get(),
+                                                       displaced_output->name,
+                                                       displaced_output->handle.get(), true)) {
+            destination_published = published_path_identifies_handle(output_directory.handle.get(),
+                                                                     destination_name, handle);
+            return false;
+          }
+
+          rename_open_file(handle, output_directory.handle.get(), temporary_name, temporary, false,
+                           false);
+          destination_published = false;
+          temporary_exists = true;
+          try {
+            rename_open_file(displaced_output->handle.get(), output_directory.handle.get(),
+                             destination_name, destination, true, false);
+          } catch (...) {
+            try {
+              rename_open_file(handle, output_directory.handle.get(), destination_name, destination,
+                               false, false);
+              destination_published = true;
+              temporary_exists = false;
+            } catch (...) {
+              // Preserve both retained identities when another entry owns the destination.
+              temporary_exists = false;
+            }
+            return false;
+          }
+
+          const bool restored_displaced = relative_path_identifies_windows_handle(
+              output_directory.handle.get(), destination_name, displaced_output->handle.get(),
+              true);
+          const bool retained_published = relative_path_identifies_windows_handle(
+              output_directory.handle.get(), temporary_name, handle, false);
+          if (!restored_displaced || !retained_published) {
+            try {
+              if (restored_displaced) {
+                rename_open_file(displaced_output->handle.get(), output_directory.handle.get(),
+                                 displaced_output->name, destination, true, false);
+              }
+              if (retained_published) {
+                rename_open_file(handle, output_directory.handle.get(), destination_name,
+                                 destination, false, false);
+                destination_published = true;
+                temporary_exists = false;
+              }
+            } catch (...) {
+            }
+            return false;
+          }
+          displaced_output.reset();
+        } else {
+          rename_open_file(handle, output_directory.handle.get(), temporary_name, temporary, false,
+                           false);
+          temporary_exists = relative_path_identifies_windows_handle(output_directory.handle.get(),
+                                                                     temporary_name, handle, false);
+          destination_published = false;
+          if (!temporary_exists) {
+            return false;
+          }
+        }
+        return true;
+      } catch (...) {
+        return false;
+      }
+    };
+    try {
+      if (after_publish) {
+        after_publish();
+      }
+    } catch (...) {
+      if (!rollback_publication()) {
+        throw std::runtime_error(
+            "post-publication hook failed and calibration output rollback failed");
+      }
+      throw;
+    }
+    if (!published_path_identifies_handle(output_directory.handle.get(), destination_name,
+                                          handle)) {
+      const bool rolled_back = rollback_publication();
+      throw std::runtime_error(
+          rolled_back ? "published calibration output identity changed after publication"
+                      : "published calibration output identity changed after publication and "
+                        "calibration output rollback failed");
+    }
+    if (displaced_output.has_value()) {
+      if (!discard_open_file(displaced_output->handle.get())) {
+        if (!rollback_publication()) {
+          throw std::runtime_error(
+              "cannot remove displaced calibration output and rollback failed");
+        }
+        throw std::runtime_error("cannot remove displaced calibration output");
+      }
+      displaced_output.reset();
+    }
+    if (CloseHandle(handle) == 0) {
+      handle = INVALID_HANDLE_VALUE;
+      throw_file_error("failed to close calibration output", destination,
+                       static_cast<int>(GetLastError()));
+    }
+    handle = INVALID_HANDLE_VALUE;
+  } catch (...) {
+    if (!destination_published && displaced_output.has_value()) {
+      try {
+        rename_open_file(displaced_output->handle.get(), output_directory.handle.get(),
+                         destination_name, destination, true, false);
+        if (relative_path_identifies_windows_handle(output_directory.handle.get(), destination_name,
+                                                    displaced_output->handle.get(), true)) {
+          displaced_output.reset();
+        }
+      } catch (...) {
+        // A concurrent replacement owns the destination; retain the displaced output by name.
+      }
+    }
+    if (handle != INVALID_HANDLE_VALUE) {
+      const bool retained_temporary =
+          temporary_exists && !temporary.empty() &&
+          relative_path_identifies_windows_handle(output_directory.handle.get(),
+                                                  temporary.filename().wstring(), handle, false);
+      if (!destination_published && retained_temporary) {
+        (void)discard_open_file(handle);
+      }
+      (void)CloseHandle(handle);
+      handle = INVALID_HANDLE_VALUE;
+      temporary_exists = false;
+    }
+    throw;
+  }
+#elif defined(__linux__)
+  (void)before_windows_publish_replace;
+  (void)before_windows_rollback_replace;
+  const auto left_identity = pin_input_identity(left_input, "left video input");
+  const auto right_identity = pin_input_identity(right_input, "right video input");
+  std::vector<PinnedFileIdentity> profile_identities;
+  profile_identities.reserve(lens_profiles.size());
+  for (std::size_t index = 0; index < lens_profiles.size(); ++index) {
+    profile_identities.push_back(pin_input_identity(
+        lens_profiles[index], index == 0 ? "left lens profile" : "right lens profile"));
+  }
+  const auto parent =
+      destination.has_parent_path() ? destination.parent_path() : std::filesystem::path(".");
+  const auto destination_name = destination.filename().string();
+  if (destination_name.empty() || destination_name == "." || destination_name == "..") {
+    throw std::runtime_error("calibration output path must name a file: " + destination.string());
+  }
+  const int raw_directory_descriptor = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (raw_directory_descriptor < 0) {
+    throw_file_error("cannot open calibration output directory", parent, errno);
+  }
+  UniqueFileDescriptor directory_descriptor(raw_directory_descriptor);
+  struct stat directory_identity{};
+  if (::fstat(directory_descriptor.get(), &directory_identity) != 0) {
+    throw_file_error("cannot inspect calibration output directory", parent, errno);
+  }
+  if (!S_ISDIR(directory_identity.st_mode)) {
+    throw std::runtime_error("calibration output parent is not a directory: " + parent.string());
+  }
+  auto publication_lock =
+      lock_output_directory(directory_descriptor.get(), parent, on_lock_contention, lock_timeout);
+
+  TemporaryOutput temporary;
+  bool temporary_exists = false;
+  std::string publication_name;
+  bool publication_exists = false;
+  bool commit_hook_ran = false;
+  bool after_publish_hook_ran = false;
+  try {
+    temporary = create_exclusive_temporary_at(directory_descriptor.get(), destination);
+    temporary_exists = true;
+    const auto temporary_path = parent / temporary.name;
+    write_all(temporary.descriptor.get(), contents, temporary_path);
+    if (::fsync(temporary.descriptor.get()) != 0) {
+      throw_file_error("failed to flush temporary calibration output", temporary_path, errno);
+    }
+    if (before_publish) {
+      before_publish();
+    }
+    if (!temporary_name_identifies_descriptor(directory_descriptor.get(), temporary.name,
+                                              temporary.descriptor.get())) {
+      temporary_exists = false;
+      throw std::runtime_error(
+          "refusing to publish calibration output: temporary output identity changed");
+    }
+    if (const auto error =
+            validate_pinned_output_identity(directory_descriptor.get(), destination_name,
+                                            left_identity, right_identity, profile_identities);
+        error.has_value()) {
+      throw std::runtime_error("refusing to publish calibration output: " + *error);
+    }
+
+    const auto run_commit_hook = [&] {
+      if (!commit_hook_ran && before_commit) {
+        before_commit();
+      }
+      commit_hook_ran = true;
+      if (const auto error =
+              validate_pinned_output_identity(directory_descriptor.get(), destination_name,
+                                              left_identity, right_identity, profile_identities);
+          error.has_value()) {
+        throw std::runtime_error("refusing to publish calibration output: " + *error);
+      }
+    };
+    const auto validate_published_or_rollback = [&](auto&& rollback) {
+      try {
+        if (const auto error =
+                validate_pinned_output_identity(directory_descriptor.get(), destination_name,
+                                                left_identity, right_identity, profile_identities);
+            error.has_value()) {
+          throw std::runtime_error("refusing to publish calibration output: " + *error);
+        }
+      } catch (...) {
+        if (!std::forward<decltype(rollback)>(rollback)()) {
+          throw std::runtime_error(
+              "refusing to publish calibration output: post-publication validation failed and "
+              "rollback failed");
+        }
+        throw;
+      }
+    };
+    const auto run_after_publish_hook = [&] {
+      if (!after_publish_hook_ran && after_publish) {
+        after_publish();
+      }
+      after_publish_hook_ran = true;
+    };
+    const auto run_after_publish_or_rollback = [&](const auto& rollback) {
+      try {
+        run_after_publish_hook();
+      } catch (...) {
+        if (!rollback()) {
+          throw std::runtime_error(
+              "post-publication hook failed and calibration output rollback failed");
+        }
+        throw;
+      }
+    };
+    bool published = false;
+    bool use_rename_fallback = force_rename_fallback;
+    bool destination_exists =
+        directory_entry_exists_at(directory_descriptor.get(), destination_name);
+
+    if (!destination_exists && !use_rename_fallback) {
+      const auto retention = create_descriptor_publication_link_at(
+          directory_descriptor.get(), destination, temporary.descriptor.get(), false);
+      if (!retention.has_value()) {
+        use_rename_fallback = true;
+      } else {
+        publication_name = *retention;
+        publication_exists = true;
+        run_commit_hook();
+        const auto status = link_descriptor_at(directory_descriptor.get(), destination_name,
+                                               temporary.descriptor.get(), false);
+        if (status == DescriptorLinkStatus::Linked) {
+          published = temporary_name_identifies_descriptor(
+              directory_descriptor.get(), destination_name, temporary.descriptor.get());
+          if (!published) {
+            throw std::runtime_error(
+                "refusing to publish calibration output: published output identity changed");
+          }
+          const auto rollback_link_if_unchanged = [&] {
+            return unlink_descriptor_entry_safely(directory_descriptor.get(), destination_name,
+                                                  temporary.descriptor.get(), destination);
+          };
+          run_after_publish_or_rollback(rollback_link_if_unchanged);
+          validate_published_or_rollback(rollback_link_if_unchanged);
+          if (temporary_name_identifies_descriptor(directory_descriptor.get(), publication_name,
+                                                   temporary.descriptor.get())) {
+            if (!unlink_descriptor_entry_safely(directory_descriptor.get(), publication_name,
+                                                temporary.descriptor.get(), destination)) {
+              throw_file_error("failed to remove calibration output retention link", destination,
+                               EBUSY);
+            }
+          }
+          publication_exists = false;
+        } else if (status == DescriptorLinkStatus::AlreadyExists) {
+          destination_exists = true;
+        } else {
+          use_rename_fallback = true;
+        }
+      }
+    }
+
+    if (!published && !use_rename_fallback) {
+      if (publication_name.empty()) {
+        const auto publication = create_descriptor_publication_link_at(
+            directory_descriptor.get(), destination, temporary.descriptor.get(), false);
+        if (!publication.has_value()) {
+          use_rename_fallback = true;
+        } else {
+          publication_name = *publication;
+          publication_exists = true;
+        }
+      }
+      if (!use_rename_fallback) {
+        run_commit_hook();
+        if (!temporary_name_identifies_descriptor(directory_descriptor.get(), publication_name,
+                                                  temporary.descriptor.get())) {
+          publication_exists = false;
+          throw std::runtime_error(
+              "refusing to publish calibration output: descriptor-bound output identity changed "
+              "before exchange");
+        }
+        const auto displaced_snapshot =
+            capture_directory_entry_snapshot(directory_descriptor.get(), destination_name);
+        exchange_directory_entries_at(directory_descriptor.get(), publication_name,
+                                      destination_name, destination);
+        const auto rollback_exchange_if_unchanged = [&] {
+          const bool rolled_back = rollback_exchanged_directory_entries_safely(
+              directory_descriptor.get(), destination_name, temporary.descriptor.get(),
+              publication_name, displaced_snapshot, destination);
+          publication_exists = temporary_name_identifies_descriptor(
+              directory_descriptor.get(), publication_name, temporary.descriptor.get());
+          return rolled_back;
+        };
+        run_after_publish_or_rollback(rollback_exchange_if_unchanged);
+        if (!temporary_name_identifies_descriptor(directory_descriptor.get(), destination_name,
+                                                  temporary.descriptor.get()) ||
+            !directory_entry_matches_snapshot(directory_descriptor.get(), publication_name,
+                                              displaced_snapshot)) {
+          publication_exists = temporary_name_identifies_descriptor(
+              directory_descriptor.get(), publication_name, temporary.descriptor.get());
+          throw std::runtime_error(
+              "refusing to publish calibration output: exchanged output identity changed; "
+              "rollback refused");
+        }
+        if (const auto error =
+                displaced_output_removal_error(directory_descriptor.get(), publication_name,
+                                               left_identity, right_identity, profile_identities);
+            error.has_value()) {
+          const bool rolled_back = rollback_exchange_if_unchanged();
+          if (!rolled_back) {
+            throw std::runtime_error("refusing to publish calibration output: " + *error +
+                                     " and rollback failed");
+          }
+          throw std::runtime_error("refusing to publish calibration output: " + *error);
+        }
+        validate_published_or_rollback([&] { return rollback_exchange_if_unchanged(); });
+        if (!unlink_directory_entry_if_unchanged(directory_descriptor.get(), publication_name,
+                                                 displaced_snapshot, destination)) {
+          const bool rolled_back = rollback_exchange_if_unchanged();
+          throw std::runtime_error(
+              rolled_back
+                  ? "failed to remove unchanged displaced calibration output"
+                  : "displaced calibration output changed before removal; rollback refused");
+        }
+        publication_exists = false;
+        published = true;
+      }
+    }
+
+    if (!published && use_rename_fallback) {
+      run_commit_hook();
+      if (!temporary_name_identifies_descriptor(directory_descriptor.get(), temporary.name,
+                                                temporary.descriptor.get())) {
+        temporary_exists = false;
+        throw std::runtime_error(
+            "refusing to publish calibration output: fallback output identity changed before "
+            "exchange");
+      }
+      bool exchanged = destination_exists;
+      std::optional<DirectoryEntrySnapshot> displaced_snapshot;
+      if (exchanged) {
+        displaced_snapshot =
+            capture_directory_entry_snapshot(directory_descriptor.get(), destination_name);
+        exchange_directory_entries_at(directory_descriptor.get(), temporary.name, destination_name,
+                                      destination);
+      } else if (!rename_directory_entry_noreplace_at(directory_descriptor.get(), temporary.name,
+                                                      destination_name, destination)) {
+        exchanged = true;
+        displaced_snapshot =
+            capture_directory_entry_snapshot(directory_descriptor.get(), destination_name);
+        exchange_directory_entries_at(directory_descriptor.get(), temporary.name, destination_name,
+                                      destination);
+      }
+      const auto rollback_fallback_if_unchanged = [&] {
+        bool rolled_back = false;
+        if (exchanged) {
+          if (!displaced_snapshot.has_value()) {
+            return false;
+          }
+          rolled_back = rollback_exchanged_directory_entries_safely(
+              directory_descriptor.get(), destination_name, temporary.descriptor.get(),
+              temporary.name, *displaced_snapshot, destination);
+        } else {
+          rolled_back = rollback_new_directory_entry_safely(
+              directory_descriptor.get(), destination_name, temporary.name,
+              temporary.descriptor.get(), destination);
+        }
+        temporary_exists = temporary_name_identifies_descriptor(
+            directory_descriptor.get(), temporary.name, temporary.descriptor.get());
+        return rolled_back;
+      };
+      run_after_publish_or_rollback(rollback_fallback_if_unchanged);
+      if (!temporary_name_identifies_descriptor(directory_descriptor.get(), destination_name,
+                                                temporary.descriptor.get()) ||
+          (exchanged && (!displaced_snapshot.has_value() ||
+                         !directory_entry_matches_snapshot(directory_descriptor.get(),
+                                                           temporary.name, *displaced_snapshot)))) {
+        throw std::runtime_error(
+            "refusing to publish calibration output: fallback output identity changed; rollback "
+            "refused");
+      }
+      if (exchanged) {
+        if (const auto error =
+                displaced_output_removal_error(directory_descriptor.get(), temporary.name,
+                                               left_identity, right_identity, profile_identities);
+            error.has_value()) {
+          const bool rolled_back = rollback_fallback_if_unchanged();
+          if (!rolled_back) {
+            throw std::runtime_error("refusing to publish calibration output: " + *error +
+                                     " and rollback failed");
+          }
+          throw std::runtime_error("refusing to publish calibration output: " + *error);
+        }
+      }
+      validate_published_or_rollback([&] { return rollback_fallback_if_unchanged(); });
+      if (exchanged &&
+          !unlink_directory_entry_if_unchanged(directory_descriptor.get(), temporary.name,
+                                               *displaced_snapshot, destination)) {
+        const bool rolled_back = rollback_fallback_if_unchanged();
+        throw std::runtime_error(
+            rolled_back ? "failed to remove unchanged displaced calibration output"
+                        : "displaced calibration output changed before removal; rollback refused");
+      }
+      temporary_exists = false;
+      published = true;
+    }
+
+    if (temporary_exists) {
+      (void)unlink_descriptor_entry_safely(directory_descriptor.get(), temporary.name,
+                                           temporary.descriptor.get(), destination);
+    }
+    temporary_exists = false;
+    temporary.descriptor.close_checked(destination);
+    if (::fsync(directory_descriptor.get()) != 0) {
+      throw_file_error("failed to flush calibration output directory", parent, errno);
+    }
+  } catch (...) {
+    if (publication_exists) {
+      (void)unlink_descriptor_entry_safely(directory_descriptor.get(), publication_name,
+                                           temporary.descriptor.get(), destination);
+    }
+    if (temporary_exists) {
+      (void)unlink_descriptor_entry_safely(directory_descriptor.get(), temporary.name,
+                                           temporary.descriptor.get(), destination);
+    }
+    throw;
+  }
+#else
+  (void)before_windows_publish_replace;
+  (void)before_windows_rollback_replace;
+  (void)force_rename_fallback;
+#if !defined(__APPLE__)
+  (void)after_publish;
+  (void)on_lock_contention;
+  (void)lock_timeout;
+#endif
+  const auto left_identity = pin_posix_path_for_publication(left_input, "left video input");
+  const auto right_identity = pin_posix_path_for_publication(right_input, "right video input");
+  std::vector<PinnedPosixPath> profile_identities;
+  profile_identities.reserve(lens_profiles.size());
+  for (std::size_t index = 0; index < lens_profiles.size(); ++index) {
+    profile_identities.push_back(pin_posix_path_for_publication(
+        lens_profiles[index], index == 0 ? "left lens profile" : "right lens profile"));
+  }
+#if !defined(__APPLE__)
+  static std::mutex publication_mutex;
+  std::lock_guard publication_lock(publication_mutex);
+#endif
+#if defined(__APPLE__)
+  const auto parent =
+      destination.has_parent_path() ? destination.parent_path() : std::filesystem::path(".");
+  const auto destination_name = destination.filename().string();
+  if (destination_name.empty() || destination_name == "." || destination_name == "..") {
+    throw std::runtime_error("calibration output path must name a file: " + destination.string());
+  }
+  auto output_directory =
+      lock_posix_output_directory(destination, on_lock_contention, lock_timeout);
+  std::string temporary_name;
+#endif
+  int descriptor = -1;
+  std::filesystem::path temporary;
+  bool temporary_exists = false;
+#if defined(__APPLE__)
+  bool destination_exchanged = false;
+  std::optional<PosixDirectoryEntrySnapshot> displaced_output_snapshot;
+#else
+  bool destination_link_exists = false;
+#endif
+  try {
+#if defined(__APPLE__)
+    temporary_name = create_exclusive_temporary_at(output_directory.get(), destination, descriptor);
+    temporary = parent / temporary_name;
+#else
+    temporary = create_exclusive_temporary(destination, descriptor);
+#endif
+    temporary_exists = true;
+    write_all(descriptor, contents, temporary);
+    if (::fsync(descriptor) != 0) {
+      throw_file_error("failed to flush temporary calibration output", temporary, errno);
+    }
+    if (before_publish) {
+      before_publish();
+    }
+#if defined(__APPLE__)
+    if (const auto error = validate_pinned_posix_output_identity_at(
+            output_directory.get(), destination_name, left_identity, right_identity,
+            profile_identities);
+#else
+    if (const auto error = reco::calibrate::validate_calibration_output_identity(
+            left_input, right_input, destination, lens_profiles);
+#endif
+        error.has_value()) {
+      throw std::runtime_error("refusing to publish calibration output: " + *error);
+    }
+    if (before_commit) {
+      before_commit();
+    }
+    left_identity.verify_unchanged();
+    right_identity.verify_unchanged();
+    for (const auto& profile : profile_identities) {
+      profile.verify_unchanged();
+    }
+#if defined(__APPLE__)
+    if (const auto error = validate_pinned_posix_output_identity_at(
+            output_directory.get(), destination_name, left_identity, right_identity,
+            profile_identities);
+        error.has_value()) {
+      throw std::runtime_error("refusing to publish calibration output: " + *error);
+    }
+    if (!path_identifies_descriptor_at(output_directory.get(), temporary_name, descriptor)) {
+#else
+    if (!path_identifies_descriptor(temporary, descriptor)) {
+#endif
+      temporary_exists = false;
+      throw std::runtime_error(
+          "refusing to publish calibration output: temporary output identity changed");
+    }
+#if defined(__APPLE__)
+    if (::renameatx_np(output_directory.get(), temporary_name.c_str(), output_directory.get(),
+                       destination_name.c_str(), RENAME_EXCL) == 0) {
+      temporary_exists = false;
+      const auto rollback_new_output = [&] {
+        const bool rolled_back = rollback_new_posix_directory_entry_safely(
+            output_directory.get(), destination_name, temporary_name, descriptor, destination);
+        temporary_exists = rolled_back && path_identifies_descriptor_at(output_directory.get(),
+                                                                        temporary_name, descriptor);
+        return rolled_back;
+      };
+      try {
+        if (after_publish) {
+          after_publish();
+        }
+      } catch (...) {
+        if (!rollback_new_output()) {
+          throw std::runtime_error(
+              "post-publication hook failed and calibration output rollback failed");
+        }
+        throw;
+      }
+      if (!path_identifies_descriptor_at(output_directory.get(), destination_name, descriptor)) {
+        const bool rolled_back = rollback_new_output();
+        throw std::runtime_error(
+            rolled_back
+                ? "refusing to publish calibration output: published output identity changed"
+                : "refusing to publish calibration output: published output identity changed and "
+                  "rollback failed");
+      }
+      try {
+        if (const auto error = validate_pinned_posix_output_identity_at(
+                output_directory.get(), destination_name, left_identity, right_identity,
+                profile_identities);
+            error.has_value()) {
+          throw std::runtime_error("refusing to publish calibration output: " + *error);
+        }
+      } catch (...) {
+        if (!rollback_new_output()) {
+          throw std::runtime_error(
+              "refusing to publish calibration output: post-publication validation failed and "
+              "rollback failed");
+        }
+        throw;
+      }
+    } else if (errno == EEXIST) {
+      displaced_output_snapshot =
+          capture_posix_directory_entry_snapshot(output_directory.get(), destination_name);
+      if (::renameatx_np(output_directory.get(), temporary_name.c_str(), output_directory.get(),
+                         destination_name.c_str(), RENAME_SWAP) != 0) {
+        throw_file_error("failed to exchange calibration output", destination, errno);
+      }
+      destination_exchanged = true;
+      const auto rollback_exchange_if_unchanged = [&] {
+        const bool rolled_back = rollback_exchanged_posix_directory_entries_safely(
+            output_directory.get(), destination_name, descriptor, temporary_name,
+            *displaced_output_snapshot, destination);
+        destination_exchanged = !rolled_back;
+        temporary_exists = rolled_back && path_identifies_descriptor_at(output_directory.get(),
+                                                                        temporary_name, descriptor);
+        return rolled_back;
+      };
+      try {
+        if (after_publish) {
+          after_publish();
+        }
+      } catch (...) {
+        if (!rollback_exchange_if_unchanged()) {
+          throw std::runtime_error(
+              "post-publication hook failed and calibration output rollback failed");
+        }
+        throw;
+      }
+      if (!path_identifies_descriptor_at(output_directory.get(), destination_name, descriptor) ||
+          !posix_directory_entry_matches_snapshot(output_directory.get(), temporary_name,
+                                                  *displaced_output_snapshot)) {
+        throw std::runtime_error(
+            "refusing to publish calibration output: exchanged output identity changed; rollback "
+            "refused");
+      }
+      if (const auto error = displaced_posix_output_removal_error_at(
+              output_directory.get(), temporary_name, left_identity, right_identity,
+              profile_identities);
+          error.has_value()) {
+        const bool rolled_back = rollback_exchange_if_unchanged();
+        throw std::runtime_error("refusing to publish calibration output: " + *error +
+                                 (rolled_back ? "" : " and rollback failed"));
+      }
+      try {
+        if (const auto error = validate_pinned_posix_output_identity_at(
+                output_directory.get(), destination_name, left_identity, right_identity,
+                profile_identities);
+            error.has_value()) {
+          throw std::runtime_error("refusing to publish calibration output: " + *error);
+        }
+      } catch (...) {
+        if (!rollback_exchange_if_unchanged()) {
+          throw std::runtime_error(
+              "refusing to publish calibration output: post-publication validation failed and "
+              "rollback failed");
+        }
+        throw;
+      }
+      if (!unlink_posix_directory_entry_if_unchanged(output_directory.get(), temporary_name,
+                                                     *displaced_output_snapshot, destination)) {
+        const bool rolled_back = rollback_exchange_if_unchanged();
+        throw std::runtime_error(
+            rolled_back ? "failed to remove unchanged displaced calibration output"
+                        : "displaced calibration output changed before removal; rollback refused");
+      }
+      temporary_exists = false;
+      destination_exchanged = false;
+      displaced_output_snapshot.reset();
+    } else {
+      throw_file_error("failed to publish calibration output", destination, errno);
+    }
+#else
+    if (::link(temporary.c_str(), destination.c_str()) != 0) {
+      if (errno == EEXIST) {
+        throw std::runtime_error(
+            "atomic calibration output replacement is unavailable on this POSIX platform");
+      }
+      throw_file_error("failed to publish calibration output", destination, errno);
+    }
+    destination_link_exists = true;
+    if (!path_identifies_descriptor(destination, descriptor)) {
+      throw std::runtime_error(
+          "refusing to publish calibration output: published output identity changed");
+    }
+    if (::unlink(temporary.c_str()) != 0) {
+      throw_file_error("failed to remove temporary calibration output", temporary, errno);
+    }
+    temporary_exists = false;
+    destination_link_exists = false;
+#endif
+    const auto close_result = ::close(descriptor);
+    descriptor = -1;
+    if (close_result != 0) {
+      throw_file_error("failed to close calibration output", destination, errno);
+    }
+  } catch (...) {
+#if defined(__APPLE__)
+    if (destination_exchanged) {
+      if (displaced_output_snapshot.has_value() &&
+          rollback_exchanged_posix_directory_entries_safely(
+              output_directory.get(), destination_name, descriptor, temporary_name,
+              *displaced_output_snapshot, destination)) {
+        destination_exchanged = false;
+        temporary_exists =
+            path_identifies_descriptor_at(output_directory.get(), temporary_name, descriptor);
+      }
+    }
+    if (temporary_exists) {
+      (void)unlink_posix_descriptor_entry_safely(output_directory.get(), temporary_name, descriptor,
+                                                 destination);
+    }
+#else
+    if (destination_link_exists && path_identifies_descriptor(destination, descriptor)) {
+      (void)::unlink(destination.c_str());
+    }
+    if (temporary_exists && path_identifies_descriptor(temporary, descriptor)) {
+      (void)::unlink(temporary.c_str());
+    }
+#endif
+    if (descriptor >= 0) {
+      ::close(descriptor);
+    }
+    throw;
+  }
+#endif
+}
+
+void write_calibration_result(const reco::calibrate::CalibrationResult& result,
+                              const reco::calibrate::GpuCalibrationRequest& request,
+                              const std::function<void()>& before_publish = {}) {
+  const auto json = reco::core::calibration_to_json(result.calibration);
+  const auto reparsed = reco::core::parse_match_calibration_json(json);
+  if (!reparsed.has_value() || !reparsed->validate().empty()) {
+    throw std::runtime_error("calibration result failed serialization validation");
+  }
+
+  const auto& left_path =
+      request.left.retained_path.has_value() ? *request.left.retained_path : request.left.path;
+  const auto& right_path =
+      request.right.retained_path.has_value() ? *request.right.retained_path : request.right.path;
+  std::vector<std::filesystem::path> profiles;
+  if (request.left.lens_profile.has_value()) {
+    profiles.push_back(reco::core::path_from_utf8(*request.left.lens_profile));
+  }
+  if (request.right.lens_profile.has_value()) {
+    profiles.push_back(reco::core::path_from_utf8(*request.right.lens_profile));
+  }
+  detail::write_calibration_json_atomically(
+      json, reco::core::path_from_utf8(request.output), reco::core::path_from_utf8(left_path),
+      reco::core::path_from_utf8(right_path), before_publish, profiles);
+}
+
+void write_calibration_result_summary(const reco::calibrate::CalibrationResult& result,
+                                      const std::string& output_path, std::ostream& out) {
+  out << "Calibration result:\n"
+      << "  output: " << output_path << '\n'
+      << "  frames used: " << result.frames_used << '\n'
+      << "  total matches: " << result.total_matches << '\n'
+      << "  confidence: " << result.confidence * 100.0 << "%\n"
+      << "  residual error: " << result.residual_error << '\n';
+  if (result.quality.has_value()) {
+    out << "  mean reprojection error: " << result.quality->mean_reprojection_error << '\n'
+        << "  trimmed reprojection error: " << result.quality->trimmed_reprojection_error << '\n'
+        << "  angular error: " << result.quality->angular_error << '\n';
+  }
+  for (std::size_t index = 0; index < result.per_frame.size(); ++index) {
+    const auto& frame = result.per_frame[index];
+    out << "  frame " << index << ": keypoints " << frame.keypoints_left << "/"
+        << frame.keypoints_right << ", matches " << frame.post_ratio_test << " -> "
+        << frame.post_spatial_filter << " -> " << frame.post_ransac << '\n';
+  }
+}
 
 template <typename T>
 std::variant<T, ParseError> parse_integral(std::string_view value, std::string_view name) {
@@ -220,7 +3127,8 @@ RuntimePlan build_stitch_plan(const StitchCommand& command,
     return plan;
   }
   plan.steps.push_back("run stitch renderer without CPU frame readback");
-  plan.steps.push_back("encode the stitched output through the GPU-capable video backend");
+  plan.steps.push_back("encode the stitched output through the GPU-capable video backend to " +
+                       command.output);
   if (command.no_zero_copy) {
     plan.blocked_reason =
         "C++ stitch does not support --no-zero-copy because it would force a CPU path";
@@ -978,6 +3886,36 @@ std::variant<CalibrateCommand, ParseError> parse_calibrate(Cursor& cursor) {
 
 } // namespace
 
+namespace detail {
+
+std::optional<std::filesystem::path>
+resolve_video_probe_worker(const std::filesystem::path& executable_path) {
+  return resolve_video_probe_worker_impl(executable_path);
+}
+
+std::optional<std::filesystem::path>
+resolve_calibration_worker(const std::filesystem::path& executable_path) {
+  return resolve_calibration_worker_impl(executable_path);
+}
+
+void write_calibration_json_atomically(
+    std::string_view json, const std::filesystem::path& destination,
+    const std::filesystem::path& left_input, const std::filesystem::path& right_input,
+    const std::function<void()>& before_publish,
+    std::span<const std::filesystem::path> lens_profiles,
+    const std::function<void()>& before_commit, bool force_rename_fallback,
+    const std::function<void()>& after_publish, const std::function<void()>& on_lock_contention,
+    std::chrono::milliseconds lock_timeout,
+    const std::function<void(const std::filesystem::path&)>& before_windows_publish_replace,
+    const std::function<void(const std::filesystem::path&)>& before_windows_rollback_replace) {
+  write_calibration_json_atomically_impl(
+      json, destination, left_input, right_input, before_publish, lens_profiles, before_commit,
+      force_rename_fallback, after_publish, on_lock_contention, lock_timeout,
+      before_windows_publish_replace, before_windows_rollback_replace);
+}
+
+} // namespace detail
+
 std::variant<float, ParseError> parse_blend(std::string_view value) {
   auto parsed = parse_float(value, "blend");
   if (const auto* error = std::get_if<ParseError>(&parsed)) {
@@ -1112,13 +4050,15 @@ std::string help_text() {
          "  reco preview LEFT RIGHT -c CALIBRATION [options]\n"
          "  reco camera --left-device DEV --right-device DEV -c CALIBRATION -o OUTPUT [options]\n"
          "  reco libcamera -c CALIBRATION -o OUTPUT [options]\n"
-         "  reco calibrate LEFT RIGHT [options]\n"
+         "  reco calibrate LEFT RIGHT --left-profile PROFILE --no-auto-sync --no-auto-imu "
+         "[options]\n"
          "  reco gopro [options]\n"
          "  reco info\n\n"
          "Runtime command execution is staged behind the remaining GPU/backend ports.";
 }
 
-int run_command(const Command& command, std::ostream& out, std::ostream& err) {
+int run_command(const Command& command, std::ostream& out, std::ostream& err,
+                const std::filesystem::path& executable_path) {
   if (std::holds_alternative<HelpCommand>(command)) {
     out << help_text() << '\n';
     return 0;
@@ -1197,6 +4137,21 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err) {
     request.manual_sync_offset = calibrate->sync_offset;
     request.debug_dir = calibrate->debug_dir;
     request.output = calibrate->output;
+    if (const auto probe_worker = detail::resolve_video_probe_worker(executable_path);
+        probe_worker.has_value()) {
+      request.probe_worker = reco::core::path_to_utf8(*probe_worker);
+    }
+    if (const auto calibration_worker = detail::resolve_calibration_worker(executable_path);
+        calibration_worker.has_value()) {
+      request.calibration_worker_path = reco::core::path_to_utf8(*calibration_worker);
+    }
+
+    try {
+      request.nvbufsurface_abi = reco::io::discover_nvbufsurface_abi();
+    } catch (const std::exception& error) {
+      err << "error: cannot discover the installed NvBufSurface ABI: " << error.what() << '\n';
+      return 2;
+    }
 
     const auto backends = reco::calibrate::probe_calibration_backends();
     const auto plan = reco::calibrate::build_gpu_calibration_plan(request, backends);
@@ -1208,8 +4163,63 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err) {
     }
 
     try {
-      (void)reco::calibrate::run_gpu_calibration(request, backends);
-    } catch (const reco::calibrate::CalibrationExecutionError& error) {
+#if defined(__linux__)
+      const auto left_identity = pin_input_identity(request.left.path, "left video input");
+      const auto right_identity = pin_input_identity(request.right.path, "right video input");
+      std::optional<PinnedFileIdentity> left_profile_identity;
+      std::optional<PinnedFileIdentity> right_profile_identity;
+      if (request.left.lens_profile.has_value()) {
+        left_profile_identity.emplace(
+            pin_input_identity(*request.left.lens_profile, "left lens profile"));
+      }
+      if (request.right.lens_profile.has_value()) {
+        right_profile_identity.emplace(
+            pin_input_identity(*request.right.lens_profile, "right lens profile"));
+      }
+      auto pinned_request = request;
+      pinned_request.left.retained_path = left_identity.retained_path().string();
+      pinned_request.right.retained_path = right_identity.retained_path().string();
+      pinned_request.left.expected_identity = left_identity.portable_identity();
+      pinned_request.right.expected_identity = right_identity.portable_identity();
+      if (left_profile_identity.has_value()) {
+        pinned_request.left.lens_profile = left_profile_identity->retained_path().string();
+        pinned_request.left.lens_profile_expected_identity =
+            left_profile_identity->portable_identity();
+      }
+      if (right_profile_identity.has_value()) {
+        pinned_request.right.lens_profile = right_profile_identity->retained_path().string();
+        pinned_request.right.lens_profile_expected_identity =
+            right_profile_identity->portable_identity();
+      }
+      auto result = reco::calibrate::run_gpu_calibration(pinned_request, backends);
+      if (result.left_lens_profile.has_value()) {
+        result.left_lens_profile->path = request.left.lens_profile;
+      }
+      if (result.right_lens_profile.has_value()) {
+        result.right_lens_profile->path = request.right.lens_profile.has_value()
+                                              ? request.right.lens_profile
+                                              : request.left.lens_profile;
+      }
+      const auto verify_pinned_inputs = [&] {
+        left_identity.verify_unchanged();
+        right_identity.verify_unchanged();
+        if (left_profile_identity.has_value()) {
+          left_profile_identity->verify_unchanged();
+        }
+        if (right_profile_identity.has_value()) {
+          right_profile_identity->verify_unchanged();
+        }
+      };
+      verify_pinned_inputs();
+      // Publish against the original user-visible entries while the descriptors used by the
+      // worker remain pinned. This preserves both symlink and target identities through commit.
+      write_calibration_result(result, request, verify_pinned_inputs);
+#else
+      const auto result = reco::calibrate::run_gpu_calibration(request, backends);
+      write_calibration_result(result, request);
+#endif
+      write_calibration_result_summary(result, request.output, out);
+    } catch (const std::exception& error) {
       err << "error: " << error.what() << '\n';
       return 2;
     }

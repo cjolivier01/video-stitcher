@@ -1,5 +1,8 @@
 #include "reco/detect/ncnn_session.hpp"
 
+#include "reco/core/path.hpp"
+#include "reco/core/windows_runtime_library.hpp"
+
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -43,9 +46,9 @@ using NcnnMatGetChannelData = void*(RECO_NCNN_CALL*)(const void*, int);
 
 class DynamicLibrary {
 public:
-  explicit DynamicLibrary(const std::filesystem::path& path) : path_(path.string()) {
+  explicit DynamicLibrary(const std::filesystem::path& path) : path_(core::path_to_utf8(path)) {
 #if defined(_WIN32)
-    handle_ = LoadLibraryA(path_.c_str());
+    handle_ = static_cast<HMODULE>(core::detail::load_windows_runtime_library(path));
 #else
     handle_ = dlopen(path_.c_str(), RTLD_NOW | RTLD_LOCAL);
 #endif
@@ -109,15 +112,10 @@ struct NcnnApi {
 };
 
 std::filesystem::path getenv_path(const char* name) {
-  if (const char* value = std::getenv(name); value != nullptr && value[0] != '\0') {
-    return std::filesystem::path(value);
-  }
-  return {};
+  return core::path_from_environment(name).value_or(std::filesystem::path{});
 }
 
-bool contains_nul(std::string_view value) {
-  return value.find('\0') != std::string_view::npos;
-}
+bool contains_nul(std::string_view value) { return value.find('\0') != std::string_view::npos; }
 
 const NcnnApi& ncnn_api() {
   static const NcnnApi api = [] {
@@ -149,11 +147,9 @@ const NcnnApi& ncnn_api() {
         .option_set_use_vulkan_compute =
             pinned_library->symbol<NcnnOptionSetInt>("ncnn_option_set_use_vulkan_compute"),
         .extractor_create = pinned_library->symbol<NcnnExtractorCreate>("ncnn_extractor_create"),
-        .extractor_destroy =
-            pinned_library->symbol<NcnnExtractorDestroy>("ncnn_extractor_destroy"),
+        .extractor_destroy = pinned_library->symbol<NcnnExtractorDestroy>("ncnn_extractor_destroy"),
         .extractor_input = pinned_library->symbol<NcnnExtractorInput>("ncnn_extractor_input"),
-        .extractor_extract =
-            pinned_library->symbol<NcnnExtractorExtract>("ncnn_extractor_extract"),
+        .extractor_extract = pinned_library->symbol<NcnnExtractorExtract>("ncnn_extractor_extract"),
         .mat_create_3d = pinned_library->symbol<NcnnMatCreate3d>("ncnn_mat_create_3d"),
         .mat_destroy = pinned_library->symbol<NcnnMatDestroy>("ncnn_mat_destroy"),
         .mat_get_w = pinned_library->symbol<NcnnMatGetInt>("ncnn_mat_get_w"),
@@ -203,8 +199,8 @@ private:
 } // namespace
 
 struct NcnnSession::Impl {
-  explicit Impl(NcnnSessionConfig config) : input_name(std::move(config.input_name)),
-                                            output_name(std::move(config.output_name)) {
+  explicit Impl(NcnnSessionConfig config)
+      : input_name(std::move(config.input_name)), output_name(std::move(config.output_name)) {
     if (config.num_threads <= 0) {
       throw NcnnError("NCNN num_threads must be positive");
     }
@@ -293,8 +289,8 @@ NcnnTensorOutput NcnnSession::run_preprocessed_chw(std::span<const float> input,
     throw NcnnError("NCNN input element count exceeds C API limit");
   }
   const auto& api = ncnn_api();
-  MatHandle input_mat(api.mat_create_3d(static_cast<int>(input_size), static_cast<int>(input_size),
-                                        3, nullptr));
+  MatHandle input_mat(
+      api.mat_create_3d(static_cast<int>(input_size), static_cast<int>(input_size), 3, nullptr));
   if (input_mat.get() == nullptr) {
     throw NcnnError("failed to create NCNN input mat");
   }
@@ -304,8 +300,7 @@ NcnnTensorOutput NcnnSession::run_preprocessed_chw(std::span<const float> input,
     throw NcnnError("NCNN input mat channel step is smaller than one plane");
   }
   for (int channel = 0; channel < 3; ++channel) {
-    auto* channel_data =
-        static_cast<float*>(api.mat_get_channel_data(input_mat.get(), channel));
+    auto* channel_data = static_cast<float*>(api.mat_get_channel_data(input_mat.get(), channel));
     if (channel_data == nullptr) {
       throw NcnnError("NCNN input mat channel data pointer is null");
     }
