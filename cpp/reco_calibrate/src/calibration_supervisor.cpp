@@ -430,6 +430,11 @@ private:
   return configured != nullptr && std::string_view(configured) == point;
 }
 
+[[nodiscard]] bool inject_stable_parent_failure(std::string_view point) noexcept {
+  const char* configured = std::getenv("RECO_FAKE_CALIBRATION_STABLE_PARENT_FAILURE");
+  return configured != nullptr && point == configured;
+}
+
 [[nodiscard]] std::uint64_t time_point_nanoseconds(Clock::time_point value) {
   const auto count =
       std::chrono::duration_cast<std::chrono::nanoseconds>(value.time_since_epoch()).count();
@@ -3546,13 +3551,16 @@ template <typename Child>
     try {
       auto process = clone_process(flags, std::move(child), -1, cleanup_deadline);
       pid = process.pid();
-      authority = process.release_pidfd();
-      monitor = ::fcntl(authority, F_DUPFD_CLOEXEC, 3);
+      if (inject_stable_parent_failure("pidfd-duplicate")) {
+        errno = EMFILE;
+      } else {
+        monitor = ::fcntl(process.pidfd(), F_DUPFD_CLOEXEC, 3);
+      }
       if (monitor < 0) {
-        signal_pidfd_noexcept(authority, SIGKILL);
-        (void)::close(authority);
-        authority = -1;
+        signal_pidfd_noexcept(process.pidfd(), SIGKILL);
         pid = -1;
+      } else {
+        authority = process.release_pidfd();
       }
     } catch (...) {
       pid = -1;

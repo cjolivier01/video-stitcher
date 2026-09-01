@@ -1,5 +1,7 @@
 #include "reco/io/gpu_decode.hpp"
 
+#include "reco/core/windows_runtime_library.hpp"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -112,7 +114,7 @@ class DynamicLibrary {
 public:
   explicit DynamicLibrary(std::string path) : path_(std::move(path)) {
 #if defined(_WIN32)
-    handle_ = LoadLibraryA(path_.c_str());
+    handle_ = static_cast<HMODULE>(core::detail::load_windows_runtime_library(path_));
     if (handle_ == nullptr) {
       throw GpuDecodeError("failed to load " + path_ + " (Windows error " +
                            std::to_string(GetLastError()) + ")");

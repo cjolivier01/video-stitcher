@@ -1,11 +1,13 @@
 #include "reco/detect/ort_session.hpp"
 
+#include "reco/core/windows_runtime_library.hpp"
+
 #include "reco/detect/detectors.hpp"
 
 #include <cstdlib>
 #include <cstring>
-#include <memory>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -32,8 +34,7 @@ constexpr int kOnnxTensorElementDataTypeFloat = 1;
 constexpr int kOrtDeviceAllocator = 0;
 constexpr int kOrtArenaAllocator = 1;
 constexpr int kOrtMemTypeDefault = 0;
-constexpr const char* kOrtSessionOptionsDisableCpuEpFallback =
-    "session.disable_cpu_ep_fallback";
+constexpr const char* kOrtSessionOptionsDisableCpuEpFallback = "session.disable_cpu_ep_fallback";
 
 #if defined(_WIN32)
 #define RECO_ORT_CALL __stdcall
@@ -225,7 +226,7 @@ class DynamicLibrary {
 public:
   explicit DynamicLibrary(const std::filesystem::path& path) : path_(path.string()) {
 #if defined(_WIN32)
-    handle_ = LoadLibraryA(path_.c_str());
+    handle_ = static_cast<HMODULE>(core::detail::load_windows_runtime_library(path_));
 #else
     handle_ = dlopen(path_.c_str(), RTLD_NOW | RTLD_LOCAL);
 #endif
@@ -421,8 +422,8 @@ const OrtRuntimeApi& ort_runtime_api() {
     }
     OrtAppendCudaProvider append_cuda_provider = nullptr;
     try {
-      append_cuda_provider =
-          pinned_library->symbol<OrtAppendCudaProvider>("OrtSessionOptionsAppendExecutionProvider_CUDA");
+      append_cuda_provider = pinned_library->symbol<OrtAppendCudaProvider>(
+          "OrtSessionOptionsAppendExecutionProvider_CUDA");
     } catch (const std::exception&) {
       append_cuda_provider = nullptr;
     }
@@ -431,9 +432,7 @@ const OrtRuntimeApi& ort_runtime_api() {
   return runtime;
 }
 
-const OrtApi& ort_api() {
-  return *ort_runtime_api().api;
-}
+const OrtApi& ort_api() { return *ort_runtime_api().api; }
 
 std::string status_message(const OrtApi& api, OrtCStatus* status) {
   if (status == nullptr) {
@@ -498,7 +497,8 @@ using SessionHandle = OrtHandle<OrtCSession, &OrtApi::ReleaseSession>;
 using MemoryInfoHandle = OrtHandle<OrtCMemoryInfo, &OrtApi::ReleaseMemoryInfo>;
 using ValueHandle = OrtHandle<OrtCValue, &OrtApi::ReleaseValue>;
 using TypeInfoHandle = OrtHandle<OrtCTypeInfo, &OrtApi::ReleaseTypeInfo>;
-using TensorInfoHandle = OrtHandle<OrtCTensorTypeAndShapeInfo, &OrtApi::ReleaseTensorTypeAndShapeInfo>;
+using TensorInfoHandle =
+    OrtHandle<OrtCTensorTypeAndShapeInfo, &OrtApi::ReleaseTensorTypeAndShapeInfo>;
 using ModelMetadataHandle = OrtHandle<OrtCModelMetadata, &OrtApi::ReleaseModelMetadata>;
 
 std::string take_allocator_string(const OrtApi& api, OrtCAllocator* allocator, char* value) {
@@ -510,8 +510,8 @@ std::string take_allocator_string(const OrtApi& api, OrtCAllocator* allocator, c
   return result;
 }
 
-std::vector<std::string> session_names(const OrtApi& api, OrtCSession* session, OrtCAllocator* allocator,
-                                       bool input) {
+std::vector<std::string> session_names(const OrtApi& api, OrtCSession* session,
+                                       OrtCAllocator* allocator, bool input) {
   std::size_t count = 0;
   throw_if_error(api,
                  input ? api.SessionGetInputCount(session, &count)
@@ -564,7 +564,8 @@ std::vector<std::string> labels_from_metadata(const OrtApi& api, OrtCSession* se
     return fallback;
   }
   ModelMetadataHandle metadata(api, nullptr);
-  if (OrtCStatus* status = api.SessionGetModelMetadata(session, metadata.out()); status != nullptr) {
+  if (OrtCStatus* status = api.SessionGetModelMetadata(session, metadata.out());
+      status != nullptr) {
     (void)status_message(api, status);
     return {"ball"};
   }
@@ -604,7 +605,8 @@ OrtSessionConfig validate_ort_session_config(OrtSessionConfig config) {
       config.providers.size() == 1 && (config.providers.front() == OrtExecutionProvider::Cpu ||
                                        config.providers.front() == OrtExecutionProvider::Cuda);
   if (!supported_provider) {
-    throw std::runtime_error("requested ORT execution provider stack is not registered in the C++ port yet");
+    throw std::runtime_error(
+        "requested ORT execution provider stack is not registered in the C++ port yet");
   }
   return config;
 }
@@ -649,17 +651,16 @@ std::filesystem::path reco_cache_dir(std::string_view subdir) {
 }
 
 struct OrtSession::Impl {
-  explicit Impl(OrtSessionConfig config) : api(&ort_api()), env(*api, nullptr), options(*api, nullptr),
-                                           session(*api, nullptr), cpu_memory_info(*api, nullptr),
-                                           cuda_memory_info(*api, nullptr),
-                                           provider(config.providers.front()) {
+  explicit Impl(OrtSessionConfig config)
+      : api(&ort_api()), env(*api, nullptr), options(*api, nullptr), session(*api, nullptr),
+        cpu_memory_info(*api, nullptr), cuda_memory_info(*api, nullptr),
+        provider(config.providers.front()) {
     throw_if_error(*api, api->CreateEnv(kOrtLoggingLevelWarning, "reco-detect", env.out()),
                    "CreateEnv");
     throw_if_error(*api, api->CreateSessionOptions(options.out()), "CreateSessionOptions");
-    throw_if_error(*api,
-                   api->SetSessionGraphOptimizationLevel(options.get(),
-                                                         kOrtEnableAllGraphOptimizations),
-                   "SetSessionGraphOptimizationLevel");
+    throw_if_error(
+        *api, api->SetSessionGraphOptimizationLevel(options.get(), kOrtEnableAllGraphOptimizations),
+        "SetSessionGraphOptimizationLevel");
     throw_if_error(*api, api->SetSessionLogSeverityLevel(options.get(), kOrtLoggingLevelWarning),
                    "SetSessionLogSeverityLevel");
     if (provider == OrtExecutionProvider::Cuda) {
@@ -667,21 +668,22 @@ struct OrtSession::Impl {
       if (append_cuda_provider == nullptr) {
         throw std::runtime_error("ONNX Runtime CUDA execution provider entry point is unavailable");
       }
-      throw_if_error(*api,
-                     api->AddSessionConfigEntry(options.get(),
-                                                kOrtSessionOptionsDisableCpuEpFallback, "1"),
-                     "AddSessionConfigEntry(session.disable_cpu_ep_fallback)");
+      throw_if_error(
+          *api,
+          api->AddSessionConfigEntry(options.get(), kOrtSessionOptionsDisableCpuEpFallback, "1"),
+          "AddSessionConfigEntry(session.disable_cpu_ep_fallback)");
       throw_if_error(*api, append_cuda_provider(options.get(), 0),
                      "OrtSessionOptionsAppendExecutionProvider_CUDA");
     }
 
     const auto model_path = ort_model_path(config.model_path);
-    throw_if_error(*api, api->CreateSession(env.get(), model_path.c_str(), options.get(), session.out()),
-                   "CreateSession");
     throw_if_error(*api,
-                   api->CreateCpuMemoryInfo(kOrtArenaAllocator, kOrtMemTypeDefault,
-                                            cpu_memory_info.out()),
-                   "CreateCpuMemoryInfo");
+                   api->CreateSession(env.get(), model_path.c_str(), options.get(), session.out()),
+                   "CreateSession");
+    throw_if_error(
+        *api,
+        api->CreateCpuMemoryInfo(kOrtArenaAllocator, kOrtMemTypeDefault, cpu_memory_info.out()),
+        "CreateCpuMemoryInfo");
     if (provider == OrtExecutionProvider::Cuda) {
       throw_if_error(*api,
                      api->CreateMemoryInfo("Cuda", kOrtDeviceAllocator, 0, kOrtMemTypeDefault,
@@ -695,8 +697,8 @@ struct OrtSession::Impl {
     metadata.input_names = session_names(*api, session.get(), allocator, true);
     metadata.output_names = session_names(*api, session.get(), allocator, false);
     metadata.input_size = input_size_from_shape(input_shape(*api, session.get()));
-    metadata.labels = labels_from_metadata(*api, session.get(), allocator,
-                                           std::move(config.fallback_labels));
+    metadata.labels =
+        labels_from_metadata(*api, session.get(), allocator, std::move(config.fallback_labels));
     if (metadata.input_names.empty()) {
       throw std::runtime_error("ONNX model has no inputs");
     }
@@ -785,8 +787,7 @@ std::vector<OrtTensorOutput> OrtSession::run_cpu_f32(std::span<const float> inpu
   result.reserve(outputs.size());
   for (const auto& output : outputs) {
     TensorInfoHandle tensor_info(*impl_->api, nullptr);
-    throw_if_error(*impl_->api,
-                   impl_->api->GetTensorTypeAndShape(output.get(), tensor_info.out()),
+    throw_if_error(*impl_->api, impl_->api->GetTensorTypeAndShape(output.get(), tensor_info.out()),
                    "GetTensorTypeAndShape");
     std::size_t rank = 0;
     throw_if_error(*impl_->api, impl_->api->GetDimensionsCount(tensor_info.get(), &rank),
@@ -794,14 +795,13 @@ std::vector<OrtTensorOutput> OrtSession::run_cpu_f32(std::span<const float> inpu
     OrtTensorOutput tensor;
     tensor.shape.assign(rank, 0);
     if (rank > 0) {
-      throw_if_error(*impl_->api,
-                     impl_->api->GetDimensions(tensor_info.get(), tensor.shape.data(),
-                                               tensor.shape.size()),
-                     "GetDimensions");
+      throw_if_error(
+          *impl_->api,
+          impl_->api->GetDimensions(tensor_info.get(), tensor.shape.data(), tensor.shape.size()),
+          "GetDimensions");
     }
     int element_type = 0;
-    throw_if_error(*impl_->api,
-                   impl_->api->GetTensorElementType(tensor_info.get(), &element_type),
+    throw_if_error(*impl_->api, impl_->api->GetTensorElementType(tensor_info.get(), &element_type),
                    "GetTensorElementType");
     if (element_type != kOnnxTensorElementDataTypeFloat) {
       throw std::runtime_error("ORT output tensor is not float32");
@@ -902,8 +902,7 @@ std::vector<OrtTensorOutput> OrtSession::run_cuda_f32(core::CudaDevicePtr input,
   result.reserve(outputs.size());
   for (const auto& output : outputs) {
     TensorInfoHandle tensor_info(*impl_->api, nullptr);
-    throw_if_error(*impl_->api,
-                   impl_->api->GetTensorTypeAndShape(output.get(), tensor_info.out()),
+    throw_if_error(*impl_->api, impl_->api->GetTensorTypeAndShape(output.get(), tensor_info.out()),
                    "GetTensorTypeAndShape");
     std::size_t rank = 0;
     throw_if_error(*impl_->api, impl_->api->GetDimensionsCount(tensor_info.get(), &rank),
@@ -911,14 +910,13 @@ std::vector<OrtTensorOutput> OrtSession::run_cuda_f32(core::CudaDevicePtr input,
     OrtTensorOutput tensor;
     tensor.shape.assign(rank, 0);
     if (rank > 0) {
-      throw_if_error(*impl_->api,
-                     impl_->api->GetDimensions(tensor_info.get(), tensor.shape.data(),
-                                               tensor.shape.size()),
-                     "GetDimensions");
+      throw_if_error(
+          *impl_->api,
+          impl_->api->GetDimensions(tensor_info.get(), tensor.shape.data(), tensor.shape.size()),
+          "GetDimensions");
     }
     int element_type = 0;
-    throw_if_error(*impl_->api,
-                   impl_->api->GetTensorElementType(tensor_info.get(), &element_type),
+    throw_if_error(*impl_->api, impl_->api->GetTensorElementType(tensor_info.get(), &element_type),
                    "GetTensorElementType");
     if (element_type != kOnnxTensorElementDataTypeFloat) {
       throw std::runtime_error("ORT output tensor is not float32");

@@ -21,6 +21,7 @@ cc_library(
         "src/shader_catalog.cpp",
         "src/source.cpp",
         "src/telemetry.cpp",
+        "src/windows_runtime_library.cpp",
     ],
     hdrs = [
         "include/reco/core/calibration.hpp",
@@ -37,6 +38,7 @@ cc_library(
         "include/reco/core/telemetry.hpp",
         "include/reco/core/video_format.hpp",
         "include/reco/core/viewport_position.hpp",
+        "include/reco/core/windows_runtime_library.hpp",
     ],
     includes = ["include"],
     visibility = ["//visibility:public"],

@@ -53,6 +53,7 @@ constexpr DWORD_PTR kProcThreadAttributeJobList = ProcThreadAttributeValue(13, F
 #include <dlfcn.h>
 #include <libproc.h>
 #include <sys/event.h>
+#include <sys/proc.h>
 #include <sys/sysctl.h>
 #include <sys/xattr.h>
 #endif
@@ -90,10 +91,12 @@ namespace reco::io {
 #if !defined(_WIN32)
 namespace detail {
 int run_gpu_video_probe_owner(const char* executable, std::uint64_t pre_worker_report_delay_ns,
-                              std::uint64_t pre_guardian_exec_delay_ns, bool has_marker);
+                              std::uint64_t pre_guardian_exec_delay_ns, bool has_marker,
+                              bool stop_supervisor_after_guardian_launch);
 int run_gpu_video_probe_supervisor(const char* executable, std::uint64_t pre_worker_report_delay_ns,
                                    std::uint64_t pre_guardian_exec_delay_ns,
-                                   std::uint64_t caller_pid, bool has_marker);
+                                   std::uint64_t caller_pid, bool has_marker,
+                                   bool stop_after_guardian_launch);
 int run_gpu_video_probe_guardian(const char* executable, std::uint64_t pre_worker_report_delay_ns);
 } // namespace detail
 #endif
@@ -142,11 +145,12 @@ struct ProbeLaunchOptions {
   std::chrono::nanoseconds pre_worker_report_delay{};
   std::chrono::nanoseconds pre_guardian_exec_delay{};
   std::filesystem::path pre_guardian_exec_marker;
+  bool stop_supervisor_after_guardian_launch = false;
   int pre_owner_fork_ready_descriptor = -1;
   int pre_owner_fork_release_descriptor = -1;
   int owner_forked_pid_descriptor = -1;
   int owner_fork_release_descriptor = -1;
-  std::chrono::nanoseconds pre_owner_wait_delay{};
+  int owner_wait_release_descriptor = -1;
 };
 
 struct SupervisorSlots {
@@ -1161,6 +1165,7 @@ GuardianLaunch spawn_guardian_process(
     std::chrono::nanoseconds pre_worker_report_delay,
     std::chrono::nanoseconds pre_guardian_exec_delay,
     const std::filesystem::path& pre_guardian_exec_marker,
+    bool stop_supervisor_after_guardian_launch,
     std::chrono::steady_clock::time_point launch_deadline, int pre_owner_fork_ready_descriptor,
     int pre_owner_fork_release_descriptor, int owner_forked_pid_descriptor,
     int owner_fork_release_descriptor, std::shared_ptr<SupervisorSlot>* reservation);
@@ -2400,7 +2405,11 @@ void guardian_wait_for_owned_session_cleanup(pid_t supervisor_pid) {
       const auto process_count = std::min(bytes / sizeof(kinfo_proc), processes.size());
       for (std::size_t index = 0; index < process_count; ++index) {
         const auto process = processes[index].kp_proc.p_pid;
-        if (process > 0 && process != owner_pid && process != supervisor_pid) {
+        // A killed pre-main grandchild can remain an init-owned zombie in the
+        // session. It has no address space or execution authority and cannot
+        // delay certification of the directly pinned supervisor child.
+        if (process > 0 && process != owner_pid && process != supervisor_pid &&
+            processes[index].kp_proc.p_stat != SZOMB) {
           found_member = true;
         }
       }
@@ -2670,7 +2679,8 @@ bool guardian_write_exact(int descriptor, const void* value, std::size_t size) {
 [[noreturn]] void run_supervisor_owner(const char* executable,
                                        std::chrono::nanoseconds pre_worker_report_delay,
                                        std::chrono::nanoseconds pre_guardian_exec_delay,
-                                       bool has_marker) {
+                                       bool has_marker,
+                                       bool stop_supervisor_after_guardian_launch) {
   const auto maximum_descriptor = descriptor_scan_limit();
   if (maximum_descriptor < kOwnerFirstUnusedDescriptor) {
     guardian_exit(127);
@@ -2719,12 +2729,14 @@ bool guardian_write_exact(int descriptor, const void* value, std::size_t size) {
     report_owner_start_error(errno);
   }
   std::array<char, 2> marker_text{has_marker ? '1' : '0', '\0'};
+  std::array<char, 2> stop_text{stop_supervisor_after_guardian_launch ? '1' : '0', '\0'};
   char* const arguments[] = {const_cast<char*>(executable),
                              const_cast<char*>("--reco-video-probe-supervisor"),
                              worker_delay_text.data(),
                              guardian_delay_text.data(),
                              owner_pid_text.data(),
                              marker_text.data(),
+                             stop_text.data(),
                              nullptr};
 
   fork_child_retained_descriptor = kOwnerSupervisorExecutable;
@@ -2775,6 +2787,7 @@ GuardianLaunch spawn_guardian_process(
     std::chrono::nanoseconds pre_worker_report_delay,
     std::chrono::nanoseconds pre_guardian_exec_delay,
     const std::filesystem::path& pre_guardian_exec_marker,
+    bool stop_supervisor_after_guardian_launch,
     std::chrono::steady_clock::time_point launch_deadline, int pre_owner_fork_ready_descriptor,
     int pre_owner_fork_release_descriptor, int owner_forked_pid_descriptor,
     int owner_fork_release_descriptor, std::shared_ptr<SupervisorSlot>* reservation) {
@@ -2797,11 +2810,13 @@ GuardianLaunch spawn_guardian_process(
   encode_argument(&guardian_delay_text,
                   static_cast<std::uint64_t>(pre_guardian_exec_delay.count()));
   std::array<char, 2> marker_text{pre_guardian_exec_marker.empty() ? '0' : '1', '\0'};
+  std::array<char, 2> stop_text{stop_supervisor_after_guardian_launch ? '1' : '0', '\0'};
   char* const owner_arguments[] = {const_cast<char*>(executable.c_str()),
                                    const_cast<char*>("--reco-video-probe-owner"),
                                    worker_delay_text.data(),
                                    guardian_delay_text.data(),
                                    marker_text.data(),
+                                   stop_text.data(),
                                    nullptr};
   std::vector<std::string> environment_storage;
   for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
@@ -3125,7 +3140,8 @@ GuardianLaunch spawn_guardian_process(
 [[noreturn]] void run_supervisor_child(const char* executable,
                                        std::chrono::nanoseconds pre_worker_report_delay,
                                        std::chrono::nanoseconds pre_guardian_exec_delay,
-                                       pid_t caller_pid, bool has_marker, long maximum_descriptor) {
+                                       pid_t caller_pid, bool has_marker,
+                                       bool stop_after_guardian_launch, long maximum_descriptor) {
   std::array<char, 32> delay_text{};
   const auto [delay_end, delay_error] =
       std::to_chars(delay_text.data(), delay_text.data() + delay_text.size() - 1,
@@ -3292,6 +3308,12 @@ GuardianLaunch spawn_guardian_process(
     while (::waitpid(guardian_pid, &status, 0) < 0 && errno == EINTR) {
     }
     guardian_exit(2);
+  }
+
+  while (stop_after_guardian_launch) {
+    if (::raise(SIGSTOP) != 0) {
+      guardian_exit(2);
+    }
   }
 
   constexpr timespec kSupervisorPollPause{.tv_sec = 0, .tv_nsec = 2'000'000};
@@ -3706,11 +3728,11 @@ class GuardianProcess {
 public:
   GuardianProcess(pid_t pid, pid_t watchdog_pid, ForkProtectedFd control,
                   ForkProtectedFd caller_lifetime, std::chrono::steady_clock::time_point deadline,
-                  std::shared_ptr<SupervisorSlot> reservation,
-                  std::chrono::nanoseconds pre_owner_wait_delay)
+                  std::shared_ptr<SupervisorSlot> reservation, int owner_wait_release_descriptor)
       : pid_(pid), watchdog_pid_(watchdog_pid), control_(std::move(control)),
         caller_lifetime_(std::move(caller_lifetime)), deadline_(deadline),
-        reservation_(std::move(reservation)), pre_owner_wait_delay_(pre_owner_wait_delay) {}
+        reservation_(std::move(reservation)),
+        owner_wait_release_descriptor_(owner_wait_release_descriptor) {}
   GuardianProcess(const GuardianProcess&) = delete;
   GuardianProcess& operator=(const GuardianProcess&) = delete;
   ~GuardianProcess() { terminate(); }
@@ -3733,8 +3755,8 @@ public:
       );
     } while (acknowledged < 0 && errno == EINTR);
     control_.reset();
-    if (pre_owner_wait_delay_.count() > 0) {
-      std::this_thread::sleep_for(pre_owner_wait_delay_);
+    if (!wait_for_owner_release()) {
+      return false;
     }
     int owner_status = 0;
     const auto owner_exited = wait_for_process_exit(watchdog_pid_, &owner_status, deadline_);
@@ -3753,6 +3775,36 @@ public:
   }
 
 private:
+  bool wait_for_owner_release() const {
+    if (owner_wait_release_descriptor_ < 0) {
+      return true;
+    }
+    pollfd release{.fd = owner_wait_release_descriptor_, .events = POLLIN, .revents = 0};
+    while (true) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline_) {
+        return false;
+      }
+      const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline_ - now);
+      const auto timeout = static_cast<int>(
+          std::clamp<std::int64_t>(remaining.count() + 1, 1, std::numeric_limits<int>::max()));
+      release.revents = 0;
+      const auto poll_result = ::poll(&release, 1, timeout);
+      if (poll_result < 0 && errno == EINTR) {
+        continue;
+      }
+      if (poll_result <= 0 || (release.revents & POLLIN) == 0) {
+        return false;
+      }
+      char command = '\0';
+      ssize_t received = -1;
+      do {
+        received = ::read(owner_wait_release_descriptor_, &command, 1);
+      } while (received < 0 && errno == EINTR);
+      return received == 1 && command == kGuardianRelease;
+    }
+  }
+
   void terminate() {
     if (pid_ <= 0 && watchdog_pid_ <= 0) {
       return;
@@ -3810,7 +3862,7 @@ private:
   ForkProtectedFd caller_lifetime_;
   std::chrono::steady_clock::time_point deadline_;
   std::shared_ptr<SupervisorSlot> reservation_;
-  std::chrono::nanoseconds pre_owner_wait_delay_{};
+  int owner_wait_release_descriptor_ = -1;
 };
 
 std::string run_probe_worker(const std::filesystem::path& worker_path, std::string_view request,
@@ -3889,13 +3941,14 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
       executable, pinned_executable.get(), guard_control.get(), guard_input.get(),
       guard_output.get(), options.pre_supervisor_arm_delay, options.pre_supervisor_arm_marker,
       options.pre_worker_report_delay, options.pre_guardian_exec_delay,
-      options.pre_guardian_exec_marker, deadline, options.pre_owner_fork_ready_descriptor,
-      options.pre_owner_fork_release_descriptor, options.owner_forked_pid_descriptor,
-      options.owner_fork_release_descriptor, &reservation);
+      options.pre_guardian_exec_marker, options.stop_supervisor_after_guardian_launch, deadline,
+      options.pre_owner_fork_ready_descriptor, options.pre_owner_fork_release_descriptor,
+      options.owner_forked_pid_descriptor, options.owner_fork_release_descriptor, &reservation);
   pinned_executable.reset();
   GuardianProcess guardian(guardian_launch.supervisor_pid, guardian_launch.watchdog_pid,
                            std::move(parent_control), std::move(guardian_launch.caller_lifetime),
-                           cleanup_deadline, std::move(reservation), options.pre_owner_wait_delay);
+                           cleanup_deadline, std::move(reservation),
+                           options.owner_wait_release_descriptor);
   child_input.reset();
   child_output.reset();
   child_control.reset();
@@ -4013,7 +4066,8 @@ GpuVideoProbe probe_gpu_video_with_delays(const GpuFileDecodeConfig& config,
 #if !defined(_WIN32)
 int detail::run_gpu_video_probe_owner(const char* executable,
                                       std::uint64_t pre_worker_report_delay_ns,
-                                      std::uint64_t pre_guardian_exec_delay_ns, bool has_marker) {
+                                      std::uint64_t pre_guardian_exec_delay_ns, bool has_marker,
+                                      bool stop_supervisor_after_guardian_launch) {
   if (executable == nullptr || executable[0] == '\0' ||
       pre_worker_report_delay_ns >
           static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ||
@@ -4022,13 +4076,15 @@ int detail::run_gpu_video_probe_owner(const char* executable,
     return 2;
   }
   run_supervisor_owner(executable, std::chrono::nanoseconds(pre_worker_report_delay_ns),
-                       std::chrono::nanoseconds(pre_guardian_exec_delay_ns), has_marker);
+                       std::chrono::nanoseconds(pre_guardian_exec_delay_ns), has_marker,
+                       stop_supervisor_after_guardian_launch);
 }
 
 int detail::run_gpu_video_probe_supervisor(const char* executable,
                                            std::uint64_t pre_worker_report_delay_ns,
                                            std::uint64_t pre_guardian_exec_delay_ns,
-                                           std::uint64_t caller_pid, bool has_marker) {
+                                           std::uint64_t caller_pid, bool has_marker,
+                                           bool stop_after_guardian_launch) {
   sigset_t empty_mask{};
   if (sigemptyset(&empty_mask) != 0 || ::pthread_sigmask(SIG_SETMASK, &empty_mask, nullptr) != 0) {
     return 2;
@@ -4047,7 +4103,8 @@ int detail::run_gpu_video_probe_supervisor(const char* executable,
   }
   run_supervisor_child(executable, std::chrono::nanoseconds(pre_worker_report_delay_ns),
                        std::chrono::nanoseconds(pre_guardian_exec_delay_ns),
-                       static_cast<pid_t>(caller_pid), has_marker, maximum_descriptor);
+                       static_cast<pid_t>(caller_pid), has_marker, stop_after_guardian_launch,
+                       maximum_descriptor);
 }
 
 int detail::run_gpu_video_probe_guardian(const char* executable,
@@ -4244,13 +4301,12 @@ GpuVideoProbe detail::probe_gpu_video_with_pre_owner_fork_barrier_for_test(
 GpuVideoProbe detail::probe_gpu_video_with_reaper_barrier_for_test(
     const GpuFileDecodeConfig& config, const std::filesystem::path& worker_path,
     std::uint64_t timeout_ns, int owner_pid_descriptor, int owner_release_descriptor,
-    std::uint64_t pre_owner_wait_delay_ns) {
+    int owner_wait_release_descriptor) {
   return probe_gpu_video_with_delays(
       config, worker_path, timeout_ns,
       ProbeLaunchOptions{.owner_forked_pid_descriptor = owner_pid_descriptor,
                          .owner_fork_release_descriptor = owner_release_descriptor,
-                         .pre_owner_wait_delay =
-                             std::chrono::nanoseconds(pre_owner_wait_delay_ns)});
+                         .owner_wait_release_descriptor = owner_wait_release_descriptor});
 }
 
 GpuVideoProbe detail::probe_gpu_video_with_pre_guardian_exec_delay_for_test(
@@ -4262,6 +4318,18 @@ GpuVideoProbe detail::probe_gpu_video_with_pre_guardian_exec_delay_for_test(
       ProbeLaunchOptions{.pre_guardian_exec_delay =
                              std::chrono::nanoseconds(pre_guardian_exec_delay_ns),
                          .pre_guardian_exec_marker = marker_path});
+}
+
+GpuVideoProbe detail::probe_gpu_video_with_stalled_guardian_session_for_test(
+    const GpuFileDecodeConfig& config, const std::filesystem::path& worker_path,
+    std::uint64_t timeout_ns, std::uint64_t pre_guardian_exec_delay_ns,
+    const std::filesystem::path& marker_path) {
+  return probe_gpu_video_with_delays(
+      config, worker_path, timeout_ns,
+      ProbeLaunchOptions{.pre_guardian_exec_delay =
+                             std::chrono::nanoseconds(pre_guardian_exec_delay_ns),
+                         .pre_guardian_exec_marker = marker_path,
+                         .stop_supervisor_after_guardian_launch = true});
 }
 
 bool detail::guardian_watchdog_exit_is_fatal_for_test(bool memory_termination_sent, int wait_result,

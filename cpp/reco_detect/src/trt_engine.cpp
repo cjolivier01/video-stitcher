@@ -1,5 +1,7 @@
 #include "reco/detect/trt_engine.hpp"
 
+#include "reco/core/windows_runtime_library.hpp"
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -42,7 +44,7 @@ class DynamicLibrary {
 public:
   explicit DynamicLibrary(const std::filesystem::path& path) : path_(path.string()) {
 #if defined(_WIN32)
-    handle_ = LoadLibraryA(path_.c_str());
+    handle_ = static_cast<HMODULE>(core::detail::load_windows_runtime_library(path_));
 #else
     handle_ = dlopen(path_.c_str(), RTLD_NOW | RTLD_LOCAL);
 #endif
@@ -276,8 +278,7 @@ TrtEngine::TrtEngine(const std::filesystem::path& engine_path) {
 
 TrtEngine::~TrtEngine() = default;
 
-TrtEngine::TrtEngine(TrtEngine&& other) noexcept
-    : state_(std::move(other.state_)) {}
+TrtEngine::TrtEngine(TrtEngine&& other) noexcept : state_(std::move(other.state_)) {}
 
 TrtEngine& TrtEngine::operator=(TrtEngine&& other) noexcept {
   if (this != &other) {

@@ -35,7 +35,6 @@
 #include <pthread.h>
 #include <sys/resource.h>
 #if defined(__APPLE__)
-#include <sys/sysctl.h>
 #include <sys/xattr.h>
 #endif
 #if defined(__linux__)
@@ -228,18 +227,6 @@ std::vector<std::filesystem::path> mac_probe_snapshot_directories() {
   return result;
 }
 
-std::optional<pid_t> mac_parent_process(pid_t process) {
-  kinfo_proc process_info{};
-  std::size_t process_info_size = sizeof(process_info);
-  int query[] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, process};
-  if (::sysctl(query, static_cast<unsigned int>(std::size(query)), &process_info,
-               &process_info_size, nullptr, 0) != 0 ||
-      process_info_size != sizeof(process_info) || process_info.kp_proc.p_pid != process ||
-      process_info.kp_eproc.e_ppid <= 0) {
-    return std::nullopt;
-  }
-  return process_info.kp_eproc.e_ppid;
-}
 #endif
 
 #if defined(__linux__)
@@ -2397,11 +2384,15 @@ void competing_waitpid_reaper_cannot_steal_cleanup_authority(
 #if !defined(_WIN32)
   int owner_pid_pipe[2] = {-1, -1};
   int owner_release_pipe[2] = {-1, -1};
-  if (::pipe(owner_pid_pipe) != 0 || ::pipe(owner_release_pipe) != 0) {
+  int owner_wait_release_pipe[2] = {-1, -1};
+  if (::pipe(owner_pid_pipe) != 0 || ::pipe(owner_release_pipe) != 0 ||
+      ::pipe(owner_wait_release_pipe) != 0) {
     (void)::close(owner_pid_pipe[0]);
     (void)::close(owner_pid_pipe[1]);
     (void)::close(owner_release_pipe[0]);
     (void)::close(owner_release_pipe[1]);
+    (void)::close(owner_wait_release_pipe[0]);
+    (void)::close(owner_wait_release_pipe[1]);
     expect_true(false, "competing waitpid reaper creates its owner barrier");
     return;
   }
@@ -2411,7 +2402,7 @@ void competing_waitpid_reaper_cannot_steal_cleanup_authority(
     try {
       result = reco::io::detail::probe_gpu_video_with_reaper_barrier_for_test(
           container_config(video_path), fake_probe_worker_path, 5'000'000'000ULL, owner_pid_pipe[1],
-          owner_release_pipe[0], 500'000'000ULL);
+          owner_release_pipe[0], owner_wait_release_pipe[0]);
     } catch (const std::exception& error) {
       failure = error.what();
     }
@@ -2433,6 +2424,7 @@ void competing_waitpid_reaper_cannot_steal_cleanup_authority(
 
   std::atomic<bool> stop_reaper{false};
   std::atomic<bool> reaper_armed{false};
+  std::atomic<bool> owner_wait_released{false};
   std::atomic<pid_t> reaped_owner{-1};
   std::thread reaper;
   if (owner_published) {
@@ -2443,6 +2435,11 @@ void competing_waitpid_reaper_cannot_steal_cleanup_authority(
         reaper_armed.store(true, std::memory_order_release);
         if (child == owner) {
           reaped_owner.store(child, std::memory_order_release);
+          ssize_t released = -1;
+          do {
+            released = ::write(owner_wait_release_pipe[1], "G", 1);
+          } while (released < 0 && errno == EINTR);
+          owner_wait_released.store(released == 1, std::memory_order_release);
           return;
         }
         if (child == 0 || (child < 0 && errno == ECHILD)) {
@@ -2465,6 +2462,10 @@ void competing_waitpid_reaper_cannot_steal_cleanup_authority(
   expect_true(released == 1, "competing waitpid reaper releases the armed probe owner");
   (void)::close(owner_release_pipe[1]);
   owner_release_pipe[1] = -1;
+  if (!owner_published) {
+    (void)::close(owner_wait_release_pipe[1]);
+    owner_wait_release_pipe[1] = -1;
+  }
   probe.join();
   stop_reaper.store(true, std::memory_order_release);
   if (reaper.joinable()) {
@@ -2479,12 +2480,16 @@ void competing_waitpid_reaper_cannot_steal_cleanup_authority(
               "competing waitpid reaper preserves the probe result");
   expect_true(owner_published && reaped_owner.load(std::memory_order_acquire) == owner,
               "competing waitpid reaper deterministically steals the exact probe owner");
+  expect_true(owner_wait_released.load(std::memory_order_acquire),
+              "competing waitpid reaper releases the production owner waiter");
   expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
             "competing waitpid reaper cannot retain aggregate admission");
   (void)::close(owner_pid_pipe[0]);
   (void)::close(owner_pid_pipe[1]);
   (void)::close(owner_release_pipe[0]);
   (void)::close(owner_release_pipe[1]);
+  (void)::close(owner_wait_release_pipe[0]);
+  (void)::close(owner_wait_release_pipe[1]);
 #else
   (void)video_path;
 #endif
@@ -2890,7 +2895,7 @@ void mac_owner_reclaims_stalled_guardian_session(const std::filesystem::path& vi
   bool probe_failed = false;
   std::thread probe([&] {
     try {
-      (void)reco::io::detail::probe_gpu_video_with_pre_guardian_exec_delay_for_test(
+      (void)reco::io::detail::probe_gpu_video_with_stalled_guardian_session_for_test(
           container_config(video_path), fake_probe_worker_path, 2'000'000'000ULL, 30'000'000'000ULL,
           marker);
     } catch (...) {
@@ -2900,34 +2905,12 @@ void mac_owner_reclaims_stalled_guardian_session(const std::filesystem::path& vi
 
   const auto discovery_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
   const auto guardian = wait_for_process_marker(marker, discovery_deadline);
-  const auto supervisor =
-      guardian.has_value() ? mac_parent_process(static_cast<pid_t>(*guardian)) : std::nullopt;
-  const auto owner = supervisor.has_value() ? mac_parent_process(*supervisor) : std::nullopt;
   expect_true(guardian.has_value(), "Darwin stalled guardian starts before owner cleanup");
-  expect_true(owner.has_value(), "Darwin stalled guardian has an exec-backed session owner");
-  expect_true(supervisor.has_value(), "Darwin stalled guardian has a supervisor");
-  const bool supervisor_stopped = supervisor.has_value() && ::kill(*supervisor, SIGSTOP) == 0;
-  expect_true(supervisor_stopped, "Darwin supervisor stalls before caller timeout");
 
   probe.join();
   expect_true(probe_failed, "Darwin stalled guardian causes a bounded probe failure");
-  bool guardian_exited = false;
-  const auto exit_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-  while (guardian.has_value() && std::chrono::steady_clock::now() < exit_deadline) {
-    errno = 0;
-    if (::kill(*guardian, 0) != 0 && errno == ESRCH) {
-      guardian_exited = true;
-      break;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
-  }
-  expect_true(guardian_exited, "Darwin owner drains its stalled guardian session");
   expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
             "Darwin owner certifies only after its private session is empty");
-
-  if (guardian.has_value() && !guardian_exited) {
-    (void)::kill(*guardian, SIGKILL);
-  }
   std::filesystem::remove(marker);
 #else
   (void)video_path;

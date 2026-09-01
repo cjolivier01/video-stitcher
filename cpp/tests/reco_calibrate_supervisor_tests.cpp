@@ -942,6 +942,21 @@ void caller_sigchld_policy_cannot_steal_worker_ownership() {
   thief.join();
 }
 
+void stable_parent_pidfd_duplication_failure_reaps_child() {
+  {
+    EnvironmentValue failure("RECO_FAKE_CALIBRATION_STABLE_PARENT_FAILURE", "pidfd-duplicate");
+    expect_execution_error(
+        [&] { (void)run_gpu_calibration(lifecycle_request_fixture(), ready_backends()); },
+        "stable calibration launcher",
+        "pidfd monitor duplication failure rejects the calibration launch");
+  }
+  int status = 0;
+  errno = 0;
+  const auto child = ::waitpid(-1, &status, WNOHANG);
+  expect_true(child < 0 && errno == ECHILD,
+              "pidfd monitor duplication failure leaves no unreaped child");
+}
+
 void worker_descriptors_are_isolated_across_exec() {
   const auto source = ::open("/dev/null", O_RDONLY);
   expect_true(source >= 0, "descriptor isolation source opens");
@@ -1502,6 +1517,8 @@ int main() {
   run_case("scratch unlink evasion", unlinked_scratch_file_cannot_escape_the_quota);
   run_case("scratch inode quota", excessive_scratch_entries_are_terminated_by_pidfd);
   run_case("SIGCHLD ownership", caller_sigchld_policy_cannot_steal_worker_ownership);
+  run_case("stable-parent pidfd duplication failure",
+           stable_parent_pidfd_duplication_failure_reaps_child);
   run_case("descriptor isolation", worker_descriptors_are_isolated_across_exec);
 #if !defined(RECO_CALIBRATION_THREAD_SANITIZER)
   run_case("pinned executable identity", executable_identity_is_pinned_across_both_execs);

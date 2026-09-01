@@ -1,7 +1,9 @@
 #include "reco/core/cuda_backend.hpp"
+#include "reco/core/windows_runtime_library.hpp"
 
 #include <atomic>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -101,6 +103,63 @@ bool address_sanitizer_build() {
 #endif
 #else
   return false;
+#endif
+}
+
+void windows_runtime_loader_rejects_current_directory_planting() {
+#if defined(_WIN32)
+  const char* runfiles = std::getenv("TEST_SRCDIR");
+  if (runfiles == nullptr || runfiles[0] == '\0') {
+    throw std::runtime_error("TEST_SRCDIR is not set");
+  }
+  std::filesystem::path fixture;
+  std::error_code error;
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(runfiles, error)) {
+    if (error) {
+      break;
+    }
+    const auto filename = entry.path().filename().string();
+    if (entry.is_regular_file(error) && !error &&
+        filename.find("fake_cuda_driver") != std::string::npos &&
+        (entry.path().extension() == ".dll" || filename.ends_with(".so"))) {
+      fixture = entry.path();
+      break;
+    }
+  }
+  if (fixture.empty()) {
+    throw std::runtime_error("fake CUDA driver DLL runfile not found");
+  }
+
+  const auto original_directory = std::filesystem::current_path();
+  const auto directory = std::filesystem::temp_directory_path() /
+                         ("reco-dll-plant-" + std::to_string(GetCurrentProcessId()));
+  std::filesystem::remove_all(directory, error);
+  std::filesystem::create_directories(directory);
+  const auto planted = directory / "reco-current-directory-plant.dll";
+  std::filesystem::copy_file(fixture, planted, std::filesystem::copy_options::overwrite_existing);
+  std::filesystem::current_path(directory);
+
+  auto* current_directory =
+      reco::core::detail::load_windows_runtime_library("reco-current-directory-plant.dll");
+  expect_true(current_directory == nullptr,
+              "Windows runtime loading excludes the process current directory");
+  if (current_directory != nullptr) {
+    FreeLibrary(static_cast<HMODULE>(current_directory));
+  }
+  auto* relative =
+      reco::core::detail::load_windows_runtime_library(".\\reco-current-directory-plant.dll");
+  expect_true(relative == nullptr, "Windows runtime loading rejects relative override paths");
+  if (relative != nullptr) {
+    FreeLibrary(static_cast<HMODULE>(relative));
+  }
+  auto* absolute = reco::core::detail::load_windows_runtime_library(planted.string());
+  expect_true(absolute != nullptr, "Windows runtime loading accepts an explicit absolute path");
+  if (absolute != nullptr) {
+    FreeLibrary(static_cast<HMODULE>(absolute));
+  }
+
+  std::filesystem::current_path(original_directory);
+  std::filesystem::remove_all(directory, error);
 #endif
 }
 
@@ -268,9 +327,15 @@ struct CountingCudaTrace final : CudaBackendTraceSink {
 } // namespace
 
 int main() {
+  try {
+    windows_runtime_loader_rejects_current_directory_planting();
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: Windows runtime loader regression threw: " << error.what() << '\n';
+    ++failures;
+  }
   if (address_sanitizer_build() && !require_cuda()) {
     std::cerr << "SKIP: CUDA driver smoke test is skipped under ASan unless explicitly required\n";
-    return EXIT_SUCCESS;
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
 
   if (!CudaBackend::is_available()) {
@@ -280,7 +345,7 @@ int main() {
       return EXIT_FAILURE;
     }
     std::cerr << "SKIP: CUDA unavailable: " << error << '\n';
-    return EXIT_SUCCESS;
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
   }
 
   try {

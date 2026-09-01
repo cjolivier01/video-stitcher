@@ -1,6 +1,7 @@
 #include "reco/io/gpu_video_probe.hpp"
 
 #include "gpu_video_probe_internal.hpp"
+#include "reco/core/windows_runtime_library.hpp"
 
 #include <algorithm>
 #include <array>
@@ -146,80 +147,11 @@ static_assert(sizeof(GstBufferAbi) == (sizeof(void*) == 8 ? 112 : 80));
 static_assert(offsetof(GstPadProbeInfoAbi, data) ==
               (sizeof(void*) == 8 && sizeof(unsigned long) == 8 ? 16 : 8));
 
-#if defined(_WIN32)
-std::wstring utf8_to_wide(std::string_view value) {
-  if (value.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-    throw GpuVideoProbeError("video-probe runtime path is too long");
-  }
-  const auto size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
-                                        static_cast<int>(value.size()), nullptr, 0);
-  if (size <= 0) {
-    throw GpuVideoProbeError("video-probe runtime path is not valid UTF-8");
-  }
-  std::wstring result(static_cast<std::size_t>(size), L'\0');
-  if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
-                          static_cast<int>(value.size()), result.data(), size) != size) {
-    throw GpuVideoProbeError("failed to convert video-probe runtime path");
-  }
-  return result;
-}
-
-std::wstring resolve_windows_library_path(const std::wstring& requested) {
-  const std::filesystem::path requested_path(requested);
-  if (requested_path.is_absolute()) {
-    return requested_path.lexically_normal().native();
-  }
-  if (requested_path.has_parent_path()) {
-    std::error_code error;
-    const auto absolute = std::filesystem::absolute(requested_path, error);
-    return error ? requested : absolute.lexically_normal().native();
-  }
-
-  const auto required = GetEnvironmentVariableW(L"PATH", nullptr, 0);
-  if (required == 0) {
-    return requested;
-  }
-  std::wstring path_value(static_cast<std::size_t>(required), L'\0');
-  const auto written = GetEnvironmentVariableW(L"PATH", path_value.data(), required);
-  if (written == 0 || written >= required) {
-    return requested;
-  }
-  path_value.resize(written);
-  std::size_t offset = 0;
-  while (offset <= path_value.size()) {
-    const auto separator = path_value.find(L';', offset);
-    auto directory = path_value.substr(
-        offset, separator == std::wstring::npos ? std::wstring::npos : separator - offset);
-    if (directory.size() >= 2 && directory.front() == L'"' && directory.back() == L'"') {
-      directory = directory.substr(1, directory.size() - 2);
-    }
-    const std::filesystem::path directory_path(directory);
-    if (!directory.empty() && directory_path.is_absolute()) {
-      const auto candidate = (directory_path / requested_path).lexically_normal();
-      std::error_code error;
-      if (std::filesystem::is_regular_file(candidate, error) && !error) {
-        return candidate.native();
-      }
-    }
-    if (separator == std::wstring::npos) {
-      break;
-    }
-    offset = separator + 1;
-  }
-  return requested;
-}
-#endif
-
 class DynamicLibrary {
 public:
   explicit DynamicLibrary(std::string path) : path_(std::move(path)) {
 #if defined(_WIN32)
-    const auto wide_path = resolve_windows_library_path(utf8_to_wide(path_));
-    auto flags = LOAD_LIBRARY_SEARCH_DEFAULT_DIRS;
-    if (std::filesystem::path(wide_path).is_absolute()) {
-      flags |= LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR;
-    }
-    handle_ = LoadLibraryExW(wide_path.c_str(), nullptr, flags);
+    handle_ = static_cast<HMODULE>(core::detail::load_windows_runtime_library(path_));
     if (handle_ == nullptr) {
       throw GpuVideoProbeError("failed to load " + path_ + " (Windows error " +
                                std::to_string(GetLastError()) + ")");

@@ -1,4 +1,5 @@
 #include "reco/core/cuda_backend.hpp"
+#include "reco/core/windows_runtime_library.hpp"
 
 #include <algorithm>
 #include <array>
@@ -87,7 +88,7 @@ class DynamicLibrary {
 public:
   explicit DynamicLibrary(const char* name) {
 #if defined(_WIN32)
-    handle_ = LoadLibraryA(name);
+    handle_ = detail::load_windows_runtime_library(name);
 #else
     handle_ = dlopen(name, RTLD_NOW | RTLD_LOCAL);
 #endif

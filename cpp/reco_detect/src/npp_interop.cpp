@@ -1,5 +1,7 @@
 #include "reco/detect/npp_interop.hpp"
 
+#include "reco/core/windows_runtime_library.hpp"
+
 #include <array>
 #include <initializer_list>
 #include <limits>
@@ -92,7 +94,7 @@ public:
 private:
   void open(const char* name) {
 #if defined(_WIN32)
-    handle_ = LoadLibraryA(name);
+    handle_ = core::detail::load_windows_runtime_library(name);
 #else
     handle_ = dlopen(name, RTLD_NOW | RTLD_LOCAL);
 #endif

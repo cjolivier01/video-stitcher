@@ -1,5 +1,7 @@
 #include "reco/io/gstreamer.hpp"
 
+#include "reco/core/windows_runtime_library.hpp"
+
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -34,7 +36,7 @@ bool all_digits(std::string_view value) {
 std::optional<std::string> loadable_library(std::initializer_list<const char*> names) {
   for (const char* name : names) {
 #if defined(_WIN32)
-    HMODULE handle = LoadLibraryA(name);
+    auto* handle = static_cast<HMODULE>(core::detail::load_windows_runtime_library(name));
     if (handle != nullptr) {
       FreeLibrary(handle);
       return std::string(name);

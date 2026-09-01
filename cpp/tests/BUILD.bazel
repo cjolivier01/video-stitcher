@@ -59,6 +59,7 @@ cc_test(
     name = "reco_core_cuda_backend_tests",
     size = "small",
     srcs = ["reco_core_cuda_backend_tests.cpp"],
+    data = [":libfake_cuda_driver.so"],
     deps = [
         "//cpp/reco_core",
     ],
