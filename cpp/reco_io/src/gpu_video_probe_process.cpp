@@ -1469,14 +1469,14 @@ private:
       int setup_error = ::setsid() < 0 ? errno : 0;
       struct sigaction ignored{};
       ignored.sa_handler = SIG_IGN;
-      (void)::sigemptyset(&ignored.sa_mask);
+      (void)sigemptyset(&ignored.sa_mask);
       for (const auto signal : {SIGHUP, SIGINT, SIGQUIT, SIGTERM}) {
         if (setup_error == 0 && ::sigaction(signal, &ignored, nullptr) != 0) {
           setup_error = errno;
         }
       }
       sigset_t empty_mask{};
-      if (setup_error == 0 && (::sigemptyset(&empty_mask) != 0 ||
+      if (setup_error == 0 && (sigemptyset(&empty_mask) != 0 ||
                                ::sigprocmask(SIG_SETMASK, &empty_mask, nullptr) != 0)) {
         setup_error = errno;
       }
@@ -1581,8 +1581,11 @@ private:
   }
 
   void stop_cleanup_helper() noexcept {
-    if (cleanup_lifetime_) {
-      (void)guardian_write(cleanup_lifetime_.get(), &kGuardianTerminate, 1);
+    if (cleanup_lifetime_.get() >= 0) {
+      ssize_t sent = -1;
+      do {
+        sent = ::send(cleanup_lifetime_.get(), &kGuardianTerminate, 1, 0);
+      } while (sent < 0 && errno == EINTR);
     }
     cleanup_lifetime_.reset();
     if (cleanup_pid_ <= 0) {
