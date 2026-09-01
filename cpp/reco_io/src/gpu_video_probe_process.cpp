@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
@@ -689,7 +690,7 @@ void make_close_on_exec(int descriptor) {
   }
 }
 
-pthread_mutex_t fork_descriptor_mutex = PTHREAD_MUTEX_INITIALIZER;
+std::atomic_flag fork_descriptor_guard = ATOMIC_FLAG_INIT;
 pthread_once_t fork_descriptor_once = PTHREAD_ONCE_INIT;
 int fork_descriptor_registration_error = 0;
 struct ForkProtectedDescriptorState {
@@ -703,12 +704,21 @@ int prepared_fork_child_retained_descriptor = -1;
 sigset_t prepared_fork_signal_mask{};
 bool prepared_fork_signal_mask_valid = false;
 
+void acquire_fork_descriptor_guard() noexcept {
+  while (fork_descriptor_guard.test_and_set(std::memory_order_acquire)) {
+  }
+}
+
+void release_fork_descriptor_guard() noexcept {
+  fork_descriptor_guard.clear(std::memory_order_release);
+}
+
 void prepare_fork_descriptors() {
   sigset_t blocked{};
   sigset_t previous{};
   const auto mask_error =
-      sigfillset(&blocked) == 0 ? ::pthread_sigmask(SIG_SETMASK, &blocked, &previous) : errno;
-  (void)::pthread_mutex_lock(&fork_descriptor_mutex);
+      sigfillset(&blocked) == 0 ? ::sigprocmask(SIG_SETMASK, &blocked, &previous) : errno;
+  acquire_fork_descriptor_guard();
   prepared_fork_signal_mask = previous;
   prepared_fork_signal_mask_valid = mask_error == 0;
   prepared_fork_child_retained_descriptor = fork_child_retained_descriptor;
@@ -719,9 +729,9 @@ void restore_fork_descriptors_in_parent() {
   const auto restore_mask = prepared_fork_signal_mask_valid;
   prepared_fork_signal_mask_valid = false;
   prepared_fork_child_retained_descriptor = -1;
-  (void)::pthread_mutex_unlock(&fork_descriptor_mutex);
+  release_fork_descriptor_guard();
   if (restore_mask) {
-    (void)::pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+    (void)::sigprocmask(SIG_SETMASK, &previous, nullptr);
   }
 }
 
@@ -740,9 +750,9 @@ void close_fork_protected_descriptors_in_child() {
   }
   prepared_fork_signal_mask_valid = false;
   prepared_fork_child_retained_descriptor = -1;
-  (void)::pthread_mutex_unlock(&fork_descriptor_mutex);
+  release_fork_descriptor_guard();
   if (restore_mask) {
-    (void)::pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+    (void)::sigprocmask(SIG_SETMASK, &previous, nullptr);
   }
 }
 
@@ -793,18 +803,14 @@ public:
       throw GpuVideoProbeError("failed to coordinate video probe descriptor creation: " +
                                std::string(std::strerror(error)));
     }
-    const auto lock_error = ::pthread_mutex_lock(&fork_descriptor_mutex);
-    if (lock_error != 0) {
-      throw GpuVideoProbeError("failed to lock video probe descriptor creation: " +
-                               std::string(std::strerror(lock_error)));
-    }
+    acquire_fork_descriptor_guard();
     locked_ = true;
   }
   ForkDescriptorLock(const ForkDescriptorLock&) = delete;
   ForkDescriptorLock& operator=(const ForkDescriptorLock&) = delete;
   ~ForkDescriptorLock() {
     if (locked_) {
-      (void)::pthread_mutex_unlock(&fork_descriptor_mutex);
+      release_fork_descriptor_guard();
     }
   }
 
@@ -947,12 +953,7 @@ public:
       (void)state_.release();
       return;
     }
-    if (::pthread_mutex_lock(&fork_descriptor_mutex) != 0) {
-      // Keep both the descriptor and registry entry live on an impossible mutex
-      // failure so a later fork still closes the inherited copy.
-      (void)state_.release();
-      return;
-    }
+    acquire_fork_descriptor_guard();
     const auto registered = std::find(fork_protected_descriptors.begin(),
                                       fork_protected_descriptors.end(), state_.get());
     if (registered != fork_protected_descriptors.end()) {
@@ -962,7 +963,7 @@ public:
       (void)::close(state_->value);
       state_->value = -1;
     }
-    (void)::pthread_mutex_unlock(&fork_descriptor_mutex);
+    release_fork_descriptor_guard();
     state_.reset();
   }
 
@@ -1431,28 +1432,58 @@ public:
 
 private:
   [[nodiscard]] int start_cleanup_helper(std::chrono::steady_clock::time_point deadline) {
-    int lifetime_descriptors[2] = {-1, -1};
-    create_socket_pair(lifetime_descriptors, "macOS snapshot cleanup");
-    UniqueFd helper_lifetime(lifetime_descriptors[0]);
-    UniqueFd owner_lifetime(lifetime_descriptors[1]);
+    auto lifetime_descriptors = ForkProtectedFd::create_socket_pair("macOS snapshot cleanup");
+    auto helper_lifetime = std::move(lifetime_descriptors[0]);
+    auto owner_lifetime = std::move(lifetime_descriptors[1]);
     const int suppress_sigpipe = 1;
     if (::setsockopt(helper_lifetime.get(), SOL_SOCKET, SO_NOSIGPIPE, &suppress_sigpipe,
+                     sizeof(suppress_sigpipe)) != 0 ||
+        ::setsockopt(owner_lifetime.get(), SOL_SOCKET, SO_NOSIGPIPE, &suppress_sigpipe,
                      sizeof(suppress_sigpipe)) != 0) {
       throw GpuVideoProbeError("failed to suppress macOS snapshot cleanup SIGPIPE: " +
                                std::string(std::strerror(errno)));
     }
     const auto owner_pid = ::getpid();
     const auto maximum_descriptor = descriptor_scan_limit();
+    sigset_t blocked_mask{};
+    sigset_t previous_mask{};
+    if (sigfillset(&blocked_mask) != 0) {
+      throw GpuVideoProbeError("failed to prepare macOS snapshot cleanup signal mask");
+    }
+    const auto block_error = ::pthread_sigmask(SIG_SETMASK, &blocked_mask, &previous_mask);
+    if (block_error != 0) {
+      throw GpuVideoProbeError("failed to block macOS snapshot cleanup signals: " +
+                               std::string(std::strerror(block_error)));
+    }
+    fork_child_retained_descriptor = helper_lifetime.get();
     const auto helper = ::fork();
     const auto fork_error = errno;
+    if (helper != 0) {
+      fork_child_retained_descriptor = -1;
+    }
     if (helper == 0) {
-      (void)::close(owner_lifetime.get());
       if (::dup2(helper_lifetime.get(), STDIN_FILENO) < 0 ||
           !guardian_close_from(STDOUT_FILENO, maximum_descriptor)) {
         guardian_exit(127);
       }
+      int setup_error = ::setsid() < 0 ? errno : 0;
+      struct sigaction ignored{};
+      ignored.sa_handler = SIG_IGN;
+      (void)::sigemptyset(&ignored.sa_mask);
+      for (const auto signal : {SIGHUP, SIGINT, SIGQUIT, SIGTERM}) {
+        if (setup_error == 0 && ::sigaction(signal, &ignored, nullptr) != 0) {
+          setup_error = errno;
+        }
+      }
+      sigset_t empty_mask{};
+      if (setup_error == 0 && (::sigemptyset(&empty_mask) != 0 ||
+                               ::sigprocmask(SIG_SETMASK, &empty_mask, nullptr) != 0)) {
+        setup_error = errno;
+      }
       UniqueFd owner_monitor(::kqueue());
-      int setup_error = owner_monitor.get() < 0 ? errno : 0;
+      if (setup_error == 0 && owner_monitor.get() < 0) {
+        setup_error = errno;
+      }
       std::array<struct kevent, 2> changes{};
       if (setup_error == 0) {
         EV_SET(&changes[0], static_cast<std::uintptr_t>(STDIN_FILENO), EVFILT_READ,
@@ -1507,7 +1538,7 @@ private:
             do {
               received = ::read(STDIN_FILENO, &lifetime, 1);
             } while (received < 0 && errno == EINTR);
-            owner_exited = received <= 0;
+            owner_exited = received <= 0 || lifetime == kGuardianTerminate;
           }
         }
       }
@@ -1516,10 +1547,19 @@ private:
       (void)::rmdir(root_.c_str());
       guardian_exit(0);
     }
+    const auto restore_error = ::pthread_sigmask(SIG_SETMASK, &previous_mask, nullptr);
     if (helper < 0) {
       errno = fork_error;
       throw GpuVideoProbeError("failed to start macOS video probe snapshot cleanup: " +
                                std::string(std::strerror(errno)));
+    }
+    if (restore_error != 0) {
+      (void)::kill(helper, SIGKILL);
+      int status = 0;
+      while (::waitpid(helper, &status, 0) < 0 && errno == EINTR) {
+      }
+      throw GpuVideoProbeError("failed to restore macOS snapshot cleanup signal mask: " +
+                               std::string(std::strerror(restore_error)));
     }
     helper_lifetime.reset();
     cleanup_pid_ = helper;
@@ -1541,6 +1581,9 @@ private:
   }
 
   void stop_cleanup_helper() noexcept {
+    if (cleanup_lifetime_) {
+      (void)guardian_write(cleanup_lifetime_.get(), &kGuardianTerminate, 1);
+    }
     cleanup_lifetime_.reset();
     if (cleanup_pid_ <= 0) {
       return;
@@ -1570,7 +1613,7 @@ private:
   std::filesystem::path root_;
   std::filesystem::path executable_;
   pid_t cleanup_pid_ = -1;
-  UniqueFd cleanup_lifetime_;
+  ForkProtectedFd cleanup_lifetime_;
   bool helper_owns_root_ = false;
 };
 #endif
@@ -2378,6 +2421,12 @@ std::size_t format_guardian_parent_argument(char* destination, std::size_t capac
   if (supervisor_pid <= 0) {
     guardian_exit(127);
   }
+  if (!guardian_pipe_write(kPreMainWatchdogTarget, kGuardianAcknowledge)) {
+    (void)::kill(-supervisor_pid, SIGKILL);
+    (void)::kill(supervisor_pid, SIGKILL);
+    (void)guardian_write(STDIN_FILENO, &kSupervisorCertified, 1);
+    guardian_exit(127);
+  }
 
   while (true) {
     std::array<pollfd, 2> descriptors{{
@@ -2563,6 +2612,10 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
     throw GpuVideoProbeError("failed to start video probe supervisor watchdog: " +
                              std::string(std::strerror(errno)));
   }
+  watchdog_lifetime_descriptor.reset();
+  watchdog_target_descriptor.reset();
+  watchdog_ready_descriptor.reset();
+  watchdog_target.reset();
 
   fork_child_retained_descriptor = supervisor_executable.get();
   const auto supervisor_pid = ::fork();
@@ -2661,9 +2714,21 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
 
   bool watchdog_armed = false;
   if (supervisor_pid > 0 && supervisor_group_error == 0 &&
-      guardian_write(caller_watchdog_target.get(), &supervisor_pid, sizeof(supervisor_pid)) &&
-      guardian_write(caller_supervisor_arm.get(), &kGuardianRelease, 1)) {
-    watchdog_armed = true;
+      guardian_write(caller_watchdog_target.get(), &supervisor_pid, sizeof(supervisor_pid))) {
+    pollfd acknowledgment{.fd = caller_watchdog_target.get(), .events = POLLIN, .revents = 0};
+    const auto acknowledgment_wait =
+        ::poll(&acknowledgment, 1, static_cast<int>(kMaximumTerminationReserve.count()));
+    char value = '\0';
+    ssize_t received = -1;
+    if (acknowledgment_wait > 0) {
+      do {
+        received = ::read(caller_watchdog_target.get(), &value, 1);
+      } while (received < 0 && errno == EINTR);
+    }
+    if (received == 1 && value == kGuardianAcknowledge &&
+        guardian_write(caller_supervisor_arm.get(), &kGuardianRelease, 1)) {
+      watchdog_armed = true;
+    }
   }
   caller_watchdog_target.reset();
   caller_supervisor_arm.reset();

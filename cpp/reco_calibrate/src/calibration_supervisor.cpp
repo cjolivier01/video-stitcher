@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
@@ -169,7 +170,7 @@ struct ForkProtectedDescriptorState {
 };
 
 constexpr std::size_t kMaximumForkProtectedDescriptors = 3;
-pthread_mutex_t fork_descriptor_mutex = PTHREAD_MUTEX_INITIALIZER;
+std::atomic_flag fork_descriptor_guard = ATOMIC_FLAG_INIT;
 pthread_once_t fork_descriptor_once = PTHREAD_ONCE_INIT;
 int fork_descriptor_registration_error = 0;
 std::array<ForkProtectedDescriptorState*, kMaximumForkProtectedDescriptors>
@@ -177,12 +178,21 @@ std::array<ForkProtectedDescriptorState*, kMaximumForkProtectedDescriptors>
 sigset_t prepared_fork_signal_mask{};
 bool prepared_fork_signal_mask_valid = false;
 
+void acquire_fork_descriptor_guard() noexcept {
+  while (fork_descriptor_guard.test_and_set(std::memory_order_acquire)) {
+  }
+}
+
+void release_fork_descriptor_guard() noexcept {
+  fork_descriptor_guard.clear(std::memory_order_release);
+}
+
 void lock_fork_descriptors() {
   sigset_t blocked{};
   sigset_t previous{};
   const auto mask_error =
-      sigfillset(&blocked) == 0 ? ::pthread_sigmask(SIG_SETMASK, &blocked, &previous) : errno;
-  (void)::pthread_mutex_lock(&fork_descriptor_mutex);
+      sigfillset(&blocked) == 0 ? ::sigprocmask(SIG_SETMASK, &blocked, &previous) : errno;
+  acquire_fork_descriptor_guard();
   prepared_fork_signal_mask = previous;
   prepared_fork_signal_mask_valid = mask_error == 0;
 }
@@ -191,9 +201,9 @@ void unlock_fork_descriptors() {
   const auto previous = prepared_fork_signal_mask;
   const auto restore_mask = prepared_fork_signal_mask_valid;
   prepared_fork_signal_mask_valid = false;
-  (void)::pthread_mutex_unlock(&fork_descriptor_mutex);
+  release_fork_descriptor_guard();
   if (restore_mask) {
-    (void)::pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+    (void)::sigprocmask(SIG_SETMASK, &previous, nullptr);
   }
 }
 
@@ -210,9 +220,9 @@ void close_fork_protected_descriptors_in_child() {
     }
   }
   prepared_fork_signal_mask_valid = false;
-  (void)::pthread_mutex_unlock(&fork_descriptor_mutex);
+  release_fork_descriptor_guard();
   if (restore_mask) {
-    (void)::pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+    (void)::sigprocmask(SIG_SETMASK, &previous, nullptr);
   }
 }
 
@@ -262,11 +272,7 @@ public:
       throw CalibrationExecutionError("cannot coordinate calibration descriptor creation: " +
                                       std::string(std::strerror(error)));
     }
-    const auto lock_error = ::pthread_mutex_lock(&fork_descriptor_mutex);
-    if (lock_error != 0) {
-      throw CalibrationExecutionError("cannot lock calibration descriptor creation: " +
-                                      std::string(std::strerror(lock_error)));
-    }
+    acquire_fork_descriptor_guard();
     locked_ = true;
   }
 
@@ -355,10 +361,7 @@ public:
       (void)state_.release();
       return;
     }
-    if (::pthread_mutex_lock(&fork_descriptor_mutex) != 0) {
-      (void)state_.release();
-      return;
-    }
+    acquire_fork_descriptor_guard();
     const auto registered = std::find(fork_protected_descriptors.begin(),
                                       fork_protected_descriptors.end(), state_.get());
     if (registered != fork_protected_descriptors.end()) {

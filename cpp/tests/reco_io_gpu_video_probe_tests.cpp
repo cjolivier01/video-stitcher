@@ -543,7 +543,8 @@ pid_t fork_exec_probe_caller(const std::filesystem::path& video_path,
                              std::uint64_t timeout_ns, std::uint64_t delay_ns = 0,
                              const std::filesystem::path& marker_path = {},
                              const std::filesystem::path& inherited_child_path = {},
-                             const std::filesystem::path& inherited_audit_path = {}) {
+                             const std::filesystem::path& inherited_audit_path = {},
+                             bool new_process_group = false) {
   set_environment(kProbeCallerVideoPath, video_path.string());
   set_environment(kProbeCallerWorkerPath, worker_path.string());
   set_environment(kProbeCallerMode, std::string(mode));
@@ -558,6 +559,9 @@ pid_t fork_exec_probe_caller(const std::filesystem::path& video_path,
   std::array<char*, 3> arguments{executable.data(), helper_mode.data(), nullptr};
   const auto caller = ::fork();
   if (caller == 0) {
+    if (new_process_group && ::setpgid(0, 0) != 0) {
+      ::_exit(126);
+    }
     ::execv(arguments[0], arguments.data());
     ::_exit(127);
   }
@@ -2603,6 +2607,38 @@ void caller_death_before_supervisor_arm(const std::filesystem::path& video_path)
 #endif
 }
 
+void dead_watchdog_cannot_release_the_supervisor(const std::filesystem::path& video_path) {
+#if !defined(_WIN32)
+  const auto marker_path =
+      video_path.parent_path() / (video_path.filename().string() + ".dead-pre-arm-watchdog");
+  std::filesystem::remove(marker_path);
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+  std::atomic<bool> watchdog_killed = false;
+  std::thread killer([&] {
+    const auto processes = wait_for_process_pair_marker(
+        marker_path, std::chrono::steady_clock::now() + std::chrono::seconds(2));
+    if (processes.has_value() &&
+        processes->second <= static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max())) {
+      watchdog_killed.store(::kill(static_cast<pid_t>(processes->second), SIGKILL) == 0,
+                            std::memory_order_release);
+    }
+  });
+  expect_probe_error(
+      [&] {
+        (void)reco::io::detail::probe_gpu_video_with_pre_supervisor_arm_delay_for_test(
+            container_config(video_path), fake_probe_worker_path, 5'000'000'000ULL, 250'000'000ULL,
+            marker_path);
+      },
+      "", "a dead pre-main watchdog prevents supervisor release");
+  killer.join();
+  expect_true(watchdog_killed.load(std::memory_order_acquire),
+              "pre-main watchdog is killed before the supervisor launch gate opens");
+  std::filesystem::remove(marker_path);
+#else
+  (void)video_path;
+#endif
+}
+
 void caller_death_before_guardian_main(const std::filesystem::path& video_path) {
 #if !defined(_WIN32)
   const auto marker_path =
@@ -2904,6 +2940,81 @@ void mac_probe_snapshot_preserves_quarantine(const std::filesystem::path& video_
 #endif
 }
 
+void mac_snapshot_normal_cleanup_ignores_fork_only_children(
+    const std::filesystem::path& video_path) {
+#if defined(__APPLE__)
+  const auto snapshot_marker =
+      video_path.parent_path() / (video_path.filename().string() + ".snapshot-success-ready");
+  const auto child_marker =
+      video_path.parent_path() / (video_path.filename().string() + ".snapshot-success-child");
+  std::filesystem::remove(snapshot_marker);
+  std::filesystem::remove(child_marker);
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+  const auto started = std::chrono::steady_clock::now();
+  const auto caller =
+      fork_exec_probe_caller(video_path, fake_probe_worker_path, "pre-supervisor-exec-delay",
+                             5'000'000'000ULL, 100'000'000ULL, snapshot_marker, child_marker);
+  int status = 0;
+  while (caller > 0 && ::waitpid(caller, &status, 0) < 0 && errno == EINTR) {
+  }
+  expect_true(caller > 0 && WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS,
+              "successful macOS probe with a fork-only child exits cleanly");
+  expect_true(std::filesystem::exists(child_marker),
+              "successful macOS probe keeps a fork-only child alive through snapshot teardown");
+  expect_true(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(900),
+              "fork-only child cannot force the one-second snapshot cleanup fallback");
+  std::filesystem::remove(snapshot_marker);
+  std::filesystem::remove(child_marker);
+#else
+  (void)video_path;
+#endif
+}
+
+void mac_snapshot_helper_survives_owner_process_group_termination(
+    const std::filesystem::path& video_path) {
+#if defined(__APPLE__)
+  const auto marker =
+      video_path.parent_path() / (video_path.filename().string() + ".snapshot-group-ready");
+  std::filesystem::remove(marker);
+  const auto snapshots_before = mac_probe_snapshot_directories();
+  const auto caller =
+      fork_exec_probe_caller(video_path, fake_probe_worker_path, "pre-supervisor-exec-delay",
+                             30'000'000'000ULL, 30'000'000'000ULL, marker, {}, {}, true);
+  expect_true(caller > 0, "macOS process-group snapshot caller starts");
+  const auto ready =
+      wait_for_process_marker(marker, std::chrono::steady_clock::now() + std::chrono::seconds(3));
+  expect_true(ready.has_value(), "macOS process-group fixture creates its snapshot");
+  std::vector<std::filesystem::path> caller_snapshots;
+  for (const auto& snapshot : mac_probe_snapshot_directories()) {
+    if (!std::binary_search(snapshots_before.begin(), snapshots_before.end(), snapshot)) {
+      caller_snapshots.push_back(snapshot);
+    }
+  }
+  expect_true(!caller_snapshots.empty(), "macOS process-group fixture observes the snapshot");
+  if (caller > 0) {
+    (void)::kill(-caller, SIGTERM);
+    int status = 0;
+    while (::waitpid(caller, &status, 0) < 0 && errno == EINTR) {
+    }
+  }
+  bool removed = caller_snapshots.empty();
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!removed && std::chrono::steady_clock::now() < deadline) {
+    removed = std::all_of(caller_snapshots.begin(), caller_snapshots.end(), [](const auto& path) {
+      std::error_code error;
+      return !std::filesystem::exists(path, error) && !error;
+    });
+    if (!removed) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  }
+  expect_true(removed, "macOS cleanup helper survives owner process-group termination");
+  std::filesystem::remove(marker);
+#else
+  (void)video_path;
+#endif
+}
+
 void mac_probe_snapshot_cleanup_tracks_owner_process(const std::filesystem::path& video_path) {
 #if defined(__APPLE__)
   const auto snapshot_marker =
@@ -2956,7 +3067,7 @@ void mac_probe_snapshot_cleanup_tracks_owner_process(const std::filesystem::path
             ? static_cast<pid_t>(*inherited_child)
             : static_cast<pid_t>(-1);
     expect_true(child_pid > 0 && ::kill(child_pid, 0) == 0,
-                "fork-only child remains alive with its inherited cleanup socket");
+                "fork-only child remains alive after its cleanup socket is closed at fork");
 
     bool snapshots_removed = caller_snapshots.empty();
     const auto cleanup_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -3683,10 +3794,13 @@ int main(int argc, char** argv) {
   parent_death_reclaims_worker(video_path);
   caller_death_reclaims_worker_and_descendant(video_path);
   caller_death_before_supervisor_arm(video_path);
+  dead_watchdog_cannot_release_the_supervisor(video_path);
   caller_death_before_supervisor_main(video_path);
   executable_replacement_cannot_change_the_pinned_probe_image(video_path);
   linux_fork_child_does_not_retain_snapshot_memfd(video_path);
   mac_probe_snapshot_preserves_quarantine(video_path);
+  mac_snapshot_normal_cleanup_ignores_fork_only_children(video_path);
+  mac_snapshot_helper_survives_owner_process_group_termination(video_path);
   mac_probe_snapshot_cleanup_tracks_owner_process(video_path);
   caller_death_before_guardian_main(video_path);
   caller_death_before_worker_main(video_path);
