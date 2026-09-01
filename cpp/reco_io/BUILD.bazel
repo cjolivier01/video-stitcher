@@ -104,6 +104,7 @@ cc_binary(
         "src/gpu_video_probe_worker.cpp",
         "src/gpu_video_probe_worker_main.cpp",
     ],
+    local_defines = ["RECO_PROBE_TEST_WORKER_DESCRIPTOR_REUSE"],
     visibility = ["//cpp/tests:__pkg__"],
     deps = [":reco_io_forced_guardian_fallbacks"],
 )

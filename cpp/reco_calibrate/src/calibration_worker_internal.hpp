@@ -64,4 +64,10 @@ void read_calibration_worker_bytes_fd(int descriptor, std::span<char> destinatio
 void write_calibration_worker_bytes_fd(int descriptor, std::string_view bytes,
                                        std::uint64_t deadline_nanoseconds);
 
+#if defined(__linux__)
+/// Holds the at-fork descriptor registry for a signal-delivery regression test.
+void hold_calibration_fork_descriptor_registry_for_test(int ready_descriptor,
+                                                        int release_descriptor);
+#endif
+
 } // namespace reco::calibrate::detail

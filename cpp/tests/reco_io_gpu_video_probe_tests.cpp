@@ -32,6 +32,7 @@
 #include <csignal>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/resource.h>
 #if defined(__APPLE__)
 #include <sys/xattr.h>
@@ -65,6 +66,20 @@ constexpr const char* kProbeCallerInheritedChildPath =
     "RECO_FAKE_PROBE_CALLER_INHERITED_CHILD_PATH";
 constexpr const char* kProbeCallerInheritedAuditPath =
     "RECO_FAKE_PROBE_CALLER_INHERITED_AUDIT_PATH";
+volatile sig_atomic_t signal_fork_report_descriptor = -1;
+
+void fork_from_signal_handler(int) {
+  const auto saved_error = errno;
+  const auto child = ::fork();
+  if (child == 0) {
+    ::_exit(EXIT_SUCCESS);
+  }
+  const auto descriptor = static_cast<int>(signal_fork_report_descriptor);
+  if (child > 0 && descriptor >= 0) {
+    (void)::write(descriptor, &child, sizeof(child));
+  }
+  errno = saved_error;
+}
 #endif
 
 void expect_true(bool value, std::string_view message) {
@@ -164,6 +179,21 @@ wait_for_process_marker(const std::filesystem::path& path,
   return std::nullopt;
 }
 
+std::optional<std::pair<std::uint64_t, std::uint64_t>>
+wait_for_process_pair_marker(const std::filesystem::path& path,
+                             std::chrono::steady_clock::time_point deadline) {
+  while (std::chrono::steady_clock::now() < deadline) {
+    std::ifstream input(path);
+    std::uint64_t first = 0;
+    std::uint64_t second = 0;
+    if (input >> first >> second && first != 0 && second != 0) {
+      return std::pair(first, second);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return std::nullopt;
+}
+
 std::optional<char> wait_for_audit_marker(const std::filesystem::path& path,
                                           std::chrono::steady_clock::time_point deadline) {
   while (std::chrono::steady_clock::now() < deadline) {
@@ -257,6 +287,14 @@ bool process_has_linux_probe_memfd(pid_t process) {
 #endif
 #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
 #define RECO_PROBE_WIDE_ADDRESS_SANITIZER 1
+#endif
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define RECO_PROBE_THREAD_SANITIZER 1
+#endif
+#endif
+#if defined(__SANITIZE_THREAD__)
+#define RECO_PROBE_THREAD_SANITIZER 1
 #endif
 
 #if defined(_WIN32)
@@ -399,10 +437,11 @@ int run_posix_probe_caller() {
 
   const auto mode = std::string_view(mode_value);
   if (mode != "probe" && mode != "pre-worker-report-delay" && mode != "pre-supervisor-exec-delay" &&
-      mode != "pre-guardian-exec-delay") {
+      mode != "pre-supervisor-arm-delay" && mode != "pre-guardian-exec-delay") {
     return EXIT_FAILURE;
   }
-  if ((mode == "pre-supervisor-exec-delay" || mode == "pre-guardian-exec-delay") &&
+  if ((mode == "pre-supervisor-exec-delay" || mode == "pre-supervisor-arm-delay" ||
+       mode == "pre-guardian-exec-delay") &&
       (marker_path == nullptr || marker_path[0] == '\0')) {
     return EXIT_FAILURE;
   }
@@ -477,6 +516,9 @@ int run_posix_probe_caller() {
       result = 2;
     } else if (mode == "pre-supervisor-exec-delay") {
       (void)reco::io::detail::probe_gpu_video_with_pre_supervisor_exec_delay_for_test(
+          config, worker, timeout_ns, delay_ns, std::filesystem::path(marker_path));
+    } else if (mode == "pre-supervisor-arm-delay") {
+      (void)reco::io::detail::probe_gpu_video_with_pre_supervisor_arm_delay_for_test(
           config, worker, timeout_ns, delay_ns, std::filesystem::path(marker_path));
     } else {
       (void)reco::io::detail::probe_gpu_video_with_pre_guardian_exec_delay_for_test(
@@ -2496,6 +2538,71 @@ void caller_death_before_supervisor_main(const std::filesystem::path& video_path
 #endif
 }
 
+void caller_death_before_supervisor_arm(const std::filesystem::path& video_path) {
+#if !defined(_WIN32)
+  const auto marker_path =
+      video_path.parent_path() / (video_path.filename().string() + ".pre-arm-supervisor");
+  const auto inherited_child_path =
+      video_path.parent_path() / (video_path.filename().string() + ".pre-arm-child");
+  std::filesystem::remove(marker_path);
+  std::filesystem::remove(inherited_child_path);
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+  const auto caller = fork_exec_probe_caller(video_path, fake_probe_worker_path,
+                                             "pre-supervisor-arm-delay", 30'000'000'000ULL,
+                                             30'000'000'000ULL, marker_path, inherited_child_path);
+  expect_true(caller > 0, "POSIX pre-arm supervisor caller starts");
+  if (caller <= 0) {
+    return;
+  }
+
+  const auto processes = wait_for_process_pair_marker(
+      marker_path, std::chrono::steady_clock::now() + std::chrono::seconds(2));
+  const auto inherited_child = wait_for_process_marker(
+      inherited_child_path, std::chrono::steady_clock::now() + std::chrono::seconds(2));
+  expect_true(processes.has_value(), "supervisor and watchdog reach their pre-arm stall");
+  expect_true(inherited_child.has_value(), "fork-only child starts before supervisor arming");
+
+  (void)::kill(caller, SIGKILL);
+  int caller_status = 0;
+  while (::waitpid(caller, &caller_status, 0) < 0 && errno == EINTR) {
+  }
+
+  const auto expect_exit = [&](std::uint64_t process, std::string_view message) {
+    bool exited = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (process <= static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max()) &&
+           std::chrono::steady_clock::now() < deadline) {
+      errno = 0;
+      if (::kill(static_cast<pid_t>(process), 0) != 0 && errno == ESRCH) {
+        exited = true;
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    expect_true(exited, message);
+    if (!exited && process <= static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max())) {
+      (void)::kill(static_cast<pid_t>(process), SIGKILL);
+    }
+  };
+  if (processes.has_value()) {
+    expect_exit(processes->first,
+                "caller death reclaims the supervisor before its launch gate is armed");
+    expect_exit(processes->second,
+                "caller death reclaims the watchdog before its target is delivered");
+  }
+  if (inherited_child.has_value()) {
+    errno = 0;
+    expect_true(::kill(static_cast<pid_t>(*inherited_child), 0) == 0,
+                "pre-arm cleanup does not depend on killing the fork-only child");
+    (void)::kill(static_cast<pid_t>(*inherited_child), SIGKILL);
+  }
+  std::filesystem::remove(marker_path);
+  std::filesystem::remove(inherited_child_path);
+#else
+  (void)video_path;
+#endif
+}
+
 void caller_death_before_guardian_main(const std::filesystem::path& video_path) {
 #if !defined(_WIN32)
   const auto marker_path =
@@ -3120,6 +3227,103 @@ void unrelated_descriptors_are_not_inherited(const std::filesystem::path& video_
 #endif
 }
 
+void signal_handler_fork_cannot_deadlock_the_probe_registry() {
+#if !defined(_WIN32)
+  std::array<int, 2> ready{-1, -1};
+  std::array<int, 2> release{-1, -1};
+  std::array<int, 2> report{-1, -1};
+  if (::pipe(ready.data()) != 0 || ::pipe(release.data()) != 0 || ::pipe(report.data()) != 0) {
+    expect_true(false, "probe signal-fork fixture creates its pipes");
+    for (const auto descriptor :
+         {ready[0], ready[1], release[0], release[1], report[0], report[1]}) {
+      if (descriptor >= 0) {
+        (void)::close(descriptor);
+      }
+    }
+    return;
+  }
+  struct sigaction action{};
+  struct sigaction previous{};
+  action.sa_handler = fork_from_signal_handler;
+  (void)::sigemptyset(&action.sa_mask);
+  if (::sigaction(SIGUSR1, &action, &previous) != 0) {
+    expect_true(false, "probe signal-fork handler installs");
+    for (const auto descriptor :
+         {ready[0], ready[1], release[0], release[1], report[0], report[1]}) {
+      (void)::close(descriptor);
+    }
+    return;
+  }
+  signal_fork_report_descriptor = report[1];
+  std::exception_ptr holder_error;
+  std::thread holder([&] {
+    try {
+      reco::io::detail::hold_probe_fork_descriptor_registry_for_test(ready[1], release[0]);
+    } catch (...) {
+      holder_error = std::current_exception();
+    }
+  });
+  char ready_marker = '\0';
+  expect_true(::read(ready[0], &ready_marker, 1) == 1 && ready_marker == 'R',
+              "probe descriptor registry reaches its held state");
+  expect_true(::pthread_kill(holder.native_handle(), SIGUSR1) == 0,
+              "probe signal-fork request is delivered to the registry owner");
+  pollfd pending{.fd = report[0], .events = POLLIN, .revents = 0};
+  expect_true(::poll(&pending, 1, 25) == 0,
+              "probe registry defers the signal handler while its mutex is held");
+  const char release_marker = 'R';
+  expect_true(::write(release[1], &release_marker, 1) == 1,
+              "probe descriptor registry holder is released");
+  holder.join();
+  expect_true(holder_error == nullptr, "probe descriptor registry holder completes");
+  pending.revents = 0;
+  const auto reported = ::poll(&pending, 1, 2000);
+  pid_t fork_child = -1;
+  if (reported > 0) {
+    (void)::read(report[0], &fork_child, sizeof(fork_child));
+  }
+  expect_true(fork_child > 0, "probe signal handler forks after the registry unlocks");
+  if (fork_child > 0) {
+    int status = 0;
+    while (::waitpid(fork_child, &status, 0) < 0 && errno == EINTR) {
+    }
+    expect_true(WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS,
+                "probe signal-handler child exits cleanly");
+  }
+  signal_fork_report_descriptor = -1;
+  expect_true(::sigaction(SIGUSR1, &previous, nullptr) == 0, "probe signal-fork handler restores");
+  for (const auto descriptor : {ready[0], ready[1], release[0], release[1], report[0], report[1]}) {
+    (void)::close(descriptor);
+  }
+#endif
+}
+
+void worker_main_preserves_a_reused_executable_descriptor(const std::filesystem::path& video_path) {
+#if defined(RECO_PROBE_TEST_FORCE_GUARDIAN_FALLBACKS) && !defined(RECO_PROBE_THREAD_SANITIZER) &&  \
+    !defined(_WIN32)
+  const auto audit_path =
+      video_path.parent_path() / (video_path.filename().string() + ".worker-fd-reuse");
+  std::filesystem::remove(audit_path);
+  set_environment("RECO_FAKE_PROBE_WORKER_DESCRIPTOR_REUSE_PATH", audit_path.string());
+  set_scenario("probe-ok");
+  try {
+    expect_eq(probe_video(container_config(video_path), 5'000'000'000ULL).width, 3840U,
+              "non-TSan worker preserves a descriptor reused after exec");
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: descriptor-reuse worker threw: " << error.what() << '\n';
+    ++failures;
+  }
+  set_environment("RECO_FAKE_PROBE_WORKER_DESCRIPTOR_REUSE_PATH", "");
+  std::ifstream audit(audit_path);
+  char marker = '\0';
+  expect_true(audit >> marker && marker == '1',
+              "worker main does not close a constructor-owned descriptor 3");
+  std::filesystem::remove(audit_path);
+#else
+  (void)video_path;
+#endif
+}
+
 void guardian_initializers_cannot_observe_unrelated_descriptors(
     const std::filesystem::path& video_path) {
 #if !defined(_WIN32)
@@ -3467,6 +3671,8 @@ int main(int argc, char** argv) {
   windows_job_reclaims_worker_descendants(video_path);
   guardian_death_after_worker_release_reclaims_group(video_path);
   unrelated_descriptors_are_not_inherited(video_path);
+  signal_handler_fork_cannot_deadlock_the_probe_registry();
+  worker_main_preserves_a_reused_executable_descriptor(video_path);
   guardian_initializers_cannot_observe_unrelated_descriptors(video_path);
   lowered_file_limit_does_not_leak_high_descriptors(video_path);
   worker_address_space_is_limited(video_path);
@@ -3476,6 +3682,7 @@ int main(int argc, char** argv) {
   unrelated_descriptor_writer_does_not_delay_pipe_eof(video_path);
   parent_death_reclaims_worker(video_path);
   caller_death_reclaims_worker_and_descendant(video_path);
+  caller_death_before_supervisor_arm(video_path);
   caller_death_before_supervisor_main(video_path);
   executable_replacement_cannot_change_the_pinned_probe_image(video_path);
   linux_fork_child_does_not_retain_snapshot_memfd(video_path);

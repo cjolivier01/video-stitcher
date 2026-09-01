@@ -168,17 +168,38 @@ struct ForkProtectedDescriptorState {
   int value = -1;
 };
 
-constexpr std::size_t kMaximumForkProtectedDescriptors = 2;
+constexpr std::size_t kMaximumForkProtectedDescriptors = 3;
 pthread_mutex_t fork_descriptor_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_once_t fork_descriptor_once = PTHREAD_ONCE_INIT;
 int fork_descriptor_registration_error = 0;
 std::array<ForkProtectedDescriptorState*, kMaximumForkProtectedDescriptors>
     fork_protected_descriptors{};
+sigset_t prepared_fork_signal_mask{};
+bool prepared_fork_signal_mask_valid = false;
 
-void lock_fork_descriptors() { (void)::pthread_mutex_lock(&fork_descriptor_mutex); }
-void unlock_fork_descriptors() { (void)::pthread_mutex_unlock(&fork_descriptor_mutex); }
+void lock_fork_descriptors() {
+  sigset_t blocked{};
+  sigset_t previous{};
+  const auto mask_error =
+      ::sigfillset(&blocked) == 0 ? ::pthread_sigmask(SIG_SETMASK, &blocked, &previous) : errno;
+  (void)::pthread_mutex_lock(&fork_descriptor_mutex);
+  prepared_fork_signal_mask = previous;
+  prepared_fork_signal_mask_valid = mask_error == 0;
+}
+
+void unlock_fork_descriptors() {
+  const auto previous = prepared_fork_signal_mask;
+  const auto restore_mask = prepared_fork_signal_mask_valid;
+  prepared_fork_signal_mask_valid = false;
+  (void)::pthread_mutex_unlock(&fork_descriptor_mutex);
+  if (restore_mask) {
+    (void)::pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+  }
+}
 
 void close_fork_protected_descriptors_in_child() {
+  const auto previous = prepared_fork_signal_mask;
+  const auto restore_mask = prepared_fork_signal_mask_valid;
   for (auto*& state : fork_protected_descriptors) {
     if (state != nullptr) {
       if (state->value >= 0) {
@@ -188,7 +209,11 @@ void close_fork_protected_descriptors_in_child() {
       state = nullptr;
     }
   }
-  unlock_fork_descriptors();
+  prepared_fork_signal_mask_valid = false;
+  (void)::pthread_mutex_unlock(&fork_descriptor_mutex);
+  if (restore_mask) {
+    (void)::pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+  }
 }
 
 void register_fork_descriptor_handlers() {
@@ -196,9 +221,40 @@ void register_fork_descriptor_handlers() {
       lock_fork_descriptors, unlock_fork_descriptors, close_fork_protected_descriptors_in_child);
 }
 
+class ForkDescriptorSignalMask {
+public:
+  ForkDescriptorSignalMask() noexcept {
+    sigset_t blocked{};
+    if (::sigfillset(&blocked) != 0) {
+      error_ = errno;
+      return;
+    }
+    error_ = ::pthread_sigmask(SIG_SETMASK, &blocked, &previous_);
+    active_ = error_ == 0;
+  }
+  ForkDescriptorSignalMask(const ForkDescriptorSignalMask&) = delete;
+  ForkDescriptorSignalMask& operator=(const ForkDescriptorSignalMask&) = delete;
+  ~ForkDescriptorSignalMask() {
+    if (active_) {
+      (void)::pthread_sigmask(SIG_SETMASK, &previous_, nullptr);
+    }
+  }
+
+  [[nodiscard]] int error() const { return error_; }
+
+private:
+  sigset_t previous_{};
+  int error_ = 0;
+  bool active_ = false;
+};
+
 class ForkDescriptorLock {
 public:
   ForkDescriptorLock() {
+    if (signal_mask_.error() != 0) {
+      throw CalibrationExecutionError("cannot block signals for calibration descriptor creation: " +
+                                      std::string(std::strerror(signal_mask_.error())));
+    }
     const auto once_error =
         ::pthread_once(&fork_descriptor_once, register_fork_descriptor_handlers);
     if (once_error != 0 || fork_descriptor_registration_error != 0) {
@@ -223,6 +279,7 @@ public:
   }
 
 private:
+  ForkDescriptorSignalMask signal_mask_;
   bool locked_ = false;
 };
 
@@ -262,11 +319,40 @@ public:
     return ForkProtectedFd(std::move(state));
   }
 
+  static ForkProtectedFd create_pipe_writer(UniqueFd* reader) {
+    if (reader == nullptr) {
+      throw CalibrationExecutionError("calibration lifetime pipe reader is required");
+    }
+    auto state = std::make_unique<ForkProtectedDescriptorState>();
+    ForkDescriptorLock lock;
+    std::array<int, 2> descriptors{-1, -1};
+    if (::pipe2(descriptors.data(), O_CLOEXEC) != 0) {
+      return {};
+    }
+    const auto available =
+        std::find(fork_protected_descriptors.begin(), fork_protected_descriptors.end(), nullptr);
+    if (available == fork_protected_descriptors.end()) {
+      (void)::close(descriptors[0]);
+      (void)::close(descriptors[1]);
+      throw CalibrationExecutionError(
+          "the calibration fork-protected descriptor registry is exhausted");
+    }
+    reader->reset(descriptors[0]);
+    state->value = descriptors[1];
+    *available = state.get();
+    return ForkProtectedFd(std::move(state));
+  }
+
   [[nodiscard]] int get() const { return state_ == nullptr ? -1 : state_->value; }
   [[nodiscard]] explicit operator bool() const { return get() >= 0; }
 
   void reset() noexcept {
     if (state_ == nullptr) {
+      return;
+    }
+    ForkDescriptorSignalMask signal_mask;
+    if (signal_mask.error() != 0) {
+      (void)state_.release();
       return;
     }
     if (::pthread_mutex_lock(&fork_descriptor_mutex) != 0) {
@@ -1204,17 +1290,16 @@ private:
     require_cgroup_control_value(cleanup_directory.get(), "memory.swap.max", 0);
     require_cgroup_control_value(cleanup_directory.get(), "memory.oom.group", 1);
     require_cgroup_control_value(cleanup_directory.get(), "pids.max", 1);
-    std::array<int, 2> lifetime{-1, -1};
     if (inject_cgroup_setup_failure("lifetime-pipe")) {
       throw CalibrationExecutionError(
           errno_message("cannot create calibration cgroup cleanup lifetime", EMFILE));
     }
-    if (::pipe2(lifetime.data(), O_CLOEXEC) != 0) {
+    UniqueFd lifetime_read;
+    auto lifetime_write = ForkProtectedFd::create_pipe_writer(&lifetime_read);
+    if (!lifetime_write) {
       throw CalibrationExecutionError(
           errno_message("cannot create calibration cgroup cleanup lifetime"));
     }
-    UniqueFd lifetime_read(lifetime[0]);
-    UniqueFd lifetime_write(lifetime[1]);
     int caller_pidfd_descriptor = -1;
     if (inject_cgroup_setup_failure("caller-pidfd")) {
       errno = EMFILE;
@@ -1286,7 +1371,7 @@ private:
   UniqueFd parent_;
   UniqueFd directory_;
   std::string name_;
-  UniqueFd cleanup_lifetime_;
+  ForkProtectedFd cleanup_lifetime_;
   OwnedProcess cleanup_process_;
   Clock::time_point teardown_deadline_;
   bool finished_ = false;
@@ -4075,6 +4160,27 @@ CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest& re
       throw CalibrationExecutionError("calibration worker exceeded its cgroup host memory limit");
     }
     throw;
+  }
+}
+
+void hold_calibration_fork_descriptor_registry_for_test(int ready_descriptor,
+                                                        int release_descriptor) {
+  ForkDescriptorLock lock;
+  const char ready = 'R';
+  ssize_t written = -1;
+  do {
+    written = ::write(ready_descriptor, &ready, 1);
+  } while (written < 0 && errno == EINTR);
+  if (written != 1) {
+    throw CalibrationExecutionError("cannot report the held calibration descriptor registry");
+  }
+  char release = '\0';
+  ssize_t received = -1;
+  do {
+    received = ::read(release_descriptor, &release, 1);
+  } while (received < 0 && errno == EINTR);
+  if (received != 1 || release != 'R') {
+    throw CalibrationExecutionError("cannot release the held calibration descriptor registry");
   }
 }
 

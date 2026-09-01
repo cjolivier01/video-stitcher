@@ -132,6 +132,8 @@ struct ProbeLaunchOptions {
   std::chrono::nanoseconds supervisor_start_delay{};
   std::chrono::nanoseconds pre_worker_spawn_delay{};
   std::filesystem::path pre_supervisor_exec_marker;
+  std::chrono::nanoseconds pre_supervisor_arm_delay{};
+  std::filesystem::path pre_supervisor_arm_marker;
   std::chrono::nanoseconds pre_worker_report_delay{};
   std::chrono::nanoseconds pre_guardian_exec_delay{};
   std::filesystem::path pre_guardian_exec_marker;
@@ -693,23 +695,39 @@ int fork_descriptor_registration_error = 0;
 struct ForkProtectedDescriptorState {
   int value = -1;
 };
-constexpr std::size_t kMaximumForkProtectedDescriptors = kMaximumConcurrentProbeWorkers * 4U;
+constexpr std::size_t kMaximumForkProtectedDescriptors = kMaximumConcurrentProbeWorkers * 6U;
 std::array<ForkProtectedDescriptorState*, kMaximumForkProtectedDescriptors>
     fork_protected_descriptors{};
 thread_local int fork_child_retained_descriptor = -1;
 int prepared_fork_child_retained_descriptor = -1;
+sigset_t prepared_fork_signal_mask{};
+bool prepared_fork_signal_mask_valid = false;
 
 void prepare_fork_descriptors() {
+  sigset_t blocked{};
+  sigset_t previous{};
+  const auto mask_error =
+      ::sigfillset(&blocked) == 0 ? ::pthread_sigmask(SIG_SETMASK, &blocked, &previous) : errno;
   (void)::pthread_mutex_lock(&fork_descriptor_mutex);
+  prepared_fork_signal_mask = previous;
+  prepared_fork_signal_mask_valid = mask_error == 0;
   prepared_fork_child_retained_descriptor = fork_child_retained_descriptor;
 }
 
 void restore_fork_descriptors_in_parent() {
+  const auto previous = prepared_fork_signal_mask;
+  const auto restore_mask = prepared_fork_signal_mask_valid;
+  prepared_fork_signal_mask_valid = false;
   prepared_fork_child_retained_descriptor = -1;
   (void)::pthread_mutex_unlock(&fork_descriptor_mutex);
+  if (restore_mask) {
+    (void)::pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+  }
 }
 
 void close_fork_protected_descriptors_in_child() {
+  const auto previous = prepared_fork_signal_mask;
+  const auto restore_mask = prepared_fork_signal_mask_valid;
   const auto retained = prepared_fork_child_retained_descriptor;
   for (auto*& state : fork_protected_descriptors) {
     if (state != nullptr) {
@@ -720,8 +738,12 @@ void close_fork_protected_descriptors_in_child() {
       state = nullptr;
     }
   }
+  prepared_fork_signal_mask_valid = false;
   prepared_fork_child_retained_descriptor = -1;
   (void)::pthread_mutex_unlock(&fork_descriptor_mutex);
+  if (restore_mask) {
+    (void)::pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+  }
 }
 
 void register_fork_descriptor_handlers() {
@@ -730,9 +752,40 @@ void register_fork_descriptor_handlers() {
                        close_fork_protected_descriptors_in_child);
 }
 
+class ForkDescriptorSignalMask {
+public:
+  ForkDescriptorSignalMask() noexcept {
+    sigset_t blocked{};
+    if (::sigfillset(&blocked) != 0) {
+      error_ = errno;
+      return;
+    }
+    error_ = ::pthread_sigmask(SIG_SETMASK, &blocked, &previous_);
+    active_ = error_ == 0;
+  }
+  ForkDescriptorSignalMask(const ForkDescriptorSignalMask&) = delete;
+  ForkDescriptorSignalMask& operator=(const ForkDescriptorSignalMask&) = delete;
+  ~ForkDescriptorSignalMask() {
+    if (active_) {
+      (void)::pthread_sigmask(SIG_SETMASK, &previous_, nullptr);
+    }
+  }
+
+  [[nodiscard]] int error() const { return error_; }
+
+private:
+  sigset_t previous_{};
+  int error_ = 0;
+  bool active_ = false;
+};
+
 class ForkDescriptorLock {
 public:
   ForkDescriptorLock() {
+    if (signal_mask_.error() != 0) {
+      throw GpuVideoProbeError("failed to block signals for video probe descriptor creation: " +
+                               std::string(std::strerror(signal_mask_.error())));
+    }
     const auto once_error =
         ::pthread_once(&fork_descriptor_once, register_fork_descriptor_handlers);
     if (once_error != 0 || fork_descriptor_registration_error != 0) {
@@ -756,6 +809,7 @@ public:
   }
 
 private:
+  ForkDescriptorSignalMask signal_mask_;
   bool locked_ = false;
 };
 
@@ -842,10 +896,55 @@ public:
     }
   }
 
+  static std::pair<UniqueFd, ForkProtectedFd>
+  create_writer_protected_socket_pair(std::string_view description) {
+    auto writer = std::make_unique<ForkProtectedDescriptorState>();
+    ForkDescriptorLock lock;
+    int descriptors[2] = {-1, -1};
+    bool close_on_exec = false;
+#if defined(SOCK_CLOEXEC)
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, descriptors) == 0) {
+      close_on_exec = true;
+    } else if (errno != EINVAL && errno != EPROTONOSUPPORT) {
+      throw GpuVideoProbeError("failed to create video probe worker " + std::string(description) +
+                               " socket: " + std::string(std::strerror(errno)));
+    }
+#endif
+    if (descriptors[0] < 0 && ::socketpair(AF_UNIX, SOCK_STREAM, 0, descriptors) != 0) {
+      throw GpuVideoProbeError("failed to create video probe worker " + std::string(description) +
+                               " socket: " + std::string(std::strerror(errno)));
+    }
+    try {
+      if (!close_on_exec) {
+        make_close_on_exec(descriptors[0]);
+        make_close_on_exec(descriptors[1]);
+      }
+      const auto available =
+          std::find(fork_protected_descriptors.begin(), fork_protected_descriptors.end(), nullptr);
+      if (available == fork_protected_descriptors.end()) {
+        throw GpuVideoProbeError("the video probe fork-protected descriptor registry is exhausted");
+      }
+      writer->value = descriptors[1];
+      *available = writer.get();
+      return {UniqueFd(descriptors[0]), ForkProtectedFd(std::move(writer))};
+    } catch (...) {
+      const auto setup_error = errno;
+      (void)::close(descriptors[0]);
+      (void)::close(descriptors[1]);
+      errno = setup_error;
+      throw;
+    }
+  }
+
   [[nodiscard]] int get() const { return state_ == nullptr ? -1 : state_->value; }
 
   void reset() noexcept {
     if (state_ == nullptr) {
+      return;
+    }
+    ForkDescriptorSignalMask signal_mask;
+    if (signal_mask.error() != 0) {
+      (void)state_.release();
       return;
     }
     if (::pthread_mutex_lock(&fork_descriptor_mutex) != 0) {
@@ -1035,6 +1134,8 @@ struct GuardianLaunch {
 GuardianLaunch spawn_guardian_process(const std::string& executable, int executable_descriptor,
                                       int control_descriptor, int worker_input_descriptor,
                                       int worker_output_descriptor,
+                                      std::chrono::nanoseconds pre_supervisor_arm_delay,
+                                      const std::filesystem::path& pre_supervisor_arm_marker,
                                       std::chrono::nanoseconds pre_worker_report_delay,
                                       std::chrono::nanoseconds pre_guardian_exec_delay,
                                       const std::filesystem::path& pre_guardian_exec_marker,
@@ -2247,7 +2348,11 @@ std::size_t format_guardian_parent_argument(char* destination, std::size_t capac
     destination[index] = reversed[digits - index - 1U];
   }
   destination[digits] = ':';
+#if defined(RECO_PROBE_THREAD_SANITIZER)
+  destination[digits + 1U] = '2';
+#else
   destination[digits + 1U] = '1';
+#endif
   destination[digits + 2U] = '\0';
   return digits + 2U;
 }
@@ -2313,6 +2418,8 @@ std::size_t format_guardian_parent_argument(char* destination, std::size_t capac
 GuardianLaunch spawn_guardian_process(const std::string& executable, int executable_descriptor,
                                       int control_descriptor, int worker_input_descriptor,
                                       int worker_output_descriptor,
+                                      std::chrono::nanoseconds pre_supervisor_arm_delay,
+                                      const std::filesystem::path& pre_supervisor_arm_marker,
                                       std::chrono::nanoseconds pre_worker_report_delay,
                                       std::chrono::nanoseconds pre_guardian_exec_delay,
                                       const std::filesystem::path& pre_guardian_exec_marker,
@@ -2378,18 +2485,28 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
   auto supervisor_lifetime = std::move(lifetime_descriptors[0]);
   auto caller_lifetime = std::move(lifetime_descriptors[1]);
   make_nonblocking(supervisor_lifetime.get());
-  int watchdog_target_descriptors[2] = {-1, -1};
-  int supervisor_arm_descriptors[2] = {-1, -1};
+  auto watchdog_target_descriptors =
+      ForkProtectedFd::create_writer_protected_socket_pair("supervisor watchdog target");
+  auto watchdog_target = std::move(watchdog_target_descriptors.first);
+  auto caller_watchdog_target = std::move(watchdog_target_descriptors.second);
+  auto supervisor_arm_descriptors =
+      ForkProtectedFd::create_writer_protected_socket_pair("supervisor launch gate");
+  auto supervisor_arm = std::move(supervisor_arm_descriptors.first);
+  auto caller_supervisor_arm = std::move(supervisor_arm_descriptors.second);
   int watchdog_ready_descriptors[2] = {-1, -1};
-  create_socket_pair(watchdog_target_descriptors, "supervisor watchdog target");
-  create_socket_pair(supervisor_arm_descriptors, "supervisor launch gate");
   create_socket_pair(watchdog_ready_descriptors, "supervisor watchdog readiness");
-  UniqueFd watchdog_target(watchdog_target_descriptors[0]);
-  UniqueFd caller_watchdog_target(watchdog_target_descriptors[1]);
-  UniqueFd supervisor_arm(supervisor_arm_descriptors[0]);
-  UniqueFd caller_supervisor_arm(supervisor_arm_descriptors[1]);
   UniqueFd watchdog_ready(watchdog_ready_descriptors[0]);
   UniqueFd supervisor_watchdog_ready(watchdog_ready_descriptors[1]);
+  UniqueFd supervisor_arm_marker;
+  if (!pre_supervisor_arm_marker.empty()) {
+    supervisor_arm_marker.reset(::open(pre_supervisor_arm_marker.c_str(),
+                                       O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
+                                       0600));
+    if (supervisor_arm_marker.get() < 0) {
+      throw GpuVideoProbeError("failed to create video probe supervisor pre-arm marker: " +
+                               std::string(std::strerror(errno)));
+    }
+  }
 #if defined(SO_NOSIGPIPE) && !defined(MSG_NOSIGNAL)
   const int suppress_lifetime_sigpipe = 1;
   if (::setsockopt(caller_lifetime.get(), SOL_SOCKET, SO_NOSIGPIPE, &suppress_lifetime_sigpipe,
@@ -2519,6 +2636,27 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
   if (supervisor_pid > 0 && ::setpgid(supervisor_pid, supervisor_pid) != 0 && errno != EACCES &&
       errno != ESRCH) {
     supervisor_group_error = errno;
+  }
+
+  if (supervisor_pid > 0 && supervisor_group_error == 0 && pre_supervisor_arm_delay.count() > 0) {
+    const auto marker = std::to_string(static_cast<std::uint64_t>(supervisor_pid)) + " " +
+                        std::to_string(static_cast<std::uint64_t>(watchdog_pid));
+    std::size_t offset = 0;
+    while (offset < marker.size()) {
+      ssize_t written = -1;
+      do {
+        written =
+            ::write(supervisor_arm_marker.get(), marker.data() + offset, marker.size() - offset);
+      } while (written < 0 && errno == EINTR);
+      if (written <= 0) {
+        supervisor_group_error = errno == 0 ? EIO : errno;
+        break;
+      }
+      offset += static_cast<std::size_t>(written);
+    }
+    if (supervisor_group_error == 0 && !guardian_sleep(pre_supervisor_arm_delay)) {
+      supervisor_group_error = errno == 0 ? EIO : errno;
+    }
   }
 
   bool watchdog_armed = false;
@@ -3365,7 +3503,8 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   wait_for_worker_launch_delay(options.pre_worker_spawn_delay, deadline);
   auto guardian_launch = spawn_guardian_process(
       executable, pinned_executable.get(), guard_control.get(), guard_input.get(),
-      guard_output.get(), options.pre_worker_report_delay, options.pre_guardian_exec_delay,
+      guard_output.get(), options.pre_supervisor_arm_delay, options.pre_supervisor_arm_marker,
+      options.pre_worker_report_delay, options.pre_guardian_exec_delay,
       options.pre_guardian_exec_marker, &reservation);
   pinned_executable.reset();
   GuardianProcess guardian(guardian_launch.supervisor_pid, guardian_launch.watchdog_pid,
@@ -3583,6 +3722,17 @@ GpuVideoProbe detail::probe_gpu_video_with_pre_worker_report_delay_for_test(
                              std::chrono::nanoseconds(pre_worker_report_delay_ns)});
 }
 
+GpuVideoProbe detail::probe_gpu_video_with_pre_supervisor_arm_delay_for_test(
+    const GpuFileDecodeConfig& config, const std::filesystem::path& worker_path,
+    std::uint64_t timeout_ns, std::uint64_t pre_supervisor_arm_delay_ns,
+    const std::filesystem::path& marker_path) {
+  return probe_gpu_video_with_delays(
+      config, worker_path, timeout_ns,
+      ProbeLaunchOptions{.pre_supervisor_arm_delay =
+                             std::chrono::nanoseconds(pre_supervisor_arm_delay_ns),
+                         .pre_supervisor_arm_marker = marker_path});
+}
+
 std::uint64_t detail::maximum_probe_worker_address_space_bytes_for_test() {
   return kMaximumWorkerAddressSpaceBytes;
 }
@@ -3659,6 +3809,27 @@ void detail::hold_probe_worker_admission_lock_for_test(std::uint64_t hold_ns,
     throw GpuVideoProbeError("failed to report the held video probe admission lock");
   }
   std::this_thread::sleep_for(std::chrono::nanoseconds(hold_ns));
+}
+
+void detail::hold_probe_fork_descriptor_registry_for_test(int ready_descriptor,
+                                                          int release_descriptor) {
+  ForkDescriptorLock lock;
+  const char ready = 'R';
+  ssize_t written = -1;
+  do {
+    written = ::write(ready_descriptor, &ready, 1);
+  } while (written < 0 && errno == EINTR);
+  if (written != 1) {
+    throw GpuVideoProbeError("failed to report the held probe descriptor registry");
+  }
+  char release = '\0';
+  ssize_t received = -1;
+  do {
+    received = ::read(release_descriptor, &release, 1);
+  } while (received < 0 && errno == EINTR);
+  if (received != 1 || release != 'R') {
+    throw GpuVideoProbeError("failed to release the held probe descriptor registry");
+  }
 }
 
 GpuVideoProbe detail::probe_gpu_video_with_pre_guardian_exec_delay_for_test(

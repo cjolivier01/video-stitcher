@@ -29,6 +29,7 @@
 #if defined(__linux__)
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -56,6 +57,23 @@ namespace {
 
 int failures = 0;
 std::filesystem::path fake_worker;
+
+#if defined(__linux__)
+volatile sig_atomic_t signal_fork_report_descriptor = -1;
+
+void fork_from_signal_handler(int) {
+  const auto saved_error = errno;
+  const auto child = ::fork();
+  if (child == 0) {
+    ::_exit(EXIT_SUCCESS);
+  }
+  const auto descriptor = static_cast<int>(signal_fork_report_descriptor);
+  if (child > 0 && descriptor >= 0) {
+    (void)::write(descriptor, &child, sizeof(child));
+  }
+  errno = saved_error;
+}
+#endif
 
 void expect_true(bool condition, std::string_view message) {
   if (!condition) {
@@ -1286,12 +1304,14 @@ void fork_only_child_does_not_retain_calibration_ownership() {
   std::filesystem::remove(marker);
   (void)::setenv("RECO_FAKE_CALIBRATION_WORKER_PID_PATH", marker.c_str(), 1);
   std::exception_ptr first_error;
+  std::optional<CalibrationResult> first_result;
   pid_t inherited_child = -1;
+  const auto started = std::chrono::steady_clock::now();
   {
-    Scenario scenario("timeout");
+    Scenario scenario("delayed-success");
     std::thread first([&] {
       try {
-        (void)run_gpu_calibration(lifecycle_request_fixture(), ready_backends());
+        first_result = run_gpu_calibration(lifecycle_request_fixture(), ready_backends());
       } catch (...) {
         first_error = std::current_exception();
       }
@@ -1308,7 +1328,11 @@ void fork_only_child_does_not_retain_calibration_ownership() {
       expect_true(inherited_child > 0, "fork-only calibration child starts");
     }
     first.join();
-    expect_true(first_error != nullptr, "fork-only fixture reaches its configured deadline");
+    expect_true(first_error == nullptr, "successful calibration cleans up with a fork-only child");
+    expect_true(first_result.has_value() && first_result->total_matches == 12U,
+                "fork-only fixture preserves the successful calibration result");
+    expect_true(std::chrono::steady_clock::now() - started < std::chrono::seconds(2),
+                "fork-only child cannot delay cgroup cleanup until the call deadline");
   }
 
   if (inherited_child > 0) {
@@ -1345,6 +1369,77 @@ void fork_only_child_does_not_retain_calibration_ownership() {
   std::filesystem::remove(marker);
   if (second_error != nullptr) {
     std::rethrow_exception(second_error);
+  }
+}
+
+void signal_handler_fork_cannot_deadlock_the_calibration_registry() {
+  std::array<int, 2> ready{-1, -1};
+  std::array<int, 2> release{-1, -1};
+  std::array<int, 2> report{-1, -1};
+  if (::pipe(ready.data()) != 0 || ::pipe(release.data()) != 0 || ::pipe(report.data()) != 0) {
+    expect_true(false, "calibration signal-fork fixture creates its pipes");
+    for (const auto descriptor :
+         {ready[0], ready[1], release[0], release[1], report[0], report[1]}) {
+      if (descriptor >= 0) {
+        (void)::close(descriptor);
+      }
+    }
+    return;
+  }
+  struct sigaction action{};
+  struct sigaction previous{};
+  action.sa_handler = fork_from_signal_handler;
+  (void)::sigemptyset(&action.sa_mask);
+  if (::sigaction(SIGUSR1, &action, &previous) != 0) {
+    expect_true(false, "calibration signal-fork handler installs");
+    for (const auto descriptor :
+         {ready[0], ready[1], release[0], release[1], report[0], report[1]}) {
+      (void)::close(descriptor);
+    }
+    return;
+  }
+  signal_fork_report_descriptor = report[1];
+  std::exception_ptr holder_error;
+  std::thread holder([&] {
+    try {
+      reco::calibrate::detail::hold_calibration_fork_descriptor_registry_for_test(ready[1],
+                                                                                  release[0]);
+    } catch (...) {
+      holder_error = std::current_exception();
+    }
+  });
+  char ready_marker = '\0';
+  expect_true(::read(ready[0], &ready_marker, 1) == 1 && ready_marker == 'R',
+              "calibration descriptor registry reaches its held state");
+  expect_true(::pthread_kill(holder.native_handle(), SIGUSR1) == 0,
+              "calibration signal-fork request is delivered to the registry owner");
+  pollfd pending{.fd = report[0], .events = POLLIN, .revents = 0};
+  expect_true(::poll(&pending, 1, 25) == 0,
+              "calibration registry defers the signal handler while its mutex is held");
+  const char release_marker = 'R';
+  expect_true(::write(release[1], &release_marker, 1) == 1,
+              "calibration descriptor registry holder is released");
+  holder.join();
+  expect_true(holder_error == nullptr, "calibration descriptor registry holder completes");
+  pending.revents = 0;
+  const auto reported = ::poll(&pending, 1, 2000);
+  pid_t fork_child = -1;
+  if (reported > 0) {
+    (void)::read(report[0], &fork_child, sizeof(fork_child));
+  }
+  expect_true(fork_child > 0, "calibration signal handler forks after the registry unlocks");
+  if (fork_child > 0) {
+    int status = 0;
+    while (::waitpid(fork_child, &status, 0) < 0 && errno == EINTR) {
+    }
+    expect_true(WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS,
+                "calibration signal-handler child exits cleanly");
+  }
+  signal_fork_report_descriptor = -1;
+  expect_true(::sigaction(SIGUSR1, &previous, nullptr) == 0,
+              "calibration signal-fork handler restores");
+  for (const auto descriptor : {ready[0], ready[1], release[0], release[1], report[0], report[1]}) {
+    (void)::close(descriptor);
   }
 }
 #endif
@@ -1417,6 +1512,8 @@ int main() {
   run_case("guardian death cleanup", unexpected_guardian_death_kills_the_worker_boundary);
   run_case("cross-process admission", active_worker_retains_cross_process_admission);
   run_case("fork-only descriptor cleanup", fork_only_child_does_not_retain_calibration_ownership);
+  run_case("signal-handler fork descriptor cleanup",
+           signal_handler_fork_cannot_deadlock_the_calibration_registry);
 #else
   expect_execution_error([&] { (void)run_gpu_calibration(request_fixture(), ready_backends()); },
                          "fails closed",

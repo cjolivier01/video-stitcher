@@ -387,6 +387,11 @@ int main(int argc, char** argv) {
     write_bytes(descriptor, encode_calibration_worker_success(result()), deadline);
     return EXIT_SUCCESS;
   }
+  if (scenario == "delayed-success") {
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    write_bytes(descriptor, encode_calibration_worker_success(result()), deadline);
+    return EXIT_SUCCESS;
+  }
   if (scenario == "large-response") {
     auto large = result();
     large.per_frame.assign(kMaximumCalibrationWorkerResultFrames, large.per_frame.front());

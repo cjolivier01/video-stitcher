@@ -502,11 +502,15 @@ int main(int argc, char** argv) {
                       expected_parent);
   const bool valid_parent =
       separator != std::string_view::npos && separator + 2 == parent_argument.size() &&
-      (parent_argument[separator + 1] == '0' || parent_argument[separator + 1] == '1') &&
+      (parent_argument[separator + 1] == '0' || parent_argument[separator + 1] == '1' ||
+       parent_argument[separator + 1] == '2') &&
       parent_error == std::errc{} && parent_end == parent_argument.data() + separator &&
       expected_parent == static_cast<std::uint64_t>(::getppid());
   if (!valid_parent || (parent_argument[separator + 1] == '0' && !close_unrelated_descriptors())) {
     return EXIT_FAILURE;
+  }
+  if (parent_argument[separator + 1] == '2') {
+    (void)::close(3);
   }
 #endif
 #if defined(_WIN32)
