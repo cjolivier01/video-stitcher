@@ -158,6 +158,8 @@ void runtime_abi_discovery_is_fail_closed() {
               "retained runtime identifies its NvBufSurface provider");
   expect_true(!validate_nvbufsurface_runtime_provenance(retained_runtime).has_value(),
               "single retained NvBufSurface provider passes provenance validation");
+  expect_true(retained_runtime->provenance_validated(),
+              "successful provenance validation certifies the retained runtime once");
   void* mixed_runtime = dlopen(nvbufsurface_7_1.c_str(), RTLD_NOW | RTLD_LOCAL);
   expect_true(mixed_runtime != nullptr, "mixed-runtime provenance fixture loads");
   if (mixed_runtime != nullptr) {
@@ -166,6 +168,8 @@ void runtime_abi_discovery_is_fail_closed() {
                     provenance_error->find("multiple NvBufSurface runtime providers") !=
                         std::string::npos,
                 "a second NvBufSurface provider fails provenance validation");
+    expect_true(!retained_runtime->provenance_validated(),
+                "failed provenance revalidation revokes the retained certification");
     (void)dlclose(mixed_runtime);
   }
 #else

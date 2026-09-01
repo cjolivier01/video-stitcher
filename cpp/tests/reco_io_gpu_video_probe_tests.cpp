@@ -1,6 +1,7 @@
 #include "reco/io/gpu_video_probe.hpp"
 
 #include "gpu_video_probe_process_test.hpp"
+#include "reco/core/path.hpp"
 
 #include "rules_cc/cc/runfiles/runfiles.h"
 
@@ -2942,6 +2943,30 @@ void mac_owner_reclaims_stalled_guardian_session(const std::filesystem::path& vi
 #endif
 }
 
+void darwin_session_scan_capacity_failure_is_bounded() {
+#if defined(__APPLE__)
+  expect_true(reco::io::detail::darwin_session_scan_failure_budget_is_bounded_for_test(),
+              "Darwin oversized process census exhausts a bounded retry budget");
+#endif
+}
+
+void windows_request_writer_failure_retires_job(const std::filesystem::path& video_path) {
+#if defined(_WIN32)
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+  expect_probe_error(
+      [&] {
+        (void)reco::io::detail::probe_gpu_video_with_request_writer_failure_for_test(
+            container_config(video_path), fake_probe_worker_path, 2'000'000'000ULL);
+      },
+      "request-writer construction failure",
+      "Windows request-writer construction failure terminates the contained worker");
+  expect_eq(reco::io::detail::reserved_probe_memory_bytes_for_test(), 0ULL,
+            "Windows request-writer construction failure retires its Job reservation");
+#else
+  (void)video_path;
+#endif
+}
+
 void caller_death_before_supervisor_arm(const std::filesystem::path& video_path) {
 #if !defined(_WIN32)
   const auto marker_path =
@@ -4420,7 +4445,8 @@ void windows_path_runtime_discovery(const std::filesystem::path& video_path,
                                     const std::filesystem::path& runtime) {
 #if defined(_WIN32)
   const auto directory = std::filesystem::temp_directory_path() /
-                         ("reco_gstreamer_path_" + std::to_string(GetCurrentProcessId()));
+                         reco::core::path_from_utf8("reco_gstreamer_\xCE\xA9_\xE4\xBE\x8B_" +
+                                                    std::to_string(GetCurrentProcessId()));
   std::filesystem::remove_all(directory);
   std::filesystem::create_directories(directory);
   for (const auto* name :
@@ -4428,13 +4454,21 @@ void windows_path_runtime_discovery(const std::filesystem::path& video_path,
     std::filesystem::copy_file(runtime, directory / name,
                                std::filesystem::copy_options::overwrite_existing);
   }
-  const char* current_path = std::getenv("PATH");
-  const std::string original_path = current_path == nullptr ? "" : current_path;
-  set_environment("PATH", directory.string() + ";" + original_path);
-  set_environment("RECO_GSTREAMER_DYLIB_PATH", "");
-  set_environment("RECO_GSTAPP_DYLIB_PATH", "");
-  set_environment("RECO_GLIB_DYLIB_PATH", "");
-  set_environment("RECO_GOBJECT_DYLIB_PATH", "");
+  const auto original_path = reco::core::path_from_environment("PATH");
+  const auto original_gstreamer = reco::core::path_from_environment("RECO_GSTREAMER_DYLIB_PATH");
+  const auto original_gstapp = reco::core::path_from_environment("RECO_GSTAPP_DYLIB_PATH");
+  const auto original_glib = reco::core::path_from_environment("RECO_GLIB_DYLIB_PATH");
+  const auto original_gobject = reco::core::path_from_environment("RECO_GOBJECT_DYLIB_PATH");
+  auto search_path = directory.native();
+  if (original_path.has_value()) {
+    search_path.push_back(L';');
+    search_path += original_path->native();
+  }
+  (void)SetEnvironmentVariableW(L"PATH", search_path.c_str());
+  (void)SetEnvironmentVariableW(L"RECO_GSTREAMER_DYLIB_PATH", nullptr);
+  (void)SetEnvironmentVariableW(L"RECO_GSTAPP_DYLIB_PATH", nullptr);
+  (void)SetEnvironmentVariableW(L"RECO_GLIB_DYLIB_PATH", nullptr);
+  (void)SetEnvironmentVariableW(L"RECO_GOBJECT_DYLIB_PATH", nullptr);
   try {
     set_scenario("probe-ok");
     expect_eq(probe_video(container_config(video_path), 5'000'000'000ULL).width, 3840U,
@@ -4443,11 +4477,26 @@ void windows_path_runtime_discovery(const std::filesystem::path& video_path,
     std::cerr << "FAIL: Windows PATH GStreamer discovery threw: " << error.what() << '\n';
     ++failures;
   }
-  set_environment("PATH", original_path);
-  set_environment("RECO_GSTREAMER_DYLIB_PATH", runtime.string());
-  set_environment("RECO_GSTAPP_DYLIB_PATH", runtime.string());
-  set_environment("RECO_GLIB_DYLIB_PATH", runtime.string());
-  set_environment("RECO_GOBJECT_DYLIB_PATH", runtime.string());
+  const auto explicit_runtime = directory / "gstreamer-1.0-0.dll";
+  (void)SetEnvironmentVariableW(L"RECO_GSTREAMER_DYLIB_PATH", explicit_runtime.c_str());
+  (void)SetEnvironmentVariableW(L"RECO_GSTAPP_DYLIB_PATH", explicit_runtime.c_str());
+  (void)SetEnvironmentVariableW(L"RECO_GLIB_DYLIB_PATH", explicit_runtime.c_str());
+  (void)SetEnvironmentVariableW(L"RECO_GOBJECT_DYLIB_PATH", explicit_runtime.c_str());
+  try {
+    expect_eq(probe_video(container_config(video_path), 5'000'000'000ULL).width, 3840U,
+              "Windows probe preserves native Unicode runtime override paths");
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: Windows Unicode GStreamer override threw: " << error.what() << '\n';
+    ++failures;
+  }
+  const auto restore = [](const wchar_t* name, const std::optional<std::filesystem::path>& value) {
+    (void)SetEnvironmentVariableW(name, value.has_value() ? value->c_str() : nullptr);
+  };
+  restore(L"PATH", original_path);
+  restore(L"RECO_GSTREAMER_DYLIB_PATH", original_gstreamer);
+  restore(L"RECO_GSTAPP_DYLIB_PATH", original_gstapp);
+  restore(L"RECO_GLIB_DYLIB_PATH", original_glib);
+  restore(L"RECO_GOBJECT_DYLIB_PATH", original_gobject);
   std::filesystem::remove_all(directory);
 #else
   (void)video_path;
@@ -4593,6 +4642,7 @@ int main(int argc, char** argv) {
   partial_owner_launch_report_respects_probe_deadline(video_path);
   competing_waitpid_reaper_cannot_steal_cleanup_authority(video_path);
   windows_job_reclaims_worker_descendants(video_path);
+  windows_request_writer_failure_retires_job(video_path);
   guardian_death_after_worker_release_reclaims_group(video_path);
   unrelated_descriptors_are_not_inherited(video_path);
   signal_handler_fork_cannot_deadlock_the_probe_registry();
@@ -4612,6 +4662,7 @@ int main(int argc, char** argv) {
   caller_death_before_supervisor_main(video_path);
   caller_process_group_death_before_supervisor_main(video_path);
   mac_owner_reclaims_stalled_guardian_session(video_path);
+  darwin_session_scan_capacity_failure_is_bounded();
   executable_replacement_cannot_change_the_pinned_probe_image(video_path);
   linux_fork_child_does_not_retain_snapshot_memfd(video_path);
   mac_probe_snapshot_preserves_quarantine(video_path);

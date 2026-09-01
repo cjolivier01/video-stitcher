@@ -103,10 +103,7 @@ struct TrtApi {
 };
 
 std::filesystem::path getenv_path(const char* name) {
-  if (const char* value = std::getenv(name); value != nullptr && value[0] != '\0') {
-    return std::filesystem::path(value);
-  }
-  return {};
+  return core::path_from_environment(name).value_or(std::filesystem::path{});
 }
 
 std::vector<std::uint8_t> read_engine_file(const std::filesystem::path& path) {

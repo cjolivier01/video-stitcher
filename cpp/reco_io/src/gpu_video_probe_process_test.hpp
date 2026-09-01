@@ -74,6 +74,17 @@ void hold_probe_fork_descriptor_registry_for_test(int ready_descriptor, int rele
                                                             std::int64_t watchdog_pid);
 #endif
 
+#if defined(_WIN32)
+[[nodiscard]] GpuVideoProbe
+probe_gpu_video_with_request_writer_failure_for_test(const GpuFileDecodeConfig& config,
+                                                     const std::filesystem::path& worker_path,
+                                                     std::uint64_t timeout_ns);
+#endif
+
+#if defined(__APPLE__)
+[[nodiscard]] bool darwin_session_scan_failure_budget_is_bounded_for_test();
+#endif
+
 #if defined(__linux__) && defined(__x86_64__)
 [[nodiscard]] bool probe_worker_rejects_x32_syscalls_for_test();
 #endif

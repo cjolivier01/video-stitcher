@@ -112,10 +112,7 @@ struct NcnnApi {
 };
 
 std::filesystem::path getenv_path(const char* name) {
-  if (const char* value = std::getenv(name); value != nullptr && value[0] != '\0') {
-    return std::filesystem::path(value);
-  }
-  return {};
+  return core::path_from_environment(name).value_or(std::filesystem::path{});
 }
 
 bool contains_nul(std::string_view value) { return value.find('\0') != std::string_view::npos; }

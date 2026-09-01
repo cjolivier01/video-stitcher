@@ -146,6 +146,7 @@ struct ProbeLaunchOptions {
   std::chrono::nanoseconds pre_guardian_exec_delay{};
   std::filesystem::path pre_guardian_exec_marker;
   bool stop_supervisor_after_guardian_launch = false;
+  bool fail_request_writer_start = false;
   int pre_owner_fork_ready_descriptor = -1;
   int pre_owner_fork_release_descriptor = -1;
   int owner_forked_pid_descriptor = -1;
@@ -585,13 +586,22 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
     throw_worker_timeout();
   }
   std::exception_ptr write_error;
-  std::thread writer([input = std::move(parent_stdin), request, &write_error]() {
-    try {
-      write_request(input.get(), request);
-    } catch (...) {
-      write_error = std::current_exception();
+  std::thread writer;
+  try {
+    if (options.fail_request_writer_start) {
+      throw GpuVideoProbeError("forced video probe request-writer construction failure");
     }
-  });
+    writer = std::thread([input = std::move(parent_stdin), request, &write_error]() {
+      try {
+        write_request(input.get(), request);
+      } catch (...) {
+        write_error = std::current_exception();
+      }
+    });
+  } catch (...) {
+    terminate_worker();
+    throw;
+  }
 
   const auto terminate_and_join = [&] {
     terminate_worker();
@@ -2425,34 +2435,70 @@ void guardian_wait_for_worker_group_cleanup(pid_t worker_pid) {
 }
 
 #if defined(__APPLE__)
-void guardian_wait_for_owned_session_cleanup(pid_t supervisor_pid) {
+constexpr std::size_t kDarwinSessionProcessCapacity = 131'072;
+constexpr std::size_t kMaximumConsecutiveDarwinSessionScanFailures = 50;
+
+class DarwinSessionScanFailureBudget {
+public:
+  [[nodiscard]] bool retry_after_failure() {
+    return ++consecutive_failures_ < kMaximumConsecutiveDarwinSessionScanFailures;
+  }
+  void reset() { consecutive_failures_ = 0; }
+
+private:
+  std::size_t consecutive_failures_ = 0;
+};
+
+struct DarwinProcessList {
+  std::size_t count = 0;
+  bool complete = false;
+};
+
+DarwinProcessList list_all_darwin_processes(ProcListPids proc_listpids, pid_t* processes,
+                                            std::size_t capacity) {
+  if (proc_listpids == nullptr || processes == nullptr || capacity == 0 ||
+      capacity > static_cast<std::size_t>(std::numeric_limits<int>::max()) / sizeof(pid_t)) {
+    return {};
+  }
+  errno = 0;
+  const auto required_bytes = proc_listpids(PROC_ALL_PIDS, 0, nullptr, 0);
+  const auto required_error = errno;
+  const auto capacity_bytes = capacity * sizeof(pid_t);
+  if (required_bytes <= 0 || required_error != 0 ||
+      required_bytes % static_cast<int>(sizeof(pid_t)) != 0 ||
+      static_cast<std::size_t>(required_bytes) > capacity_bytes) {
+    return {};
+  }
+
+  errno = 0;
+  const auto bytes = proc_listpids(PROC_ALL_PIDS, 0, processes, static_cast<int>(capacity_bytes));
+  const auto list_error = errno;
+  if (bytes <= 0 || list_error != 0 || bytes % static_cast<int>(sizeof(pid_t)) != 0 ||
+      static_cast<std::size_t>(bytes) >= capacity_bytes) {
+    return {};
+  }
+  return DarwinProcessList{.count = static_cast<std::size_t>(bytes) / sizeof(pid_t),
+                           .complete = true};
+}
+
+bool guardian_wait_for_owned_session_cleanup(pid_t supervisor_pid) {
   constexpr timespec kSessionPollPause{.tv_sec = 0, .tv_nsec = 2'000'000};
   const auto owner_pid = ::getpid();
   const auto session_id = ::getsid(0);
   if (session_id != owner_pid) {
-    while (true) {
-      (void)::nanosleep(&kSessionPollPause, nullptr);
-    }
+    return false;
   }
 
+  std::array<pid_t, kDarwinSessionProcessCapacity> processes;
+  DarwinSessionScanFailureBudget failure_budget;
   while (true) {
-    std::array<pid_t, 4096> processes{};
     const auto proc_listpids = apple_proc_listpids();
-    if (proc_listpids == nullptr) {
-      (void)::nanosleep(&kSessionPollPause, nullptr);
-      continue;
-    }
-    errno = 0;
-    const auto bytes =
-        proc_listpids(PROC_ALL_PIDS, 0, processes.data(), static_cast<int>(sizeof(processes)));
-    const auto list_error = errno;
-    bool uncertain = bytes < 0 || (bytes == 0 && list_error != 0) ||
-                     static_cast<std::size_t>(bytes) >= sizeof(processes) ||
-                     bytes % static_cast<int>(sizeof(pid_t)) != 0;
+    const auto process_list =
+        list_all_darwin_processes(proc_listpids, processes.data(), processes.size());
+    bool uncertain = !process_list.complete;
     bool found_member = false;
     if (!uncertain) {
-      const auto process_count = static_cast<std::size_t>(bytes) / sizeof(pid_t);
-      for (std::size_t index = 0; index < process_count; ++index) {
+      for (std::size_t index = 0; index < process_list.count; ++index) {
         const auto process = processes[index];
         if (process <= 0 || process == owner_pid || process == supervisor_pid) {
           continue;
@@ -2502,7 +2548,14 @@ void guardian_wait_for_owned_session_cleanup(pid_t supervisor_pid) {
       }
     }
     if (!found_member && !uncertain) {
-      return;
+      return true;
+    }
+    if (uncertain) {
+      if (!failure_budget.retry_after_failure()) {
+        return false;
+      }
+    } else {
+      failure_budget.reset();
     }
     (void)::nanosleep(&kSessionPollPause, nullptr);
   }
@@ -2604,15 +2657,20 @@ bool guardian_write_exact(int descriptor, const void* value, std::size_t size) {
     guardian_exit(127);
   }
 
+  bool cleanup_certified = true;
 #if defined(__APPLE__)
-  guardian_wait_for_owned_session_cleanup(supervisor_pid);
-#endif
+  cleanup_certified = guardian_wait_for_owned_session_cleanup(supervisor_pid);
+#else
   guardian_wait_for_worker_group_cleanup(supervisor_pid);
+#endif
   int status = 0;
   while (::waitpid(supervisor_pid, &status, 0) < 0) {
     if (errno != EINTR) {
       guardian_exit(127);
     }
+  }
+  if (!cleanup_certified) {
+    guardian_exit(127);
   }
   const char certificate =
       owner_exit_status == 0 ? kSupervisorCertified : kSupervisorCertificationFailed;
@@ -4329,6 +4387,43 @@ void detail::hold_probe_worker_memory_reservation_for_test(std::uint64_t hold_ns
   SupervisorSlot slot;
   std::this_thread::sleep_for(std::chrono::nanoseconds(hold_ns));
 }
+
+#if defined(_WIN32)
+GpuVideoProbe detail::probe_gpu_video_with_request_writer_failure_for_test(
+    const GpuFileDecodeConfig& config, const std::filesystem::path& worker_path,
+    std::uint64_t timeout_ns) {
+  return probe_gpu_video_with_delays(config, worker_path, timeout_ns,
+                                     ProbeLaunchOptions{.fail_request_writer_start = true});
+}
+#endif
+
+#if defined(__APPLE__)
+bool detail::darwin_session_scan_failure_budget_is_bounded_for_test() {
+  const auto oversized_process_list = [](std::uint32_t, std::uint32_t, void* buffer, int) {
+    errno = 0;
+    return buffer == nullptr
+               ? static_cast<int>((kDarwinSessionProcessCapacity + 1U) * sizeof(pid_t))
+               : 0;
+  };
+  std::array<pid_t, kDarwinSessionProcessCapacity> processes;
+  if (list_all_darwin_processes(oversized_process_list, processes.data(), processes.size())
+          .complete) {
+    return false;
+  }
+
+  DarwinSessionScanFailureBudget budget;
+  for (std::size_t attempt = 1; attempt < kMaximumConsecutiveDarwinSessionScanFailures; ++attempt) {
+    if (!budget.retry_after_failure()) {
+      return false;
+    }
+  }
+  if (budget.retry_after_failure()) {
+    return false;
+  }
+  budget.reset();
+  return budget.retry_after_failure();
+}
+#endif
 
 #if defined(__linux__)
 void detail::hold_linux_probe_executable_snapshot_for_test(const std::filesystem::path& worker_path,

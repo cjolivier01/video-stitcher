@@ -91,6 +91,9 @@ public:
   [[nodiscard]] NvbufSurfaceAbi abi() const noexcept;
   /// Returns the loaded object that provides NvBufSurface mapping.
   [[nodiscard]] std::string_view library() const noexcept;
+  /// Returns whether the retained provider has passed an explicit loader-wide
+  /// provenance check since the most recent validation attempt.
+  [[nodiscard]] bool provenance_validated() const noexcept;
 
 private:
   struct State;

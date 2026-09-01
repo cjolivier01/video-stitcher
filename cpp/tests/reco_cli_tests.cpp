@@ -100,6 +100,39 @@ private:
   std::optional<std::string> previous_;
 };
 
+#if defined(_WIN32)
+class ScopedWideEnvironment {
+public:
+  ScopedWideEnvironment(std::wstring name, const std::filesystem::path& value)
+      : name_(std::move(name)) {
+    const auto required = GetEnvironmentVariableW(name_.c_str(), nullptr, 0);
+    if (required != 0) {
+      previous_.resize(required);
+      const auto written = GetEnvironmentVariableW(name_.c_str(), previous_.data(), required);
+      if (written < required) {
+        previous_.resize(written);
+      } else {
+        previous_.clear();
+      }
+    }
+    if (SetEnvironmentVariableW(name_.c_str(), value.c_str()) == 0) {
+      throw std::runtime_error("cannot set native Windows environment path");
+    }
+  }
+
+  ~ScopedWideEnvironment() {
+    (void)SetEnvironmentVariableW(name_.c_str(), previous_.empty() ? nullptr : previous_.c_str());
+  }
+
+  ScopedWideEnvironment(const ScopedWideEnvironment&) = delete;
+  ScopedWideEnvironment& operator=(const ScopedWideEnvironment&) = delete;
+
+private:
+  std::wstring name_;
+  std::wstring previous_;
+};
+#endif
+
 class ScopedCurrentPath {
 public:
   explicit ScopedCurrentPath(const std::filesystem::path& path)
@@ -942,6 +975,23 @@ void probe_worker_discovery_handles_path_and_bzlmod_runfiles() {
                 "PATH executable directory wins over working directory");
     }
   }
+
+#if defined(_WIN32)
+  const auto unicode_bin =
+      path_root.path() / reco::core::path_from_utf8("bin-\xCE\xA9-\xE4\xBE\x8B");
+  std::filesystem::create_directories(unicode_bin);
+  const auto unicode_worker = unicode_bin / worker_name;
+  write_text_file(unicode_worker, "Unicode override worker");
+  {
+    ScopedWideEnvironment override_worker(L"RECO_VIDEO_PROBE_WORKER", unicode_worker);
+    const auto resolved = detail::resolve_video_probe_worker("stage27-missing-reco");
+    expect_true(resolved.has_value(), "native Unicode worker override resolves");
+    if (resolved.has_value()) {
+      expect_true(canonical_path(*resolved).native() == canonical_path(unicode_worker).native(),
+                  "worker override preserves native Unicode path components");
+    }
+  }
+#endif
 }
 
 void calibration_output_replacement_is_exclusive_and_atomic() {

@@ -68,11 +68,11 @@ using rules_cc::cc::runfiles::Runfiles;
 #if defined(_WIN32)
 constexpr std::string_view probe_worker_name = "reco_video_probe_worker.exe";
 constexpr std::string_view calibration_worker_name = "reco_calibration_worker.exe";
-constexpr char path_separator = ';';
+constexpr std::filesystem::path::value_type path_separator = L';';
 #else
 constexpr std::string_view probe_worker_name = "reco_video_probe_worker";
 constexpr std::string_view calibration_worker_name = "reco_calibration_worker";
-constexpr char path_separator = ':';
+constexpr std::filesystem::path::value_type path_separator = ':';
 #endif
 
 std::optional<std::filesystem::path>
@@ -102,11 +102,11 @@ resolve_path_invocation(const std::filesystem::path& executable_path) {
     return existing_absolute_executable(executable_path);
   }
 
-  const char* path_value = std::getenv("PATH");
-  if (path_value == nullptr) {
+  const auto path_value = reco::core::path_from_environment("PATH");
+  if (!path_value.has_value()) {
     return std::nullopt;
   }
-  const std::string path(path_value);
+  const auto& path = path_value->native();
   std::size_t begin = 0;
   while (begin <= path.size()) {
     const auto end = path.find(path_separator, begin);
@@ -127,7 +127,7 @@ resolve_path_invocation(const std::filesystem::path& executable_path) {
       }
     }
 #endif
-    if (end == std::string::npos) {
+    if (end == std::filesystem::path::string_type::npos) {
       break;
     }
     begin = end + 1;
@@ -139,9 +139,9 @@ std::optional<std::filesystem::path>
 resolve_worker_impl(const std::filesystem::path& executable_path, const char* environment_name,
                     std::string_view name, std::string_view runfiles_directory,
                     std::string_view output_directory) {
-  if (const char* configured = std::getenv(environment_name);
-      configured != nullptr && configured[0] != '\0') {
-    return existing_absolute_executable(configured);
+  if (const auto configured = reco::core::path_from_environment(environment_name);
+      configured.has_value()) {
+    return existing_absolute_executable(*configured);
   }
 
   const auto resolved_executable = resolve_path_invocation(executable_path);

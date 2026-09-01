@@ -274,13 +274,17 @@ private:
 
 std::filesystem::path current_executable() {
 #if defined(_WIN32)
-  std::string buffer(MAX_PATH, '\0');
-  const DWORD len = GetModuleFileNameA(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
-  if (len == 0) {
-    return {};
+  for (DWORD capacity = 512; capacity <= 32768; capacity *= 2) {
+    std::vector<wchar_t> buffer(capacity);
+    const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), capacity);
+    if (length == 0) {
+      return {};
+    }
+    if (length + 1U < capacity) {
+      return std::filesystem::path(std::wstring_view(buffer.data(), length));
+    }
   }
-  buffer.resize(len);
-  return buffer;
+  return {};
 #elif defined(__APPLE__)
   std::uint32_t size = 0;
   _NSGetExecutablePath(nullptr, &size);
@@ -312,11 +316,7 @@ std::filesystem::path default_soname() {
 }
 
 std::filesystem::path getenv_path(const char* name) {
-  const char* value = std::getenv(name);
-  if (value == nullptr || *value == '\0') {
-    return {};
-  }
-  return value;
+  return core::path_from_environment(name).value_or(std::filesystem::path{});
 }
 
 std::filesystem::path resolve_ort_library_path() {

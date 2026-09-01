@@ -1,5 +1,6 @@
 #include "reco/io/gpu_decode.hpp"
 
+#include "reco/core/path.hpp"
 #include "reco/core/windows_runtime_library.hpp"
 
 #include <algorithm>
@@ -112,15 +113,15 @@ static_assert(offsetof(GstMessageAbi, type) == (sizeof(void*) == 8 ? 64 : 36));
 
 class DynamicLibrary {
 public:
-  explicit DynamicLibrary(std::string path) : path_(std::move(path)) {
+  explicit DynamicLibrary(const std::filesystem::path& path) : path_(core::path_to_utf8(path)) {
 #if defined(_WIN32)
-    handle_ = static_cast<HMODULE>(core::detail::load_windows_runtime_library(path_));
+    handle_ = static_cast<HMODULE>(core::detail::load_windows_runtime_library(path));
     if (handle_ == nullptr) {
       throw GpuDecodeError("failed to load " + path_ + " (Windows error " +
                            std::to_string(GetLastError()) + ")");
     }
 #else
-    handle_ = dlopen(path_.c_str(), RTLD_NOW | RTLD_LOCAL);
+    handle_ = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (handle_ == nullptr) {
       const char* error = dlerror();
       throw GpuDecodeError("failed to load " + path_ +
@@ -169,15 +170,15 @@ private:
 std::shared_ptr<DynamicLibrary> load_runtime_library(const char* environment_variable,
                                                      std::initializer_list<const char*> names,
                                                      std::string_view component) {
-  if (const char* override_path = std::getenv(environment_variable);
-      override_path != nullptr && override_path[0] != '\0') {
-    return std::make_shared<DynamicLibrary>(override_path);
+  if (const auto override_path = core::path_from_environment(environment_variable);
+      override_path.has_value()) {
+    return std::make_shared<DynamicLibrary>(*override_path);
   }
 
   std::string errors;
   for (const char* name : names) {
     try {
-      return std::make_shared<DynamicLibrary>(name);
+      return std::make_shared<DynamicLibrary>(std::filesystem::path(name));
     } catch (const GpuDecodeError& error) {
       if (!errors.empty()) {
         errors += "; ";

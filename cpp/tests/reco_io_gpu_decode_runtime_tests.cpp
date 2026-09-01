@@ -15,6 +15,13 @@
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 using namespace reco::io;
 
 namespace {
@@ -76,6 +83,20 @@ std::filesystem::path find_fake_runtime_runfile(std::string_view runtime_name) {
 void set_environment(const char* name, const std::string& value) {
 #if defined(_WIN32)
   _putenv_s(name, value.c_str());
+#else
+  setenv(name, value.c_str(), 1);
+#endif
+}
+
+void set_path_environment(const char* name, const std::filesystem::path& value) {
+#if defined(_WIN32)
+  std::wstring wide_name;
+  for (const unsigned char character : std::string_view(name)) {
+    wide_name.push_back(static_cast<wchar_t>(character));
+  }
+  if (SetEnvironmentVariableW(wide_name.c_str(), value.c_str()) == 0) {
+    throw std::runtime_error("failed to set native runtime path environment");
+  }
 #else
   setenv(name, value.c_str(), 1);
 #endif
@@ -720,10 +741,21 @@ void runtime_failures_are_reported() {
 
 int main() {
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
-  const auto runtime = find_fake_runtime_runfile("fake_gstreamer_runtime");
-  set_environment("RECO_GSTREAMER_DYLIB_PATH", runtime.string());
-  set_environment("RECO_GSTAPP_DYLIB_PATH", runtime.string());
-  set_environment("RECO_GLIB_DYLIB_PATH", runtime.string());
+  const auto source_runtime = find_fake_runtime_runfile("fake_gstreamer_runtime");
+  auto runtime = source_runtime;
+#if defined(_WIN32)
+  const auto unicode_runtime_directory =
+      std::filesystem::temp_directory_path() /
+      std::filesystem::path(std::u8string(u8"reco-gstreamer-\u5f55\u50cf"));
+  std::filesystem::remove_all(unicode_runtime_directory);
+  std::filesystem::create_directories(unicode_runtime_directory);
+  runtime = unicode_runtime_directory / source_runtime.filename();
+  std::filesystem::copy_file(source_runtime, runtime,
+                             std::filesystem::copy_options::overwrite_existing);
+#endif
+  set_path_environment("RECO_GSTREAMER_DYLIB_PATH", runtime);
+  set_path_environment("RECO_GSTAPP_DYLIB_PATH", runtime);
+  set_path_environment("RECO_GLIB_DYLIB_PATH", runtime);
 #if defined(__linux__)
   const auto nvbufsurface = find_fake_runtime_runfile("fake_nvbufsurface.so");
   set_environment("RECO_NVBUFSURFACE_DYLIB_PATH", nvbufsurface.string());

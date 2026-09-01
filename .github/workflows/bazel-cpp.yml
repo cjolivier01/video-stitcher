@@ -28,7 +28,7 @@ jobs:
           - os: windows-latest
             bazel_args: "--cxxopt=/std:c++20 --host_cxxopt=/std:c++20"
             test_args: ""
-            test_target: "//cpp/reco_io:gpu_video_probe_protocol_tests //cpp/tests:reco_core_cuda_backend_tests //cpp/tests:reco_io_gpu_video_probe_tests //cpp/tests:reco_cli_tests"
+            test_target: "//cpp/reco_io:gpu_video_probe_protocol_tests //cpp/tests:reco_core_cuda_backend_tests //cpp/tests:reco_io_gpu_video_probe_tests //cpp/tests:reco_cli_tests //cpp/tests:reco_io_gpu_decode_runtime_tests //cpp/tests:reco_io_gstreamer_tests //cpp/tests:reco_detect_ncnn_session_fake_runtime_tests //cpp/tests:reco_detect_ort_session_fake_runtime_tests //cpp/tests:reco_detect_trt_engine_fake_runtime_tests"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3

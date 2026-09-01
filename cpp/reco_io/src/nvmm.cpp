@@ -3,6 +3,7 @@
 #include "reco/io/detail/nvbufsurface_7_1.hpp"
 #include "reco/io/detail/nvbufsurface_9_1.hpp"
 
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <limits>
@@ -643,6 +644,7 @@ struct NvbufSurfaceRuntime::State {
 #endif
   NvbufSurfaceAbi abi = NvbufSurfaceAbi::DeepStream7_1;
   std::string library;
+  std::atomic<bool> provenance_validated = false;
 };
 
 NvbufSurfaceRuntime::NvbufSurfaceRuntime(std::unique_ptr<State> state) : state_(std::move(state)) {}
@@ -652,6 +654,10 @@ NvbufSurfaceRuntime::~NvbufSurfaceRuntime() = default;
 NvbufSurfaceAbi NvbufSurfaceRuntime::abi() const noexcept { return state_->abi; }
 
 std::string_view NvbufSurfaceRuntime::library() const noexcept { return state_->library; }
+
+bool NvbufSurfaceRuntime::provenance_validated() const noexcept {
+  return state_->provenance_validated.load(std::memory_order_acquire);
+}
 
 std::shared_ptr<const NvbufSurfaceRuntime> discover_nvbufsurface_runtime() {
 #if defined(__linux__)
@@ -697,7 +703,12 @@ std::shared_ptr<const NvbufSurfaceRuntime> discover_nvbufsurface_runtime() {
   state->version_library = std::move(deepstream_utils);
   state->abi = abi;
   state->library = state->functions->provider_path;
-  return std::shared_ptr<const NvbufSurfaceRuntime>(new NvbufSurfaceRuntime(std::move(state)));
+  auto runtime =
+      std::shared_ptr<const NvbufSurfaceRuntime>(new NvbufSurfaceRuntime(std::move(state)));
+  if (const auto error = validate_nvbufsurface_runtime_provenance(runtime); error.has_value()) {
+    throw NvmmError(*error);
+  }
+  return runtime;
 #else
   throw NvmmError("DeepStream NvBufSurface ABI discovery is only supported on Linux");
 #endif
@@ -711,6 +722,7 @@ std::optional<std::string> validate_nvbufsurface_runtime_provenance(
   if (!runtime || !runtime->state_ || !runtime->state_->functions) {
     return "NvBufSurface runtime binding is missing";
   }
+  runtime->state_->provenance_validated.store(false, std::memory_order_release);
   struct LoadedObject {
     std::uintptr_t base = 0;
     std::string path;
@@ -745,6 +757,7 @@ std::optional<std::string> validate_nvbufsurface_runtime_provenance(
              runtime->state_->functions->provider_path + " but also found " + object.path;
     }
   }
+  runtime->state_->provenance_validated.store(true, std::memory_order_release);
   return std::nullopt;
 #else
   (void)runtime;
@@ -869,11 +882,8 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info, std::shared_ptr<
   };
 
 #if defined(__linux__)
-  if (info.runtime) {
-    if (const auto error = validate_nvbufsurface_runtime_provenance(info.runtime);
-        error.has_value()) {
-      throw NvmmError(*error);
-    }
+  if (info.runtime && !info.runtime->provenance_validated()) {
+    throw NvmmError("NvBufSurface runtime provenance has not been validated");
   }
   auto cuda = cuda_functions();
   DeviceZeroContext context(cuda);
