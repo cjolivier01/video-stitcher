@@ -849,6 +849,19 @@ int main(int argc, char** argv) {
       return EXIT_FAILURE;
     }
     errno = 0;
+    if (::truncate(metadata_target, 0) == 0 ||
+        (errno != EPERM && errno != EACCES && errno != EROFS)) {
+      return EXIT_FAILURE;
+    }
+    errno = 0;
+    const auto forbidden_truncate = ::open(metadata_target, O_RDONLY | O_TRUNC | O_CLOEXEC);
+    if (forbidden_truncate >= 0 || (errno != EPERM && errno != EACCES && errno != EROFS)) {
+      if (forbidden_truncate >= 0) {
+        (void)::close(forbidden_truncate);
+      }
+      return EXIT_FAILURE;
+    }
+    errno = 0;
     const auto forbidden_write =
         ::open(write_target, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, S_IRUSR | S_IWUSR);
     if (forbidden_write >= 0 || (errno != EACCES && errno != EROFS)) {

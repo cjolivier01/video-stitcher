@@ -91,6 +91,8 @@ int run_calibration_guardian_fd(int, const char*, std::uint64_t) { return EXIT_F
 
 bool install_calibration_worker_sandbox() noexcept { return false; }
 
+bool install_legacy_landlock_truncation_filter_for_test() noexcept { return false; }
+
 #else
 namespace {
 
@@ -2240,6 +2242,83 @@ void close_child_descriptors_except(int preserved) noexcept {
 #endif
 }
 
+[[nodiscard]] bool install_legacy_landlock_truncation_filter() noexcept {
+#define RECO_LEGACY_TRUNCATION_DENY(syscall_number)                                                \
+  BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, syscall_number, 0, 1),                                       \
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM)
+#if defined(__x86_64__)
+  constexpr std::uint32_t architecture = AUDIT_ARCH_X86_64;
+  constexpr std::uint32_t x32_syscall_bit = 0x40000000U;
+  static const sock_filter filter[] = {
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, arch)),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, architecture, 1, 0),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+      BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, x32_syscall_bit, 0, 1),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+#if defined(SYS_truncate)
+      RECO_LEGACY_TRUNCATION_DENY(SYS_truncate),
+#endif
+#if defined(SYS_ftruncate)
+      RECO_LEGACY_TRUNCATION_DENY(SYS_ftruncate),
+#endif
+#if defined(SYS_creat)
+      RECO_LEGACY_TRUNCATION_DENY(SYS_creat),
+#endif
+#if defined(SYS_open)
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_open, 0, 4),
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, args[1])),
+      BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, O_TRUNC, 0, 1),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+#endif
+#if defined(SYS_openat)
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_openat, 0, 4),
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, args[2])),
+      BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, O_TRUNC, 0, 1),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+#endif
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+  };
+#elif defined(__aarch64__)
+  constexpr std::uint32_t architecture = AUDIT_ARCH_AARCH64;
+  static const sock_filter filter[] = {
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, arch)),
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, architecture, 1, 0),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS),
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+#if defined(SYS_truncate)
+      RECO_LEGACY_TRUNCATION_DENY(SYS_truncate),
+#endif
+#if defined(SYS_ftruncate)
+      RECO_LEGACY_TRUNCATION_DENY(SYS_ftruncate),
+#endif
+#if defined(SYS_creat)
+      RECO_LEGACY_TRUNCATION_DENY(SYS_creat),
+#endif
+#if defined(SYS_openat)
+      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_openat, 0, 4),
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, args[2])),
+      BPF_JUMP(BPF_JMP | BPF_JSET | BPF_K, O_TRUNC, 0, 1),
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+#endif
+      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+  };
+#else
+#undef RECO_LEGACY_TRUNCATION_DENY
+  return false;
+#endif
+#undef RECO_LEGACY_TRUNCATION_DENY
+#if defined(__x86_64__) || defined(__aarch64__)
+  const sock_fprog program{.len = static_cast<unsigned short>(std::size(filter)),
+                           .filter = const_cast<sock_filter*>(filter)};
+  return ::prctl(PR_SET_NO_NEW_PRIVS, 1L, 0L, 0L, 0L) == 0 &&
+         ::syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0U, &program) == 0;
+#endif
+}
+
 [[nodiscard]] bool install_worker_filesystem_boundary(const char* scratch, int left_input,
                                                       int right_input, int left_profile,
                                                       int right_profile) noexcept {
@@ -2260,6 +2339,7 @@ void close_child_descriptors_except(int preserved) noexcept {
   if (abi < 1) {
     return false;
   }
+  bool landlock_handles_truncation = false;
   std::uint64_t write_access = LANDLOCK_ACCESS_FS_WRITE_FILE | LANDLOCK_ACCESS_FS_MAKE_CHAR |
                                LANDLOCK_ACCESS_FS_MAKE_DIR | LANDLOCK_ACCESS_FS_MAKE_REG |
                                LANDLOCK_ACCESS_FS_MAKE_SOCK | LANDLOCK_ACCESS_FS_MAKE_FIFO |
@@ -2274,6 +2354,7 @@ void close_child_descriptors_except(int preserved) noexcept {
 #if defined(LANDLOCK_ACCESS_FS_TRUNCATE)
   if (abi >= 3) {
     write_access |= LANDLOCK_ACCESS_FS_TRUNCATE;
+    landlock_handles_truncation = true;
   }
 #endif
   constexpr std::uint64_t read_access =
@@ -2427,7 +2508,7 @@ void close_child_descriptors_except(int preserved) noexcept {
       ::syscall(SYS_landlock_restrict_self, ruleset.get(), 0U) != 0) {
     return false;
   }
-  return true;
+  return landlock_handles_truncation || install_legacy_landlock_truncation_filter();
 #endif
 }
 
@@ -3637,6 +3718,10 @@ extern "C"
 #endif
 
 bool install_calibration_worker_sandbox() noexcept { return install_worker_syscall_filter(); }
+
+bool install_legacy_landlock_truncation_filter_for_test() noexcept {
+  return install_legacy_landlock_truncation_filter();
+}
 
 int run_calibration_guardian_fd(int descriptor, const char* executable,
                                 std::uint64_t deadline_nanoseconds) {

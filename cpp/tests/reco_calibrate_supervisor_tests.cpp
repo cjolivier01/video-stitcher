@@ -1,5 +1,7 @@
 #include "reco/calibrate/pipeline.hpp"
 
+#include "calibration_worker_internal.hpp"
+
 #include "rules_cc/cc/runfiles/runfiles.h"
 
 #include <algorithm>
@@ -14,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <set>
@@ -28,6 +31,7 @@
 #include <poll.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
 #include <unistd.h>
@@ -613,6 +617,11 @@ void worker_allows_threads_but_blocks_process_descendants() {
     struct stat metadata_after{};
     expect_true(::lstat(metadata_target.c_str(), &metadata_after) == 0,
                 "sandbox metadata fixture remains after worker exit");
+    std::ifstream metadata_contents(metadata_target, std::ios::binary);
+    const std::string metadata_text((std::istreambuf_iterator<char>(metadata_contents)),
+                                    std::istreambuf_iterator<char>());
+    expect_true(metadata_text == "host metadata must remain unchanged",
+                "worker cannot truncate host files");
     expect_true(metadata_after.st_uid == metadata_before.st_uid &&
                     metadata_after.st_gid == metadata_before.st_gid &&
                     metadata_after.st_mode == metadata_before.st_mode,
@@ -652,6 +661,75 @@ void worker_allows_threads_but_blocks_process_descendants() {
     }
     std::filesystem::remove(metadata_target);
   }
+}
+
+void legacy_landlock_truncation_fallback_denies_mutation() {
+  const auto target = temporary_path("legacy-landlock-truncation");
+  static constexpr std::string_view original = "host data must not be truncated";
+  {
+    std::ofstream output(target, std::ios::binary | std::ios::trunc);
+    output << original;
+  }
+  const auto child = ::fork();
+  expect_true(child >= 0, "legacy Landlock truncation fixture forks a filter child");
+  if (child == 0) {
+    if (!reco::calibrate::detail::install_legacy_landlock_truncation_filter_for_test()) {
+      std::_Exit(10);
+    }
+#if defined(SYS_truncate)
+    errno = 0;
+    if (::syscall(SYS_truncate, target.c_str(), 0) == 0 || errno != EPERM) {
+      std::_Exit(11);
+    }
+#endif
+#if defined(SYS_openat)
+    errno = 0;
+    const auto open_result = static_cast<int>(
+        ::syscall(SYS_openat, AT_FDCWD, target.c_str(), O_RDONLY | O_TRUNC | O_CLOEXEC, 0U));
+    if (open_result >= 0 || errno != EPERM) {
+      if (open_result >= 0) {
+        (void)::close(open_result);
+      }
+      std::_Exit(12);
+    }
+#endif
+#if defined(SYS_creat)
+    errno = 0;
+    const auto created = static_cast<int>(::syscall(SYS_creat, target.c_str(), S_IRUSR | S_IWUSR));
+    if (created >= 0 || errno != EPERM) {
+      if (created >= 0) {
+        (void)::close(created);
+      }
+      std::_Exit(13);
+    }
+#endif
+#if defined(SYS_ftruncate)
+    const auto readonly = ::open(target.c_str(), O_RDONLY | O_CLOEXEC);
+    if (readonly < 0) {
+      std::_Exit(14);
+    }
+    errno = 0;
+    const auto truncate_result = ::syscall(SYS_ftruncate, readonly, 0);
+    const auto truncate_error = errno;
+    (void)::close(readonly);
+    if (truncate_result == 0 || truncate_error != EPERM) {
+      std::_Exit(15);
+    }
+#endif
+    std::_Exit(EXIT_SUCCESS);
+  }
+  if (child > 0) {
+    int status = 0;
+    while (::waitpid(child, &status, 0) < 0 && errno == EINTR) {
+    }
+    expect_true(WIFEXITED(status) && WEXITSTATUS(status) == EXIT_SUCCESS,
+                "legacy Landlock fallback denies every truncation syscall path");
+  }
+  std::ifstream input(target, std::ios::binary);
+  const std::string contents((std::istreambuf_iterator<char>(input)),
+                             std::istreambuf_iterator<char>());
+  expect_true(contents == original, "legacy Landlock fallback preserves the protected file");
+  std::filesystem::remove(target);
 }
 
 void worker_starts_inside_the_hard_memory_boundary() {
@@ -1236,6 +1314,8 @@ int main() {
   run_case("caller cgroup OOM cleanup", caller_cgroup_oom_preserves_cleanup_authority);
 #endif
   run_case("worker process policy", worker_allows_threads_but_blocks_process_descendants);
+  run_case("legacy Landlock truncation fallback",
+           legacy_landlock_truncation_fallback_denies_mutation);
   run_case("hard memory boundary", worker_starts_inside_the_hard_memory_boundary);
   run_case("cgroup setup failure cleanup", cgroup_setup_failures_remove_the_cleanup_boundary);
   run_case("recursive scratch cleanup", worker_scratch_is_removed_recursively);

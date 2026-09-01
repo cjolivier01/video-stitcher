@@ -50,6 +50,8 @@ int run_calibration_guardian_fd(int descriptor, const char* executable,
                                 std::uint64_t deadline_nanoseconds);
 /// Installs the post-exec worker syscall boundary before any IPC or parser work.
 [[nodiscard]] bool install_calibration_worker_sandbox() noexcept;
+/// Installs the truncation fallback used when Landlock ABI 3 is unavailable.
+[[nodiscard]] bool install_legacy_landlock_truncation_filter_for_test() noexcept;
 
 /// Handles one framed worker request. Exposed only to the worker and protocol tests.
 int run_calibration_worker(std::istream& input, std::ostream& output);

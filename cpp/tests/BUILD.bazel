@@ -389,6 +389,7 @@ cc_test(
     ],
     deps = [
         "//cpp/reco_calibrate",
+        "//cpp/reco_calibrate:calibration_worker_test_support",
         "@rules_cc//cc/runfiles",
     ],
 )

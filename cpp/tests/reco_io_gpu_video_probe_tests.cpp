@@ -32,6 +32,9 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/resource.h>
+#if defined(__APPLE__)
+#include <sys/xattr.h>
+#endif
 #if defined(__linux__)
 #include <sys/syscall.h>
 #endif
@@ -155,6 +158,27 @@ wait_for_process_marker(const std::filesystem::path& path,
   }
   return std::nullopt;
 }
+
+#if defined(__APPLE__)
+std::vector<std::filesystem::path> mac_probe_snapshot_directories() {
+  std::vector<std::filesystem::path> result;
+  std::error_code error;
+  for (const auto& entry :
+       std::filesystem::directory_iterator(std::filesystem::temp_directory_path(), error)) {
+    if (error) {
+      break;
+    }
+    const auto name = entry.path().filename().string();
+    std::error_code status_error;
+    if (name.rfind("reco-video-probe-", 0) == 0 && entry.is_directory(status_error) &&
+        !status_error) {
+      result.push_back(entry.path());
+    }
+  }
+  std::sort(result.begin(), result.end());
+  return result;
+}
+#endif
 
 #if defined(__linux__)
 std::vector<pid_t> direct_children(pid_t parent) {
@@ -341,10 +365,12 @@ int run_posix_probe_caller() {
   }
 
   const auto mode = std::string_view(mode_value);
-  if (mode != "probe" && mode != "pre-worker-report-delay" && mode != "pre-guardian-exec-delay") {
+  if (mode != "probe" && mode != "pre-worker-report-delay" && mode != "pre-supervisor-exec-delay" &&
+      mode != "pre-guardian-exec-delay") {
     return EXIT_FAILURE;
   }
-  if (mode == "pre-guardian-exec-delay" && (marker_path == nullptr || marker_path[0] == '\0')) {
+  if ((mode == "pre-supervisor-exec-delay" || mode == "pre-guardian-exec-delay") &&
+      (marker_path == nullptr || marker_path[0] == '\0')) {
     return EXIT_FAILURE;
   }
 
@@ -357,6 +383,9 @@ int run_posix_probe_caller() {
       (void)reco::io::detail::probe_gpu_video_with_pre_worker_report_delay_for_test(
           config, worker, timeout_ns, delay_ns);
       return 2;
+    } else if (mode == "pre-supervisor-exec-delay") {
+      (void)reco::io::detail::probe_gpu_video_with_pre_supervisor_exec_delay_for_test(
+          config, worker, timeout_ns, delay_ns, std::filesystem::path(marker_path));
     } else {
       (void)reco::io::detail::probe_gpu_video_with_pre_guardian_exec_delay_for_test(
           config, worker, timeout_ns, delay_ns, std::filesystem::path(marker_path));
@@ -2145,6 +2174,10 @@ void guardian_death_after_worker_release_reclaims_group(const std::filesystem::p
 
 void caller_death_before_supervisor_main(const std::filesystem::path& video_path) {
 #if !defined(_WIN32)
+#if defined(__APPLE__)
+  const auto snapshots_before = mac_probe_snapshot_directories();
+  std::vector<std::filesystem::path> caller_snapshots;
+#endif
   const auto marker_path =
       video_path.parent_path() / (video_path.filename().string() + ".pre-main-supervisor");
   std::filesystem::remove(marker_path);
@@ -2157,6 +2190,16 @@ void caller_death_before_supervisor_main(const std::filesystem::path& video_path
     const auto supervisor = wait_for_process_marker(marker_path, std::chrono::steady_clock::now() +
                                                                      std::chrono::seconds(2));
     expect_true(supervisor.has_value(), "supervisor reaches its pre-main test block");
+#if defined(__APPLE__)
+    const auto snapshots_during = mac_probe_snapshot_directories();
+    for (const auto& snapshot : snapshots_during) {
+      if (!std::binary_search(snapshots_before.begin(), snapshots_before.end(), snapshot)) {
+        caller_snapshots.push_back(snapshot);
+      }
+    }
+    expect_true(!caller_snapshots.empty(),
+                "macOS caller owns a named executable snapshot before termination");
+#endif
     (void)::kill(caller, SIGKILL);
     int caller_status = 0;
     while (::waitpid(caller, &caller_status, 0) < 0 && errno == EINTR) {
@@ -2175,6 +2218,22 @@ void caller_death_before_supervisor_main(const std::filesystem::path& video_path
     if (supervisor.has_value() && !exited) {
       (void)::kill(static_cast<pid_t>(*supervisor), SIGKILL);
     }
+#if defined(__APPLE__)
+    const auto cleanup_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool snapshots_removed = caller_snapshots.empty();
+    while (!snapshots_removed && std::chrono::steady_clock::now() < cleanup_deadline) {
+      snapshots_removed =
+          std::all_of(caller_snapshots.begin(), caller_snapshots.end(), [](const auto& snapshot) {
+            std::error_code exists_error;
+            const bool exists = std::filesystem::exists(snapshot, exists_error);
+            return !exists && !exists_error;
+          });
+      if (!snapshots_removed) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+    }
+    expect_true(snapshots_removed, "macOS caller death reclaims its executable snapshot");
+#endif
   }
   set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", "");
   set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
@@ -2270,7 +2329,7 @@ void executable_replacement_cannot_change_the_pinned_probe_image(
                                      std::filesystem::perms::owner_exec,
                                  std::filesystem::perm_options::replace);
 
-    const auto run_race = [&](std::string_view name, bool symlink_retarget,
+    const auto run_race = [&](std::string_view name, bool symlink_retarget, bool in_place,
                               bool before_supervisor) {
       const auto selected = root / (std::string(name) + "-selected");
       const auto staged = root / (std::string(name) + "-staged");
@@ -2304,9 +2363,18 @@ void executable_replacement_cannot_change_the_pinned_probe_image(
       expect_true(guardian.has_value(), std::string(name) + " reaches the pre-exec race hook");
       std::error_code replace_error;
       if (guardian.has_value()) {
-        std::filesystem::rename(staged, selected, replace_error);
+        if (in_place) {
+          std::ifstream input(hostile, std::ios::binary);
+          std::ofstream output(selected, std::ios::binary | std::ios::trunc);
+          output << input.rdbuf();
+          if (!input || !output) {
+            replace_error = std::make_error_code(std::errc::io_error);
+          }
+        } else {
+          std::filesystem::rename(staged, selected, replace_error);
+        }
       }
-      expect_true(!replace_error, std::string(name) + " replacement is atomic");
+      expect_true(!replace_error, std::string(name) + " replacement completes");
       probe.join();
 
       if (probe_error != nullptr) {
@@ -2327,16 +2395,93 @@ void executable_replacement_cannot_change_the_pinned_probe_image(
 
     set_scenario("probe-ok");
     set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
-    run_race("pre-supervisor regular executable replacement", false, true);
-    run_race("pre-supervisor symlink retarget", true, true);
-    run_race("pre-guardian regular executable replacement", false, false);
-    run_race("pre-guardian symlink retarget", true, false);
+    run_race("pre-supervisor regular executable replacement", false, false, true);
+    run_race("pre-supervisor in-place executable overwrite", false, true, true);
+    run_race("pre-supervisor symlink retarget", true, false, true);
+    run_race("pre-guardian regular executable replacement", false, false, false);
+    run_race("pre-guardian in-place executable overwrite", false, true, false);
+    run_race("pre-guardian symlink retarget", true, false, false);
   } catch (const std::exception& error) {
     std::cerr << "FAIL: pinned executable race fixture failed: " << error.what() << '\n';
     ++failures;
   }
   std::filesystem::remove_all(root, cleanup_error);
   set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+#else
+  (void)video_path;
+#endif
+}
+
+void mac_probe_snapshot_preserves_quarantine(const std::filesystem::path& video_path) {
+#if defined(__APPLE__)
+  const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto root =
+      std::filesystem::temp_directory_path() / ("reco_probe_quarantine_" + std::to_string(unique));
+  const auto selected = root / "quarantined-probe-worker";
+  const auto marker = root / "snapshot-ready";
+  std::error_code cleanup_error;
+  std::filesystem::remove_all(root, cleanup_error);
+  try {
+    std::filesystem::create_directory(root);
+    std::filesystem::copy_file(fake_probe_worker_path, selected);
+    std::filesystem::permissions(selected,
+                                 std::filesystem::perms::owner_read |
+                                     std::filesystem::perms::owner_write |
+                                     std::filesystem::perms::owner_exec,
+                                 std::filesystem::perm_options::replace);
+    static constexpr std::string_view quarantine =
+        "0081;65000000;Reco;00000000-0000-0000-0000-000000000000";
+    if (::setxattr(selected.c_str(), "com.apple.quarantine", quarantine.data(), quarantine.size(),
+                   0, 0) != 0) {
+      throw std::runtime_error("failed to install quarantine metadata");
+    }
+    const auto snapshots_before = mac_probe_snapshot_directories();
+    const auto caller = fork_exec_probe_caller(video_path, selected, "pre-supervisor-exec-delay",
+                                               30'000'000'000ULL, 30'000'000'000ULL, marker);
+    expect_true(caller > 0, "macOS quarantine snapshot caller starts");
+    const auto reached_marker =
+        wait_for_process_marker(marker, std::chrono::steady_clock::now() + std::chrono::seconds(2));
+    expect_true(reached_marker.has_value(), "macOS quarantine snapshot reaches its race hook");
+    bool preserved = false;
+    std::vector<std::filesystem::path> caller_snapshots;
+    for (const auto& snapshot : mac_probe_snapshot_directories()) {
+      if (std::binary_search(snapshots_before.begin(), snapshots_before.end(), snapshot)) {
+        continue;
+      }
+      caller_snapshots.push_back(snapshot);
+      std::array<char, 256> value{};
+      const auto value_size = ::getxattr((snapshot / "probe-worker").c_str(),
+                                         "com.apple.quarantine", value.data(), value.size(), 0, 0);
+      preserved =
+          preserved ||
+          (value_size == static_cast<ssize_t>(quarantine.size()) &&
+           std::string_view(value.data(), static_cast<std::size_t>(value_size)) == quarantine);
+    }
+    expect_true(preserved, "macOS executable snapshot preserves quarantine metadata");
+    if (caller > 0) {
+      (void)::kill(caller, SIGKILL);
+      int status = 0;
+      while (::waitpid(caller, &status, 0) < 0 && errno == EINTR) {
+      }
+    }
+    const auto cleanup_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool snapshots_removed = caller_snapshots.empty();
+    while (!snapshots_removed && std::chrono::steady_clock::now() < cleanup_deadline) {
+      snapshots_removed =
+          std::all_of(caller_snapshots.begin(), caller_snapshots.end(), [](const auto& snapshot) {
+            std::error_code exists_error;
+            return !std::filesystem::exists(snapshot, exists_error) && !exists_error;
+          });
+      if (!snapshots_removed) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+    }
+    expect_true(snapshots_removed, "macOS quarantine snapshot cleanup is bounded");
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: macOS quarantine snapshot fixture failed: " << error.what() << '\n';
+    ++failures;
+  }
+  std::filesystem::remove_all(root, cleanup_error);
 #else
   (void)video_path;
 #endif
@@ -2930,6 +3075,7 @@ int main(int argc, char** argv) {
   caller_death_reclaims_worker_and_descendant(video_path);
   caller_death_before_supervisor_main(video_path);
   executable_replacement_cannot_change_the_pinned_probe_image(video_path);
+  mac_probe_snapshot_preserves_quarantine(video_path);
   caller_death_before_guardian_main(video_path);
   caller_death_before_worker_main(video_path);
   pre_main_loader_stall_respects_timeout(video_path);

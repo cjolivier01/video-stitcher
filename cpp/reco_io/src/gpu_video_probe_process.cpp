@@ -15,6 +15,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -45,14 +46,17 @@ constexpr DWORD_PTR kProcThreadAttributeJobList = ProcThreadAttributeValue(13, F
 #include <unistd.h>
 
 #if defined(__APPLE__)
+#include <copyfile.h>
 #include <dlfcn.h>
 #include <libproc.h>
 #include <sys/sysctl.h>
+#include <sys/xattr.h>
 #endif
 
 #if defined(__linux__)
 #include <linux/audit.h>
 #include <linux/filter.h>
+#include <linux/memfd.h>
 #include <linux/seccomp.h>
 #include <sched.h>
 #include <sys/prctl.h>
@@ -840,6 +844,10 @@ constexpr char kGuardianAcknowledge = 'A';
 void execute_pinned_probe(int descriptor, char* const arguments[],
                           char* const environment[]) noexcept {
 #if defined(__APPLE__)
+  // Darwin has no fexecve/execveat equivalent. The caller therefore executes a private,
+  // high-entropy, non-writable snapshot and preserves its security xattrs. Deliberate mutation by
+  // another process running as the same UID is outside the OS boundary available to an
+  // unprivileged CLI; such a process can also modify other user-owned deployment artifacts.
   (void)descriptor;
   ::execve(arguments[0], arguments, environment);
 #else
@@ -852,6 +860,9 @@ constexpr char kSupervisorCertified = 'C';
 constexpr char kWorkerGroupCertified = 'C';
 
 long descriptor_scan_limit();
+[[noreturn]] void guardian_exit(int status);
+bool guardian_close_from(int descriptor, long maximum_descriptor);
+bool wait_for_process_exit(pid_t pid, int* status, std::chrono::steady_clock::time_point deadline);
 
 struct GuardianLaunch {
   pid_t supervisor_pid = -1;
@@ -906,7 +917,7 @@ UniqueFd duplicate_for_supervisor(int descriptor) {
 UniqueFd open_probe_executable(const std::filesystem::path& path) {
   int flags = O_CLOEXEC;
 #if defined(__linux__) && defined(O_PATH)
-  flags |= O_PATH;
+  flags |= O_RDONLY;
 #elif defined(__APPLE__)
   flags |= O_RDONLY;
 #elif defined(O_EXEC)
@@ -929,10 +940,92 @@ UniqueFd open_probe_executable(const std::filesystem::path& path) {
   return executable;
 }
 
+#if defined(__linux__)
+UniqueFd snapshot_linux_probe_executable(int source) {
+#if !defined(SYS_memfd_create)
+  (void)source;
+  throw GpuVideoProbeError("sealed Linux video probe snapshots require memfd_create");
+#else
+  struct stat before{};
+  constexpr std::uint64_t maximum_snapshot_bytes = 256ULL * 1024ULL * 1024ULL;
+  if (::fstat(source, &before) != 0 || before.st_size <= 0 ||
+      static_cast<std::uint64_t>(before.st_size) > maximum_snapshot_bytes) {
+    throw GpuVideoProbeError("failed to snapshot Linux video probe worker: invalid size");
+  }
+  constexpr auto base_flags = static_cast<unsigned int>(MFD_CLOEXEC | MFD_ALLOW_SEALING);
+  int raw_snapshot = -1;
+#if defined(MFD_EXEC)
+  raw_snapshot =
+      static_cast<int>(::syscall(SYS_memfd_create, "reco-video-probe", base_flags | MFD_EXEC));
+  if (raw_snapshot < 0 && errno == EINVAL) {
+    raw_snapshot = static_cast<int>(::syscall(SYS_memfd_create, "reco-video-probe", base_flags));
+  }
+#else
+  raw_snapshot = static_cast<int>(::syscall(SYS_memfd_create, "reco-video-probe", base_flags));
+#endif
+  UniqueFd snapshot(raw_snapshot);
+  if (snapshot.get() < 0) {
+    throw GpuVideoProbeError("failed to create sealed Linux video probe snapshot: " +
+                             std::string(std::strerror(errno)));
+  }
+
+  std::array<char, 64U * 1024U> buffer{};
+  off_t offset = 0;
+  while (offset < before.st_size) {
+    const auto remaining = static_cast<std::uint64_t>(before.st_size - offset);
+    const auto requested = static_cast<std::size_t>(
+        std::min<std::uint64_t>(remaining, static_cast<std::uint64_t>(buffer.size())));
+    ssize_t received = -1;
+    do {
+      received = ::pread(source, buffer.data(), requested, offset);
+    } while (received < 0 && errno == EINTR);
+    if (received <= 0) {
+      throw GpuVideoProbeError("failed to read Linux video probe executable snapshot");
+    }
+    std::size_t written = 0;
+    while (written < static_cast<std::size_t>(received)) {
+      ssize_t count = -1;
+      do {
+        count = ::write(snapshot.get(), buffer.data() + written,
+                        static_cast<std::size_t>(received) - written);
+      } while (count < 0 && errno == EINTR);
+      if (count <= 0) {
+        throw GpuVideoProbeError("failed to write Linux video probe executable snapshot");
+      }
+      written += static_cast<std::size_t>(count);
+    }
+    offset += received;
+  }
+
+  struct stat after{};
+  struct stat snapshot_status{};
+  if (::fstat(source, &after) != 0 || before.st_dev != after.st_dev ||
+      before.st_ino != after.st_ino || before.st_size != after.st_size ||
+      before.st_mtim.tv_sec != after.st_mtim.tv_sec ||
+      before.st_mtim.tv_nsec != after.st_mtim.tv_nsec ||
+      before.st_ctim.tv_sec != after.st_ctim.tv_sec ||
+      before.st_ctim.tv_nsec != after.st_ctim.tv_nsec ||
+      ::fstat(snapshot.get(), &snapshot_status) != 0 || snapshot_status.st_size != before.st_size) {
+    throw GpuVideoProbeError("Linux video probe executable changed while it was snapshotted");
+  }
+  int seals = F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE;
+#if defined(F_SEAL_FUTURE_WRITE)
+  seals |= F_SEAL_FUTURE_WRITE;
+#endif
+  if (::fchmod(snapshot.get(), 0500) != 0 || ::fcntl(snapshot.get(), F_ADD_SEALS, seals) != 0 ||
+      (::fcntl(snapshot.get(), F_GET_SEALS) & seals) != seals) {
+    throw GpuVideoProbeError("failed to seal Linux video probe executable snapshot: " +
+                             std::string(std::strerror(errno)));
+  }
+  return snapshot;
+#endif
+}
+#endif
+
 #if defined(__APPLE__)
 class MacProbeExecutableSnapshot final {
 public:
-  explicit MacProbeExecutableSnapshot(int source) {
+  MacProbeExecutableSnapshot(int source, std::chrono::steady_clock::time_point deadline) {
     try {
       struct stat before{};
       constexpr std::uint64_t maximum_snapshot_bytes = 256ULL * 1024ULL * 1024ULL;
@@ -942,13 +1035,27 @@ public:
             "failed to snapshot macOS video probe worker: invalid executable size");
       }
 
-      auto pattern = (std::filesystem::temp_directory_path() / "reco-video-probe-XXXXXX").string();
-      if (::mkdtemp(pattern.data()) == nullptr) {
-        throw GpuVideoProbeError("failed to create macOS video probe snapshot directory: " +
-                                 std::string(std::strerror(errno)));
+      const auto temporary_directory = std::filesystem::temp_directory_path();
+      std::random_device random;
+      constexpr char hexadecimal[] = "0123456789abcdef";
+      int setup_error = EEXIST;
+      for (int attempt = 0; attempt < 128 && setup_error == EEXIST; ++attempt) {
+        std::string token(32U, '0');
+        for (auto& digit : token) {
+          digit = hexadecimal[random() & 0x0fU];
+        }
+        root_ = temporary_directory / ("reco-video-probe-" + token);
+        executable_ = root_ / "probe-worker";
+        setup_error = start_cleanup_helper(deadline);
+        if (setup_error == EEXIST) {
+          root_.clear();
+          executable_.clear();
+        }
       }
-      root_ = std::filesystem::path(pattern);
-      executable_ = root_ / "probe-worker";
+      if (setup_error != 0) {
+        throw GpuVideoProbeError("failed to create macOS video probe snapshot directory: " +
+                                 std::string(std::strerror(setup_error)));
+      }
       UniqueFd output(
           ::open(executable_.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600));
       if (output.get() < 0) {
@@ -956,41 +1063,50 @@ public:
                                  std::string(std::strerror(errno)));
       }
 
-      std::array<char, 64U * 1024U> buffer{};
-      off_t offset = 0;
-      while (offset < before.st_size) {
-        const auto remaining = static_cast<std::uint64_t>(before.st_size - offset);
-        const auto requested = static_cast<std::size_t>(
-            std::min<std::uint64_t>(remaining, static_cast<std::uint64_t>(buffer.size())));
-        ssize_t received = -1;
-        do {
-          received = ::pread(source, buffer.data(), requested, offset);
-        } while (received < 0 && errno == EINTR);
-        if (received <= 0) {
-          throw GpuVideoProbeError("failed to read macOS video probe executable snapshot");
+      constexpr std::size_t maximum_xattr_names_bytes = 1024U * 1024U;
+      constexpr std::uint64_t maximum_xattr_value_bytes = 16ULL * 1024ULL * 1024ULL;
+      const auto xattr_names_size = ::flistxattr(source, nullptr, 0, 0);
+      if (xattr_names_size < 0 ||
+          static_cast<std::uint64_t>(xattr_names_size) > maximum_xattr_names_bytes) {
+        throw GpuVideoProbeError("failed to bound macOS video probe executable metadata");
+      }
+      std::vector<char> xattr_names(static_cast<std::size_t>(xattr_names_size));
+      if (xattr_names_size > 0 &&
+          ::flistxattr(source, xattr_names.data(), xattr_names.size(), 0) != xattr_names_size) {
+        throw GpuVideoProbeError("failed to read macOS video probe executable metadata");
+      }
+      std::uint64_t xattr_value_bytes = 0;
+      std::size_t name_offset = 0;
+      while (name_offset < xattr_names.size()) {
+        const auto remaining = xattr_names.size() - name_offset;
+        const auto name_size = ::strnlen(xattr_names.data() + name_offset, remaining);
+        if (name_size == 0 || name_size == remaining) {
+          throw GpuVideoProbeError("macOS video probe executable metadata is malformed");
         }
-        std::size_t written = 0;
-        while (written < static_cast<std::size_t>(received)) {
-          ssize_t count = -1;
-          do {
-            count = ::write(output.get(), buffer.data() + written,
-                            static_cast<std::size_t>(received) - written);
-          } while (count < 0 && errno == EINTR);
-          if (count <= 0) {
-            throw GpuVideoProbeError("failed to write macOS video probe executable snapshot");
-          }
-          written += static_cast<std::size_t>(count);
+        const auto value_size =
+            ::fgetxattr(source, xattr_names.data() + name_offset, nullptr, 0, 0, 0);
+        if (value_size < 0 || static_cast<std::uint64_t>(value_size) >
+                                  maximum_xattr_value_bytes - xattr_value_bytes) {
+          throw GpuVideoProbeError("macOS video probe executable metadata exceeds its limit");
         }
-        offset += received;
+        xattr_value_bytes += static_cast<std::uint64_t>(value_size);
+        name_offset += name_size + 1U;
+      }
+      if (::fcopyfile(source, output.get(), nullptr, COPYFILE_DATA | COPYFILE_XATTR) != 0) {
+        throw GpuVideoProbeError("failed to copy macOS video probe executable snapshot: " +
+                                 std::string(std::strerror(errno)));
       }
 
       struct stat after{};
+      struct stat snapshot_status{};
       if (::fstat(source, &after) != 0 || before.st_dev != after.st_dev ||
           before.st_ino != after.st_ino || before.st_size != after.st_size ||
           before.st_mtimespec.tv_sec != after.st_mtimespec.tv_sec ||
           before.st_mtimespec.tv_nsec != after.st_mtimespec.tv_nsec ||
           before.st_ctimespec.tv_sec != after.st_ctimespec.tv_sec ||
-          before.st_ctimespec.tv_nsec != after.st_ctimespec.tv_nsec) {
+          before.st_ctimespec.tv_nsec != after.st_ctimespec.tv_nsec ||
+          ::fstat(output.get(), &snapshot_status) != 0 ||
+          snapshot_status.st_size != before.st_size) {
         throw GpuVideoProbeError("macOS video probe executable changed while it was snapshotted");
       }
       if (::fsync(output.get()) != 0 || ::fchmod(output.get(), 0500) != 0 ||
@@ -1011,19 +1127,116 @@ public:
   [[nodiscard]] const std::filesystem::path& executable() const { return executable_; }
 
 private:
-  void cleanup() noexcept {
-    if (root_.empty()) {
+  [[nodiscard]] int start_cleanup_helper(std::chrono::steady_clock::time_point deadline) {
+    int lifetime_descriptors[2] = {-1, -1};
+    create_socket_pair(lifetime_descriptors, "macOS snapshot cleanup");
+    UniqueFd helper_lifetime(lifetime_descriptors[0]);
+    UniqueFd owner_lifetime(lifetime_descriptors[1]);
+    const int suppress_sigpipe = 1;
+    if (::setsockopt(helper_lifetime.get(), SOL_SOCKET, SO_NOSIGPIPE, &suppress_sigpipe,
+                     sizeof(suppress_sigpipe)) != 0) {
+      throw GpuVideoProbeError("failed to suppress macOS snapshot cleanup SIGPIPE: " +
+                               std::string(std::strerror(errno)));
+    }
+    const auto maximum_descriptor = descriptor_scan_limit();
+    const auto helper = ::fork();
+    const auto fork_error = errno;
+    if (helper == 0) {
+      (void)::close(owner_lifetime.get());
+      if (::dup2(helper_lifetime.get(), STDIN_FILENO) < 0 ||
+          !guardian_close_from(STDOUT_FILENO, maximum_descriptor)) {
+        guardian_exit(127);
+      }
+      const int setup_error = ::mkdir(root_.c_str(), 0700) == 0 ? 0 : errno;
+      std::size_t offset = 0;
+      while (offset < sizeof(setup_error)) {
+        ssize_t written = -1;
+        do {
+          written = ::write(STDIN_FILENO, reinterpret_cast<const char*>(&setup_error) + offset,
+                            sizeof(setup_error) - offset);
+        } while (written < 0 && errno == EINTR);
+        if (written <= 0) {
+          if (setup_error == 0) {
+            (void)::rmdir(root_.c_str());
+          }
+          guardian_exit(127);
+        }
+        offset += static_cast<std::size_t>(written);
+      }
+      if (setup_error != 0) {
+        guardian_exit(0);
+      }
+      char lifetime = '\0';
+      while (true) {
+        const auto received = ::read(STDIN_FILENO, &lifetime, 1);
+        if (received < 0 && errno == EINTR) {
+          continue;
+        }
+        if (received <= 0) {
+          break;
+        }
+      }
+      (void)::chmod(root_.c_str(), 0700);
+      (void)::unlink(executable_.c_str());
+      (void)::rmdir(root_.c_str());
+      guardian_exit(0);
+    }
+    if (helper < 0) {
+      errno = fork_error;
+      throw GpuVideoProbeError("failed to start macOS video probe snapshot cleanup: " +
+                               std::string(std::strerror(errno)));
+    }
+    helper_lifetime.reset();
+    cleanup_pid_ = helper;
+    cleanup_lifetime_ = std::move(owner_lifetime);
+    int setup_error = 0;
+    try {
+      read_exact(cleanup_lifetime_.get(), reinterpret_cast<char*>(&setup_error),
+                 sizeof(setup_error), deadline);
+    } catch (...) {
+      stop_cleanup_helper();
+      throw;
+    }
+    if (setup_error != 0) {
+      stop_cleanup_helper();
+      return setup_error;
+    }
+    helper_owns_root_ = true;
+    return 0;
+  }
+
+  void stop_cleanup_helper() noexcept {
+    cleanup_lifetime_.reset();
+    if (cleanup_pid_ <= 0) {
       return;
     }
-    (void)::chmod(root_.c_str(), 0700);
-    (void)::unlink(executable_.c_str());
-    (void)::rmdir(root_.c_str());
+    int status = 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    if (!wait_for_process_exit(cleanup_pid_, &status, deadline)) {
+      (void)::kill(cleanup_pid_, SIGKILL);
+      while (::waitpid(cleanup_pid_, &status, 0) < 0 && errno == EINTR) {
+      }
+    }
+    cleanup_pid_ = -1;
+  }
+
+  void cleanup() noexcept {
+    stop_cleanup_helper();
+    if (helper_owns_root_ && !root_.empty()) {
+      (void)::chmod(root_.c_str(), 0700);
+      (void)::unlink(executable_.c_str());
+      (void)::rmdir(root_.c_str());
+    }
+    helper_owns_root_ = false;
     executable_.clear();
     root_.clear();
   }
 
   std::filesystem::path root_;
   std::filesystem::path executable_;
+  pid_t cleanup_pid_ = -1;
+  UniqueFd cleanup_lifetime_;
+  bool helper_owns_root_ = false;
 };
 #endif
 
@@ -2845,12 +3058,16 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
                              std::shared_ptr<SupervisorSlot> reservation) {
   require_worker_launch_active(deadline);
   (void)deferred_process_reaper();
-  auto pinned_executable = open_probe_executable(worker_path);
-#if defined(__APPLE__)
-  MacProbeExecutableSnapshot executable_snapshot(pinned_executable.get());
-  pinned_executable = open_probe_executable(executable_snapshot.executable());
+  auto source_executable = open_probe_executable(worker_path);
+#if defined(__linux__)
+  auto pinned_executable = snapshot_linux_probe_executable(source_executable.get());
+  const auto executable = worker_path.string();
+#elif defined(__APPLE__)
+  MacProbeExecutableSnapshot executable_snapshot(source_executable.get(), deadline);
+  auto pinned_executable = open_probe_executable(executable_snapshot.executable());
   const auto executable = executable_snapshot.executable().string();
 #else
+  auto pinned_executable = std::move(source_executable);
   const auto executable = worker_path.string();
 #endif
   int request_socket[2] = {-1, -1};
