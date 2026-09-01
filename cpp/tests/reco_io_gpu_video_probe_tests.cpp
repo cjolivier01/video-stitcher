@@ -3444,10 +3444,22 @@ void signal_handler_fork_cannot_deadlock_the_probe_registry() {
   }
   struct sigaction action{};
   struct sigaction previous{};
+  sigset_t signal_set{};
+  sigset_t previous_mask{};
+  if (sigemptyset(&signal_set) != 0 || sigaddset(&signal_set, SIGUSR1) != 0 ||
+      ::pthread_sigmask(SIG_UNBLOCK, &signal_set, &previous_mask) != 0) {
+    expect_true(false, "probe signal-fork fixture unblocks its signal");
+    for (const auto descriptor :
+         {ready[0], ready[1], release[0], release[1], report[0], report[1]}) {
+      (void)::close(descriptor);
+    }
+    return;
+  }
   action.sa_handler = fork_from_signal_handler;
   (void)sigemptyset(&action.sa_mask);
   if (::sigaction(SIGUSR1, &action, &previous) != 0) {
     expect_true(false, "probe signal-fork handler installs");
+    (void)::pthread_sigmask(SIG_SETMASK, &previous_mask, nullptr);
     for (const auto descriptor :
          {ready[0], ready[1], release[0], release[1], report[0], report[1]}) {
       (void)::close(descriptor);
@@ -3492,6 +3504,8 @@ void signal_handler_fork_cannot_deadlock_the_probe_registry() {
   }
   signal_fork_report_descriptor = -1;
   expect_true(::sigaction(SIGUSR1, &previous, nullptr) == 0, "probe signal-fork handler restores");
+  expect_true(::pthread_sigmask(SIG_SETMASK, &previous_mask, nullptr) == 0,
+              "probe signal-fork mask restores");
   for (const auto descriptor : {ready[0], ready[1], release[0], release[1], report[0], report[1]}) {
     (void)::close(descriptor);
   }
