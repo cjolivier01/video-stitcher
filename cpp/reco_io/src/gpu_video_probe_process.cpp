@@ -684,13 +684,35 @@ void make_close_on_exec(int descriptor) {
 pthread_mutex_t fork_descriptor_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_once_t fork_descriptor_once = PTHREAD_ONCE_INIT;
 int fork_descriptor_registration_error = 0;
+struct ForkProtectedDescriptorState {
+  int value = -1;
+};
+constexpr std::size_t kMaximumForkProtectedDescriptors = kMaximumConcurrentProbeWorkers * 2U;
+std::array<ForkProtectedDescriptorState*, kMaximumForkProtectedDescriptors>
+    fork_protected_descriptors{};
+thread_local int fork_child_retained_descriptor = -1;
 
 void lock_fork_descriptors() { (void)::pthread_mutex_lock(&fork_descriptor_mutex); }
 void unlock_fork_descriptors() { (void)::pthread_mutex_unlock(&fork_descriptor_mutex); }
 
+void close_fork_protected_descriptors_in_child() {
+  const auto retained = fork_child_retained_descriptor;
+  for (auto*& state : fork_protected_descriptors) {
+    if (state != nullptr) {
+      if (state->value >= 0 && state->value != retained) {
+        (void)::close(state->value);
+        state->value = -1;
+      }
+      state = nullptr;
+    }
+  }
+  fork_child_retained_descriptor = -1;
+  unlock_fork_descriptors();
+}
+
 void register_fork_descriptor_handlers() {
-  fork_descriptor_registration_error =
-      ::pthread_atfork(lock_fork_descriptors, unlock_fork_descriptors, unlock_fork_descriptors);
+  fork_descriptor_registration_error = ::pthread_atfork(
+      lock_fork_descriptors, unlock_fork_descriptors, close_fork_protected_descriptors_in_child);
 }
 
 class ForkDescriptorLock {
@@ -720,6 +742,73 @@ public:
 
 private:
   bool locked_ = false;
+};
+
+class ForkProtectedFd {
+public:
+  ForkProtectedFd() = default;
+  ForkProtectedFd(const ForkProtectedFd&) = delete;
+  ForkProtectedFd& operator=(const ForkProtectedFd&) = delete;
+  ForkProtectedFd(ForkProtectedFd&&) noexcept = default;
+  ForkProtectedFd& operator=(ForkProtectedFd&& other) noexcept {
+    if (this != &other) {
+      reset();
+      state_ = std::move(other.state_);
+    }
+    return *this;
+  }
+  ~ForkProtectedFd() { reset(); }
+
+  template <typename Creator> static ForkProtectedFd create(Creator&& creator) {
+    auto state = std::make_unique<ForkProtectedDescriptorState>();
+    ForkDescriptorLock lock;
+    state->value = std::forward<Creator>(creator)();
+    if (state->value < 0) {
+      const auto create_error = errno;
+      errno = create_error;
+      return {};
+    }
+    const auto available =
+        std::find(fork_protected_descriptors.begin(), fork_protected_descriptors.end(), nullptr);
+    if (available == fork_protected_descriptors.end()) {
+      (void)::close(state->value);
+      state->value = -1;
+      throw GpuVideoProbeError("the video probe fork-protected descriptor registry is exhausted");
+    }
+    *available = state.get();
+    return ForkProtectedFd(std::move(state));
+  }
+
+  [[nodiscard]] int get() const { return state_ == nullptr ? -1 : state_->value; }
+
+  void reset() noexcept {
+    if (state_ == nullptr) {
+      return;
+    }
+    if (::pthread_mutex_lock(&fork_descriptor_mutex) != 0) {
+      // Keep both the descriptor and registry entry live on an impossible mutex
+      // failure so a later fork still closes the inherited copy.
+      (void)state_.release();
+      return;
+    }
+    const auto registered = std::find(fork_protected_descriptors.begin(),
+                                      fork_protected_descriptors.end(), state_.get());
+    if (registered != fork_protected_descriptors.end()) {
+      *registered = nullptr;
+    }
+    if (state_->value >= 0) {
+      (void)::close(state_->value);
+      state_->value = -1;
+    }
+    (void)::pthread_mutex_unlock(&fork_descriptor_mutex);
+    state_.reset();
+  }
+
+private:
+  explicit ForkProtectedFd(std::unique_ptr<ForkProtectedDescriptorState> state)
+      : state_(std::move(state)) {}
+
+  std::unique_ptr<ForkProtectedDescriptorState> state_;
 };
 
 void create_socket_pair(int descriptors[2], std::string_view description) {
@@ -924,7 +1013,7 @@ UniqueFd duplicate_for_supervisor(int descriptor) {
   return duplicate_close_on_exec(descriptor, kSupervisorFirstUnusedDescriptor);
 }
 
-UniqueFd open_probe_executable(const std::filesystem::path& path) {
+int probe_executable_open_flags() {
   int flags = O_CLOEXEC;
 #if defined(__linux__) && defined(O_PATH)
   flags |= O_RDONLY;
@@ -935,23 +1024,62 @@ UniqueFd open_probe_executable(const std::filesystem::path& path) {
 #else
   flags |= O_RDONLY;
 #endif
-  UniqueFd executable(::open(path.c_str(), flags));
+  return flags;
+}
+
+void validate_probe_executable(int descriptor) {
   struct stat status{};
-  if (executable.get() < 0) {
+  if (descriptor < 0) {
     throw GpuVideoProbeError("failed to start video probe worker: cannot open executable: " +
                              std::string(std::strerror(errno)));
   }
-  if (::fstat(executable.get(), &status) != 0 || !S_ISREG(status.st_mode) || status.st_size <= 0 ||
+  if (::fstat(descriptor, &status) != 0 || !S_ISREG(status.st_mode) || status.st_size <= 0 ||
       (status.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) == 0 ||
       (status.st_mode & (S_ISUID | S_ISGID)) != 0) {
     throw GpuVideoProbeError(
         "failed to start video probe worker: executable must be a non-set-id regular file");
   }
+}
+
+UniqueFd open_probe_executable(const std::filesystem::path& path) {
+  UniqueFd executable(::open(path.c_str(), probe_executable_open_flags()));
+  validate_probe_executable(executable.get());
   return executable;
 }
 
+#if defined(__APPLE__)
+ForkProtectedFd open_fork_protected_probe_executable(const std::filesystem::path& path) {
+  auto executable =
+      ForkProtectedFd::create([&] { return ::open(path.c_str(), probe_executable_open_flags()); });
+  validate_probe_executable(executable.get());
+  return executable;
+}
+#endif
+
+ForkProtectedFd duplicate_fork_protected_for_supervisor(int descriptor) {
+  auto duplicate = ForkProtectedFd::create([&] {
+#if defined(F_DUPFD_CLOEXEC)
+    return ::fcntl(descriptor, F_DUPFD_CLOEXEC, kSupervisorFirstUnusedDescriptor);
+#else
+    const auto value = ::fcntl(descriptor, F_DUPFD, kSupervisorFirstUnusedDescriptor);
+    if (value >= 0 && ::fcntl(value, F_SETFD, FD_CLOEXEC) != 0) {
+      const auto configure_error = errno;
+      (void)::close(value);
+      errno = configure_error;
+      return -1;
+    }
+    return value;
+#endif
+  });
+  if (duplicate.get() < 0) {
+    throw GpuVideoProbeError("failed to isolate video probe supervisor executable: " +
+                             std::string(std::strerror(errno)));
+  }
+  return duplicate;
+}
+
 #if defined(__linux__)
-UniqueFd snapshot_linux_probe_executable(int source) {
+ForkProtectedFd snapshot_linux_probe_executable(int source) {
 #if !defined(SYS_memfd_create)
   (void)source;
   throw GpuVideoProbeError("sealed Linux video probe snapshots require memfd_create");
@@ -962,17 +1090,18 @@ UniqueFd snapshot_linux_probe_executable(int source) {
     throw GpuVideoProbeError("failed to snapshot Linux video probe worker: invalid size");
   }
   constexpr auto base_flags = static_cast<unsigned int>(MFD_CLOEXEC | MFD_ALLOW_SEALING);
-  int raw_snapshot = -1;
+  auto snapshot = ForkProtectedFd::create([&] {
 #if defined(MFD_EXEC)
-  raw_snapshot =
-      static_cast<int>(::syscall(SYS_memfd_create, "reco-video-probe", base_flags | MFD_EXEC));
-  if (raw_snapshot < 0 && errno == EINVAL) {
-    raw_snapshot = static_cast<int>(::syscall(SYS_memfd_create, "reco-video-probe", base_flags));
-  }
+    auto descriptor =
+        static_cast<int>(::syscall(SYS_memfd_create, "reco-video-probe", base_flags | MFD_EXEC));
+    if (descriptor < 0 && errno == EINVAL) {
+      descriptor = static_cast<int>(::syscall(SYS_memfd_create, "reco-video-probe", base_flags));
+    }
+    return descriptor;
 #else
-  raw_snapshot = static_cast<int>(::syscall(SYS_memfd_create, "reco-video-probe", base_flags));
+    return static_cast<int>(::syscall(SYS_memfd_create, "reco-video-probe", base_flags));
 #endif
-  UniqueFd snapshot(raw_snapshot);
+  });
   if (snapshot.get() < 0) {
     throw GpuVideoProbeError("failed to create sealed Linux video probe snapshot: " +
                              std::string(std::strerror(errno)));
@@ -1064,8 +1193,10 @@ public:
         throw GpuVideoProbeError("failed to create macOS video probe snapshot directory: " +
                                  std::string(std::strerror(setup_error)));
       }
-      UniqueFd output(
-          ::open(executable_.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600));
+      auto output = ForkProtectedFd::create([&] {
+        return ::open(executable_.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                      0600);
+      });
       if (output.get() < 0) {
         throw GpuVideoProbeError("failed to create macOS video probe snapshot: " +
                                  std::string(std::strerror(errno)));
@@ -2206,7 +2337,7 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
   }
 #endif
   auto supervisor_lifetime_descriptor = duplicate_for_supervisor(supervisor_lifetime.get());
-  auto supervisor_executable = duplicate_for_supervisor(executable_descriptor);
+  auto supervisor_executable = duplicate_fork_protected_for_supervisor(executable_descriptor);
   auto supervisor_control = duplicate_for_supervisor(control_descriptor);
   auto supervisor_worker_input = duplicate_for_supervisor(worker_input_descriptor);
   auto supervisor_worker_output = duplicate_for_supervisor(worker_output_descriptor);
@@ -2254,8 +2385,10 @@ GuardianLaunch spawn_guardian_process(const std::string& executable, int executa
                              std::string(std::strerror(errno)));
   }
 
+  fork_child_retained_descriptor = supervisor_executable.get();
   const auto supervisor_pid = ::fork();
   const auto supervisor_fork_error = errno;
+  fork_child_retained_descriptor = -1;
   if (supervisor_pid == 0) {
     const auto report_error = [&](int error) {
       const auto write_exact = [](const void* data, std::size_t size) {
@@ -3104,7 +3237,7 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   const auto executable = worker_path.string();
 #elif defined(__APPLE__)
   MacProbeExecutableSnapshot executable_snapshot(source_executable.get(), deadline);
-  auto pinned_executable = open_probe_executable(executable_snapshot.executable());
+  auto pinned_executable = open_fork_protected_probe_executable(executable_snapshot.executable());
   const auto executable = executable_snapshot.executable().string();
 #else
   auto pinned_executable = std::move(source_executable);
@@ -3148,7 +3281,8 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
       throw GpuVideoProbeError("failed to create video probe supervisor pre-exec marker: " +
                                std::string(std::strerror(errno)));
     }
-    const auto process = std::to_string(static_cast<std::uint64_t>(::getpid()));
+    const auto process = std::to_string(static_cast<std::uint64_t>(::getpid())) + " " +
+                         std::to_string(pinned_executable.get());
     std::size_t offset = 0;
     while (offset < process.size()) {
       ssize_t written = -1;

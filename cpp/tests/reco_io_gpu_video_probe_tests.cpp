@@ -63,6 +63,8 @@ constexpr const char* kProbeCallerDelay = "RECO_FAKE_PROBE_CALLER_DELAY_NS";
 constexpr const char* kProbeCallerMarkerPath = "RECO_FAKE_PROBE_CALLER_MARKER_PATH";
 constexpr const char* kProbeCallerInheritedChildPath =
     "RECO_FAKE_PROBE_CALLER_INHERITED_CHILD_PATH";
+constexpr const char* kProbeCallerInheritedAuditPath =
+    "RECO_FAKE_PROBE_CALLER_INHERITED_AUDIT_PATH";
 #endif
 
 void expect_true(bool value, std::string_view message) {
@@ -162,6 +164,19 @@ wait_for_process_marker(const std::filesystem::path& path,
   return std::nullopt;
 }
 
+std::optional<char> wait_for_audit_marker(const std::filesystem::path& path,
+                                          std::chrono::steady_clock::time_point deadline) {
+  while (std::chrono::steady_clock::now() < deadline) {
+    std::ifstream input(path);
+    char value = '\0';
+    if (input >> value && (value == '0' || value == '1')) {
+      return value;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return std::nullopt;
+}
+
 #if defined(__APPLE__)
 std::vector<std::filesystem::path> mac_probe_snapshot_directories() {
   std::vector<std::filesystem::path> result;
@@ -218,6 +233,19 @@ std::optional<pid_t> wait_for_direct_child(pid_t parent,
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
   return std::nullopt;
+}
+
+bool process_has_linux_probe_memfd(pid_t process) {
+  std::error_code directory_error;
+  const auto descriptors = std::filesystem::path("/proc") / std::to_string(process) / "fd";
+  for (const auto& entry : std::filesystem::directory_iterator(descriptors, directory_error)) {
+    std::error_code link_error;
+    const auto target = std::filesystem::read_symlink(entry.path(), link_error).string();
+    if (!link_error && target.find("reco-video-probe") != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
 }
 #endif
 
@@ -359,6 +387,7 @@ int run_posix_probe_caller() {
   const char* mode_value = std::getenv(kProbeCallerMode);
   const char* marker_path = std::getenv(kProbeCallerMarkerPath);
   const char* inherited_child_path = std::getenv(kProbeCallerInheritedChildPath);
+  const char* inherited_audit_path = std::getenv(kProbeCallerInheritedAuditPath);
   std::uint64_t timeout_ns = 0;
   std::uint64_t delay_ns = 0;
   if (video_path == nullptr || video_path[0] == '\0' || worker_path == nullptr ||
@@ -378,7 +407,8 @@ int run_posix_probe_caller() {
     return EXIT_FAILURE;
   }
   if (inherited_child_path != nullptr && inherited_child_path[0] != '\0' &&
-      (marker_path == nullptr || marker_path[0] == '\0')) {
+      (marker_path == nullptr || marker_path[0] == '\0' || inherited_audit_path == nullptr ||
+       inherited_audit_path[0] == '\0')) {
     return EXIT_FAILURE;
   }
 
@@ -388,9 +418,16 @@ int run_posix_probe_caller() {
   if (inherited_child_path != nullptr && inherited_child_path[0] != '\0') {
     const auto snapshot_marker = std::filesystem::path(marker_path);
     const auto child_marker = std::filesystem::path(inherited_child_path);
-    inherited_child_thread = std::thread([&, snapshot_marker, child_marker] {
-      while (!stop_inherited_child.load(std::memory_order_acquire) &&
-             ::access(snapshot_marker.c_str(), F_OK) != 0) {
+    const auto audit_marker = std::filesystem::path(inherited_audit_path);
+    inherited_child_thread = std::thread([&, snapshot_marker, child_marker, audit_marker] {
+      int snapshot_descriptor = -1;
+      while (!stop_inherited_child.load(std::memory_order_acquire)) {
+        std::ifstream marker(snapshot_marker);
+        std::uint64_t process_id = 0;
+        if (marker >> process_id >> snapshot_descriptor && process_id != 0 &&
+            snapshot_descriptor >= 0) {
+          break;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
       }
       if (stop_inherited_child.load(std::memory_order_acquire)) {
@@ -398,6 +435,15 @@ int run_posix_probe_caller() {
       }
       const auto child = ::fork();
       if (child == 0) {
+        errno = 0;
+        const auto descriptor_status = ::fcntl(snapshot_descriptor, F_GETFD);
+        const char retained = descriptor_status >= 0 || errno != EBADF ? '1' : '0';
+        const int audit =
+            ::open(audit_marker.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        if (audit >= 0) {
+          (void)::write(audit, &retained, 1);
+          (void)::close(audit);
+        }
         while (true) {
           (void)::pause();
         }
@@ -451,7 +497,8 @@ pid_t fork_exec_probe_caller(const std::filesystem::path& video_path,
                              const std::filesystem::path& worker_path, std::string_view mode,
                              std::uint64_t timeout_ns, std::uint64_t delay_ns = 0,
                              const std::filesystem::path& marker_path = {},
-                             const std::filesystem::path& inherited_child_path = {}) {
+                             const std::filesystem::path& inherited_child_path = {},
+                             const std::filesystem::path& inherited_audit_path = {}) {
   set_environment(kProbeCallerVideoPath, video_path.string());
   set_environment(kProbeCallerWorkerPath, worker_path.string());
   set_environment(kProbeCallerMode, std::string(mode));
@@ -459,6 +506,7 @@ pid_t fork_exec_probe_caller(const std::filesystem::path& video_path,
   set_environment(kProbeCallerDelay, std::to_string(delay_ns));
   set_environment(kProbeCallerMarkerPath, marker_path.string());
   set_environment(kProbeCallerInheritedChildPath, inherited_child_path.string());
+  set_environment(kProbeCallerInheritedAuditPath, inherited_audit_path.string());
 
   auto executable = test_executable_path.string();
   std::string helper_mode = "--reco-posix-probe-caller";
@@ -476,6 +524,7 @@ pid_t fork_exec_probe_caller(const std::filesystem::path& video_path,
   set_environment(kProbeCallerDelay, "");
   set_environment(kProbeCallerMarkerPath, "");
   set_environment(kProbeCallerInheritedChildPath, "");
+  set_environment(kProbeCallerInheritedAuditPath, "");
   return caller;
 }
 #endif
@@ -2594,6 +2643,63 @@ void executable_replacement_cannot_change_the_pinned_probe_image(
 #endif
 }
 
+void linux_fork_child_does_not_retain_snapshot_memfd(const std::filesystem::path& video_path) {
+#if defined(__linux__)
+  const auto snapshot_marker =
+      video_path.parent_path() / (video_path.filename().string() + ".linux-snapshot-ready");
+  const auto child_marker =
+      video_path.parent_path() / (video_path.filename().string() + ".linux-snapshot-child");
+  const auto audit_marker =
+      video_path.parent_path() / (video_path.filename().string() + ".linux-snapshot-audit");
+  std::filesystem::remove(snapshot_marker);
+  std::filesystem::remove(child_marker);
+  std::filesystem::remove(audit_marker);
+  std::optional<std::uint64_t> inherited_child;
+  pid_t caller = -1;
+  try {
+    set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+    caller = fork_exec_probe_caller(video_path, fake_probe_worker_path, "pre-supervisor-exec-delay",
+                                    30'000'000'000ULL, 30'000'000'000ULL, snapshot_marker,
+                                    child_marker, audit_marker);
+    expect_true(caller > 0, "Linux snapshot inheritance caller starts");
+    const auto marker_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    const auto snapshot_ready = wait_for_process_marker(snapshot_marker, marker_deadline);
+    inherited_child = wait_for_process_marker(child_marker, marker_deadline);
+    const auto inherited_audit = wait_for_audit_marker(audit_marker, marker_deadline);
+    expect_true(snapshot_ready.has_value(), "Linux snapshot inheritance fixture pins its memfd");
+    expect_true(inherited_child.has_value(),
+                "Linux snapshot inheritance fixture forks after memfd creation");
+    expect_true(inherited_audit.has_value() && *inherited_audit == '0',
+                "Linux at-fork child closes the exact pinned memfd descriptor");
+    const auto child_pid =
+        inherited_child.has_value() &&
+                *inherited_child <= static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max())
+            ? static_cast<pid_t>(*inherited_child)
+            : static_cast<pid_t>(-1);
+    expect_true(child_pid > 0 && !process_has_linux_probe_memfd(child_pid),
+                "Linux fork-only child retains no video probe memfd");
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: Linux snapshot inheritance fixture failed: " << error.what() << '\n';
+    ++failures;
+  }
+  if (caller > 0) {
+    (void)::kill(caller, SIGKILL);
+    int status = 0;
+    while (::waitpid(caller, &status, 0) < 0 && errno == EINTR) {
+    }
+  }
+  if (inherited_child.has_value() &&
+      *inherited_child <= static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max())) {
+    (void)::kill(static_cast<pid_t>(*inherited_child), SIGKILL);
+  }
+  std::filesystem::remove(snapshot_marker);
+  std::filesystem::remove(child_marker);
+  std::filesystem::remove(audit_marker);
+#else
+  (void)video_path;
+#endif
+}
+
 void mac_probe_snapshot_preserves_quarantine(const std::filesystem::path& video_path) {
 #if defined(__APPLE__)
   const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -2675,25 +2781,31 @@ void mac_probe_snapshot_cleanup_tracks_owner_process(const std::filesystem::path
       video_path.parent_path() / (video_path.filename().string() + ".snapshot-owner-ready");
   const auto child_marker =
       video_path.parent_path() / (video_path.filename().string() + ".snapshot-inherited-child");
+  const auto audit_marker =
+      video_path.parent_path() / (video_path.filename().string() + ".snapshot-inherited-audit");
   std::filesystem::remove(snapshot_marker);
   std::filesystem::remove(child_marker);
+  std::filesystem::remove(audit_marker);
   const auto snapshots_before = mac_probe_snapshot_directories();
   std::vector<std::filesystem::path> caller_snapshots;
   std::optional<std::uint64_t> inherited_child;
   pid_t caller = -1;
   try {
     set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
-    caller =
-        fork_exec_probe_caller(video_path, fake_probe_worker_path, "pre-supervisor-exec-delay",
-                               30'000'000'000ULL, 30'000'000'000ULL, snapshot_marker, child_marker);
+    caller = fork_exec_probe_caller(video_path, fake_probe_worker_path, "pre-supervisor-exec-delay",
+                                    30'000'000'000ULL, 30'000'000'000ULL, snapshot_marker,
+                                    child_marker, audit_marker);
     expect_true(caller > 0, "macOS inherited-socket snapshot caller starts");
     const auto marker_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     const auto snapshot_ready = wait_for_process_marker(snapshot_marker, marker_deadline);
     inherited_child = wait_for_process_marker(child_marker, marker_deadline);
+    const auto inherited_audit = wait_for_audit_marker(audit_marker, marker_deadline);
     expect_true(snapshot_ready.has_value(),
                 "macOS inherited-socket fixture creates its executable snapshot");
     expect_true(inherited_child.has_value(),
                 "macOS inherited-socket fixture forks a child after snapshot creation");
+    expect_true(inherited_audit.has_value() && *inherited_audit == '0',
+                "macOS at-fork child closes the exact snapshot backing vnode descriptor");
     for (const auto& snapshot : mac_probe_snapshot_directories()) {
       if (!std::binary_search(snapshots_before.begin(), snapshots_before.end(), snapshot)) {
         caller_snapshots.push_back(snapshot);
@@ -2749,6 +2861,7 @@ void mac_probe_snapshot_cleanup_tracks_owner_process(const std::filesystem::path
   }
   std::filesystem::remove(snapshot_marker);
   std::filesystem::remove(child_marker);
+  std::filesystem::remove(audit_marker);
 #else
   (void)video_path;
 #endif
@@ -3343,6 +3456,7 @@ int main(int argc, char** argv) {
   caller_death_reclaims_worker_and_descendant(video_path);
   caller_death_before_supervisor_main(video_path);
   executable_replacement_cannot_change_the_pinned_probe_image(video_path);
+  linux_fork_child_does_not_retain_snapshot_memfd(video_path);
   mac_probe_snapshot_preserves_quarantine(video_path);
   mac_probe_snapshot_cleanup_tracks_owner_process(video_path);
   caller_death_before_guardian_main(video_path);
