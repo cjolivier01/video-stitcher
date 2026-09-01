@@ -2230,7 +2230,7 @@ void read_plain_exact(int descriptor, char* destination, std::size_t size,
 void reset_child_signals() noexcept {
   struct sigaction action{};
   action.sa_handler = SIG_DFL;
-  (void)::sigemptyset(&action.sa_mask);
+  (void)sigemptyset(&action.sa_mask);
   for (const auto signal : {SIGCHLD, SIGTERM, SIGUSR1, SIGINT, SIGHUP}) {
     if (::sigaction(signal, &action, nullptr) != 0) {
       static constexpr char failure[] = "calibration child signal reset failed\n";
@@ -2242,7 +2242,7 @@ void reset_child_signals() noexcept {
     }
   }
   sigset_t empty{};
-  (void)::sigemptyset(&empty);
+  (void)sigemptyset(&empty);
   if (::sigprocmask(SIG_SETMASK, &empty, nullptr) != 0) {
     static constexpr char failure[] = "calibration child signal mask reset failed\n";
     ssize_t written = -1;

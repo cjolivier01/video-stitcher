@@ -906,7 +906,7 @@ void caller_sigchld_policy_cannot_steal_worker_ownership() {
   struct sigaction original{};
   struct sigaction ignored{};
   ignored.sa_handler = SIG_IGN;
-  (void)::sigemptyset(&ignored.sa_mask);
+  (void)sigemptyset(&ignored.sa_mask);
   expect_true(::sigaction(SIGCHLD, &ignored, &original) == 0, "SIGCHLD ignore policy installs");
   {
     Scenario scenario("success");
@@ -1389,7 +1389,7 @@ void signal_handler_fork_cannot_deadlock_the_calibration_registry() {
   struct sigaction action{};
   struct sigaction previous{};
   action.sa_handler = fork_from_signal_handler;
-  (void)::sigemptyset(&action.sa_mask);
+  (void)sigemptyset(&action.sa_mask);
   if (::sigaction(SIGUSR1, &action, &previous) != 0) {
     expect_true(false, "calibration signal-fork handler installs");
     for (const auto descriptor :

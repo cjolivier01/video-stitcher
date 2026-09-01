@@ -3356,7 +3356,7 @@ void signal_handler_fork_cannot_deadlock_the_probe_registry() {
   struct sigaction action{};
   struct sigaction previous{};
   action.sa_handler = fork_from_signal_handler;
-  (void)::sigemptyset(&action.sa_mask);
+  (void)sigemptyset(&action.sa_mask);
   if (::sigaction(SIGUSR1, &action, &previous) != 0) {
     expect_true(false, "probe signal-fork handler installs");
     for (const auto descriptor :
