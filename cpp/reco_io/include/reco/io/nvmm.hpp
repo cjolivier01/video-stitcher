@@ -77,6 +77,7 @@ enum class NvbufSurfaceAbi : std::uint32_t {
 
 struct NvmmFrameInfo;
 struct NvmmCudaFrame;
+struct NvmmSurfaceAllocation;
 
 /// Retains the exact NvBufSurface and DeepStream-version libraries used to
 /// select an ABI and to map frames produced by a decoder.
@@ -106,6 +107,10 @@ private:
       const std::shared_ptr<const NvbufSurfaceRuntime>& runtime);
   friend NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info,
                                               std::shared_ptr<void> owner);
+  friend NvmmSurfaceAllocation
+  allocate_nvmm_nv12_surface(std::uint32_t width, std::uint32_t height, std::uint32_t gpu_id,
+                             core::YuvColorMatrix color_matrix, core::YuvColorRange color_range,
+                             std::shared_ptr<const NvbufSurfaceRuntime> runtime);
 };
 
 /// Discovers the installed DeepStream NvBufSurface ABI from the runtime
@@ -150,6 +155,26 @@ struct NvmmFrameInfo {
   std::uint32_t y_size = 0;
   std::uint32_t uv_size = 0;
 };
+
+/// One NvBufSurface allocation owned by its originating DeepStream runtime.
+struct NvmmSurfaceAllocation {
+  /// Descriptor used for CUDA mapping and for `memory:NVMM` GStreamer buffers.
+  NvmmFrameInfo frame;
+  /// Retains and destroys the descriptor and all of its pixel storage.
+  std::shared_ptr<void> owner;
+  /// Exact ABI size of the descriptor wrapped by GStreamer.
+  std::size_t descriptor_size = 0;
+};
+
+/// Allocates an even-sized NV12 surface on the selected GPU without host pixel storage.
+///
+/// The runtime selects CUDA device memory on discrete GPUs and surface-array memory on Jetson.
+/// The returned owner must outlive every CUDA mapping and GStreamer buffer that references the
+/// descriptor.
+[[nodiscard]] NvmmSurfaceAllocation
+allocate_nvmm_nv12_surface(std::uint32_t width, std::uint32_t height, std::uint32_t gpu_id,
+                           Nv12ColorMatrix color_matrix, Nv12ColorRange color_range,
+                           std::shared_ptr<const NvbufSurfaceRuntime> runtime);
 
 struct NvmmCudaFrame {
   core::CudaDevicePtr y_ptr = 0;
