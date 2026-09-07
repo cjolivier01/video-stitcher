@@ -967,7 +967,7 @@ private:
                            std::string(operation));
     }
     wait_for_state(kGstStatePaused, "before " + std::string(operation));
-    geometry_probe_state_->reset_before_seek();
+    reset_geometry_before_seek();
 
     const long double target_ns = static_cast<long double>(*config_.indexed_stream_time_origin_ns) +
                                   static_cast<long double>(seek_index) * 1'000'000'000.0L *
@@ -1003,7 +1003,7 @@ private:
       }
       wait_for_state(kGstStateReady, "before " + std::string(operation));
     }
-    geometry_probe_state_->reset_before_seek();
+    reset_geometry_before_seek();
     reset_indexed_position(0U);
     if (api_->element_set_state(pipeline_, kGstStatePlaying) == kGstStateChangeFailure) {
       throw GpuDecodeError("GStreamer pipeline rejected the PLAYING state after " +
@@ -1017,6 +1017,12 @@ private:
     last_indexed_stream_time_ns_.reset();
     timestamp_group_ordinal_ = 0;
     ended_ = false;
+  }
+
+  void reset_geometry_before_seek() {
+    geometry_probe_state_->reset_before_seek();
+    previous_allocation_dimensions_.reset();
+    previous_visible_dimensions_.reset();
   }
 
   void wait_for_state(int expected, std::string_view operation) {

@@ -334,6 +334,46 @@ void indexed_decode_seeks_to_absolute_start_frame() {
       "post-seek sample without a presentation stream-time mapping is rejected");
 }
 
+void indexed_seeks_reset_geometry_continuity() {
+  set_scenario("indexed-seek-pool-change");
+  auto config = valid_config();
+  config.indexed_fps_numerator = 1U;
+  config.indexed_fps_denominator = 1U;
+  config.indexed_stream_time_origin_ns = 1'000'000'000ULL;
+
+  auto source = open_gstreamer_gpu_file_decode_source(config, NvbufSurfaceAbi::DeepStream9_1);
+  const auto before_seek = source->read();
+  expect_true(before_seek.frame.has_value(), "pool-change fixture returns its pre-seek frame");
+  if (before_seek.frame.has_value()) {
+    expect_eq(before_seek.frame->nvmm.width, 864U, "pre-seek decoder allocation width");
+    expect_eq(before_seek.frame->visible_width, 854U, "pre-seek visible width");
+  }
+  source->seek_to_frame(1U);
+  const auto after_seek = source->read();
+  expect_true(after_seek.frame.has_value(), "pool-change fixture returns its post-seek frame");
+  if (after_seek.frame.has_value()) {
+    expect_eq(after_seek.frame->frame_index, 1U, "post-seek frame retains its absolute index");
+    expect_eq(after_seek.frame->nvmm.width, 880U, "post-seek decoder pool may be rebuilt");
+    expect_eq(after_seek.frame->visible_width, 854U,
+              "post-seek pool rebuild preserves visible geometry");
+  }
+
+  config.indexed_fps_numerator = 2U;
+  config.indexed_timestamp_multiplicity = 2U;
+  source = open_gstreamer_gpu_file_decode_source(config, NvbufSurfaceAbi::DeepStream9_1);
+  (void)source->read();
+  source->seek_to_frame(0U);
+  const auto after_restart = source->read();
+  expect_true(after_restart.frame.has_value(), "frame-zero restart returns a frame");
+  if (after_restart.frame.has_value()) {
+    expect_eq(after_restart.frame->frame_index, 0U, "frame-zero restart resets the absolute index");
+    expect_eq(after_restart.frame->nvmm.width, 880U,
+              "frame-zero restart may rebuild the decoder pool");
+    expect_eq(after_restart.frame->visible_width, 854U,
+              "frame-zero restart preserves visible geometry");
+  }
+}
+
 void stalled_appsink_reads_are_bounded() {
   set_scenario("read-timeout");
   auto config = valid_config();
@@ -772,6 +812,7 @@ int run_tests() {
   orientation_tags_are_preserved();
   indexed_cadence_drives_frame_indices();
   indexed_decode_seeks_to_absolute_start_frame();
+  indexed_seeks_reset_geometry_continuity();
   stalled_appsink_reads_are_bounded();
   padded_sink_caps_preserve_predecoder_dimensions();
   runahead_caps_are_correlated_by_timestamp();

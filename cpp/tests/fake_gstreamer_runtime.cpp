@@ -553,7 +553,7 @@ GErrorAbi* make_error(const char* message) {
   return error;
 }
 
-FakeSample* make_sample(std::uint32_t sample_index = 0) {
+FakeSample* make_sample(std::uint32_t sample_index = 0, bool after_seek = false) {
   auto* sample = new FakeSample;
   if (scenario() == "unknown-time" || scenario() == "caps-runahead-unknown-time" ||
       scenario() == "dropped-unknown-transition") {
@@ -575,7 +575,8 @@ FakeSample* make_sample(std::uint32_t sample_index = 0) {
   }
 
   sample->params.width =
-      scenario() == "visible-crop" ||
+      scenario() == "indexed-seek-pool-change" ? (after_seek ? 880U : 864U)
+      : scenario() == "visible-crop" ||
               ((scenario() == "caps-runahead" || scenario() == "caps-runahead-unknown-time" ||
                 scenario() == "caps-runahead-stale-caps") &&
                sample_index == 0)
@@ -613,8 +614,8 @@ FakeSample* make_sample(std::uint32_t sample_index = 0) {
 }
 
 std::uint32_t predecoder_width(std::uint32_t sample_index) {
-  if (scenario() == "visible-crop" || scenario() == "caps-runahead-stale-caps" ||
-      scenario() == "drop-stale-caps-first") {
+  if (scenario() == "visible-crop" || scenario() == "indexed-seek-pool-change" ||
+      scenario() == "caps-runahead-stale-caps" || scenario() == "drop-stale-caps-first") {
     return 854;
   }
   if (scenario() == "oversized-caps") {
@@ -1889,13 +1890,18 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
   }
   if ((current_scenario == "indexed-cfr" || current_scenario == "indexed-gap" ||
        current_scenario == "indexed-off-cadence" || current_scenario == "indexed-seek" ||
+       current_scenario == "indexed-seek-pool-change" ||
        current_scenario == "indexed-seek-nonzero-origin" ||
        current_scenario == "indexed-seek-wrong-first" ||
        current_scenario == "indexed-seek-invalid-segment") &&
       current < 2) {
-    auto* sample = make_sample(current);
-    if (current_scenario == "indexed-seek-nonzero-origin" ||
-        current_scenario == "indexed-seek-wrong-first") {
+    auto* sample = make_sample(current, sink->pipeline->seek_generation != 0);
+    if (current_scenario == "indexed-seek-pool-change") {
+      sample->buffer.pts = sink->pipeline->has_seek
+                               ? static_cast<std::uint64_t>(sink->pipeline->seek_target_ns)
+                               : 1'000'000'000ULL;
+    } else if (current_scenario == "indexed-seek-nonzero-origin" ||
+               current_scenario == "indexed-seek-wrong-first") {
       constexpr std::uint64_t kPtsOffsetNs = 5'000'000'000ULL;
       constexpr std::uint64_t kNtscFrameDurationNs = 33'366'667ULL;
       sample->segment_pts_offset_ns = kPtsOffsetNs;
@@ -1917,7 +1923,10 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
                               : current_scenario == "indexed-off-cadence" ? 50'000'000ULL
                                                                           : 33'333'333ULL);
     }
-    push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, 1280, 720);
+    const auto visible_width =
+        current_scenario == "indexed-seek-pool-change" ? predecoder_width(current) : 1280U;
+    push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, visible_width,
+                           predecoder_height());
     return deliver_output(sink, sample);
   }
   const bool caps_runahead = current_scenario == "caps-runahead" ||
