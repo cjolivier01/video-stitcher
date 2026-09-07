@@ -293,8 +293,6 @@ CalibrationResult run_gpu_calibration_frame_provider(
         frame.right.applied_rotation_degrees != first.right.applied_rotation_degrees) {
       throw std::invalid_argument("GPU calibration frame rotation changed between pairs");
     }
-    left_undistorted.color_range = frame.left.color_range;
-    right_undistorted.color_range = frame.right.color_range;
     left_undistorter.undistort_y(frame.left, left_undistorted);
     right_undistorter.undistort_y(frame.right, right_undistorted);
     if (auto result = process_gpu_frame_pair(akaze, left_undistorted, right_undistorted,

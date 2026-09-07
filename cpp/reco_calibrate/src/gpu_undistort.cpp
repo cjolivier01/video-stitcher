@@ -41,7 +41,7 @@ extern "C" __global__ void undistort_y_plane(
     float k1,
     float k2,
     float k3,
-    unsigned int black_level) {
+    unsigned int limited_range) {
   const unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
   const unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
   if (x >= dst_width || y >= dst_height) {
@@ -69,7 +69,7 @@ extern "C" __global__ void undistort_y_plane(
   const float sx = src_fx * nx * scale + src_cx - 0.5f;
   const float sy = src_fy * ny * scale + src_cy - 0.5f;
 
-  unsigned char value = (unsigned char)black_level;
+  unsigned char value = 0;
   // The shader bounds-checks normalized coordinates in [0, 1], then its
   // clamp-to-edge sampler extends the edge texels by half a pixel.
   if (sx >= -0.5f && sy >= -0.5f && sx <= (float)src_width - 0.5f &&
@@ -86,7 +86,11 @@ extern "C" __global__ void undistort_y_plane(
     const unsigned char* row1 = src + (unsigned long long)y1 * src_pitch;
     const float a = (1.0f - tx) * (float)row0[x0] + tx * (float)row0[x1];
     const float b = (1.0f - tx) * (float)row1[x0] + tx * (float)row1[x1];
-    const float sample = (1.0f - ty) * a + ty * b;
+    float sample = (1.0f - ty) * a + ty * b;
+    if (limited_range != 0U) {
+      sample = (sample - 16.0f) * (255.0f / 219.0f);
+    }
+    sample = fminf(fmaxf(sample, 0.0f), 255.0f);
     value = (unsigned char)(sample + 0.5f);
   }
 
@@ -211,8 +215,8 @@ void GpuCalibrationUndistorter::undistort_y(const GpuGrayFrame& src,
                                             const GpuGrayFrame& dst) const {
   validate_frame(src, "source");
   validate_frame(dst, "destination");
-  if (src.color_range != dst.color_range) {
-    throw std::invalid_argument("GPU undistort source and destination color ranges must match");
+  if (dst.color_range != reco::core::YuvColorRange::Full) {
+    throw std::invalid_argument("GPU undistort destination must use full-range luma");
   }
   const auto& config = impl_->config;
   if (dst.width != config.output_width || dst.height != config.output_height) {
@@ -257,12 +261,12 @@ void GpuCalibrationUndistorter::undistort_y(const GpuGrayFrame& src,
   auto k1 = static_cast<float>(config.camera.d[1]);
   auto k2 = static_cast<float>(config.camera.d[2]);
   auto k3 = static_cast<float>(config.camera.d[3]);
-  std::uint32_t black_level = src.color_range == reco::core::YuvColorRange::Limited ? 16U : 0U;
+  std::uint32_t limited_range = src.color_range == reco::core::YuvColorRange::Limited ? 1U : 0U;
 
   std::array<void*, 21> args{
       &src_ptr,    &src_pitch, &src_width, &src_height, &dst_ptr, &dst_pitch, &dst_width,
       &dst_height, &src_fx,    &src_fy,    &src_cx,     &src_cy,  &out_fx,    &out_fy,
-      &out_cx,     &out_cy,    &k0,        &k1,         &k2,      &k3,        &black_level,
+      &out_cx,     &out_cy,    &k0,        &k1,         &k2,      &k3,        &limited_range,
   };
   impl_->kernel.launch({.grid = {.x = (dst.width + 15U) / 16U, .y = (dst.height + 15U) / 16U},
                         .block = {.x = 16, .y = 16}},

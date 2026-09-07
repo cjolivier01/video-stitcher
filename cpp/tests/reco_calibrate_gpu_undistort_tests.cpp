@@ -115,8 +115,8 @@ double kb4_forward_scale(double r, const std::array<double, 4>& d) {
   return theta_d / r;
 }
 
-std::uint8_t bilinear_sample(const std::vector<std::uint8_t>& data, std::size_t pitch,
-                             std::uint32_t width, std::uint32_t height, double x, double y) {
+double bilinear_sample(const std::vector<std::uint8_t>& data, std::size_t pitch,
+                       std::uint32_t width, std::uint32_t height, double x, double y) {
   if (x < -0.5 || y < -0.5 || x > static_cast<double>(width) - 0.5 ||
       y > static_cast<double>(height) - 0.5) {
     return 0;
@@ -135,12 +135,13 @@ std::uint8_t bilinear_sample(const std::vector<std::uint8_t>& data, std::size_t 
   const double p11 = data[y1 * pitch + x1];
   const double value =
       p00 * (1.0 - tx) * (1.0 - ty) + p10 * tx * (1.0 - ty) + p01 * (1.0 - tx) * ty + p11 * tx * ty;
-  return static_cast<std::uint8_t>(std::round(value));
+  return value;
 }
 
 std::vector<std::uint8_t> reference_undistort(const std::vector<std::uint8_t>& input,
                                               std::size_t input_pitch, std::uint32_t width,
-                                              std::uint32_t height, const CameraParams& camera) {
+                                              std::uint32_t height, const CameraParams& camera,
+                                              YuvColorRange source_range = YuvColorRange::Full) {
   const double src_scale_x = static_cast<double>(width) / static_cast<double>(camera.width);
   const double src_scale_y = static_cast<double>(height) / static_cast<double>(camera.height);
   const double src_fx = camera.fx * src_scale_x;
@@ -157,9 +158,13 @@ std::vector<std::uint8_t> reference_undistort(const std::vector<std::uint8_t>& i
       const double nx = (static_cast<double>(x) + 0.5 - out_cx) / out_fx;
       const double ny = (static_cast<double>(y) + 0.5 - out_cy) / out_fy;
       const double scale = kb4_forward_scale(std::sqrt(nx * nx + ny * ny), camera.d);
-      out[y * width + x] =
+      double sample =
           bilinear_sample(input, input_pitch, width, height, src_fx * nx * scale + src_cx - 0.5,
                           src_fy * ny * scale + src_cy - 0.5);
+      if (source_range == YuvColorRange::Limited) {
+        sample = (sample - 16.0) * (255.0 / 219.0);
+      }
+      out[y * width + x] = static_cast<std::uint8_t>(std::round(std::clamp(sample, 0.0, 255.0)));
     }
   }
   return out;
@@ -258,14 +263,14 @@ int main() {
                                    .pitch = src_pitch,
                                    .width = width,
                                    .height = height,
-                                   .color_range = YuvColorRange::Limited},
+                                   .color_range = YuvColorRange::Full},
                                   {.ptr = dst.ptr(),
                                    .pitch = dst_pitch,
                                    .width = width,
                                    .height = height,
-                                   .color_range = YuvColorRange::Full});
+                                   .color_range = YuvColorRange::Limited});
         },
-        "mismatched source and destination color ranges");
+        "limited-range destination");
     expect_invalid_argument(
         [&] {
           undistorter.undistort_y(
@@ -313,19 +318,14 @@ int main() {
                              .pitch = dst_pitch,
                              .width = width,
                              .height = height,
-                             .color_range = YuvColorRange::Limited});
+                             .color_range = YuvColorRange::Full});
     backend.synchronize();
     const auto limited = download_y_plane(backend, limited_dst, dst_pitch, width, height);
-    bool checked_limited_black = false;
-    for (std::size_t index = 0; index < expected.size(); ++index) {
-      if (expected[index] == 0U) {
-        expect_eq(limited[index], 16U, "limited-range undistort uses legal black fill");
-        checked_limited_black = true;
-      }
-    }
-    if (!checked_limited_black) {
-      std::cerr << "FAIL: undistort fixture did not exercise out-of-source fill\n";
-      ++failures;
+    const auto expected_limited = reference_undistort(
+        input, src_pitch, width, height, undistorter.config().camera, YuvColorRange::Limited);
+    for (std::size_t index = 0; index < expected_limited.size(); ++index) {
+      expect_u8_near(limited[index], expected_limited[index], 1,
+                     "limited-range undistort emits full-range luma");
     }
 
     const auto make_owned_undistorter = [width, height] {

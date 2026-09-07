@@ -32,11 +32,11 @@ fn camera() -> CameraParams {
     CameraParams {
         width: 640,
         height: 360,
-        fx: 1.0e10,
-        fy: 1.0e10,
-        cx: 320.0,
-        cy: 180.0,
-        d: [0.0; 4],
+        fx: 3000.0,
+        fy: 2950.0,
+        cx: 318.0,
+        cy: 181.0,
+        d: [1.0 / 3.0, 2.0 / 15.0, 17.0 / 315.0, 62.0 / 2835.0],
     }
 }
 
@@ -184,6 +184,12 @@ fn decoded_video_calibration_matches_cpp_golden() {
         result: first,
     };
     let golden_path = fixture_path("rust_golden.json");
+    if std::env::var_os("RECO_UPDATE_CPP_GPU_VIDEO_PARITY_GOLDEN").is_some() {
+        let mut encoded = serde_json::to_vec_pretty(&actual).expect("serialize parity golden");
+        encoded.push(b'\n');
+        std::fs::write(&golden_path, encoded).expect("update parity golden");
+        return;
+    }
     let expected: ParityGolden =
         serde_json::from_slice(&std::fs::read(&golden_path).expect("read parity golden"))
             .expect("parse parity golden");

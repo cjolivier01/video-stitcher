@@ -24,3 +24,11 @@ Fixture SHA-256 values:
 89c08be9318805e3951310de428f6fc942a0efeda0df2f605e24af8d2531bd37  left.mp4
 662a43532a0ad9a0d9ddb255f27e4ed71efb8dbb997cdd156f2c88777f9294de  right.mp4
 ```
+
+Regenerate the Rust calibration golden on a machine with a supported wgpu
+adapter after intentionally changing the fixture or camera model:
+
+```bash
+RECO_UPDATE_CPP_GPU_VIDEO_PARITY_GOLDEN=1 \
+  cargo test -p reco-calibrate --features io --test cpp_gpu_video_parity
+```

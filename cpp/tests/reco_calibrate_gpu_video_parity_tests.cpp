@@ -131,11 +131,11 @@ GpuFileDecodeConfig decode_config(const std::filesystem::path& path) {
 CameraParams camera() {
   return {.width = kWidth,
           .height = kHeight,
-          .fx = 1.0e10,
-          .fy = 1.0e10,
-          .cx = 320.0,
-          .cy = 180.0,
-          .d = {0.0, 0.0, 0.0, 0.0}};
+          .fx = 3000.0,
+          .fy = 2950.0,
+          .cx = 318.0,
+          .cy = 181.0,
+          .d = {1.0 / 3.0, 2.0 / 15.0, 17.0 / 315.0, 62.0 / 2835.0}};
 }
 
 CalibrationConfig config() {
@@ -295,6 +295,9 @@ bool point_matches(const MatchedPoint& actual, const Json& expected) {
 }
 
 void compare_frame(const FrameMatches& actual, const Json& expected, std::size_t frame_index) {
+  // CUDA and wgpu use different floating-point feature pipelines, so points at
+  // a detector threshold may move into or out of the result set.
+  constexpr std::size_t kBackendCountTolerance = 4;
   const auto label = "frame " + std::to_string(frame_index);
   expect_eq(actual.keypoints_left, expected.at("keypoints_left").get<std::size_t>(),
             label + " left keypoints");
@@ -302,16 +305,17 @@ void compare_frame(const FrameMatches& actual, const Json& expected, std::size_t
             label + " right keypoints");
   expect_eq(actual.min_descriptors, expected.at("min_descriptors").get<std::size_t>(),
             label + " minimum descriptors");
-  expect_count_near(actual.post_ratio_test, expected.at("post_ratio_test").get<std::size_t>(), 2,
-                    label + " ratio-test matches");
+  expect_count_near(actual.post_ratio_test, expected.at("post_ratio_test").get<std::size_t>(),
+                    kBackendCountTolerance, label + " ratio-test matches");
   expect_count_near(actual.post_spatial_filter,
-                    expected.at("post_spatial_filter").get<std::size_t>(), 2,
+                    expected.at("post_spatial_filter").get<std::size_t>(), kBackendCountTolerance,
                     label + " spatial matches");
-  expect_count_near(actual.post_ransac, expected.at("post_ransac").get<std::size_t>(), 2,
-                    label + " RANSAC inliers");
+  expect_count_near(actual.post_ransac, expected.at("post_ransac").get<std::size_t>(),
+                    kBackendCountTolerance, label + " RANSAC inliers");
 
   const auto& expected_points = expected.at("points");
-  expect_count_near(actual.points.size(), expected_points.size(), 2, label + " point count");
+  expect_count_near(actual.points.size(), expected_points.size(), kBackendCountTolerance,
+                    label + " point count");
   std::vector<bool> used(actual.points.size(), false);
   std::size_t matched = 0;
   for (const auto& expected_point : expected_points) {
@@ -324,12 +328,16 @@ void compare_frame(const FrameMatches& actual, const Json& expected, std::size_t
     }
   }
   const auto required = std::min(actual.points.size(), expected_points.size());
-  expect_count_near(matched, required, 2, label + " Rust correspondence overlap");
+  expect_count_near(matched, required, kBackendCountTolerance,
+                    label + " Rust correspondence overlap");
 }
 
 void compare_result(const CalibrationResult& actual, const Json& expected) {
-  constexpr double kLayoutTolerance = 2.0e-3;
+  // Layout and angular error amplify sub-pixel backend differences through
+  // RANSAC and optimization; correspondence coordinates remain tightly bound.
+  constexpr double kLayoutTolerance = 6.0e-3;
   constexpr double kQualityTolerance = 1.0e-2;
+  constexpr double kAngularQualityTolerance = 1.5e-1;
   const auto& expected_calibration = expected.at("calibration");
   const auto& expected_layout = expected_calibration.at("params");
   const auto compare_camera = [](const CameraParams& camera, const Json& golden,
@@ -401,7 +409,7 @@ void compare_result(const CalibrationResult& actual, const Json& expected) {
                 quality.at("trimmed_reprojection_error").get<double>(), kQualityTolerance,
                 "Rust trimmed reprojection error");
     expect_near(actual.quality->angular_error, quality.at("angular_error").get<double>(),
-                kQualityTolerance, "Rust angular error");
+                kAngularQualityTolerance, "Rust angular error");
   }
   const auto& expected_frames = expected.at("per_frame");
   expect_eq(actual.per_frame.size(), expected_frames.size(), "Rust per-frame result count");
