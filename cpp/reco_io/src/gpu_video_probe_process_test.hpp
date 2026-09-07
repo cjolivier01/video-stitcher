@@ -68,6 +68,11 @@ void hold_probe_fork_descriptor_registry_for_test(int ready_descriptor, int rele
     std::uint64_t timeout_ns, std::uint64_t pre_guardian_exec_delay_ns,
     const std::filesystem::path& marker_path);
 
+[[nodiscard]] GpuVideoProbe
+probe_gpu_video_with_forced_worker_memory_limit_for_test(const GpuFileDecodeConfig& config,
+                                                         const std::filesystem::path& worker_path,
+                                                         std::uint64_t timeout_ns);
+
 [[nodiscard]] bool guardian_watchdog_exit_is_fatal_for_test(bool memory_termination_sent,
                                                             int wait_result, int wait_error,
                                                             std::int64_t observed_pid,

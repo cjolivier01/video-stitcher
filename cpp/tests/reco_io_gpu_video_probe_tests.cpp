@@ -4457,17 +4457,8 @@ void lowered_file_limit_does_not_leak_high_descriptors(const std::filesystem::pa
 }
 
 void worker_address_space_is_limited(const std::filesystem::path& video_path) {
-#if defined(__APPLE__) && !defined(RECO_PROBE_WIDE_ADDRESS_SANITIZER)
-  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "memory-over-limit");
-  expect_probe_error(
-      [&] {
-        (void)reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
-                                        5'000'000'000ULL);
-      },
-      "video probe worker exited abnormally",
-      "macOS watchdog-first memory termination reports the worker status");
-  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
-#elif !defined(_WIN32) && !defined(RECO_PROBE_WIDE_ADDRESS_SANITIZER)
+#if !defined(_WIN32) && !defined(RECO_PROBE_WIDE_ADDRESS_SANITIZER)
+#if !defined(__APPLE__)
   set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "memory-limit");
   try {
     expect_eq(reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
@@ -4478,6 +4469,15 @@ void worker_address_space_is_limited(const std::filesystem::path& video_path) {
     std::cerr << "FAIL: address-space limit probe threw: " << error.what() << '\n';
     ++failures;
   }
+#endif
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "block-input");
+  expect_probe_error(
+      [&] {
+        (void)reco::io::detail::probe_gpu_video_with_forced_worker_memory_limit_for_test(
+            container_config(video_path), fake_probe_worker_path, 5'000'000'000ULL);
+      },
+      "video probe worker exited abnormally",
+      "forced watchdog memory termination reports the worker status");
   set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
 #else
   (void)video_path;

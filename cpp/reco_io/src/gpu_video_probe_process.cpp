@@ -92,12 +92,15 @@ namespace reco::io {
 namespace detail {
 int run_gpu_video_probe_owner(const char* executable, std::uint64_t pre_worker_report_delay_ns,
                               std::uint64_t pre_guardian_exec_delay_ns, bool has_marker,
-                              bool stop_supervisor_after_guardian_launch);
+                              bool stop_supervisor_after_guardian_launch,
+                              bool force_worker_memory_limit_for_test);
 int run_gpu_video_probe_supervisor(const char* executable, std::uint64_t pre_worker_report_delay_ns,
                                    std::uint64_t pre_guardian_exec_delay_ns,
                                    std::uint64_t caller_pid, bool has_marker,
-                                   bool stop_after_guardian_launch);
-int run_gpu_video_probe_guardian(const char* executable, std::uint64_t pre_worker_report_delay_ns);
+                                   bool stop_after_guardian_launch,
+                                   bool force_worker_memory_limit_for_test);
+int run_gpu_video_probe_guardian(const char* executable, std::uint64_t pre_worker_report_delay_ns,
+                                 bool force_worker_memory_limit_for_test);
 } // namespace detail
 #endif
 namespace {
@@ -147,6 +150,7 @@ struct ProbeLaunchOptions {
   std::filesystem::path pre_guardian_exec_marker;
   bool stop_supervisor_after_guardian_launch = false;
   bool fail_request_writer_start = false;
+  bool force_worker_memory_limit_for_test = false;
 #if defined(_WIN32)
   bool pad_request_to_maximum_size = false;
 #endif
@@ -1176,7 +1180,7 @@ GuardianLaunch spawn_guardian_process(
     std::chrono::nanoseconds pre_worker_report_delay,
     std::chrono::nanoseconds pre_guardian_exec_delay,
     const std::filesystem::path& pre_guardian_exec_marker,
-    bool stop_supervisor_after_guardian_launch,
+    bool stop_supervisor_after_guardian_launch, bool force_worker_memory_limit_for_test,
     std::chrono::steady_clock::time_point launch_deadline, int pre_owner_fork_ready_descriptor,
     int pre_owner_fork_release_descriptor, int owner_forked_pid_descriptor,
     int owner_fork_release_descriptor, std::shared_ptr<SupervisorSlot>* reservation);
@@ -3031,8 +3035,8 @@ bool guardian_write_exact(int descriptor, const void* value, std::size_t size) {
 [[noreturn]] void run_supervisor_owner(const char* executable,
                                        std::chrono::nanoseconds pre_worker_report_delay,
                                        std::chrono::nanoseconds pre_guardian_exec_delay,
-                                       bool has_marker,
-                                       bool stop_supervisor_after_guardian_launch) {
+                                       bool has_marker, bool stop_supervisor_after_guardian_launch,
+                                       bool force_worker_memory_limit_for_test) {
   const auto maximum_descriptor = descriptor_scan_limit();
   if (maximum_descriptor < kOwnerFirstUnusedDescriptor) {
     guardian_exit(127);
@@ -3082,6 +3086,7 @@ bool guardian_write_exact(int descriptor, const void* value, std::size_t size) {
   }
   std::array<char, 2> marker_text{has_marker ? '1' : '0', '\0'};
   std::array<char, 2> stop_text{stop_supervisor_after_guardian_launch ? '1' : '0', '\0'};
+  std::array<char, 2> force_memory_limit_text{force_worker_memory_limit_for_test ? '1' : '0', '\0'};
   char* const arguments[] = {const_cast<char*>(executable),
                              const_cast<char*>("--reco-video-probe-supervisor"),
                              worker_delay_text.data(),
@@ -3089,6 +3094,7 @@ bool guardian_write_exact(int descriptor, const void* value, std::size_t size) {
                              owner_pid_text.data(),
                              marker_text.data(),
                              stop_text.data(),
+                             force_memory_limit_text.data(),
                              nullptr};
 
   fork_child_retained_descriptor = kOwnerSupervisorExecutable;
@@ -3146,7 +3152,7 @@ GuardianLaunch spawn_guardian_process(
     std::chrono::nanoseconds pre_worker_report_delay,
     std::chrono::nanoseconds pre_guardian_exec_delay,
     const std::filesystem::path& pre_guardian_exec_marker,
-    bool stop_supervisor_after_guardian_launch,
+    bool stop_supervisor_after_guardian_launch, bool force_worker_memory_limit_for_test,
     std::chrono::steady_clock::time_point launch_deadline, int pre_owner_fork_ready_descriptor,
     int pre_owner_fork_release_descriptor, int owner_forked_pid_descriptor,
     int owner_fork_release_descriptor, std::shared_ptr<SupervisorSlot>* reservation) {
@@ -3170,12 +3176,14 @@ GuardianLaunch spawn_guardian_process(
                   static_cast<std::uint64_t>(pre_guardian_exec_delay.count()));
   std::array<char, 2> marker_text{pre_guardian_exec_marker.empty() ? '0' : '1', '\0'};
   std::array<char, 2> stop_text{stop_supervisor_after_guardian_launch ? '1' : '0', '\0'};
+  std::array<char, 2> force_memory_limit_text{force_worker_memory_limit_for_test ? '1' : '0', '\0'};
   char* const owner_arguments[] = {const_cast<char*>(executable.c_str()),
                                    const_cast<char*>("--reco-video-probe-owner"),
                                    worker_delay_text.data(),
                                    guardian_delay_text.data(),
                                    marker_text.data(),
                                    stop_text.data(),
+                                   force_memory_limit_text.data(),
                                    nullptr};
   std::vector<std::string> environment_storage;
   for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
@@ -3496,11 +3504,11 @@ GuardianLaunch spawn_guardian_process(
                         .caller_lifetime = std::move(caller_lifetime)};
 }
 
-[[noreturn]] void run_supervisor_child(const char* executable,
-                                       std::chrono::nanoseconds pre_worker_report_delay,
-                                       std::chrono::nanoseconds pre_guardian_exec_delay,
-                                       pid_t caller_pid, bool has_marker,
-                                       bool stop_after_guardian_launch, long maximum_descriptor) {
+[[noreturn]] void
+run_supervisor_child(const char* executable, std::chrono::nanoseconds pre_worker_report_delay,
+                     std::chrono::nanoseconds pre_guardian_exec_delay, pid_t caller_pid,
+                     bool has_marker, bool stop_after_guardian_launch,
+                     bool force_worker_memory_limit_for_test, long maximum_descriptor) {
   std::array<char, 32> delay_text{};
   const auto [delay_end, delay_error] =
       std::to_chars(delay_text.data(), delay_text.data() + delay_text.size() - 1,
@@ -3509,9 +3517,10 @@ GuardianLaunch spawn_guardian_process(
     guardian_exit(2);
   }
   *delay_end = '\0';
+  std::array<char, 2> force_memory_limit_text{force_worker_memory_limit_for_test ? '1' : '0', '\0'};
   char* const arguments[] = {const_cast<char*>(executable),
                              const_cast<char*>("--reco-video-probe-guardian"), delay_text.data(),
-                             nullptr};
+                             force_memory_limit_text.data(), nullptr};
 
   char initial_lifetime = '\0';
   ssize_t initial_lifetime_size = -1;
@@ -3783,7 +3792,8 @@ GuardianLaunch spawn_guardian_process(
 [[noreturn]] void run_guardian_child(const char* executable, int control_descriptor,
                                      int worker_input_descriptor, int worker_output_descriptor,
                                      long maximum_descriptor,
-                                     std::chrono::nanoseconds pre_worker_report_delay) {
+                                     std::chrono::nanoseconds pre_worker_report_delay,
+                                     bool force_worker_memory_limit_for_test) {
   if (::unsetenv("RECO_VIDEO_PROBE_GUARDIAN_PROCESS") != 0 || ::setpgid(0, 0) != 0 ||
       ::dup2(control_descriptor, STDIN_FILENO) < 0 ||
       ::dup2(control_descriptor, STDOUT_FILENO) < 0 ||
@@ -4044,7 +4054,8 @@ GuardianLaunch spawn_guardian_process(
       guardian_exit(2);
     }
 #if defined(__linux__) || defined(__APPLE__)
-    if (!memory_termination_sent && !guardian_worker_group_within_memory_limit(worker_pid)) {
+    if (!memory_termination_sent && (force_worker_memory_limit_for_test ||
+                                     !guardian_worker_group_within_memory_limit(worker_pid))) {
       kill_worker_process_group(worker_pid);
       memory_termination_sent = true;
     }
@@ -4300,9 +4311,10 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
       executable, pinned_executable.get(), guard_control.get(), guard_input.get(),
       guard_output.get(), options.pre_supervisor_arm_delay, options.pre_supervisor_arm_marker,
       options.pre_worker_report_delay, options.pre_guardian_exec_delay,
-      options.pre_guardian_exec_marker, options.stop_supervisor_after_guardian_launch, deadline,
-      options.pre_owner_fork_ready_descriptor, options.pre_owner_fork_release_descriptor,
-      options.owner_forked_pid_descriptor, options.owner_fork_release_descriptor, &reservation);
+      options.pre_guardian_exec_marker, options.stop_supervisor_after_guardian_launch,
+      options.force_worker_memory_limit_for_test, deadline, options.pre_owner_fork_ready_descriptor,
+      options.pre_owner_fork_release_descriptor, options.owner_forked_pid_descriptor,
+      options.owner_fork_release_descriptor, &reservation);
   pinned_executable.reset();
   GuardianProcess guardian(guardian_launch.supervisor_pid, guardian_launch.watchdog_pid,
                            std::move(parent_control), std::move(guardian_launch.caller_lifetime),
@@ -4431,7 +4443,8 @@ GpuVideoProbe probe_gpu_video_with_delays(const GpuFileDecodeConfig& config,
 int detail::run_gpu_video_probe_owner(const char* executable,
                                       std::uint64_t pre_worker_report_delay_ns,
                                       std::uint64_t pre_guardian_exec_delay_ns, bool has_marker,
-                                      bool stop_supervisor_after_guardian_launch) {
+                                      bool stop_supervisor_after_guardian_launch,
+                                      bool force_worker_memory_limit_for_test) {
   if (executable == nullptr || executable[0] == '\0' ||
       pre_worker_report_delay_ns >
           static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) ||
@@ -4441,14 +4454,15 @@ int detail::run_gpu_video_probe_owner(const char* executable,
   }
   run_supervisor_owner(executable, std::chrono::nanoseconds(pre_worker_report_delay_ns),
                        std::chrono::nanoseconds(pre_guardian_exec_delay_ns), has_marker,
-                       stop_supervisor_after_guardian_launch);
+                       stop_supervisor_after_guardian_launch, force_worker_memory_limit_for_test);
 }
 
 int detail::run_gpu_video_probe_supervisor(const char* executable,
                                            std::uint64_t pre_worker_report_delay_ns,
                                            std::uint64_t pre_guardian_exec_delay_ns,
                                            std::uint64_t caller_pid, bool has_marker,
-                                           bool stop_after_guardian_launch) {
+                                           bool stop_after_guardian_launch,
+                                           bool force_worker_memory_limit_for_test) {
   sigset_t empty_mask{};
   if (sigemptyset(&empty_mask) != 0 || ::pthread_sigmask(SIG_SETMASK, &empty_mask, nullptr) != 0) {
     return 2;
@@ -4468,11 +4482,12 @@ int detail::run_gpu_video_probe_supervisor(const char* executable,
   run_supervisor_child(executable, std::chrono::nanoseconds(pre_worker_report_delay_ns),
                        std::chrono::nanoseconds(pre_guardian_exec_delay_ns),
                        static_cast<pid_t>(caller_pid), has_marker, stop_after_guardian_launch,
-                       maximum_descriptor);
+                       force_worker_memory_limit_for_test, maximum_descriptor);
 }
 
 int detail::run_gpu_video_probe_guardian(const char* executable,
-                                         std::uint64_t pre_worker_report_delay_ns) {
+                                         std::uint64_t pre_worker_report_delay_ns,
+                                         bool force_worker_memory_limit_for_test) {
   sigset_t empty_mask{};
   if (sigemptyset(&empty_mask) != 0) {
     report_guardian_startup_error(errno);
@@ -4496,7 +4511,8 @@ int detail::run_gpu_video_probe_guardian(const char* executable,
     report_guardian_startup_error(EMFILE);
   }
   run_guardian_child(executable, STDIN_FILENO, kGuardianWorkerInput, kGuardianWorkerOutput,
-                     maximum_descriptor, std::chrono::nanoseconds(pre_worker_report_delay_ns));
+                     maximum_descriptor, std::chrono::nanoseconds(pre_worker_report_delay_ns),
+                     force_worker_memory_limit_for_test);
 }
 #endif
 
@@ -4779,6 +4795,14 @@ GpuVideoProbe detail::probe_gpu_video_with_stalled_guardian_session_for_test(
                              std::chrono::nanoseconds(pre_guardian_exec_delay_ns),
                          .pre_guardian_exec_marker = marker_path,
                          .stop_supervisor_after_guardian_launch = true});
+}
+
+GpuVideoProbe detail::probe_gpu_video_with_forced_worker_memory_limit_for_test(
+    const GpuFileDecodeConfig& config, const std::filesystem::path& worker_path,
+    std::uint64_t timeout_ns) {
+  return probe_gpu_video_with_delays(
+      config, worker_path, timeout_ns,
+      ProbeLaunchOptions{.force_worker_memory_limit_for_test = true});
 }
 
 bool detail::guardian_watchdog_exit_is_fatal_for_test(bool memory_termination_sent, int wait_result,
