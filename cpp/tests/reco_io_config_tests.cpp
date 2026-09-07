@@ -396,11 +396,13 @@ void jsonl_sink_writes_one_pipeline_event_per_line() {
     expect_eq(sink.write_failures(), 0ULL, "jsonl sink no write failures");
   }
 
-  std::ifstream input(path);
-  std::string line;
   std::vector<std::string> lines;
-  while (std::getline(input, line)) {
-    lines.push_back(line);
+  {
+    std::ifstream input(path);
+    std::string line;
+    while (std::getline(input, line)) {
+      lines.push_back(line);
+    }
   }
   expect_eq(lines.size(), 5U, "jsonl line count");
   for (std::size_t i = 0; i < lines.size(); ++i) {
