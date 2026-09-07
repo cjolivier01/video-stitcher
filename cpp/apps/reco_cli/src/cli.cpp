@@ -615,20 +615,18 @@ public:
 
 [[nodiscard]] DWORD link_open_file(HANDLE handle, HANDLE directory, std::wstring_view link_name) {
   const auto filename_bytes = link_name.size() * sizeof(wchar_t);
+  // winternl.h does not expose FILE_LINK_INFORMATION. Keep this definition
+  // local to the native FileLinkInformation (class 11) call.
   struct NativeLinkInfo {
     BOOLEAN replace_if_exists;
     HANDLE root_directory;
     ULONG filename_length;
     wchar_t filename[1];
   };
-  static_assert(offsetof(NativeLinkInfo, replace_if_exists) ==
-                offsetof(FILE_LINK_INFO, ReplaceIfExists));
-  static_assert(offsetof(NativeLinkInfo, root_directory) ==
-                offsetof(FILE_LINK_INFO, RootDirectory));
-  static_assert(offsetof(NativeLinkInfo, filename_length) ==
-                offsetof(FILE_LINK_INFO, FileNameLength));
-  static_assert(offsetof(NativeLinkInfo, filename) == offsetof(FILE_LINK_INFO, FileName));
-  const auto info_bytes = sizeof(FILE_LINK_INFO) + filename_bytes;
+  static_assert(std::is_standard_layout_v<NativeLinkInfo>);
+  static_assert(sizeof(BOOLEAN) == 1U);
+  static_assert(sizeof(ULONG) == 4U);
+  const auto info_bytes = offsetof(NativeLinkInfo, filename) + filename_bytes;
   std::vector<std::max_align_t> storage(
       (info_bytes + sizeof(std::max_align_t) - 1U) / sizeof(std::max_align_t), std::max_align_t{});
   auto* raw = reinterpret_cast<std::byte*>(storage.data());
