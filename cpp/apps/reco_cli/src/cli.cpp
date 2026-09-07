@@ -832,6 +832,18 @@ void publish_windows_output(
       return;
     }
 
+    if (current_is_reparse_point) {
+      retained_current = UniqueWindowsHandle{};
+      rename_open_file(temporary_handle, directory, destination_name, destination, false, true);
+      destination_published = true;
+      if (!path_identifies_windows_handle(resolved_directory, directory, true) ||
+          !published_path_identifies_handle(directory, destination_name, temporary_handle)) {
+        throw WindowsPublicationIdentityError(
+            "Windows reparse-point replacement changed publication identity");
+      }
+      return;
+    }
+
     BY_HANDLE_FILE_INFORMATION temporary_identity{};
     if (GetFileInformationByHandle(temporary_handle, &temporary_identity) == 0) {
       throw_file_error("cannot inspect temporary calibration output identity", destination,
