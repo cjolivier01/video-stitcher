@@ -205,7 +205,7 @@ bool write_lifecycle_event(std::string_view event) {
   return static_cast<bool>(output);
 }
 
-std::uint64_t spawn_sleeping_descendant() {
+std::uint64_t spawn_sleeping_descendant(bool inherit_standard_handles = false) {
 #if defined(_WIN32)
   std::vector<wchar_t> executable(32'768);
   const auto length =
@@ -217,9 +217,16 @@ std::uint64_t spawn_sleeping_descendant() {
   auto command_line = L"\"" + application + L"\" --reco-fake-probe-sleeper";
   STARTUPINFOW startup{};
   startup.cb = sizeof(startup);
+  if (inherit_standard_handles) {
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    startup.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+  }
   PROCESS_INFORMATION process{};
-  if (CreateProcessW(application.c_str(), command_line.data(), nullptr, nullptr, FALSE,
-                     CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process) == 0) {
+  if (CreateProcessW(application.c_str(), command_line.data(), nullptr, nullptr,
+                     inherit_standard_handles ? TRUE : FALSE, CREATE_NO_WINDOW, nullptr, nullptr,
+                     &startup, &process) == 0) {
     return 0;
   }
   const auto process_id = static_cast<std::uint64_t>(process.dwProcessId);
@@ -227,6 +234,7 @@ std::uint64_t spawn_sleeping_descendant() {
   CloseHandle(process.hProcess);
   return process_id;
 #else
+  (void)inherit_standard_handles;
   const auto process_id = ::fork();
   if (process_id == 0) {
     std::this_thread::sleep_for(std::chrono::seconds(30));
@@ -713,13 +721,16 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     return EXIT_SUCCESS;
   }
-  if (scenario != nullptr && (std::strcmp(scenario, "valid-metadata-with-descendant") == 0 ||
-                              std::strcmp(scenario, "block-input-with-descendant") == 0)) {
+  if (scenario != nullptr &&
+      (std::strcmp(scenario, "valid-metadata-with-descendant") == 0 ||
+       std::strcmp(scenario, "block-input-with-descendant") == 0 ||
+       std::strcmp(scenario, "exit-before-request-with-inherited-descendant") == 0)) {
     const char* descendant_path = std::getenv("RECO_FAKE_PROBE_DESCENDANT_PATH");
     if (descendant_path == nullptr || descendant_path[0] == '\0') {
       return EXIT_FAILURE;
     }
-    const auto descendant = spawn_sleeping_descendant();
+    const auto descendant = spawn_sleeping_descendant(
+        std::strcmp(scenario, "exit-before-request-with-inherited-descendant") == 0);
     if (descendant == 0) {
       return EXIT_FAILURE;
     }
@@ -729,7 +740,9 @@ int main(int argc, char** argv) {
   }
   if (scenario != nullptr && std::strcmp(scenario, "block-input") != 0 &&
       std::strcmp(scenario, "block-input-with-descendant") != 0) {
-    if (!read_request()) {
+    const bool exit_before_request =
+        std::strcmp(scenario, "exit-before-request-with-inherited-descendant") == 0;
+    if (!exit_before_request && !read_request()) {
       return EXIT_FAILURE;
     }
     if (!write_lifecycle_event("request")) {
@@ -766,6 +779,7 @@ int main(int argc, char** argv) {
       response = {{"protocol_version", std::numeric_limits<std::uint64_t>::max()}, {"ok", false}};
     } else if (std::strcmp(scenario, "valid-metadata") == 0 ||
                std::strcmp(scenario, "valid-metadata-with-descendant") == 0 ||
+               std::strcmp(scenario, "exit-before-request-with-inherited-descendant") == 0 ||
 #if !defined(_WIN32)
                std::strcmp(scenario, "descriptor-isolation") == 0 ||
                std::strcmp(scenario, "process-spawn-denied") == 0 ||
@@ -778,37 +792,40 @@ int main(int argc, char** argv) {
                std::strcmp(scenario, "oversized-metadata") == 0) {
       const bool negative = std::strcmp(scenario, "negative-metadata") == 0;
       const bool oversized = std::strcmp(scenario, "oversized-metadata") == 0;
-      response = {{"protocol_version", 5},
-                  {"ok", true},
-                  {"width",
-                   negative ? nlohmann::json(-2)
-                   : oversized
-                       ? nlohmann::json(std::numeric_limits<std::uint64_t>::max())
-                       : nlohmann::json(
-                             std::strcmp(scenario, "valid-metadata") == 0 ||
-                                     std::strcmp(scenario, "valid-metadata-with-descendant") == 0 ||
+      response = {
+          {"protocol_version", 5},
+          {"ok", true},
+          {"width",
+           negative ? nlohmann::json(-2)
+           : oversized
+               ? nlohmann::json(std::numeric_limits<std::uint64_t>::max())
+               : nlohmann::json(
+                     std::strcmp(scenario, "valid-metadata") == 0 ||
+                             std::strcmp(scenario, "valid-metadata-with-descendant") == 0 ||
+                             std::strcmp(scenario,
+                                         "exit-before-request-with-inherited-descendant") == 0 ||
 #if !defined(_WIN32)
-                                     std::strcmp(scenario, "descriptor-isolation") == 0 ||
-                                     std::strcmp(scenario, "process-spawn-denied") == 0 ||
+                             std::strcmp(scenario, "descriptor-isolation") == 0 ||
+                             std::strcmp(scenario, "process-spawn-denied") == 0 ||
 #endif
 #if !defined(_WIN32) && !defined(__APPLE__)
-                                     std::strcmp(scenario, "memory-limit") == 0 || false
+                             std::strcmp(scenario, "memory-limit") == 0 || false
 #else
-                                     false
+                             false
 #endif
-                                 ? 854
-                                 : 853)},
-                  {"height", 480},
-                  {"fps_numerator", 30},
-                  {"fps_denominator", 1},
-                  {"duration_ns", negative ? nlohmann::json(-1) : nlohmann::json(1'000'000'000)},
-                  {"total_frames", negative ? nlohmann::json(-1) : nlohmann::json(30)},
-                  {"first_stream_time_ns", 0},
-                  {"timestamp_multiplicity", 1},
-                  {"duration_is_estimated", false},
-                  {"total_frames_is_estimated", false},
-                  {"selected_stream_caps_verified", true},
-                  {"indexed_sampling_cadence_verified", true}};
+                         ? 854
+                         : 853)},
+          {"height", 480},
+          {"fps_numerator", 30},
+          {"fps_denominator", 1},
+          {"duration_ns", negative ? nlohmann::json(-1) : nlohmann::json(1'000'000'000)},
+          {"total_frames", negative ? nlohmann::json(-1) : nlohmann::json(30)},
+          {"first_stream_time_ns", 0},
+          {"timestamp_multiplicity", 1},
+          {"duration_is_estimated", false},
+          {"total_frames_is_estimated", false},
+          {"selected_stream_caps_verified", true},
+          {"indexed_sampling_cadence_verified", true}};
     }
     const auto encoded = nlohmann::json::to_cbor(response);
     write_frame({reinterpret_cast<const char*>(encoded.data()), encoded.size()});

@@ -1,3 +1,4 @@
+#include "reco/core/path.hpp"
 #include "reco/core/source.hpp"
 #include "reco/io/jsonl_sink.hpp"
 #include "reco/io/output.hpp"
@@ -72,13 +73,14 @@ void from_json(const nlohmann::json& json, DummySettings& settings) {
 class ScopedConfigDir {
 public:
   ScopedConfigDir() {
-    path_ = std::filesystem::temp_directory_path() / "reco_io_cpp_settings_tests";
+    path_ = std::filesystem::temp_directory_path() /
+            reco::core::path_from_utf8("reco_io_cpp_settings_tests-\xCE\xA9-\xE4\xBE\x8B");
     std::filesystem::remove_all(path_);
     std::filesystem::create_directories(path_);
 #if defined(_WIN32)
-    _putenv_s("RECO_CONFIG_DIR", path_.string().c_str());
+    _wputenv_s(L"RECO_CONFIG_DIR", path_.c_str());
 #else
-    setenv("RECO_CONFIG_DIR", path_.string().c_str(), 1);
+    setenv("RECO_CONFIG_DIR", reco::core::path_to_utf8(path_).c_str(), 1);
 #endif
   }
 
@@ -355,6 +357,16 @@ void recent_files_match_rust_mru_policy() {
   const auto roundtrip = json.get<RecentFiles>();
   expect_eq(roundtrip.size(), 3U, "recent json roundtrip size");
   expect_true(roundtrip.entries()[0] == std::filesystem::path("/b"), "recent json order");
+
+  const auto unicode_path = reco::core::path_from_utf8("/video/\xCE\xA9-\xE4\xBE\x8B.mp4");
+  recent.push(unicode_path);
+  const nlohmann::json unicode_json = recent;
+  expect_true(unicode_json["entries"][0].get<std::string>() ==
+                  reco::core::path_to_utf8(unicode_path),
+              "recent file serializes as UTF-8");
+  const auto unicode_roundtrip = unicode_json.get<RecentFiles>();
+  expect_true(unicode_roundtrip.entries()[0] == unicode_path,
+              "recent file preserves a Unicode native path");
 }
 
 void jsonl_sink_writes_one_pipeline_event_per_line() {

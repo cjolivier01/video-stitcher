@@ -244,6 +244,10 @@ void write_roi_points(Writer& writer, const std::vector<std::array<double, 2>>& 
   }
   writer.u32(static_cast<std::uint32_t>(points.size()));
   for (const auto& point : points) {
+    if (!std::isfinite(point[0]) || !std::isfinite(point[1])) {
+      throw CalibrationExecutionError(
+          "calibration result field ROI contains a non-finite coordinate");
+    }
     writer.floating(point[0]);
     writer.floating(point[1]);
   }
@@ -257,7 +261,12 @@ std::vector<std::array<double, 2>> read_roi_points(Reader& reader) {
   std::vector<std::array<double, 2>> points;
   points.reserve(count);
   for (std::uint32_t index = 0; index < count; ++index) {
-    points.push_back({reader.floating64("field ROI x"), reader.floating64("field ROI y")});
+    const std::array point{reader.floating64("field ROI x"), reader.floating64("field ROI y")};
+    if (!std::isfinite(point[0]) || !std::isfinite(point[1])) {
+      throw CalibrationExecutionError(
+          "calibration worker returned a non-finite field ROI coordinate");
+    }
+    points.push_back(point);
   }
   return points;
 }

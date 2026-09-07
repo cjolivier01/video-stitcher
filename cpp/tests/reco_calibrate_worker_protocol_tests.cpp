@@ -499,6 +499,32 @@ void correspondence_limits_and_numeric_validation_are_strict() {
                "non-finite correspondence rejected on decode");
 }
 
+void field_roi_coordinates_must_be_finite_on_encode_and_decode() {
+  auto nan_result = result_fixture();
+  nan_result.calibration.field_roi->left[0][0] = std::numeric_limits<double>::quiet_NaN();
+  expect_error([&] { (void)encode_calibration_worker_success(nan_result); }, "non-finite",
+               "NaN field ROI coordinate rejected on encode");
+
+  auto infinite_result = result_fixture();
+  infinite_result.calibration.field_roi->right[1][1] = std::numeric_limits<double>::infinity();
+  expect_error([&] { (void)encode_calibration_worker_success(infinite_result); }, "non-finite",
+               "infinite field ROI coordinate rejected on encode");
+
+  auto nan_wire = encode_calibration_worker_success(result_fixture());
+  expect_eq(replace_u64(nan_wire, std::bit_cast<std::uint64_t>(0.2),
+                        std::bit_cast<std::uint64_t>(std::numeric_limits<double>::quiet_NaN()), 0U),
+            1U, "NaN field ROI decoder fixture mutation");
+  expect_error([&] { (void)decode_calibration_worker_response(nan_wire); }, "non-finite",
+               "NaN field ROI coordinate rejected on decode");
+
+  auto infinite_wire = encode_calibration_worker_success(result_fixture());
+  expect_eq(replace_u64(infinite_wire, std::bit_cast<std::uint64_t>(0.9),
+                        std::bit_cast<std::uint64_t>(std::numeric_limits<double>::infinity()), 0U),
+            1U, "infinite field ROI decoder fixture mutation");
+  expect_error([&] { (void)decode_calibration_worker_response(infinite_wire); }, "non-finite",
+               "infinite field ROI coordinate rejected on decode");
+}
+
 void result_metric_ranges_are_validated_on_encode_and_decode() {
   const std::array<std::pair<std::string_view, std::function<void(CalibrationResult&)>>, 6> cases{{
       {"negative residual", [](CalibrationResult& value) { value.residual_error = -0.1; }},
@@ -766,6 +792,7 @@ int main() {
   result_round_trip_preserves_correspondences_exactly();
   result_envelope_covers_maximum_valid_gpu_output();
   correspondence_limits_and_numeric_validation_are_strict();
+  field_roi_coordinates_must_be_finite_on_encode_and_decode();
   result_metric_ranges_are_validated_on_encode_and_decode();
   malformed_frames_fail_before_unbounded_allocation();
   inconsistent_result_counts_are_rejected_on_encode_and_decode();

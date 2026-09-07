@@ -265,8 +265,6 @@ public:
 
   [[nodiscard]] const std::string& path() const { return path_; }
 
-  void release() noexcept { handle_ = nullptr; }
-
 private:
   void* handle_ = nullptr;
   std::string path_;
@@ -360,79 +358,84 @@ unsigned int parse_minor_version(std::string_view version) {
   return static_cast<unsigned int>(value);
 }
 
-OrtRuntimeProbe compute_ort_probe() {
+struct OrtRuntimeState {
+  OrtRuntimeProbe probe;
+  std::unique_ptr<DynamicLibrary> library;
+  const OrtApi* api = nullptr;
+  OrtAppendCudaProvider append_cuda_provider = nullptr;
+  std::string api_error;
+};
+
+OrtRuntimeState compute_ort_runtime_state() {
   const auto path = resolve_ort_library_path();
   const auto encoded_path = core::path_to_utf8(path);
+  OrtRuntimeState state;
   try {
-    DynamicLibrary lib(path);
-    const auto api_base_getter = lib.symbol<OrtGetApiBase>("OrtGetApiBase");
+    auto library = std::make_unique<DynamicLibrary>(path);
+    const auto api_base_getter = library->symbol<OrtGetApiBase>("OrtGetApiBase");
     const OrtApiBase* base = api_base_getter();
     if (base == nullptr || base->get_version_string == nullptr) {
-      return {.available = false,
-              .path = encoded_path,
-              .error = encoded_path + ": OrtGetApiBase returned an invalid API base"};
+      state.probe = {.available = false,
+                     .path = encoded_path,
+                     .error = encoded_path + ": OrtGetApiBase returned an invalid API base"};
+      return state;
     }
 
     const char* raw_version = base->get_version_string();
     const std::string version = raw_version == nullptr ? std::string{} : std::string(raw_version);
     const auto minor = parse_minor_version(version);
     if (minor < kMinimumOrtMinorVersion) {
-      return {.available = false,
-              .path = encoded_path,
-              .version = version,
-              .error = "ONNX Runtime at `" + encoded_path + "` is version " + version +
-                       "; reco needs >= 1.23"};
+      state.probe = {.available = false,
+                     .path = encoded_path,
+                     .version = version,
+                     .error = "ONNX Runtime at `" + encoded_path + "` is version " + version +
+                              "; reco needs >= 1.23"};
+      return state;
     }
-    lib.release();
-    return {.available = true, .path = encoded_path, .version = version};
+
+    state.probe = {.available = true, .path = encoded_path, .version = version};
+    state.library = std::move(library);
+    if (base->get_api == nullptr) {
+      state.api_error = encoded_path + ": OrtGetApiBase returned an invalid API base";
+      return state;
+    }
+    state.api = static_cast<const OrtApi*>(base->get_api(kOrtApiVersion));
+    if (state.api == nullptr) {
+      state.api_error =
+          "ONNX Runtime at `" + encoded_path + "` does not support ORT C API version 23";
+      return state;
+    }
+    try {
+      state.append_cuda_provider = state.library->symbol<OrtAppendCudaProvider>(
+          "OrtSessionOptionsAppendExecutionProvider_CUDA");
+    } catch (const std::exception&) {
+      state.append_cuda_provider = nullptr;
+    }
+    return state;
   } catch (const std::exception& error) {
-    return {.available = false,
-            .path = encoded_path,
-            .error = "ONNX Runtime library not found (`" + encoded_path + "`: " + error.what() +
-                     "). Install onnxruntime or place the library next to the executable."};
+    state.probe = {.available = false,
+                   .path = encoded_path,
+                   .error = "ONNX Runtime library not found (`" + encoded_path +
+                            "`: " + error.what() +
+                            "). Install onnxruntime or place the library next to the executable."};
+    return state;
   }
 }
 
-const OrtRuntimeProbe& cached_ort_probe() {
-  static const OrtRuntimeProbe probe = compute_ort_probe();
-  return probe;
+const OrtRuntimeState& ort_runtime_state() {
+  static const OrtRuntimeState state = compute_ort_runtime_state();
+  return state;
 }
 
-struct OrtRuntimeApi {
-  const OrtApi* api = nullptr;
-  OrtAppendCudaProvider append_cuda_provider = nullptr;
-};
-
-const OrtRuntimeApi& ort_runtime_api() {
-  static const OrtRuntimeApi runtime = [] {
-    const auto probe = cached_ort_probe();
-    if (!probe.available) {
-      throw std::runtime_error(probe.error);
-    }
-    const auto path = resolve_ort_library_path();
-    static std::unique_ptr<DynamicLibrary> pinned_library;
-    pinned_library = std::make_unique<DynamicLibrary>(path);
-    const auto api_base_getter = pinned_library->symbol<OrtGetApiBase>("OrtGetApiBase");
-    const OrtApiBase* base = api_base_getter();
-    if (base == nullptr || base->get_api == nullptr) {
-      throw std::runtime_error(core::path_to_utf8(path) +
-                               ": OrtGetApiBase returned an invalid API base");
-    }
-    const auto* api = static_cast<const OrtApi*>(base->get_api(kOrtApiVersion));
-    if (api == nullptr) {
-      throw std::runtime_error("ONNX Runtime at `" + core::path_to_utf8(path) +
-                               "` does not support ORT C API version 23");
-    }
-    OrtAppendCudaProvider append_cuda_provider = nullptr;
-    try {
-      append_cuda_provider = pinned_library->symbol<OrtAppendCudaProvider>(
-          "OrtSessionOptionsAppendExecutionProvider_CUDA");
-    } catch (const std::exception&) {
-      append_cuda_provider = nullptr;
-    }
-    return OrtRuntimeApi{.api = api, .append_cuda_provider = append_cuda_provider};
-  }();
-  return runtime;
+const OrtRuntimeState& ort_runtime_api() {
+  const auto& state = ort_runtime_state();
+  if (!state.probe.available) {
+    throw std::runtime_error(state.probe.error);
+  }
+  if (state.api == nullptr) {
+    throw std::runtime_error(state.api_error);
+  }
+  return state;
 }
 
 const OrtApi& ort_api() { return *ort_runtime_api().api; }
@@ -636,11 +639,11 @@ std::filesystem::path platform_cache_base() {
 
 } // namespace
 
-OrtRuntimeProbe probe_ort_runtime() { return cached_ort_probe(); }
+OrtRuntimeProbe probe_ort_runtime() { return ort_runtime_state().probe; }
 
-bool ort_runtime_available() { return cached_ort_probe().available; }
+bool ort_runtime_available() { return ort_runtime_state().probe.available; }
 
-std::string ort_runtime_error() { return cached_ort_probe().error; }
+std::string ort_runtime_error() { return ort_runtime_state().probe.error; }
 
 std::filesystem::path reco_cache_dir(std::string_view subdir) {
   std::filesystem::path dir = platform_cache_base() / "reco" / std::filesystem::path(subdir);

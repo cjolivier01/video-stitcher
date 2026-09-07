@@ -1,3 +1,4 @@
+#include "reco/core/path.hpp"
 #include "reco/gui/settings.hpp"
 #include "reco/gui/toast.hpp"
 
@@ -43,13 +44,14 @@ void expect_near(float actual, float expected, float tolerance, std::string_view
 class ScopedConfigDir {
 public:
   ScopedConfigDir() {
-    path_ = std::filesystem::temp_directory_path() / "reco_gui_cpp_settings_tests";
+    path_ = std::filesystem::temp_directory_path() /
+            reco::core::path_from_utf8("reco_gui_cpp_settings_tests-\xCE\xA9-\xE4\xBE\x8B");
     std::filesystem::remove_all(path_);
     std::filesystem::create_directories(path_);
 #if defined(_WIN32)
-    _putenv_s("RECO_CONFIG_DIR", path_.string().c_str());
+    _wputenv_s(L"RECO_CONFIG_DIR", path_.c_str());
 #else
-    setenv("RECO_CONFIG_DIR", path_.string().c_str(), 1);
+    setenv("RECO_CONFIG_DIR", reco::core::path_to_utf8(path_).c_str(), 1);
 #endif
   }
 
@@ -102,21 +104,28 @@ void settings_round_trip_persists_gui_namespace() {
   GuiSettings settings;
   settings.default_codec = "av1";
   settings.window_size = std::pair<std::uint32_t, std::uint32_t>{1440, 900};
-  settings.ai_model_path = std::filesystem::path("/models/ball.onnx");
+  const auto model_path = reco::core::path_from_utf8("/models/\xCE\xA9-\xE4\xBE\x8B.onnx");
+  const auto recording_path = reco::core::path_from_utf8("/recordings/\xE8\xA9\xA6\xE5\x90\x88");
+  const auto recent_path = reco::core::path_from_utf8("/video/\xCE\xA9-left.mp4");
+  settings.ai_model_path = model_path;
+  settings.recording_folder = recording_path;
+  settings.recent_left.push(recent_path);
   settings.save();
 
   const auto loaded = GuiSettings::load();
   expect_eq(loaded.default_codec, std::string("av1"), "roundtrip codec");
   expect_true(loaded.window_size.has_value(), "roundtrip window size");
   expect_eq(loaded.window_size->first, 1440U, "roundtrip window width");
-  expect_eq(loaded.ai_model_path->string(), std::string("/models/ball.onnx"),
-            "roundtrip model path");
+  expect_true(loaded.ai_model_path == model_path, "roundtrip Unicode model path");
+  expect_true(loaded.recording_folder == recording_path, "roundtrip Unicode recording path");
+  expect_true(loaded.recent_left.entries()[0] == recent_path, "roundtrip Unicode recent path");
 
   settings.push_left(std::filesystem::path("/video/left.mp4"));
   const auto pushed = GuiSettings::load();
-  expect_eq(pushed.recent_left.size(), 1U, "push left saved");
-  expect_eq(pushed.recent_left.entries()[0].string(), std::string("/video/left.mp4"),
-            "push left path");
+  expect_eq(pushed.recent_left.size(), 2U, "push left saved");
+  expect_true(pushed.recent_left.entries()[0] == std::filesystem::path("/video/left.mp4"),
+              "push left path");
+  expect_true(pushed.recent_left.entries()[1] == recent_path, "push preserves Unicode MRU path");
 }
 
 void toast_manager_matches_rust() {

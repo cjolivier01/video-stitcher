@@ -638,6 +638,28 @@ int run_windows_parent_death_probe_caller() {
   }
   return EXIT_SUCCESS;
 }
+
+int run_windows_maximum_request_probe_caller() {
+  const char* video_path = std::getenv("RECO_FAKE_PROBE_CALLER_VIDEO_PATH");
+  const char* worker_path = std::getenv("RECO_FAKE_PROBE_CALLER_WORKER_PATH");
+  if (video_path == nullptr || video_path[0] == '\0' || worker_path == nullptr ||
+      worker_path[0] == '\0') {
+    return EXIT_FAILURE;
+  }
+  try {
+    (void)reco::io::detail::probe_gpu_video_with_maximum_request_for_test(
+        container_config(std::filesystem::path(video_path)), std::filesystem::path(worker_path),
+        2'000'000'000ULL);
+    return EXIT_FAILURE;
+  } catch (const GpuVideoProbeError& error) {
+    return std::string_view(error.what()).find("failed to write video probe worker request") !=
+                   std::string_view::npos
+               ? EXIT_SUCCESS
+               : EXIT_FAILURE;
+  } catch (...) {
+    return EXIT_FAILURE;
+  }
+}
 #endif
 
 std::vector<std::string> read_events(const std::filesystem::path& path) {
@@ -1689,6 +1711,26 @@ void worker_ipc_failures_are_bounded(const std::filesystem::path& video_path) {
     expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
               std::string("invalid worker cleanup is certified: ") + std::string(scenario));
   }
+}
+
+void rapid_posix_probe_launches_establish_process_groups(const std::filesystem::path& video_path) {
+#if !defined(_WIN32)
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+  constexpr std::size_t launch_count = 32;
+  for (std::size_t launch = 0; launch < launch_count; ++launch) {
+    try {
+      const auto result = reco::io::probe_gpu_video(container_config(video_path),
+                                                    fake_probe_worker_path, 5'000'000'000ULL);
+      expect_eq(result.width, 854U, "rapid POSIX probe launch returns worker metadata");
+    } catch (const std::exception& error) {
+      std::cerr << "FAIL: rapid POSIX probe launch " << launch << " threw: " << error.what()
+                << '\n';
+      ++failures;
+    }
+  }
+#else
+  (void)video_path;
+#endif
 }
 
 void aggregate_worker_memory_budget_is_enforced() {
@@ -2969,6 +3011,72 @@ void windows_request_writer_failure_retires_job(const std::filesystem::path& vid
       "Windows request-writer construction failure terminates the contained worker");
   expect_eq(reco::io::detail::reserved_probe_memory_bytes_for_test(), 0ULL,
             "Windows request-writer construction failure retires its Job reservation");
+#else
+  (void)video_path;
+#endif
+}
+
+void windows_normal_exit_cancels_blocked_request_writer(const std::filesystem::path& video_path) {
+#if defined(_WIN32)
+  const auto descendant_marker =
+      video_path.parent_path() / (video_path.filename().string() + ".stdin-descendant");
+  std::filesystem::remove(descendant_marker);
+  set_environment("RECO_FAKE_PROBE_DESCENDANT_PATH", descendant_marker.string());
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO",
+                  "exit-before-request-with-inherited-descendant");
+  set_environment("RECO_FAKE_PROBE_CALLER_VIDEO_PATH", video_path.string());
+  set_environment("RECO_FAKE_PROBE_CALLER_WORKER_PATH", fake_probe_worker_path.string());
+
+  const auto application = current_test_executable().native();
+  auto command_line = L"\"" + application + L"\" --reco-maximum-request-probe-caller";
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  PROCESS_INFORMATION caller_info{};
+  const bool caller_started =
+      CreateProcessW(application.c_str(), command_line.data(), nullptr, nullptr, FALSE,
+                     CREATE_NO_WINDOW, nullptr, nullptr, &startup, &caller_info) != 0;
+  expect_true(caller_started, "Windows maximum-request probe caller starts");
+  if (caller_started) {
+    WindowsHandle caller_process(caller_info.hProcess);
+    WindowsHandle caller_thread(caller_info.hThread);
+    const auto caller_exit = WaitForSingleObject(caller_process.get(), 3'000);
+    expect_true(caller_exit == WAIT_OBJECT_0,
+                "Windows normal worker exit cannot leave its maximum request writer blocked");
+    DWORD exit_code = EXIT_FAILURE;
+    expect_true(caller_exit == WAIT_OBJECT_0 &&
+                    GetExitCodeProcess(caller_process.get(), &exit_code) != 0 &&
+                    exit_code == EXIT_SUCCESS,
+                "Windows maximum-request probe reports its bounded request-writer error");
+    if (caller_exit != WAIT_OBJECT_0) {
+      (void)TerminateProcess(caller_process.get(), EXIT_FAILURE);
+      (void)WaitForSingleObject(caller_process.get(), 2'000);
+    }
+  }
+
+  const auto descendant = wait_for_process_marker(
+      descendant_marker, std::chrono::steady_clock::now() + std::chrono::seconds(2));
+  expect_true(descendant.has_value(),
+              "Windows fake worker starts a descendant that inherits its stdin");
+  if (descendant.has_value() && *descendant <= std::numeric_limits<DWORD>::max()) {
+    SetLastError(ERROR_SUCCESS);
+    WindowsHandle process(
+        OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, static_cast<DWORD>(*descendant)));
+    const auto open_error = GetLastError();
+    bool exited = !process && open_error == ERROR_INVALID_PARAMETER;
+    if (process) {
+      exited = WaitForSingleObject(process.get(), 2'000) == WAIT_OBJECT_0;
+      if (!exited) {
+        (void)TerminateProcess(process.get(), EXIT_FAILURE);
+      }
+    }
+    expect_true(exited, "Windows normal-exit cleanup retires the stdin-inheriting descendant");
+  }
+
+  set_environment("RECO_FAKE_PROBE_DESCENDANT_PATH", "");
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+  set_environment("RECO_FAKE_PROBE_CALLER_VIDEO_PATH", "");
+  set_environment("RECO_FAKE_PROBE_CALLER_WORKER_PATH", "");
+  std::filesystem::remove(descendant_marker);
 #else
   (void)video_path;
 #endif
@@ -4568,6 +4676,9 @@ int main(int argc, char** argv) {
   if (argc == 2 && std::string_view(argv[1]) == "--reco-parent-death-probe-caller") {
     return run_windows_parent_death_probe_caller();
   }
+  if (argc == 2 && std::string_view(argv[1]) == "--reco-maximum-request-probe-caller") {
+    return run_windows_maximum_request_probe_caller();
+  }
 #else
   try {
     test_executable_path = std::filesystem::absolute(argv[0]);
@@ -4635,6 +4746,7 @@ int main(int argc, char** argv) {
   expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
             "path tests leave no aggregate admission behind");
   worker_ipc_failures_are_bounded(video_path);
+  rapid_posix_probe_launches_establish_process_groups(video_path);
   aggregate_worker_memory_budget_is_enforced();
   maximum_linux_snapshots_are_aggregate_bounded();
   inherited_probe_state_is_rejected_after_fork(video_path);
@@ -4650,6 +4762,7 @@ int main(int argc, char** argv) {
   competing_waitpid_reaper_cannot_steal_cleanup_authority(video_path);
   windows_job_reclaims_worker_descendants(video_path);
   windows_request_writer_failure_retires_job(video_path);
+  windows_normal_exit_cancels_blocked_request_writer(video_path);
   guardian_death_after_worker_release_reclaims_group(video_path);
   unrelated_descriptors_are_not_inherited(video_path);
   signal_handler_fork_cannot_deadlock_the_probe_registry();

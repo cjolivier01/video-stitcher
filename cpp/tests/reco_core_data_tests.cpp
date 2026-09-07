@@ -82,6 +82,15 @@ void source_path_validation_matches_rust_reasons() {
   expect_true(!empty.ok, "empty rejected");
   expect_true(empty.reason == InvalidPathReason::Empty, "empty reason");
   expect_eq(invalid_path_reason_name(InvalidPathReason::Empty), "file is empty", "empty label");
+
+  const auto unicode = dir / path_from_utf8("video-\xCE\xA9-\xE4\xBE\x8B.mp4");
+  {
+    std::ofstream output(unicode, std::ios::binary);
+    output << "native path probe";
+  }
+  const auto unicode_result = validate_input_path(unicode);
+  expect_true(unicode_result.ok, "Unicode input path accepted");
+  expect_eq(unicode_result.path, path_to_utf8(unicode), "input path diagnostic is UTF-8");
 }
 
 void frame_plane_validation_matches_rust_messages() {

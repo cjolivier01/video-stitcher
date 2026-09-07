@@ -1,7 +1,9 @@
 #include "reco/core/source.hpp"
 
+#include "reco/core/path.hpp"
+
 #include <cerrno>
-#include <cstdio>
+#include <fstream>
 #include <sstream>
 #include <system_error>
 
@@ -9,7 +11,7 @@ namespace reco::core {
 
 PathValidationResult validate_input_path(const std::filesystem::path& path) {
   PathValidationResult result;
-  result.path = path.string();
+  result.path = path_to_utf8(path);
 
   std::error_code ec;
   const auto status = std::filesystem::status(path, ec);
@@ -37,13 +39,10 @@ PathValidationResult validate_input_path(const std::filesystem::path& path) {
     return result;
   }
   errno = 0;
-  FILE* input = std::fopen(path.string().c_str(), "rb");
-  if (input == nullptr && (errno == EACCES || errno == EPERM)) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input && (errno == EACCES || errno == EPERM)) {
     result.reason = InvalidPathReason::PermissionDenied;
     return result;
-  }
-  if (input != nullptr) {
-    std::fclose(input);
   }
   result.ok = true;
   return result;

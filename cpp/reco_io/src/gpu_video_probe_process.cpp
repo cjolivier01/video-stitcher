@@ -147,6 +147,9 @@ struct ProbeLaunchOptions {
   std::filesystem::path pre_guardian_exec_marker;
   bool stop_supervisor_after_guardian_launch = false;
   bool fail_request_writer_start = false;
+#if defined(_WIN32)
+  bool pad_request_to_maximum_size = false;
+#endif
   int pre_owner_fork_ready_descriptor = -1;
   int pre_owner_fork_release_descriptor = -1;
   int owner_forked_pid_descriptor = -1;
@@ -603,7 +606,7 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
     throw;
   }
 
-  const auto terminate_and_join = [&] {
+  const auto terminate_cancel_and_join = [&] {
     terminate_worker();
     (void)CancelSynchronousIo(writer.native_handle());
     writer.join();
@@ -611,7 +614,7 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
 
   const auto now = std::chrono::steady_clock::now();
   if (now >= deadline) {
-    terminate_and_join();
+    terminate_cancel_and_join();
     throw_worker_timeout();
   }
   const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
@@ -620,18 +623,14 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
                                 std::numeric_limits<DWORD>::max() - 1ULL));
   const auto wait_result = WaitForSingleObject(process.get(), wait_ms);
   if (wait_result == WAIT_TIMEOUT) {
-    terminate_and_join();
+    terminate_cancel_and_join();
     throw_worker_timeout();
   }
   if (wait_result != WAIT_OBJECT_0) {
-    terminate_and_join();
+    terminate_cancel_and_join();
     throw GpuVideoProbeError("failed while waiting for video probe worker");
   }
-  writer.join();
-  if (job) {
-    (void)TerminateJobObject(job.get(), 1);
-    (void)retire_job();
-  }
+  terminate_cancel_and_join();
   if (write_error != nullptr) {
     std::rethrow_exception(write_error);
   }
@@ -3105,17 +3104,20 @@ bool guardian_write_exact(int descriptor, const void* value, std::size_t size) {
     guardian_exit(127);
   }
 
-  int group_error = 0;
-  if (::setpgid(supervisor_pid, supervisor_pid) != 0) {
-    const auto set_group_error = errno;
-    if (set_group_error != EACCES) {
-      group_error = set_group_error;
-    }
-  }
+  const auto set_group_result = ::setpgid(supervisor_pid, supervisor_pid);
+  const auto set_group_error = set_group_result == 0 ? 0 : errno;
   errno = 0;
   const auto observed_group = ::getpgid(supervisor_pid);
-  if (group_error == 0 && observed_group != supervisor_pid) {
-    group_error = observed_group < 0 && errno != 0 ? errno : EPERM;
+  const auto observed_group_error = observed_group < 0 ? errno : 0;
+  int group_error = 0;
+  if (observed_group != supervisor_pid) {
+    if (set_group_result != 0 && set_group_error != EACCES) {
+      group_error = set_group_error;
+    } else if (observed_group_error != 0) {
+      group_error = observed_group_error;
+    } else {
+      group_error = EPERM;
+    }
   }
   if (group_error != 0) {
     const SupervisorLaunchReport report{.pid = supervisor_pid, .error = group_error};
@@ -4411,7 +4413,12 @@ GpuVideoProbe probe_gpu_video_with_delays(const GpuFileDecodeConfig& config,
                  std::chrono::duration_cast<std::chrono::nanoseconds>(kMaximumTerminationReserve));
   const auto public_deadline = std::chrono::steady_clock::now() + timeout;
   const auto worker_deadline = public_deadline - termination_reserve;
-  const auto request = detail::encode_probe_request(config, timeout_ns);
+  auto request = detail::encode_probe_request(config, timeout_ns);
+#if defined(_WIN32)
+  if (options.pad_request_to_maximum_size) {
+    request.resize(detail::kMaximumProbeIpcBytes, '\0');
+  }
+#endif
   return detail::decode_probe_response(
       run_probe_worker_bounded(worker_path, request, worker_deadline, public_deadline, options));
 }
@@ -4586,6 +4593,14 @@ GpuVideoProbe detail::probe_gpu_video_with_request_writer_failure_for_test(
     std::uint64_t timeout_ns) {
   return probe_gpu_video_with_delays(config, worker_path, timeout_ns,
                                      ProbeLaunchOptions{.fail_request_writer_start = true});
+}
+
+GpuVideoProbe
+detail::probe_gpu_video_with_maximum_request_for_test(const GpuFileDecodeConfig& config,
+                                                      const std::filesystem::path& worker_path,
+                                                      std::uint64_t timeout_ns) {
+  return probe_gpu_video_with_delays(config, worker_path, timeout_ns,
+                                     ProbeLaunchOptions{.pad_request_to_maximum_size = true});
 }
 #endif
 

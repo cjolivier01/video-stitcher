@@ -79,6 +79,11 @@ void hold_probe_fork_descriptor_registry_for_test(int ready_descriptor, int rele
 probe_gpu_video_with_request_writer_failure_for_test(const GpuFileDecodeConfig& config,
                                                      const std::filesystem::path& worker_path,
                                                      std::uint64_t timeout_ns);
+
+[[nodiscard]] GpuVideoProbe
+probe_gpu_video_with_maximum_request_for_test(const GpuFileDecodeConfig& config,
+                                              const std::filesystem::path& worker_path,
+                                              std::uint64_t timeout_ns);
 #endif
 
 #if defined(__APPLE__)

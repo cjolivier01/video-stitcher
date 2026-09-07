@@ -135,11 +135,21 @@ void fake_runtime_session_contract() {
   expect_eq(probe.version, std::string("1.23.2"), "fake ORT runtime version");
 
   const auto model = write_marker_model();
+  auto missing_runtime = model;
+  missing_runtime += ".missing-runtime";
+  std::error_code remove_error;
+  std::filesystem::remove(missing_runtime, remove_error);
+  if (remove_error) {
+    throw std::runtime_error("failed to prepare missing ORT runtime path: " +
+                             remove_error.message());
+  }
+  set_env("ORT_DYLIB_PATH", missing_runtime);
   OrtSession session(OrtSessionConfig{
       .model_path = model,
       .fallback_labels = {},
       .providers = {OrtExecutionProvider::Cpu},
   });
+  set_env("ORT_DYLIB_PATH", fake_runtime);
   expect_eq(session.metadata().input_size, 8U, "metadata input size");
   expect_eq(session.metadata().input_names[0], std::string("images"), "metadata input name");
   expect_eq(session.metadata().output_names[0], std::string("detections"), "metadata output name");
