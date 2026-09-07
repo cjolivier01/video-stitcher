@@ -1,4 +1,5 @@
 #include "reco/io/gpu_encode.hpp"
+#include "reco/io/gpu_preview.hpp"
 
 #include "reco/io/gpu_memory.hpp"
 
@@ -383,6 +384,23 @@ struct GpuEncodeFrameLease::State {
   std::shared_ptr<EncodePoolState> pool;
   std::size_t slot_index = 0;
   bool acquired = true;
+};
+
+class GpuFrameLeaseAccess {
+public:
+  static GpuEncodeFrameLease make(const std::shared_ptr<EncodePoolState>& pool,
+                                  std::size_t slot_index) {
+    return GpuEncodeFrameLease(std::make_unique<GpuEncodeFrameLease::State>(pool, slot_index));
+  }
+
+  static GpuEncodeFrameLease::State* state(GpuEncodeFrameLease& lease) {
+    return lease.state_.get();
+  }
+
+  static void consume(GpuEncodeFrameLease& lease) {
+    lease.state_->acquired = false;
+    lease.state_.reset();
+  }
 };
 
 struct GpuVideoEncodeSession::Impl {
@@ -837,6 +855,268 @@ struct GpuVideoEncodeSession::Impl {
   bool aborted = false;
 };
 
+struct GpuPreviewSession::Impl {
+  using SetWindowHandle = void (*)(void*, std::uintptr_t);
+
+  Impl(GpuPreviewConfig config_value, std::shared_ptr<const NvbufSurfaceRuntime> runtime,
+       std::shared_ptr<GpuEncodeTraceSink> trace)
+      : config(std::move(config_value)),
+        pipeline_text(build_gstreamer_gpu_preview_pipeline(config)),
+        api(std::make_shared<GstreamerEncodeApi>()), pool(std::make_shared<EncodePoolState>()) {
+    pool->trace = std::move(trace);
+#if defined(_WIN32)
+    video_library =
+        load_runtime_library("RECO_GSTVIDEO_DYLIB_PATH", {"gstvideo-1.0-0.dll"}, "GstVideo");
+#elif defined(__APPLE__)
+    video_library =
+        load_runtime_library("RECO_GSTVIDEO_DYLIB_PATH",
+                             {"libgstvideo-1.0.0.dylib", "libgstvideo-1.0.dylib"}, "GstVideo");
+#else
+    video_library = load_runtime_library(
+        "RECO_GSTVIDEO_DYLIB_PATH", {"libgstvideo-1.0.so.0", "libgstvideo-1.0.so"}, "GstVideo");
+#endif
+    set_window_handle =
+        video_library->symbol<SetWindowHandle>("gst_video_overlay_set_window_handle");
+
+    GErrorAbi* error = nullptr;
+    if (api->init_check(nullptr, nullptr, &error) == 0) {
+      throw GpuPreviewError(take_error(api, error, "GStreamer initialization failed"));
+    }
+    std::uint32_t major = 0;
+    std::uint32_t minor = 0;
+    std::uint32_t micro = 0;
+    std::uint32_t nano = 0;
+    api->version(&major, &minor, &micro, &nano);
+    if (major != 1U) {
+      throw GpuPreviewError("unsupported GStreamer runtime major version " + std::to_string(major));
+    }
+
+    for (std::uint32_t index = 0; index < config.pool_capacity; ++index) {
+      auto allocation = allocate_nvmm_nv12_surface(
+          config.width, config.height, config.device_ordinal, core::YuvColorMatrix::Bt709,
+          core::YuvColorRange::Limited, runtime);
+      auto mapping = map_nvmm_frame_to_cuda(allocation.frame, allocation.owner);
+      auto view = make_nv12_view(mapping);
+      pool->slots.push_back(
+          std::make_unique<EncodeSlot>(std::move(allocation), std::move(mapping), std::move(view)));
+      if (pool->trace) {
+        pool->trace->surface_allocated();
+      }
+    }
+
+    error = nullptr;
+    pipeline = api->parse_launch(pipeline_text.c_str(), &error);
+    if (pipeline == nullptr || error != nullptr) {
+      const auto detail = take_error(api, error, "failed to construct GPU preview pipeline");
+      close_resources();
+      throw GpuPreviewError(detail);
+    }
+    source = api->bin_get_by_name(pipeline, "source");
+    sink = api->bin_get_by_name(pipeline, "preview_sink");
+    bus = api->element_get_bus(pipeline);
+    if (source == nullptr || sink == nullptr || bus == nullptr) {
+      close_resources();
+      throw GpuPreviewError("GPU preview pipeline is missing appsrc, overlay, or bus resources");
+    }
+    set_window_handle(sink, config.window_handle);
+    if (api->element_set_state(pipeline, kGstStatePlaying) == kGstStateChangeFailure) {
+      (void)api->element_set_state(pipeline, kGstStateNull);
+      close_resources();
+      throw GpuPreviewError("GStreamer GPU preview pipeline failed to enter PLAYING");
+    }
+    int current = 0;
+    int pending = 0;
+    const int startup =
+        api->element_get_state(pipeline, &current, &pending, timeout_ns(config.startup_timeout));
+    if (startup != kGstStateChangeSuccess || current != kGstStatePlaying || pending != 0) {
+      (void)api->element_set_state(pipeline, kGstStateNull);
+      close_resources();
+      throw GpuPreviewError(startup == kGstStateChangeFailure
+                                ? "GStreamer GPU preview pipeline failed during startup"
+                                : "GStreamer GPU preview pipeline timed out before PLAYING");
+    }
+  }
+
+  ~Impl() {
+    stop();
+    close_resources();
+  }
+
+  void close_resources() noexcept {
+    if (sink != nullptr) {
+      api->object_unref(sink);
+      sink = nullptr;
+    }
+    if (source != nullptr) {
+      api->object_unref(source);
+      source = nullptr;
+    }
+    if (bus != nullptr) {
+      api->object_unref(bus);
+      bus = nullptr;
+    }
+    if (pipeline != nullptr) {
+      api->object_unref(pipeline);
+      pipeline = nullptr;
+    }
+  }
+
+  std::optional<std::string> poll_bus() {
+    if (bus == nullptr) {
+      return std::string("GPU preview pipeline is closed");
+    }
+    void* message = api->bus_timed_pop_filtered(bus, 0, kGstMessageEos | kGstMessageError);
+    if (message == nullptr) {
+      return std::nullopt;
+    }
+    const std::unique_ptr<void, GstreamerEncodeApi::MessageUnref> owner(message,
+                                                                        api->message_unref);
+    const auto type = static_cast<GstMessageAbi*>(message)->type;
+    std::string detail;
+    if ((type & kGstMessageError) != 0U) {
+      GErrorAbi* error = nullptr;
+      char* debug = nullptr;
+      api->message_parse_error(message, &error, &debug);
+      detail = take_error(api, error, "GStreamer GPU preview pipeline failed");
+      if (debug != nullptr) {
+        api->free(debug);
+      }
+    } else if ((type & kGstMessageEos) != 0U) {
+      detail = "GStreamer GPU preview pipeline reached unexpected EOS";
+    }
+    if (!detail.empty()) {
+      pool->record_error(detail);
+      return detail;
+    }
+    return std::nullopt;
+  }
+
+  GpuEncodeFrameLease acquire() {
+    const auto deadline = std::chrono::steady_clock::now() + config.acquire_timeout;
+    for (;;) {
+      if (const auto bus_result = poll_bus(); bus_result.has_value()) {
+        throw GpuPreviewError(*bus_result);
+      }
+      std::unique_lock lock(pool->mutex);
+      if (pool->sticky_error.has_value()) {
+        throw GpuPreviewError(*pool->sticky_error);
+      }
+      if (!pool->accepting || stopped) {
+        throw GpuPreviewError("GPU preview session is no longer accepting frames");
+      }
+      for (std::size_t index = 0; index < pool->slots.size(); ++index) {
+        if (pool->slots[index]->status == SlotStatus::Free) {
+          pool->slots[index]->status = SlotStatus::Acquired;
+          lock.unlock();
+          if (pool->trace) {
+            pool->trace->surface_acquired();
+          }
+          return GpuFrameLeaseAccess::make(pool, index);
+        }
+      }
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= deadline) {
+        throw GpuPreviewError("timed out waiting for a free GPU preview surface");
+      }
+      pool->available.wait_until(lock, std::min(deadline, now + std::chrono::milliseconds(100)));
+    }
+  }
+
+  void present(GpuEncodeFrameLease&& lease, std::uint64_t pts_ns, std::uint64_t duration_ns) {
+    std::lock_guard submission_lock(submission_mutex);
+    auto* lease_state = GpuFrameLeaseAccess::state(lease);
+    if (lease_state == nullptr || !lease_state->acquired || lease_state->pool.get() != pool.get()) {
+      throw GpuPreviewError("GPU preview frame lease does not belong to this session");
+    }
+    if (duration_ns == 0 || pts_ns == kGstClockTimeNone || duration_ns == kGstClockTimeNone ||
+        pts_ns > std::numeric_limits<std::uint64_t>::max() - duration_ns) {
+      throw GpuPreviewError("GPU preview timestamps must be finite and non-overflowing");
+    }
+    if (const auto bus_result = poll_bus(); bus_result.has_value()) {
+      throw GpuPreviewError(*bus_result);
+    }
+
+    const auto index = lease_state->slot_index;
+    EncodeSlot* slot = nullptr;
+    {
+      std::lock_guard lock(pool->mutex);
+      if (pool->sticky_error.has_value()) {
+        throw GpuPreviewError(*pool->sticky_error);
+      }
+      if (!pool->accepting || stopped || index >= pool->slots.size() ||
+          pool->slots[index]->status != SlotStatus::Acquired) {
+        throw GpuPreviewError("GPU preview frame cannot be presented in the current state");
+      }
+      slot = pool->slots[index].get();
+      slot->status = SlotStatus::InPipeline;
+    }
+    GpuFrameLeaseAccess::consume(lease);
+
+    std::unique_ptr<WrappedSurfaceOwner> wrapped_owner;
+    void* buffer = nullptr;
+    try {
+      wrapped_owner = std::make_unique<WrappedSurfaceOwner>(
+          WrappedSurfaceOwner{pool, slot->allocation.owner, index});
+      buffer = api->buffer_new_wrapped_full(
+          0, slot->allocation.frame.surface_ptr, slot->allocation.descriptor_size, 0,
+          slot->allocation.descriptor_size, wrapped_owner.get(), release_wrapped_surface);
+      if (buffer == nullptr) {
+        throw GpuPreviewError("GStreamer failed to wrap an NVMM preview surface");
+      }
+      wrapped_owner.release();
+      auto* header = static_cast<GstBufferAbi*>(buffer);
+      header->pts = pts_ns;
+      header->dts = pts_ns;
+      header->duration = duration_ns;
+      if (pool->trace) {
+        pool->trace->surface_submitted();
+      }
+      const int flow = api->app_src_push_buffer(source, buffer);
+      if (flow != kGstFlowOk) {
+        const std::string detail =
+            "GStreamer appsrc rejected a GPU preview frame with flow status " +
+            std::to_string(flow);
+        pool->record_error(detail);
+        throw GpuPreviewError(detail);
+      }
+    } catch (...) {
+      if (buffer == nullptr) {
+        pool->release(index, SlotStatus::InPipeline);
+      }
+      throw;
+    }
+  }
+
+  void stop() noexcept {
+    std::lock_guard submission_lock(submission_mutex);
+    {
+      std::lock_guard lock(pool->mutex);
+      if (stopped) {
+        return;
+      }
+      stopped = true;
+      pool->accepting = false;
+    }
+    pool->available.notify_all();
+    if (pipeline != nullptr) {
+      (void)api->element_set_state(pipeline, kGstStateNull);
+    }
+  }
+
+  GpuPreviewConfig config;
+  std::string pipeline_text;
+  std::shared_ptr<GstreamerEncodeApi> api;
+  std::shared_ptr<DynamicLibrary> video_library;
+  SetWindowHandle set_window_handle = nullptr;
+  std::shared_ptr<EncodePoolState> pool;
+  std::mutex submission_mutex;
+  void* pipeline = nullptr;
+  void* source = nullptr;
+  void* sink = nullptr;
+  void* bus = nullptr;
+  bool stopped = false;
+};
+
 GpuEncodeFrameLease::GpuEncodeFrameLease(std::unique_ptr<State> state) : state_(std::move(state)) {}
 
 GpuEncodeFrameLease::GpuEncodeFrameLease(GpuEncodeFrameLease&&) noexcept = default;
@@ -978,4 +1258,58 @@ std::string_view GpuVideoEncodeSession::pipeline() const {
   return impl_->pipeline_text;
 }
 
+GpuPreviewSession GpuPreviewSession::open(GpuPreviewConfig config,
+                                          std::shared_ptr<GpuEncodeTraceSink> trace_sink) {
+  return open(std::move(config), discover_nvbufsurface_runtime(), std::move(trace_sink));
+}
+
+GpuPreviewSession GpuPreviewSession::open(GpuPreviewConfig config,
+                                          std::shared_ptr<const NvbufSurfaceRuntime> runtime,
+                                          std::shared_ptr<GpuEncodeTraceSink> trace_sink) {
+  if (const auto error = validate_gpu_preview_config(config); error.has_value()) {
+    throw GpuPreviewError(*error);
+  }
+  return GpuPreviewSession(
+      std::make_unique<Impl>(std::move(config), std::move(runtime), std::move(trace_sink)));
+}
+
+GpuPreviewSession::GpuPreviewSession(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+
+GpuPreviewSession::GpuPreviewSession(GpuPreviewSession&&) noexcept = default;
+
+GpuPreviewSession& GpuPreviewSession::operator=(GpuPreviewSession&&) noexcept = default;
+
+GpuPreviewSession::~GpuPreviewSession() = default;
+
+GpuEncodeFrameLease GpuPreviewSession::acquire_frame() {
+  if (!impl_) {
+    throw GpuPreviewError("GPU preview session is empty");
+  }
+  return impl_->acquire();
+}
+
+void GpuPreviewSession::present(GpuEncodeFrameLease&& frame, std::uint64_t pts_ns,
+                                std::uint64_t duration_ns) {
+  if (!impl_) {
+    throw GpuPreviewError("GPU preview session is empty");
+  }
+  impl_->present(std::move(frame), pts_ns, duration_ns);
+}
+
+void GpuPreviewSession::stop() noexcept {
+  if (impl_) {
+    impl_->stop();
+  }
+}
+
+const GpuPreviewConfig& GpuPreviewSession::config() const {
+  if (!impl_) {
+    throw GpuPreviewError("GPU preview session is empty");
+  }
+  return impl_->config;
+}
+
+std::string_view GpuPreviewSession::pipeline() const {
+  return impl_ ? std::string_view(impl_->pipeline_text) : std::string_view{};
+}
 } // namespace reco::io
