@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -27,6 +28,18 @@ int failures = 0;
 void expect_true(bool condition, std::string_view message) {
   if (!condition) {
     std::cerr << "FAIL: " << message << '\n';
+    ++failures;
+  }
+}
+
+void run_test(std::string_view name, void (*test)()) {
+  try {
+    test();
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: " << name << " threw: " << error.what() << '\n';
+    ++failures;
+  } catch (...) {
+    std::cerr << "FAIL: " << name << " threw an unknown exception\n";
     ++failures;
   }
 }
@@ -486,17 +499,17 @@ void pipeline_event_json_serializes_core_event_vocabulary() {
 
 int main() {
   static_assert(std::is_copy_constructible_v<StackError>, "StackError is copyable");
-  output_parsing_matches_rust_aliases();
-  format_detection_matches_rust_policy();
-  layout_validation_matches_rust_guards();
-  pack_unpack_round_trips_identity();
-  empty_tiles_get_grey_fill();
-  stack_errors_match_rust_cases();
-  grid_3x3_round_trips_nine_tiles();
-  timestamp_follows_first_nonempty_tile();
-  settings_round_trip_and_namespace_guards_match_rust();
-  recent_files_match_rust_mru_policy();
-  jsonl_sink_writes_one_pipeline_event_per_line();
-  pipeline_event_json_serializes_core_event_vocabulary();
+  run_test("output parsing", output_parsing_matches_rust_aliases);
+  run_test("format detection", format_detection_matches_rust_policy);
+  run_test("layout validation", layout_validation_matches_rust_guards);
+  run_test("pack/unpack identity", pack_unpack_round_trips_identity);
+  run_test("empty tile fill", empty_tiles_get_grey_fill);
+  run_test("stack errors", stack_errors_match_rust_cases);
+  run_test("3x3 grid roundtrip", grid_3x3_round_trips_nine_tiles);
+  run_test("timestamp selection", timestamp_follows_first_nonempty_tile);
+  run_test("settings roundtrip", settings_round_trip_and_namespace_guards_match_rust);
+  run_test("recent files", recent_files_match_rust_mru_policy);
+  run_test("JSONL sink", jsonl_sink_writes_one_pipeline_event_per_line);
+  run_test("pipeline event JSON", pipeline_event_json_serializes_core_event_vocabulary);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

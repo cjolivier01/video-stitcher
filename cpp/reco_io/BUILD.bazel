@@ -48,7 +48,7 @@ cc_library(
     name = "gpu_video_probe_test_support",
     testonly = True,
     hdrs = ["src/gpu_video_probe_process_test.hpp"],
-    strip_include_prefix = "src",
+    includes = ["src"],
     visibility = ["//cpp/tests:__pkg__"],
     deps = [":reco_io"],
 )
@@ -56,7 +56,7 @@ cc_library(
 cc_library(
     name = "gpu_video_probe_in_process_support",
     hdrs = ["src/gpu_video_probe_internal.hpp"],
-    strip_include_prefix = "src",
+    includes = ["src"],
     visibility = ["//cpp/reco_calibrate:__pkg__"],
     deps = [":reco_io"],
 )
@@ -78,7 +78,7 @@ cc_library(
     name = "gpu_video_probe_fallback_test_support",
     testonly = True,
     hdrs = ["src/gpu_video_probe_process_test.hpp"],
-    strip_include_prefix = "src",
+    includes = ["src"],
     visibility = ["//cpp/tests:__pkg__"],
     deps = [":reco_io_forced_guardian_fallbacks"],
 )

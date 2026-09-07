@@ -63,7 +63,7 @@ cc_library(
         "src/calibration_worker_protocol.hpp",
         "src/stable_media_file.hpp",
     ],
-    strip_include_prefix = "src",
+    includes = ["src"],
     visibility = ["//cpp/tests:__pkg__"],
     deps = [":reco_calibrate"],
 )

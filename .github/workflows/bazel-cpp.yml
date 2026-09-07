@@ -156,7 +156,8 @@ jobs:
           bazelisk-cache: true
       - name: Require full calibration containment lifecycle
         run: >-
-          bazel test --jobs=2 --local_test_jobs=1
+          bazel --output_base="$RUNNER_TEMP/reco-bazel-output" test
+          --jobs=2 --local_test_jobs=1
           --cache_test_results=no
           --test_env=RECO_REQUIRE_CALIBRATION_CONTAINMENT_TEST=1
           --test_output=errors
@@ -181,7 +182,8 @@ jobs:
           RECO_REQUIRE_CUDA_TEST: "1"
           RECO_REQUIRE_NPP_TEST: "1"
         run: >-
-          bazel test --jobs=2 --local_test_jobs=1
+          bazel --output_base="$RUNNER_TEMP/reco-bazel-output" test
+          --jobs=2 --local_test_jobs=1
           --cache_test_results=no
           --test_env=RECO_REQUIRE_CUDA_TEST=1
           --test_env=RECO_REQUIRE_NPP_TEST=1
@@ -226,7 +228,8 @@ jobs:
             '{"width":1280,"height":720,"fx":10000000000.0,"fy":10000000000.0,"cx":640.0,"cy":360.0,"d":[0.0,0.0,0.0,0.0]}' \
             >"$work_dir/profile.json"
 
-          bazel run --jobs=2 --local_test_jobs=1 //cpp/apps/reco_cli:reco -- calibrate \
+          bazel --output_base="$RUNNER_TEMP/reco-bazel-output" run \
+            --jobs=2 --local_test_jobs=1 //cpp/apps/reco_cli:reco -- calibrate \
             "$work_dir/left.mp4" "$work_dir/right.mp4" \
             --left-profile "$work_dir/profile.json" \
             --no-auto-sync \
