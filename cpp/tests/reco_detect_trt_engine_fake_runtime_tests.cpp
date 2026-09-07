@@ -320,8 +320,19 @@ void fake_runtime_detector_contract() {
 
 } // namespace
 
-int main() {
+int run_tests() {
   fake_runtime_engine_contract();
   fake_runtime_detector_contract();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+int main() {
+  try {
+    return run_tests();
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: uncaught TensorRT runtime test exception: " << error.what() << '\n';
+  } catch (...) {
+    std::cerr << "FAIL: uncaught non-standard TensorRT runtime test exception\n";
+  }
+  return EXIT_FAILURE;
 }

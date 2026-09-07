@@ -739,7 +739,7 @@ void runtime_failures_are_reported() {
 
 } // namespace
 
-int main() {
+int run_tests() {
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
   const auto source_runtime = find_fake_runtime_runfile("fake_gstreamer_runtime");
   auto runtime = source_runtime;
@@ -794,4 +794,15 @@ int main() {
   std::filesystem::remove(event_path);
 #endif
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+int main() {
+  try {
+    return run_tests();
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: uncaught GPU decode runtime test exception: " << error.what() << '\n';
+  } catch (...) {
+    std::cerr << "FAIL: uncaught non-standard GPU decode runtime test exception\n";
+  }
+  return EXIT_FAILURE;
 }

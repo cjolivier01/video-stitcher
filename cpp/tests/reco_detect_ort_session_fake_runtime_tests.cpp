@@ -371,9 +371,20 @@ void fake_runtime_cuda_detector_contract() {
 
 } // namespace
 
-int main() {
+int run_tests() {
   fake_runtime_session_contract();
   fake_runtime_cpu_detector_contract();
   fake_runtime_cuda_detector_contract();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+int main() {
+  try {
+    return run_tests();
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: uncaught ORT runtime test exception: " << error.what() << '\n';
+  } catch (...) {
+    std::cerr << "FAIL: uncaught non-standard ORT runtime test exception\n";
+  }
+  return EXIT_FAILURE;
 }
