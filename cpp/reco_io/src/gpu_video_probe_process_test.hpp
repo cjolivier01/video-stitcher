@@ -90,6 +90,8 @@ probe_gpu_video_with_request_writer_failure_for_test(const GpuFileDecodeConfig& 
 #endif
 
 #if defined(__linux__)
+[[nodiscard]] bool linux_session_scan_ignores_zombie_for_test();
+
 void hold_linux_probe_executable_snapshot_for_test(const std::filesystem::path& worker_path,
                                                    int ready_descriptor, int release_descriptor);
 #endif

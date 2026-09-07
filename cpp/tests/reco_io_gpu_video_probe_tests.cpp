@@ -2950,6 +2950,13 @@ void darwin_session_scan_capacity_failure_is_bounded() {
 #endif
 }
 
+void linux_session_scan_ignores_zombies() {
+#if defined(__linux__)
+  expect_true(reco::io::detail::linux_session_scan_ignores_zombie_for_test(),
+              "Linux session cleanup ignores terminal zombies");
+#endif
+}
+
 void windows_request_writer_failure_retires_job(const std::filesystem::path& video_path) {
 #if defined(_WIN32)
   set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
@@ -4663,6 +4670,7 @@ int main(int argc, char** argv) {
   caller_process_group_death_before_supervisor_main(video_path);
   mac_owner_reclaims_stalled_guardian_session(video_path);
   darwin_session_scan_capacity_failure_is_bounded();
+  linux_session_scan_ignores_zombies();
   executable_replacement_cannot_change_the_pinned_probe_image(video_path);
   linux_fork_child_does_not_retain_snapshot_memfd(video_path);
   mac_probe_snapshot_preserves_quarantine(video_path);

@@ -2098,6 +2098,8 @@ bool guardian_restrict_worker_process_creation() {
 #if defined(__linux__)
 struct LinuxProcessUsage {
   pid_t process_group = -1;
+  pid_t session = -1;
+  char state = '\0';
   std::uint64_t resident_pages = 0;
 };
 
@@ -2115,12 +2117,14 @@ bool parse_linux_process_usage(const char* data, std::size_t size, LinuxProcessU
     return false;
   }
   const char* cursor = close_parenthesis + 2;
-  ++cursor; // state, field 3
+  const char state = *cursor; // field 3
+  ++cursor;
   if (cursor >= data + size || *cursor != ' ') {
     return false;
   }
   ++cursor;
   std::int64_t process_group = -1;
+  std::int64_t session = -1;
   std::int64_t resident_pages = -1;
   for (int field = 4; field <= 24; ++field) {
     const char* end = cursor;
@@ -2134,6 +2138,8 @@ bool parse_linux_process_usage(const char* data, std::size_t size, LinuxProcessU
     }
     if (field == 5) {
       process_group = value;
+    } else if (field == 6) {
+      session = value;
     } else if (field == 24) {
       resident_pages = value;
     }
@@ -2142,14 +2148,53 @@ bool parse_linux_process_usage(const char* data, std::size_t size, LinuxProcessU
       ++cursor;
     }
   }
-  if (process_group <= 0 || process_group > std::numeric_limits<pid_t>::max() ||
-      resident_pages < 0) {
+  if (state == '\0' || state == ' ' || process_group <= 0 ||
+      process_group > std::numeric_limits<pid_t>::max() || session <= 0 ||
+      session > std::numeric_limits<pid_t>::max() || resident_pages < 0) {
     return false;
   }
   usage->process_group = static_cast<pid_t>(process_group);
+  usage->session = static_cast<pid_t>(session);
+  usage->state = state;
   usage->resident_pages = static_cast<std::uint64_t>(resident_pages);
   return true;
 }
+
+enum class LinuxProcessUsageRead { Present, Missing, Invalid };
+
+LinuxProcessUsageRead read_linux_process_usage(int proc_directory, const char* process_name,
+                                               std::size_t name_length, LinuxProcessUsage* usage) {
+  char relative_path[64]{};
+  if (name_length + 6U >= sizeof(relative_path)) {
+    return LinuxProcessUsageRead::Invalid;
+  }
+  std::memcpy(relative_path, process_name, name_length);
+  std::memcpy(relative_path + name_length, "/stat", 6U);
+  const auto process_stat = ::openat(proc_directory, relative_path, O_RDONLY | O_CLOEXEC);
+  if (process_stat < 0) {
+    return errno == ENOENT || errno == ESRCH ? LinuxProcessUsageRead::Missing
+                                             : LinuxProcessUsageRead::Invalid;
+  }
+
+  std::array<char, 4096> stat{};
+  ssize_t stat_size = -1;
+  do {
+    stat_size = ::read(process_stat, stat.data(), stat.size());
+  } while (stat_size < 0 && errno == EINTR);
+  const auto read_error = errno;
+  (void)::close(process_stat);
+  if (stat_size < 0) {
+    return read_error == ENOENT || read_error == ESRCH ? LinuxProcessUsageRead::Missing
+                                                       : LinuxProcessUsageRead::Invalid;
+  }
+  if (stat_size == 0 ||
+      !parse_linux_process_usage(stat.data(), static_cast<std::size_t>(stat_size), usage)) {
+    return LinuxProcessUsageRead::Invalid;
+  }
+  return LinuxProcessUsageRead::Present;
+}
+
+bool linux_process_state_is_terminal(char state) { return state == 'Z' || state == 'X'; }
 
 struct LinuxWorkerGroupScan {
   bool valid = false;
@@ -2242,50 +2287,26 @@ LinuxWorkerGroupScan scan_linux_worker_group(pid_t worker_pid) {
           offset += entry->record_length;
           continue;
         }
-        char relative_path[64]{};
-        if (name_length + 6U >= sizeof(relative_path)) {
+        LinuxProcessUsage usage{};
+        const auto usage_read =
+            read_linux_process_usage(directory, entry->name, name_length, &usage);
+        if (usage_read == LinuxProcessUsageRead::Invalid) {
           valid = false;
           break;
         }
-        std::memcpy(relative_path, entry->name, name_length);
-        std::memcpy(relative_path + name_length, "/stat", 6U);
-        const auto process_stat = ::openat(directory, relative_path, O_RDONLY | O_CLOEXEC);
-        if (process_stat >= 0) {
-          std::array<char, 4096> stat{};
-          ssize_t stat_size = -1;
-          do {
-            stat_size = ::read(process_stat, stat.data(), stat.size());
-          } while (stat_size < 0 && errno == EINTR);
-          const auto read_error = errno;
-          (void)::close(process_stat);
-          if (stat_size > 0) {
-            LinuxProcessUsage usage{};
-            if (!parse_linux_process_usage(stat.data(), static_cast<std::size_t>(stat_size),
-                                           &usage)) {
-              valid = false;
-              break;
-            }
-            if (usage.process_group != worker_pid) {
-              offset += entry->record_length;
-              continue;
-            }
-            result.has_other_members |= process_id != worker_pid;
-            const auto page_bytes = static_cast<std::uint64_t>(page_size);
-            if (usage.resident_pages >
-                (std::numeric_limits<std::uint64_t>::max() - result.resident_bytes) / page_bytes) {
-              valid = false;
-              break;
-            }
-            result.resident_bytes += usage.resident_pages * page_bytes;
-          }
-          if (stat_size < 0 && read_error != ENOENT && read_error != ESRCH) {
-            valid = false;
-            break;
-          }
-        } else if (errno != ENOENT && errno != ESRCH) {
+        if (usage_read == LinuxProcessUsageRead::Missing || usage.process_group != worker_pid) {
+          offset += entry->record_length;
+          continue;
+        }
+        result.has_other_members |=
+            process_id != worker_pid && !linux_process_state_is_terminal(usage.state);
+        const auto page_bytes = static_cast<std::uint64_t>(page_size);
+        if (usage.resident_pages >
+            (std::numeric_limits<std::uint64_t>::max() - result.resident_bytes) / page_bytes) {
           valid = false;
           break;
         }
+        result.resident_bytes += usage.resident_pages * page_bytes;
       }
       offset += entry->record_length;
     }
@@ -2410,6 +2431,22 @@ LinuxSessionScan scan_linux_owned_session(pid_t session_id, pid_t owner_pid, pid
           errno = 0;
           const auto observed_session = ::getsid(process_id);
           if (observed_session == session_id) {
+            LinuxProcessUsage usage{};
+            const auto usage_read =
+                read_linux_process_usage(directory, entry->name, name_length, &usage);
+            if (usage_read == LinuxProcessUsageRead::Missing ||
+                (usage_read == LinuxProcessUsageRead::Present && usage.session != session_id)) {
+              offset += entry->record_length;
+              continue;
+            }
+            if (usage_read == LinuxProcessUsageRead::Invalid) {
+              valid = false;
+              break;
+            }
+            if (linux_process_state_is_terminal(usage.state)) {
+              offset += entry->record_length;
+              continue;
+            }
             result.has_other_members = true;
             if (!terminate_linux_session_process(process_id, session_id)) {
               valid = false;
@@ -2434,6 +2471,7 @@ LinuxSessionScan scan_linux_owned_session(pid_t session_id, pid_t owner_pid, pid
 bool guardian_wait_for_owned_linux_session_cleanup(pid_t supervisor_pid) {
   constexpr timespec kSessionPollPause{.tv_sec = 0, .tv_nsec = 2'000'000};
   constexpr std::size_t kMaximumConsecutiveScanFailures = 50;
+  constexpr std::size_t kMaximumSessionCleanupPolls = 125;
   const auto owner_pid = ::getpid();
   const auto session_id = ::getsid(0);
   if (session_id != owner_pid) {
@@ -2441,7 +2479,7 @@ bool guardian_wait_for_owned_linux_session_cleanup(pid_t supervisor_pid) {
   }
 
   std::size_t consecutive_failures = 0;
-  while (true) {
+  for (std::size_t poll = 0; poll < kMaximumSessionCleanupPolls; ++poll) {
     const auto scan = scan_linux_owned_session(session_id, owner_pid, supervisor_pid);
     if (!scan.valid) {
       if (++consecutive_failures >= kMaximumConsecutiveScanFailures) {
@@ -2455,6 +2493,7 @@ bool guardian_wait_for_owned_linux_session_cleanup(pid_t supervisor_pid) {
     }
     (void)::nanosleep(&kSessionPollPause, nullptr);
   }
+  return false;
 }
 #elif defined(__APPLE__)
 using ProcListPids = int (*)(std::uint32_t, std::uint32_t, void*, int);
@@ -4579,6 +4618,46 @@ bool detail::darwin_session_scan_failure_budget_is_bounded_for_test() {
 #endif
 
 #if defined(__linux__)
+bool detail::linux_session_scan_ignores_zombie_for_test() {
+  const auto owner = ::fork();
+  if (owner == 0) {
+    if (::setsid() != ::getpid()) {
+      ::_exit(1);
+    }
+    const auto zombie = ::fork();
+    if (zombie == 0) {
+      ::_exit(0);
+    }
+    if (zombie < 0) {
+      ::_exit(2);
+    }
+    siginfo_t zombie_info{};
+    int wait_result = -1;
+    do {
+      wait_result = ::waitid(P_PID, static_cast<id_t>(zombie), &zombie_info, WEXITED | WNOWAIT);
+    } while (wait_result < 0 && errno == EINTR);
+    if (wait_result != 0 || zombie_info.si_pid != zombie) {
+      (void)::kill(zombie, SIGKILL);
+      (void)::waitpid(zombie, nullptr, 0);
+      ::_exit(3);
+    }
+    const auto scan = scan_linux_owned_session(::getpid(), ::getpid(), -1);
+    int zombie_status = 0;
+    while (::waitpid(zombie, &zombie_status, 0) < 0 && errno == EINTR) {
+    }
+    ::_exit(scan.valid && !scan.has_other_members ? 0 : 4);
+  }
+  if (owner < 0) {
+    return false;
+  }
+  int owner_status = 0;
+  pid_t waited = -1;
+  do {
+    waited = ::waitpid(owner, &owner_status, 0);
+  } while (waited < 0 && errno == EINTR);
+  return waited == owner && WIFEXITED(owner_status) && WEXITSTATUS(owner_status) == 0;
+}
+
 void detail::hold_linux_probe_executable_snapshot_for_test(const std::filesystem::path& worker_path,
                                                            int ready_descriptor,
                                                            int release_descriptor) {
