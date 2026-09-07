@@ -362,14 +362,15 @@ unsigned int parse_minor_version(std::string_view version) {
 
 OrtRuntimeProbe compute_ort_probe() {
   const auto path = resolve_ort_library_path();
+  const auto encoded_path = core::path_to_utf8(path);
   try {
     DynamicLibrary lib(path);
     const auto api_base_getter = lib.symbol<OrtGetApiBase>("OrtGetApiBase");
     const OrtApiBase* base = api_base_getter();
     if (base == nullptr || base->get_version_string == nullptr) {
       return {.available = false,
-              .path = path.string(),
-              .error = path.string() + ": OrtGetApiBase returned an invalid API base"};
+              .path = encoded_path,
+              .error = encoded_path + ": OrtGetApiBase returned an invalid API base"};
     }
 
     const char* raw_version = base->get_version_string();
@@ -377,17 +378,17 @@ OrtRuntimeProbe compute_ort_probe() {
     const auto minor = parse_minor_version(version);
     if (minor < kMinimumOrtMinorVersion) {
       return {.available = false,
-              .path = path.string(),
+              .path = encoded_path,
               .version = version,
-              .error = "ONNX Runtime at `" + path.string() + "` is version " + version +
+              .error = "ONNX Runtime at `" + encoded_path + "` is version " + version +
                        "; reco needs >= 1.23"};
     }
     lib.release();
-    return {.available = true, .path = path.string(), .version = version};
+    return {.available = true, .path = encoded_path, .version = version};
   } catch (const std::exception& error) {
     return {.available = false,
-            .path = path.string(),
-            .error = "ONNX Runtime library not found (`" + path.string() + "`: " + error.what() +
+            .path = encoded_path,
+            .error = "ONNX Runtime library not found (`" + encoded_path + "`: " + error.what() +
                      "). Install onnxruntime or place the library next to the executable."};
   }
 }
@@ -414,11 +415,12 @@ const OrtRuntimeApi& ort_runtime_api() {
     const auto api_base_getter = pinned_library->symbol<OrtGetApiBase>("OrtGetApiBase");
     const OrtApiBase* base = api_base_getter();
     if (base == nullptr || base->get_api == nullptr) {
-      throw std::runtime_error(path.string() + ": OrtGetApiBase returned an invalid API base");
+      throw std::runtime_error(core::path_to_utf8(path) +
+                               ": OrtGetApiBase returned an invalid API base");
     }
     const auto* api = static_cast<const OrtApi*>(base->get_api(kOrtApiVersion));
     if (api == nullptr) {
-      throw std::runtime_error("ONNX Runtime at `" + path.string() +
+      throw std::runtime_error("ONNX Runtime at `" + core::path_to_utf8(path) +
                                "` does not support ORT C API version 23");
     }
     OrtAppendCudaProvider append_cuda_provider = nullptr;
@@ -597,7 +599,7 @@ OrtSessionConfig validate_ort_session_config(OrtSessionConfig config) {
     throw std::invalid_argument("OrtSessionConfig.model_path is required");
   }
   if (!std::filesystem::exists(config.model_path)) {
-    throw std::runtime_error("ONNX model not found: " + config.model_path.string());
+    throw std::runtime_error("ONNX model not found: " + core::path_to_utf8(config.model_path));
   }
   if (config.providers.empty()) {
     throw std::invalid_argument("OrtSessionConfig.providers must not be empty");

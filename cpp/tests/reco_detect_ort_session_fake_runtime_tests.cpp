@@ -1,4 +1,5 @@
 #include "reco/core/cuda_backend.hpp"
+#include "reco/core/path.hpp"
 #include "reco/detect/detectors.hpp"
 #include "reco/detect/ort_session.hpp"
 
@@ -129,6 +130,8 @@ void fake_runtime_session_contract() {
 
   const auto probe = probe_ort_runtime();
   expect_true(probe.available, "fake ORT runtime available");
+  expect_eq(probe.path, reco::core::path_to_utf8(fake_runtime),
+            "fake ORT runtime reports its UTF-8 path");
   expect_eq(probe.version, std::string("1.23.2"), "fake ORT runtime version");
 
   const auto model = write_marker_model();
