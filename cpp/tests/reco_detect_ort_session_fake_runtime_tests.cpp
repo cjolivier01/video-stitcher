@@ -97,7 +97,8 @@ std::filesystem::path native_fake_runtime_path() {
   const auto source = find_fake_runtime_runfile();
 #if defined(_WIN32)
   const auto directory = std::filesystem::temp_directory_path() /
-                         std::filesystem::path(std::u8string(u8"reco-ort-\u5f55\u50cf"));
+                         std::filesystem::path(std::u8string(u8"reco-ort-\u5f55\u50cf")) /
+                         std::to_string(GetCurrentProcessId());
   std::filesystem::create_directories(directory);
   const auto destination = directory / source.filename();
   std::filesystem::copy_file(source, destination,
@@ -124,9 +125,37 @@ void unset_env(const char* name) {
 #endif
 }
 
+void fake_runtime_invalid_api_contract(std::string_view mode) {
+  const auto fake_runtime = native_fake_runtime_path();
+  set_env("ORT_DYLIB_PATH", fake_runtime);
+
+  std::string_view expected_error;
+  if (mode == "null-get-api") {
+    set_env("RECO_FAKE_ORT_NULL_GET_API", "1");
+    expected_error = "OrtGetApiBase returned an invalid API base";
+  } else if (mode == "unsupported-api-version") {
+    set_env("RECO_FAKE_ORT_UNSUPPORTED_API_VERSION", "1");
+    expected_error = "does not support ORT C API version 23";
+  } else {
+    throw std::invalid_argument("unknown fake ORT test mode");
+  }
+
+  const auto probe = probe_ort_runtime();
+  expect_true(!probe.available, "unusable fake ORT runtime is unavailable");
+  expect_eq(probe.path, reco::core::path_to_utf8(fake_runtime),
+            "unusable fake ORT runtime reports its UTF-8 path");
+  expect_eq(probe.version, std::string("1.23.2"), "unusable fake ORT runtime version");
+  expect_true(!probe.error.empty(), "unusable fake ORT runtime reports an error");
+  expect_true(probe.error.find(expected_error) != std::string::npos,
+              "unusable fake ORT runtime reports the API failure");
+  expect_true(!ort_runtime_available(), "unusable fake ORT runtime availability helper");
+}
+
 void fake_runtime_session_contract() {
   const auto fake_runtime = native_fake_runtime_path();
   set_env("ORT_DYLIB_PATH", fake_runtime);
+  unset_env("RECO_FAKE_ORT_NULL_GET_API");
+  unset_env("RECO_FAKE_ORT_UNSUPPORTED_API_VERSION");
 
   const auto probe = probe_ort_runtime();
   expect_true(probe.available, "fake ORT runtime available");
@@ -383,16 +412,23 @@ void fake_runtime_cuda_detector_contract() {
 
 } // namespace
 
-int run_tests() {
+int run_tests(std::string_view mode) {
+  if (!mode.empty()) {
+    fake_runtime_invalid_api_contract(mode);
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   fake_runtime_session_contract();
   fake_runtime_cpu_detector_contract();
   fake_runtime_cuda_detector_contract();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
-int main() {
+int main(int argc, char** argv) {
   try {
-    return run_tests();
+    if (argc > 2) {
+      throw std::invalid_argument("expected at most one fake ORT test mode");
+    }
+    return run_tests(argc == 2 ? std::string_view(argv[1]) : std::string_view{});
   } catch (const std::exception& error) {
     std::cerr << "FAIL: uncaught ORT runtime test exception: " << error.what() << '\n';
   } catch (...) {

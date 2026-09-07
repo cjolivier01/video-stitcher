@@ -282,7 +282,14 @@ int main(int argc, char** argv) {
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(delay));
     }
-    return run_calibration_guardian_fd(descriptor, argv[0], deadline);
+    const auto status = run_calibration_guardian_fd(descriptor, argv[0], deadline);
+    if (status == EXIT_SUCCESS) {
+      const char* forced_status = std::getenv("RECO_FAKE_CALIBRATION_GUARDIAN_FAIL_AFTER_RESPONSE");
+      if (forced_status != nullptr && std::string_view(forced_status) == "1") {
+        return EXIT_FAILURE;
+      }
+    }
+    return status;
   }
   if (!is_worker) {
     return EXIT_FAILURE;

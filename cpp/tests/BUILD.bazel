@@ -519,6 +519,32 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "reco_detect_ort_session_null_get_api_tests",
+    size = "small",
+    srcs = ["reco_detect_ort_session_fake_runtime_tests.cpp"],
+    args = ["null-get-api"],
+    data = [":libfake_onnxruntime.so"],
+    deps = [
+        "//cpp/reco_core",
+        "//cpp/reco_detect",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
+cc_test(
+    name = "reco_detect_ort_session_unsupported_api_tests",
+    size = "small",
+    srcs = ["reco_detect_ort_session_fake_runtime_tests.cpp"],
+    args = ["unsupported-api-version"],
+    data = [":libfake_onnxruntime.so"],
+    deps = [
+        "//cpp/reco_core",
+        "//cpp/reco_detect",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
 cc_binary(
     name = "libfake_tensorrt.so",
     testonly = True,

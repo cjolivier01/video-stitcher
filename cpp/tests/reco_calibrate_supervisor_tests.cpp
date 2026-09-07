@@ -341,6 +341,33 @@ void success_returns_the_bounded_result() {
             "supervisor transfers each reported correspondence");
 }
 
+void successful_response_requires_clean_guardian_exit() {
+  EnvironmentValue forced_exit("RECO_FAKE_CALIBRATION_GUARDIAN_FAIL_AFTER_RESPONSE", "1");
+  Scenario scenario("success");
+  expect_execution_error([&] { (void)run_gpu_calibration(request_fixture(), ready_backends()); },
+                         "guardian did not exit successfully after returning a result",
+                         "an abnormal guardian exit invalidates a complete success response");
+}
+
+void unavailable_cgroup_fails_closed_before_worker_launch() {
+  const auto marker = temporary_path("unavailable-cgroup-worker.pid");
+  const auto cgroups_before = calibration_cgroups();
+  std::filesystem::remove(marker);
+  {
+    EnvironmentValue unavailable("RECO_FAKE_CALIBRATION_CGROUP_UNAVAILABLE", "1");
+    EnvironmentValue worker_marker("RECO_FAKE_CALIBRATION_WORKER_PID_PATH", marker.string());
+    Scenario scenario("success");
+    expect_execution_error([&] { (void)run_gpu_calibration(request_fixture(), ready_backends()); },
+                           "delegated cgroup-v2",
+                           "an unavailable delegated memory controller rejects calibration");
+  }
+  expect_true(!std::filesystem::exists(marker),
+              "fail-closed containment rejects calibration before worker launch");
+  expect_true(wait_for_cgroup_set(cgroups_before, std::chrono::milliseconds(500)),
+              "failed containment setup leaves no calibration cgroup");
+  std::filesystem::remove(marker);
+}
+
 void retained_input_descriptors_reach_the_sandboxed_worker() {
   const auto left = temporary_path("retained-left.mp4");
   const auto right = temporary_path("retained-right.mp4");
@@ -902,23 +929,39 @@ void excessive_scratch_entries_are_terminated_by_pidfd() {
               "excessive scratch entries leave no scratch tree");
 }
 
-void caller_sigchld_policy_cannot_steal_worker_ownership() {
+void caller_sigchld_policy_cannot_fake_success_or_steal_worker_ownership() {
+  const auto marker = temporary_path("sigchld-policy-worker.pid");
+  std::filesystem::remove(marker);
   struct sigaction original{};
   struct sigaction ignored{};
   ignored.sa_handler = SIG_IGN;
   (void)sigemptyset(&ignored.sa_mask);
   expect_true(::sigaction(SIGCHLD, &ignored, &original) == 0, "SIGCHLD ignore policy installs");
   {
+    EnvironmentValue worker_marker("RECO_FAKE_CALIBRATION_WORKER_PID_PATH", marker.string());
     Scenario scenario("success");
-    try {
-      expect_eq(run_gpu_calibration(request_fixture(), ready_backends()).total_matches, 12U,
-                "SIGCHLD ignore policy cannot break guardian observation");
-    } catch (const std::exception& error) {
-      std::cerr << "FAIL: SIGCHLD ignore policy threw: " << error.what() << '\n';
-      ++failures;
-    }
+    expect_execution_error(
+        [&] { (void)run_gpu_calibration(request_fixture(), ready_backends()); },
+        "observable child exit status",
+        "SIGCHLD ignore policy fails closed before accepting an unverifiable result");
   }
+  expect_true(!std::filesystem::exists(marker),
+              "SIGCHLD ignore policy is rejected before worker launch");
   expect_true(::sigaction(SIGCHLD, &original, nullptr) == 0, "SIGCHLD policy restores");
+
+  struct sigaction no_wait{};
+  no_wait.sa_handler = SIG_DFL;
+  no_wait.sa_flags = SA_NOCLDWAIT;
+  (void)sigemptyset(&no_wait.sa_mask);
+  expect_true(::sigaction(SIGCHLD, &no_wait, nullptr) == 0, "SIGCHLD no-wait policy installs");
+  {
+    Scenario scenario("success");
+    expect_execution_error(
+        [&] { (void)run_gpu_calibration(request_fixture(), ready_backends()); },
+        "observable child exit status",
+        "SIGCHLD no-wait policy fails closed before accepting an unverifiable result");
+  }
+  expect_true(::sigaction(SIGCHLD, &original, nullptr) == 0, "SIGCHLD no-wait policy restores");
 
   std::atomic<bool> stop{false};
   std::thread thief([&] {
@@ -940,6 +983,7 @@ void caller_sigchld_policy_cannot_steal_worker_ownership() {
   }
   stop.store(true, std::memory_order_relaxed);
   thief.join();
+  std::filesystem::remove(marker);
 }
 
 void stable_parent_pidfd_duplication_failure_reaps_child() {
@@ -1490,11 +1534,14 @@ int main() {
         std::cerr << "FAIL: delegated cgroup-v2 memory controller is required but unavailable\n";
         return EXIT_FAILURE;
       }
-      std::cout << "SKIP: delegated cgroup-v2 memory controller is unavailable\n";
-      return EXIT_SUCCESS;
+      run_case("unavailable cgroup fails closed",
+               unavailable_cgroup_fails_closed_before_worker_launch);
+      return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     throw;
   }
+  run_case("guardian success exit", successful_response_requires_clean_guardian_exit);
+  run_case("unavailable cgroup fails closed", unavailable_cgroup_fails_closed_before_worker_launch);
   run_case("retained media descriptors", retained_input_descriptors_reach_the_sandboxed_worker);
   run_case("input mutation", input_mutation_is_rejected);
   run_case("native stdout isolation", native_stdout_noise_does_not_corrupt_protocol);
@@ -1516,7 +1563,8 @@ int main() {
   run_case("scratch disk quota", oversized_scratch_file_is_terminated_by_pidfd);
   run_case("scratch unlink evasion", unlinked_scratch_file_cannot_escape_the_quota);
   run_case("scratch inode quota", excessive_scratch_entries_are_terminated_by_pidfd);
-  run_case("SIGCHLD ownership", caller_sigchld_policy_cannot_steal_worker_ownership);
+  run_case("SIGCHLD ownership",
+           caller_sigchld_policy_cannot_fake_success_or_steal_worker_ownership);
   run_case("stable-parent pidfd duplication failure",
            stable_parent_pidfd_duplication_failure_reaps_child);
   run_case("descriptor isolation", worker_descriptors_are_isolated_across_exec);

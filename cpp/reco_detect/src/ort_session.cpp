@@ -393,18 +393,23 @@ OrtRuntimeState compute_ort_runtime_state() {
       return state;
     }
 
-    state.probe = {.available = true, .path = encoded_path, .version = version};
-    state.library = std::move(library);
     if (base->get_api == nullptr) {
       state.api_error = encoded_path + ": OrtGetApiBase returned an invalid API base";
+      state.probe = {
+          .available = false, .path = encoded_path, .version = version, .error = state.api_error};
       return state;
     }
-    state.api = static_cast<const OrtApi*>(base->get_api(kOrtApiVersion));
-    if (state.api == nullptr) {
+    const auto* api = static_cast<const OrtApi*>(base->get_api(kOrtApiVersion));
+    if (api == nullptr) {
       state.api_error =
           "ONNX Runtime at `" + encoded_path + "` does not support ORT C API version 23";
+      state.probe = {
+          .available = false, .path = encoded_path, .version = version, .error = state.api_error};
       return state;
     }
+    state.probe = {.available = true, .path = encoded_path, .version = version};
+    state.library = std::move(library);
+    state.api = api;
     try {
       state.append_cuda_provider = state.library->symbol<OrtAppendCudaProvider>(
           "OrtSessionOptionsAppendExecutionProvider_CUDA");

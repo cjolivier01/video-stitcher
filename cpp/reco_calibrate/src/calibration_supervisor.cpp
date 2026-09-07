@@ -430,9 +430,25 @@ private:
   return configured != nullptr && std::string_view(configured) == point;
 }
 
+[[nodiscard]] bool force_cgroup_unavailable_for_test() noexcept {
+  const char* configured = std::getenv("RECO_FAKE_CALIBRATION_CGROUP_UNAVAILABLE");
+  return configured != nullptr && std::string_view(configured) == "1";
+}
+
 [[nodiscard]] bool inject_stable_parent_failure(std::string_view point) noexcept {
   const char* configured = std::getenv("RECO_FAKE_CALIBRATION_STABLE_PARENT_FAILURE");
   return configured != nullptr && point == configured;
+}
+
+void require_observable_child_status() {
+  struct sigaction action{};
+  if (::sigaction(SIGCHLD, nullptr, &action) != 0) {
+    throw CalibrationExecutionError(errno_message("cannot inspect SIGCHLD policy"));
+  }
+  if (action.sa_handler == SIG_IGN || (action.sa_flags & SA_NOCLDWAIT) != 0) {
+    throw CalibrationExecutionError(
+        "isolated calibration requires observable child exit status; SIGCHLD cannot be ignored");
+  }
 }
 
 [[nodiscard]] std::uint64_t time_point_nanoseconds(Clock::time_point value) {
@@ -566,16 +582,16 @@ public:
   OwnedProcess(pid_t pid, int pidfd, Clock::time_point cleanup_deadline = Clock::time_point::min())
       : pid_(pid), pidfd_(pidfd), cleanup_deadline_(cleanup_deadline) {}
   OwnedProcess(pid_t pid, int pidfd, std::thread launcher, int launcher_stop,
-               Clock::time_point cleanup_deadline)
+               Clock::time_point cleanup_deadline, std::shared_ptr<ProcessExit> launcher_exit)
       : pid_(pid), pidfd_(pidfd), launcher_(std::move(launcher)), launcher_stop_(launcher_stop),
-        cleanup_deadline_(cleanup_deadline) {}
+        cleanup_deadline_(cleanup_deadline), launcher_exit_(std::move(launcher_exit)) {}
   OwnedProcess(const OwnedProcess&) = delete;
   OwnedProcess& operator=(const OwnedProcess&) = delete;
   OwnedProcess(OwnedProcess&& other) noexcept
       : pid_(std::exchange(other.pid_, -1)), pidfd_(std::move(other.pidfd_)),
         reaped_(std::exchange(other.reaped_, true)), launcher_(std::move(other.launcher_)),
-        launcher_stop_(std::move(other.launcher_stop_)),
-        cleanup_deadline_(other.cleanup_deadline_) {}
+        launcher_stop_(std::move(other.launcher_stop_)), cleanup_deadline_(other.cleanup_deadline_),
+        launcher_exit_(std::move(other.launcher_exit_)) {}
   OwnedProcess& operator=(OwnedProcess&& other) noexcept {
     if (this != &other) {
       terminate_and_reap_noexcept();
@@ -586,6 +602,7 @@ public:
       launcher_ = std::move(other.launcher_);
       launcher_stop_ = std::move(other.launcher_stop_);
       cleanup_deadline_ = other.cleanup_deadline_;
+      launcher_exit_ = std::move(other.launcher_exit_);
     }
     return *this;
   }
@@ -634,6 +651,15 @@ public:
   [[nodiscard]] ProcessExit reap() noexcept {
     ProcessExit result;
     if (reaped_ || !pidfd_) {
+      return result;
+    }
+    if (launcher_.joinable()) {
+      launcher_.join();
+      launcher_stop_.reset();
+      if (launcher_exit_ != nullptr) {
+        result = *launcher_exit_;
+      }
+      reaped_ = true;
       return result;
     }
     siginfo_t information{};
@@ -700,6 +726,7 @@ private:
   std::thread launcher_;
   UniqueFd launcher_stop_;
   Clock::time_point cleanup_deadline_ = Clock::time_point::min();
+  std::shared_ptr<ProcessExit> launcher_exit_;
 };
 
 [[noreturn]] void cgroup_cleanup_exit(int status) noexcept {
@@ -1198,6 +1225,10 @@ class CgroupMemoryBoundary {
 public:
   CgroupMemoryBoundary(std::uint64_t memory_limit, Clock::time_point teardown_deadline)
       : teardown_deadline_(teardown_deadline) {
+    if (force_cgroup_unavailable_for_test()) {
+      throw CalibrationExecutionError(
+          "a delegated cgroup-v2 memory controller is required for calibration");
+    }
     std::ifstream membership("/proc/self/cgroup");
     std::string line;
     std::optional<std::filesystem::path> current;
@@ -3503,7 +3534,10 @@ clone_process(std::uint64_t flags, Child&& child, int cgroup = -1,
     arguments.cgroup = static_cast<std::uint64_t>(cgroup);
   }
   arguments.pidfd = reinterpret_cast<std::uint64_t>(&pidfd);
-  arguments.exit_signal = SIGCHLD;
+  // No-signal clone children cannot be consumed by an unrelated waitpid(-1).
+  // OwnedProcess reaps them with waitid(P_PIDFD, ..., __WALL), so completion
+  // status remains authoritative.
+  arguments.exit_signal = 0;
 #if defined(RECO_CALIBRATION_THREAD_SANITIZER)
   __sanitizer_syscall_pre_impl_fork();
 #endif
@@ -3542,9 +3576,10 @@ template <typename Child>
     int pidfd = -1;
     bool complete = false;
   } state;
+  auto launcher_exit = std::make_shared<ProcessExit>();
 
   std::thread launcher([flags, child = std::forward<Child>(child), &state,
-                        stop = std::move(stop_read), cleanup_deadline]() mutable {
+                        stop = std::move(stop_read), cleanup_deadline, launcher_exit]() mutable {
     pid_t pid = -1;
     int authority = -1;
     int monitor = -1;
@@ -3586,6 +3621,19 @@ template <typename Child>
       if (result < 0 && errno == EINTR) {
         continue;
       }
+      if (result > 0 && (items[0].revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
+        siginfo_t information{};
+        constexpr auto pidfd_id_type = static_cast<idtype_t>(3);
+        while (::waitid(pidfd_id_type, static_cast<id_t>(monitor_fd.get()), &information,
+                        WEXITED | __WALL) != 0) {
+          if (errno == EINTR) {
+            continue;
+          }
+          return;
+        }
+        *launcher_exit = {
+            .known = true, .code = information.si_code, .status = information.si_status};
+      }
       return;
     }
   });
@@ -3602,7 +3650,7 @@ template <typename Child>
     throw CalibrationExecutionError("cannot create stable calibration launcher process");
   }
   return OwnedProcess(state.pid, state.pidfd, std::move(launcher), stop_write.release(),
-                      cleanup_deadline);
+                      cleanup_deadline, std::move(launcher_exit));
 }
 
 [[nodiscard]] std::vector<char*> make_argv(const std::string& executable,
@@ -4031,6 +4079,7 @@ CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest& re
     throw CalibrationExecutionError("calibration timeout is outside the supervisor clock range");
   }
   const auto deadline = Clock::now() + timeout;
+  require_observable_child_status();
   AdmissionLock admission;
   check_admission_headroom(request.calibration_host_memory_limit_bytes);
   PinnedExecutable executable(std::filesystem::path(request.calibration_worker_path), deadline);
@@ -4118,10 +4167,22 @@ CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest& re
                                maximum_calibration_worker_success_frame_bytes(
                                    request.config.num_frames, request.config.akaze.max_keypoints));
     guardian.wait_until(deadline);
-    (void)guardian.reap();
+    const auto status = guardian.reap();
     certify_channel_eof(channel.get());
     if (memory_boundary.oom_killed()) {
       throw CalibrationExecutionError("calibration worker exceeded its cgroup host memory limit");
+    }
+    const auto message = response_message(response);
+    if (message == CalibrationWorkerMessage::Success &&
+        (!status.known || status.code != CLD_EXITED || status.status != EXIT_SUCCESS)) {
+      throw CalibrationExecutionError(
+          "calibration guardian did not exit successfully after returning a result "
+          "(known=" +
+          std::to_string(status.known) + ", code=" + std::to_string(status.code) +
+          ", status=" + std::to_string(status.status) + ")");
+    }
+    if (status.known && status.code != CLD_EXITED) {
+      throw CalibrationExecutionError("calibration guardian terminated abnormally");
     }
     auto result = decode_calibration_worker_response(response);
     if (result.frames_used > request.config.num_frames ||

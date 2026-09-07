@@ -1075,13 +1075,7 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
   std::thread reader([&] {
     while (running.load(std::memory_order_acquire)) {
       const auto result = read_atomic_output(destination);
-      // The Windows no-replace handoff can transiently hide the destination while never exposing
-      // partial contents.
-      if (result.status == AtomicReadStatus::RetryableFailure
-#if defined(_WIN32)
-          || result.status == AtomicReadStatus::Missing
-#endif
-      ) {
+      if (result.status == AtomicReadStatus::RetryableFailure) {
         std::this_thread::yield();
         continue;
       }
@@ -1421,6 +1415,10 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
     replacement_failed = true;
   }
   expect_true(replacement_failed, "failed calibration replacement reports an error");
+  expect_true(std::filesystem::is_directory(blocked_destination),
+              "failed calibration replacement preserves the destination directory");
+  expect_eq(read_text_file(blocked_destination / "keep"), std::string("keep"),
+            "failed calibration replacement preserves destination contents");
 
   const auto raced_destination = root.path() / "raced-match.json";
   const auto initial_identity_error = reco::calibrate::validate_calibration_output_identity(
@@ -2228,6 +2226,32 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
   expect_eq(read_text_file(windows_replace_race_retained),
             std::string("Windows replace original output\n"),
             "Windows exact-replacement race preserves the prior output moved by the racer");
+
+  const auto windows_removed_destination = root.path() / "windows-removed-destination.json";
+  const auto windows_removed_destination_retained =
+      root.path() / "windows-removed-destination-retained.json";
+  write_text_file(windows_removed_destination, "Windows removed destination original output\n");
+  bool windows_removed_destination_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"windows-removed-destination"})json", windows_removed_destination,
+        left_input, right_input, {}, {}, {}, false, {}, {}, std::chrono::seconds(2),
+        [&](const std::filesystem::path&) {
+          std::filesystem::rename(windows_removed_destination,
+                                  windows_removed_destination_retained);
+        });
+  } catch (const std::exception& error) {
+    windows_removed_destination_rejected =
+        std::string_view(error.what())
+            .find("identity changed before Windows publication handoff") != std::string_view::npos;
+  }
+  expect_true(windows_removed_destination_rejected,
+              "Windows existing-destination removal is rejected");
+  expect_true(!std::filesystem::exists(windows_removed_destination),
+              "Windows replacement does not fall back after an existing destination disappears");
+  expect_eq(read_text_file(windows_removed_destination_retained),
+            std::string("Windows removed destination original output\n"),
+            "Windows rejected replacement preserves the removed destination identity");
 
   const auto windows_source_race_destination = root.path() / "windows-source-race.json";
   const auto windows_source_race_retained = root.path() / "windows-source-race-retained.json";

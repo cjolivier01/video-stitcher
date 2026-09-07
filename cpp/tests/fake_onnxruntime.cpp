@@ -580,11 +580,17 @@ OrtApi make_api() {
 const OrtApi api = make_api();
 
 const OrtApiBase api_base = {get_api, get_version_string};
+const OrtApiBase null_get_api_base = {nullptr, get_version_string};
 
 const void* RECO_ORT_CALL get_api(std::uint32_t version) {
+  if (env_set("RECO_FAKE_ORT_UNSUPPORTED_API_VERSION")) {
+    return nullptr;
+  }
   return version == 23 ? &api : nullptr;
 }
 
 } // namespace
 
-RECO_ORT_EXPORT const OrtApiBase* RECO_ORT_CALL OrtGetApiBase() { return &api_base; }
+RECO_ORT_EXPORT const OrtApiBase* RECO_ORT_CALL OrtGetApiBase() {
+  return env_set("RECO_FAKE_ORT_NULL_GET_API") ? &null_get_api_base : &api_base;
+}
