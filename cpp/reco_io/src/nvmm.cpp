@@ -157,6 +157,44 @@ struct NvbufFunctions {
   std::string provider_path;
 };
 
+std::optional<std::string> validate_loaded_nvbufsurface_provider(void* expected_base,
+                                                                 std::string_view expected_path) {
+  struct LoadedObject {
+    std::uintptr_t base = 0;
+    std::string path;
+  };
+  std::vector<LoadedObject> loaded_objects;
+  const auto collect = [](dl_phdr_info* info, std::size_t, void* raw_objects) {
+    if (info->dlpi_name != nullptr && info->dlpi_name[0] != '\0') {
+      static_cast<std::vector<LoadedObject>*>(raw_objects)
+          ->push_back(LoadedObject{.base = static_cast<std::uintptr_t>(info->dlpi_addr),
+                                   .path = info->dlpi_name});
+    }
+    return 0;
+  };
+  (void)dl_iterate_phdr(collect, &loaded_objects);
+
+  for (const auto& object : loaded_objects) {
+    void* handle = dlopen(object.path.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+    if (handle == nullptr) {
+      continue;
+    }
+    dlerror();
+    void* symbol = dlsym(handle, "NvBufSurfaceMapEglImage");
+    Dl_info symbol_info{};
+    const bool owns_provider =
+        symbol != nullptr && dladdr(symbol, &symbol_info) != 0 &&
+        symbol_info.dli_fbase != nullptr &&
+        reinterpret_cast<std::uintptr_t>(symbol_info.dli_fbase) == object.base;
+    (void)dlclose(handle);
+    if (owns_provider && symbol_info.dli_fbase != expected_base) {
+      return "multiple NvBufSurface runtime providers are loaded: retained " +
+             std::string(expected_path) + " but also found " + object.path;
+    }
+  }
+  return std::nullopt;
+}
+
 std::shared_ptr<NvbufFunctions> nvbuf_functions() {
   static const std::shared_ptr<NvbufFunctions> functions = [] {
     const char* path = std::getenv("RECO_NVBUFSURFACE_DYLIB_PATH");
@@ -723,39 +761,10 @@ std::optional<std::string> validate_nvbufsurface_runtime_provenance(
     return "NvBufSurface runtime binding is missing";
   }
   runtime->state_->provenance_validated.store(false, std::memory_order_release);
-  struct LoadedObject {
-    std::uintptr_t base = 0;
-    std::string path;
-  };
-  std::vector<LoadedObject> loaded_objects;
-  const auto collect = [](dl_phdr_info* info, std::size_t, void* raw_objects) {
-    if (info->dlpi_name != nullptr && info->dlpi_name[0] != '\0') {
-      static_cast<std::vector<LoadedObject>*>(raw_objects)
-          ->push_back(LoadedObject{.base = static_cast<std::uintptr_t>(info->dlpi_addr),
-                                   .path = info->dlpi_name});
-    }
-    return 0;
-  };
-  (void)dl_iterate_phdr(collect, &loaded_objects);
-
-  const auto expected_base = runtime->state_->functions->provider_base;
-  for (const auto& object : loaded_objects) {
-    void* handle = dlopen(object.path.c_str(), RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
-    if (handle == nullptr) {
-      continue;
-    }
-    dlerror();
-    void* symbol = dlsym(handle, "NvBufSurfaceMapEglImage");
-    Dl_info symbol_info{};
-    const bool owns_provider =
-        symbol != nullptr && dladdr(symbol, &symbol_info) != 0 &&
-        symbol_info.dli_fbase != nullptr &&
-        reinterpret_cast<std::uintptr_t>(symbol_info.dli_fbase) == object.base;
-    (void)dlclose(handle);
-    if (owns_provider && symbol_info.dli_fbase != expected_base) {
-      return "multiple NvBufSurface runtime providers are loaded: retained " +
-             runtime->state_->functions->provider_path + " but also found " + object.path;
-    }
+  if (const auto error = validate_loaded_nvbufsurface_provider(
+          runtime->state_->functions->provider_base, runtime->state_->functions->provider_path);
+      error.has_value()) {
+    return error;
   }
   runtime->state_->provenance_validated.store(true, std::memory_order_release);
   return std::nullopt;
@@ -882,8 +891,20 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info, std::shared_ptr<
   };
 
 #if defined(__linux__)
-  if (info.runtime && !info.runtime->provenance_validated()) {
-    throw NvmmError("NvBufSurface runtime provenance has not been validated");
+  std::shared_ptr<NvbufFunctions> functions;
+  if (info.runtime) {
+    if (const auto error = validate_nvbufsurface_runtime_provenance(info.runtime);
+        error.has_value()) {
+      throw NvmmError(*error);
+    }
+    functions = info.runtime->state_->functions;
+  } else {
+    functions = nvbuf_functions();
+    if (const auto error = validate_loaded_nvbufsurface_provider(functions->provider_base,
+                                                                 functions->provider_path);
+        error.has_value()) {
+      throw NvmmError(*error);
+    }
   }
   auto cuda = cuda_functions();
   DeviceZeroContext context(cuda);
@@ -920,7 +941,6 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info, std::shared_ptr<
     return make_frame(existing->y_ptr, existing->uv_ptr, acquire_mapping_lease(existing, registry));
   }
 
-  auto functions = info.runtime ? info.runtime->state_->functions : nvbuf_functions();
   if (mapped_cuda_buffer_handle(info) != nullptr || mapped_egl_image(info) != nullptr) {
     throw NvmmError("NvBufSurface already has an external CUDA or EGL mapping");
   }

@@ -219,6 +219,60 @@ abi::Surface make_surface(abi::SurfaceParams& params) {
   return make_surface_as<abi::Surface>(params);
 }
 
+void mapping_boundaries_revalidate_provider_provenance() {
+#if defined(__linux__)
+  const auto nvbufsurface = find_fake_runtime_runfile("fake_nvbufsurface.so");
+  const auto nvbufsurface_7_1 = find_fake_runtime_runfile("fake_nvbufsurface_7_1");
+  set_runtime_path("RECO_NVBUFSURFACE_DYLIB_PATH", nvbufsurface);
+  set_runtime_path("RECO_NVDS_UTILS_DYLIB_PATH", nvbufsurface);
+  set_runtime_path("RECO_CUDA_DRIVER_DYLIB_PATH", find_fake_runtime_runfile("fake_cuda_driver"));
+  set_environment("RECO_FAKE_DEEPSTREAM_VERSION", "9.1");
+
+  auto params = make_params();
+  auto surface = make_surface(params);
+  auto info = extract_info(&surface);
+  const auto runtime = discover_nvbufsurface_runtime();
+  info.runtime = runtime;
+  expect_true(runtime->provenance_validated(),
+              "retained runtime starts with validated provider provenance");
+
+  void* mixed_runtime = dlopen(nvbufsurface_7_1.c_str(), RTLD_NOW | RTLD_LOCAL);
+  expect_true(mixed_runtime != nullptr, "late mixed-runtime mapping fixture loads");
+  if (mixed_runtime != nullptr) {
+    expect_nvmm_error_contains(
+        [&] { (void)map_nvmm_frame_to_cuda(info, std::make_shared<int>(23)); },
+        "multiple NvBufSurface runtime providers",
+        "retained-runtime mapping boundary rejects a late second provider");
+    expect_true(!runtime->provenance_validated(),
+                "failed mapping-boundary validation revokes retained certification");
+    (void)dlclose(mixed_runtime);
+  }
+
+  expect_true(!validate_nvbufsurface_runtime_provenance(runtime).has_value(),
+              "retained runtime can be revalidated after the second provider unloads");
+  auto mapped = map_nvmm_frame_to_cuda(info, std::make_shared<int>(24));
+  mapped.owner.reset();
+
+  auto compatibility_params = make_params();
+  auto compatibility_surface = make_surface(compatibility_params);
+  const auto compatibility_info = extract_info(&compatibility_surface);
+  auto compatibility_mapping =
+      map_nvmm_frame_to_cuda(compatibility_info, std::make_shared<int>(25));
+  compatibility_mapping.owner.reset();
+  mixed_runtime = dlopen(nvbufsurface_7_1.c_str(), RTLD_NOW | RTLD_LOCAL);
+  expect_true(mixed_runtime != nullptr, "late compatibility mixed-runtime fixture loads");
+  if (mixed_runtime != nullptr) {
+    expect_nvmm_error_contains(
+        [&] { (void)map_nvmm_frame_to_cuda(compatibility_info, std::make_shared<int>(26)); },
+        "multiple NvBufSurface runtime providers",
+        "compatibility mapping boundary rejects a late second provider");
+    expect_true(compatibility_params.mapped_addr.cuda_ptr == nullptr,
+                "rejected compatibility mapping does not call either provider");
+    (void)dlclose(mixed_runtime);
+  }
+#endif
+}
+
 void surface_array_mapping_retains_and_unmaps_owner() {
 #if defined(__linux__)
   set_runtime_path("RECO_NVBUFSURFACE_DYLIB_PATH",
@@ -615,6 +669,7 @@ void failed_cleanup_poisoning_retains_surface_owners() {
 
 int main() {
   runtime_abi_discovery_is_fail_closed();
+  mapping_boundaries_revalidate_provider_provenance();
   surface_array_mapping_retains_and_unmaps_owner();
   deepstream_7_1_egl_mapping_is_gpu_resident();
   cuda_device_mapping_retains_context_and_owner();
