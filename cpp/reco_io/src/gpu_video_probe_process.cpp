@@ -454,8 +454,10 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
                                .bInheritHandle = TRUE};
   HANDLE child_stdin_raw = nullptr;
   HANDLE parent_stdin_raw = nullptr;
-  if (CreatePipe(&child_stdin_raw, &parent_stdin_raw, &security,
-                 static_cast<DWORD>(detail::kMaximumProbeIpcBytes)) == 0) {
+  const auto input_pipe_capacity = options.pad_request_to_maximum_size
+                                       ? DWORD{1}
+                                       : static_cast<DWORD>(detail::kMaximumProbeIpcBytes);
+  if (CreatePipe(&child_stdin_raw, &parent_stdin_raw, &security, input_pipe_capacity) == 0) {
     throw GpuVideoProbeError("failed to create video probe worker input pipe");
   }
   UniqueHandle child_stdin(child_stdin_raw);
