@@ -843,28 +843,25 @@ void publish_windows_output(
                        static_cast<int>(GetLastError()));
     }
     temporary_handle = INVALID_HANDLE_VALUE;
-    DWORD retained_error = ERROR_SUCCESS;
-    const HANDLE retained_temporary = open_windows_file_relative(
-        directory, temporary_name, access, sharing, FILE_OPEN, options, retained_error);
-    if (retained_temporary == INVALID_HANDLE_VALUE) {
-      throw_file_error("cannot retain temporary calibration output for replacement", destination,
-                       static_cast<int>(retained_error));
-    }
-    UniqueWindowsHandle retained_temporary_handle(retained_temporary);
-    BY_HANDLE_FILE_INFORMATION retained_identity{};
-    if (GetFileInformationByHandle(retained_temporary, &retained_identity) == 0 ||
-        !same_windows_file_identity(temporary_identity, retained_identity) ||
-        !relative_path_identifies_windows_handle(directory, temporary_name, retained_temporary,
-                                                 false)) {
-      throw WindowsPublicationIdentityError(
-          "temporary output identity changed while reducing replacement access");
-    }
-    temporary_handle = retained_temporary_handle.release();
     retained_current = UniqueWindowsHandle{};
 
     if (ReplaceFileW(resolved_destination.c_str(), resolved_temporary.c_str(),
                      resolved_rollback.c_str(), 0, nullptr, nullptr) == 0) {
       const DWORD replace_error = GetLastError();
+      DWORD retained_error = ERROR_SUCCESS;
+      const HANDLE retained_temporary = open_windows_file_relative(
+          directory, temporary_name, access, sharing, FILE_OPEN, options, retained_error);
+      UniqueWindowsHandle retained_temporary_handle(retained_temporary);
+      BY_HANDLE_FILE_INFORMATION retained_identity{};
+      const bool temporary_unchanged =
+          retained_temporary != INVALID_HANDLE_VALUE &&
+          GetFileInformationByHandle(retained_temporary, &retained_identity) != 0 &&
+          same_windows_file_identity(temporary_identity, retained_identity) &&
+          relative_path_identifies_windows_handle(directory, temporary_name, retained_temporary,
+                                                  false);
+      if (temporary_unchanged) {
+        temporary_handle = retained_temporary_handle.release();
+      }
       const bool destination_unchanged = expected_destination_identity.has_value() && [&] {
         DWORD reopened_error = ERROR_SUCCESS;
         const HANDLE reopened = open_windows_file_relative(
@@ -878,10 +875,9 @@ void publish_windows_output(
         return GetFileInformationByHandle(reopened, &reopened_identity) != 0 &&
                same_windows_file_identity(*expected_destination_identity, reopened_identity);
       }();
-      const bool temporary_unchanged = relative_path_identifies_windows_handle(
-          directory, temporary_name, temporary_handle, false);
       if (!destination_unchanged || !temporary_unchanged) {
         destination_published =
+            temporary_handle != INVALID_HANDLE_VALUE &&
             published_path_identifies_handle(directory, destination_name, temporary_handle);
         DWORD rollback_error = ERROR_SUCCESS;
         const HANDLE rollback = open_windows_file_relative(
@@ -904,6 +900,19 @@ void publish_windows_output(
     }
 
     destination_published = true;
+    DWORD published_error = ERROR_SUCCESS;
+    const HANDLE published = open_windows_file_relative(
+        directory, destination_name, access, sharing, FILE_OPEN, options, published_error);
+    UniqueWindowsHandle retained_published(published);
+    BY_HANDLE_FILE_INFORMATION published_identity{};
+    if (published == INVALID_HANDLE_VALUE ||
+        GetFileInformationByHandle(published, &published_identity) == 0 ||
+        !same_windows_file_identity(temporary_identity, published_identity) ||
+        !published_path_identifies_handle(directory, destination_name, published)) {
+      throw WindowsPublicationIdentityError(
+          "published calibration output changed during atomic replacement");
+    }
+    temporary_handle = retained_published.release();
     DWORD rollback_error = ERROR_SUCCESS;
     const HANDLE rollback = open_windows_file_relative(directory, rollback_name, access, sharing,
                                                        FILE_OPEN, options, rollback_error);
