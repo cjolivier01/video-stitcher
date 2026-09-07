@@ -215,7 +215,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Install dependencies
-        run: brew install ffmpeg gstreamer gst-plugins-base pkg-config
+        run: |
+          brew install ffmpeg@7 gstreamer gst-plugins-base pkg-config
+          echo "PKG_CONFIG_PATH=$(brew --prefix ffmpeg@7)/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "$(brew --prefix ffmpeg@7)/bin" >> "$GITHUB_PATH"
       - name: Check reco-core
         run: cargo check -p reco-core
       - name: Check reco-core (profiling)

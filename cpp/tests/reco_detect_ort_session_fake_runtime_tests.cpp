@@ -1,11 +1,14 @@
+#include "reco/core/cuda_backend.hpp"
 #include "reco/detect/detectors.hpp"
 #include "reco/detect/ort_session.hpp"
-#include "reco/core/cuda_backend.hpp"
+
+#include "rules_cc/cc/runfiles/runfiles.h"
 
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -49,25 +52,23 @@ template <typename Fn> void expect_runtime_error(Fn&& fn, std::string_view messa
   }
 }
 
-bool ends_with(std::string_view value, std::string_view suffix) {
-  return value.size() >= suffix.size() &&
-         value.substr(value.size() - suffix.size()) == suffix;
-}
-
 std::filesystem::path find_fake_runtime_runfile() {
-  const char* runfiles = std::getenv("TEST_SRCDIR");
-  if (runfiles == nullptr || *runfiles == '\0') {
-    throw std::runtime_error("TEST_SRCDIR is not set");
+  const char* workspace = std::getenv("TEST_WORKSPACE");
+  if (workspace == nullptr || workspace[0] == '\0') {
+    throw std::runtime_error("TEST_WORKSPACE is not set");
   }
-  for (const auto& entry : std::filesystem::recursive_directory_iterator(runfiles)) {
-    const auto filename = entry.path().filename().string();
-    if (filename.find("fake_onnxruntime") != std::string::npos &&
-        (ends_with(filename, ".so") || ends_with(filename, ".dylib") ||
-         ends_with(filename, ".dll"))) {
-      return entry.path();
-    }
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(&error));
+  if (!runfiles) {
+    throw std::runtime_error("failed to initialize Bazel runfiles: " + error);
   }
-  throw std::runtime_error("fake ONNX Runtime runfile not found");
+  const auto logical_path = std::string(workspace) + "/cpp/tests/libfake_onnxruntime.so";
+  const auto resolved = std::filesystem::path(runfiles->Rlocation(logical_path));
+  if (resolved.empty() || !std::filesystem::is_regular_file(resolved)) {
+    throw std::runtime_error("fake ONNX Runtime runfile not found");
+  }
+  return resolved;
 }
 
 std::filesystem::path write_marker_model() {
@@ -254,15 +255,14 @@ void fake_runtime_cpu_detector_contract() {
   unset_env("RECO_FAKE_ORT_EMPTY_OUTPUT");
 
   try {
-    (void)detector.detect(CameraId::Left,
-                          DetectorFrame(GpuNv12Frame{
-                              .y_ptr = 1,
-                              .uv_ptr = 2,
-                              .y_pitch = 2,
-                              .uv_pitch = 2,
-                              .width = 2,
-                              .height = 2,
-                          }));
+    (void)detector.detect(CameraId::Left, DetectorFrame(GpuNv12Frame{
+                                              .y_ptr = 1,
+                                              .uv_ptr = 2,
+                                              .y_pitch = 2,
+                                              .uv_pitch = 2,
+                                              .width = 2,
+                                              .height = 2,
+                                          }));
     std::cerr << "FAIL: cpu detector accepted CUDA frame\n";
     ++failures;
   } catch (const DetectorError& error) {
@@ -309,43 +309,42 @@ void fake_runtime_cuda_detector_contract() {
   });
 
   set_env("RECO_FAKE_ORT_VALIDATE_CUDA_INPUT_ANY", "1");
-  const auto detections = detector.detect(
-      CameraId::Left, DetectorFrame(GpuNv12Frame{
-                          .y_ptr = y_device.ptr(),
-                          .uv_ptr = uv_device.ptr(),
-                          .y_pitch = 2,
-                          .uv_pitch = 2,
-                          .width = 2,
-                          .height = 2,
-                      }));
+  const auto detections = detector.detect(CameraId::Left, DetectorFrame(GpuNv12Frame{
+                                                              .y_ptr = y_device.ptr(),
+                                                              .uv_ptr = uv_device.ptr(),
+                                                              .y_pitch = 2,
+                                                              .uv_pitch = 2,
+                                                              .width = 2,
+                                                              .height = 2,
+                                                          }));
   unset_env("RECO_FAKE_ORT_VALIDATE_CUDA_INPUT_ANY");
   expect_eq(detections.size(), 2U, "cuda detector detections");
 
   set_env("RECO_FAKE_ORT_VALIDATE_CUDA_INPUT_ANY", "1");
-  const auto colorimetry_detections = detector.detect(
-      CameraId::Left, DetectorFrame(GpuNv12Frame{
-                          .y_ptr = y_device.ptr(),
-                          .uv_ptr = uv_device.ptr(),
-                          .y_pitch = 2,
-                          .uv_pitch = 2,
-                          .width = 2,
-                          .height = 2,
-                          .color_matrix = reco::core::YuvColorMatrix::Bt709,
-                          .color_range = reco::core::YuvColorRange::Limited,
-                      }));
+  const auto colorimetry_detections =
+      detector.detect(CameraId::Left, DetectorFrame(GpuNv12Frame{
+                                          .y_ptr = y_device.ptr(),
+                                          .uv_ptr = uv_device.ptr(),
+                                          .y_pitch = 2,
+                                          .uv_pitch = 2,
+                                          .width = 2,
+                                          .height = 2,
+                                          .color_matrix = reco::core::YuvColorMatrix::Bt709,
+                                          .color_range = reco::core::YuvColorRange::Limited,
+                                      }));
   unset_env("RECO_FAKE_ORT_VALIDATE_CUDA_INPUT_ANY");
   expect_eq(colorimetry_detections.size(), 2U, "cuda detector accepts colorimetry");
 
   try {
     (void)detector.detect(CameraId::Left, DetectorFrame(GpuNv12Frame{
-                                            .y_ptr = y_device.ptr(),
-                                            .uv_ptr = uv_device.ptr(),
-                                            .y_pitch = 2,
-                                            .uv_pitch = 2,
-                                            .width = 2,
-                                            .height = 2,
-                                            .color_matrix = reco::core::YuvColorMatrix::Bt709,
-                                        }));
+                                              .y_ptr = y_device.ptr(),
+                                              .uv_ptr = uv_device.ptr(),
+                                              .y_pitch = 2,
+                                              .uv_pitch = 2,
+                                              .width = 2,
+                                              .height = 2,
+                                              .color_matrix = reco::core::YuvColorMatrix::Bt709,
+                                          }));
     std::cerr << "FAIL: CUDA detector accepted partial colorimetry\n";
     ++failures;
   } catch (const DetectorError& error) {
@@ -356,11 +355,11 @@ void fake_runtime_cuda_detector_contract() {
   try {
     const std::vector<float> chw(1 * 3 * 8 * 8, 0.5F);
     (void)detector.detect(CameraId::Left, DetectorFrame(PreprocessedChwFrame{
-                                            .data = chw,
-                                            .input_size = 8,
-                                            .src_width = 2,
-                                            .src_height = 2,
-                                        }));
+                                              .data = chw,
+                                              .input_size = 8,
+                                              .src_width = 2,
+                                              .src_height = 2,
+                                          }));
     std::cerr << "FAIL: cuda detector accepted CPU frame\n";
     ++failures;
   } catch (const DetectorError& error) {

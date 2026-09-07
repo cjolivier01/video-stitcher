@@ -131,7 +131,10 @@ cc_test(
         ":libfake_gstreamer_runtime.so",
         ":libfake_nvbufsurface.so",
     ],
-    deps = ["//cpp/reco_io"],
+    deps = [
+        "//cpp/reco_io",
+        "@rules_cc//cc/runfiles",
+    ],
 )
 
 cc_test(
@@ -512,6 +515,7 @@ cc_test(
     deps = [
         "//cpp/reco_core",
         "//cpp/reco_detect",
+        "@rules_cc//cc/runfiles",
     ],
 )
 
@@ -529,6 +533,7 @@ cc_test(
     data = [":libfake_tensorrt.so"],
     deps = [
         "//cpp/reco_detect",
+        "@rules_cc//cc/runfiles",
     ],
 )
 
@@ -546,6 +551,7 @@ cc_test(
     data = [":libfake_ncnn.so"],
     deps = [
         "//cpp/reco_detect",
+        "@rules_cc//cc/runfiles",
     ],
 )
 

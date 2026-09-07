@@ -1,11 +1,15 @@
 #include "reco/detect/detectors.hpp"
 #include "reco/detect/ncnn_session.hpp"
 
+#include "rules_cc/cc/runfiles/runfiles.h"
+
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -48,8 +52,8 @@ template <typename Fn> void expect_ncnn_error(Fn&& fn, std::string_view message)
   }
 }
 
-template <typename Fn> void expect_detector_error(Fn&& fn, DetectorErrorKind kind,
-                                                  std::string_view message) {
+template <typename Fn>
+void expect_detector_error(Fn&& fn, DetectorErrorKind kind, std::string_view message) {
   try {
     fn();
     std::cerr << "FAIL: " << message << " did not throw\n";
@@ -95,25 +99,23 @@ void unset_env(const char* name) {
 #endif
 }
 
-bool ends_with(std::string_view value, std::string_view suffix) {
-  return value.size() >= suffix.size() &&
-         value.substr(value.size() - suffix.size()) == suffix;
-}
-
 std::filesystem::path find_fake_runtime_runfile() {
-  const char* runfiles = std::getenv("TEST_SRCDIR");
-  if (runfiles == nullptr || *runfiles == '\0') {
-    throw NcnnError("TEST_SRCDIR is not set");
+  const char* workspace = std::getenv("TEST_WORKSPACE");
+  if (workspace == nullptr || workspace[0] == '\0') {
+    throw NcnnError("TEST_WORKSPACE is not set");
   }
-  for (const auto& entry : std::filesystem::recursive_directory_iterator(runfiles)) {
-    const auto filename = entry.path().filename().string();
-    if (filename.find("fake_ncnn") != std::string::npos &&
-        (ends_with(filename, ".so") || ends_with(filename, ".dylib") ||
-         ends_with(filename, ".dll"))) {
-      return entry.path();
-    }
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(&error));
+  if (!runfiles) {
+    throw NcnnError("failed to initialize Bazel runfiles: " + error);
   }
-  throw NcnnError("fake NCNN runtime runfile not found");
+  const auto logical_path = std::string(workspace) + "/cpp/tests/libfake_ncnn.so";
+  const auto resolved = std::filesystem::path(runfiles->Rlocation(logical_path));
+  if (resolved.empty() || !std::filesystem::is_regular_file(resolved)) {
+    throw NcnnError("fake NCNN runtime runfile not found");
+  }
+  return resolved;
 }
 
 std::filesystem::path native_fake_runtime_path() {
@@ -132,7 +134,8 @@ std::filesystem::path native_fake_runtime_path() {
 }
 
 std::filesystem::path write_model_dir(std::string_view marker) {
-  const auto dir = std::filesystem::temp_directory_path() / ("reco-fake-ncnn-" + std::string(marker));
+  const auto dir =
+      std::filesystem::temp_directory_path() / ("reco-fake-ncnn-" + std::string(marker));
   std::filesystem::create_directories(dir);
   {
     std::ofstream param(dir / "model.ncnn.param");
@@ -162,22 +165,26 @@ void fake_runtime_session_contract() {
   expect_eq(output.data[1], 0.50F, "NCNN output second channel value");
   expect_eq(output.data[2], 0.75F, "NCNN output third channel value");
 
-  expect_ncnn_error([&] { (void)session.run_preprocessed_chw({}, 7); },
-                    "input size mismatch");
+  expect_ncnn_error([&] { (void)session.run_preprocessed_chw({}, 7); }, "input size mismatch");
   expect_ncnn_error([] { NcnnSession(NcnnSessionConfig{.model_dir = "/does/not/exist"}); },
                     "missing model dir");
-  expect_ncnn_error([] {
-    NcnnSession(NcnnSessionConfig{.model_dir = write_model_dir("bad_threads"),
-                                  .num_threads = 0});
-  }, "bad thread count");
-  expect_ncnn_error([] {
-    NcnnSession(NcnnSessionConfig{.model_dir = write_model_dir("bad_input_name"),
-                                  .input_name = std::string("bad\0name", 8)});
-  }, "input name rejects nul");
+  expect_ncnn_error(
+      [] {
+        NcnnSession(
+            NcnnSessionConfig{.model_dir = write_model_dir("bad_threads"), .num_threads = 0});
+      },
+      "bad thread count");
+  expect_ncnn_error(
+      [] {
+        NcnnSession(NcnnSessionConfig{.model_dir = write_model_dir("bad_input_name"),
+                                      .input_name = std::string("bad\0name", 8)});
+      },
+      "input name rejects nul");
 
   set_env("RECO_FAKE_NCNN_PARAM_FAIL", "1");
-  expect_ncnn_error([] { NcnnSession(NcnnSessionConfig{.model_dir = write_model_dir("param_fail")}); },
-                    "param load failure");
+  expect_ncnn_error(
+      [] { NcnnSession(NcnnSessionConfig{.model_dir = write_model_dir("param_fail")}); },
+      "param load failure");
   unset_env("RECO_FAKE_NCNN_PARAM_FAIL");
 
   set_env("RECO_FAKE_NCNN_EXTRACT_FAIL", "1");

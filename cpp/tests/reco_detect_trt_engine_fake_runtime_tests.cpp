@@ -3,10 +3,14 @@
 #include "reco/detect/npp_interop.hpp"
 #include "reco/detect/trt_engine.hpp"
 
+#include "rules_cc/cc/runfiles/runfiles.h"
+
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -80,25 +84,23 @@ void unset_env(const char* name) {
 #endif
 }
 
-bool ends_with(std::string_view value, std::string_view suffix) {
-  return value.size() >= suffix.size() &&
-         value.substr(value.size() - suffix.size()) == suffix;
-}
-
 std::filesystem::path find_fake_runtime_runfile() {
-  const char* runfiles = std::getenv("TEST_SRCDIR");
-  if (runfiles == nullptr || *runfiles == '\0') {
-    throw TrtError("TEST_SRCDIR is not set");
+  const char* workspace = std::getenv("TEST_WORKSPACE");
+  if (workspace == nullptr || workspace[0] == '\0') {
+    throw TrtError("TEST_WORKSPACE is not set");
   }
-  for (const auto& entry : std::filesystem::recursive_directory_iterator(runfiles)) {
-    const auto filename = entry.path().filename().string();
-    if (filename.find("fake_tensorrt") != std::string::npos &&
-        (ends_with(filename, ".so") || ends_with(filename, ".dylib") ||
-         ends_with(filename, ".dll"))) {
-      return entry.path();
-    }
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(&error));
+  if (!runfiles) {
+    throw TrtError("failed to initialize Bazel runfiles: " + error);
   }
-  throw TrtError("fake TensorRT runtime runfile not found");
+  const auto logical_path = std::string(workspace) + "/cpp/tests/libfake_tensorrt.so";
+  const auto resolved = std::filesystem::path(runfiles->Rlocation(logical_path));
+  if (resolved.empty() || !std::filesystem::is_regular_file(resolved)) {
+    throw TrtError("fake TensorRT runtime runfile not found");
+  }
+  return resolved;
 }
 
 std::filesystem::path native_fake_runtime_path() {
@@ -117,8 +119,8 @@ std::filesystem::path native_fake_runtime_path() {
 }
 
 std::filesystem::path write_engine(std::string_view marker) {
-  const auto path = std::filesystem::temp_directory_path() /
-                    ("reco-fake-trt-" + std::string(marker) + ".engine");
+  const auto path =
+      std::filesystem::temp_directory_path() / ("reco-fake-trt-" + std::string(marker) + ".engine");
   std::ofstream file(path, std::ios::binary);
   file << marker;
   return path;
@@ -152,10 +154,12 @@ void fake_runtime_engine_contract() {
       reinterpret_cast<void*>(0x56780000U),
       nullptr,
   };
-  expect_trt_error([&] {
-    std::vector<void*> short_bindings = {reinterpret_cast<void*>(0x12340000U)};
-    context.enqueue(short_bindings, nullptr);
-  }, "enqueue rejects short binding array");
+  expect_trt_error(
+      [&] {
+        std::vector<void*> short_bindings = {reinterpret_cast<void*>(0x12340000U)};
+        context.enqueue(short_bindings, nullptr);
+      },
+      "enqueue rejects short binding array");
   set_env("RECO_FAKE_TRT_VALIDATE_BINDINGS", "1");
   context.enqueue(binding_ptrs, reinterpret_cast<void*>(0x90120000U));
   unset_env("RECO_FAKE_TRT_VALIDATE_BINDINGS");
@@ -192,8 +196,8 @@ void fake_runtime_detector_contract() {
     if (std::getenv("RECO_REQUIRE_CUDA_TEST") != nullptr ||
         std::getenv("RECO_REQUIRE_NPP_TEST") != nullptr) {
       std::cerr << "FAIL: CUDA/NPP required but unavailable: "
-                << reco::core::CudaBackend::availability_error() << ' '
-                << npp_availability_error() << '\n';
+                << reco::core::CudaBackend::availability_error() << ' ' << npp_availability_error()
+                << '\n';
       ++failures;
     }
     return;
@@ -231,43 +235,42 @@ void fake_runtime_detector_contract() {
   });
 
   set_env("RECO_FAKE_TRT_VALIDATE_DETECTOR_BINDINGS", "1");
-  const auto detections = detector.detect(
-      CameraId::Left, DetectorFrame(GpuNv12Frame{
-                          .y_ptr = y_device.ptr(),
-                          .uv_ptr = uv_device.ptr(),
-                          .y_pitch = 4,
-                          .uv_pitch = 4,
-                          .width = 4,
-                          .height = 4,
-                      }));
+  const auto detections = detector.detect(CameraId::Left, DetectorFrame(GpuNv12Frame{
+                                                              .y_ptr = y_device.ptr(),
+                                                              .uv_ptr = uv_device.ptr(),
+                                                              .y_pitch = 4,
+                                                              .uv_pitch = 4,
+                                                              .width = 4,
+                                                              .height = 4,
+                                                          }));
   unset_env("RECO_FAKE_TRT_VALIDATE_DETECTOR_BINDINGS");
   expect_eq(detections.size(), 0U, "fake TensorRT detector has zeroed output");
 
   set_env("RECO_FAKE_TRT_VALIDATE_DETECTOR_BINDINGS", "1");
-  const auto colorimetry_detections = detector.detect(
-      CameraId::Left, DetectorFrame(GpuNv12Frame{
-                          .y_ptr = y_device.ptr(),
-                          .uv_ptr = uv_device.ptr(),
-                          .y_pitch = 4,
-                          .uv_pitch = 4,
-                          .width = 4,
-                          .height = 4,
-                          .color_matrix = reco::core::YuvColorMatrix::Bt601,
-                          .color_range = reco::core::YuvColorRange::Limited,
-                      }));
+  const auto colorimetry_detections =
+      detector.detect(CameraId::Left, DetectorFrame(GpuNv12Frame{
+                                          .y_ptr = y_device.ptr(),
+                                          .uv_ptr = uv_device.ptr(),
+                                          .y_pitch = 4,
+                                          .uv_pitch = 4,
+                                          .width = 4,
+                                          .height = 4,
+                                          .color_matrix = reco::core::YuvColorMatrix::Bt601,
+                                          .color_range = reco::core::YuvColorRange::Limited,
+                                      }));
   unset_env("RECO_FAKE_TRT_VALIDATE_DETECTOR_BINDINGS");
   expect_eq(colorimetry_detections.size(), 0U, "TensorRT detector accepts colorimetry");
 
   try {
     (void)detector.detect(CameraId::Left, DetectorFrame(GpuNv12Frame{
-                                            .y_ptr = y_device.ptr(),
-                                            .uv_ptr = uv_device.ptr(),
-                                            .y_pitch = 4,
-                                            .uv_pitch = 4,
-                                            .width = 4,
-                                            .height = 4,
-                                            .color_range = reco::core::YuvColorRange::Full,
-                                        }));
+                                              .y_ptr = y_device.ptr(),
+                                              .uv_ptr = uv_device.ptr(),
+                                              .y_pitch = 4,
+                                              .uv_pitch = 4,
+                                              .width = 4,
+                                              .height = 4,
+                                              .color_range = reco::core::YuvColorRange::Full,
+                                          }));
     std::cerr << "FAIL: TensorRT detector accepted partial colorimetry\n";
     ++failures;
   } catch (const DetectorError& error) {
@@ -278,13 +281,13 @@ void fake_runtime_detector_contract() {
   set_env("RECO_FAKE_TRT_ENQUEUE_FAIL", "1");
   try {
     (void)detector.detect(CameraId::Left, DetectorFrame(GpuNv12Frame{
-                                            .y_ptr = y_device.ptr(),
-                                            .uv_ptr = uv_device.ptr(),
-                                            .y_pitch = 4,
-                                            .uv_pitch = 4,
-                                            .width = 4,
-                                            .height = 4,
-                                        }));
+                                              .y_ptr = y_device.ptr(),
+                                              .uv_ptr = uv_device.ptr(),
+                                              .y_pitch = 4,
+                                              .uv_pitch = 4,
+                                              .width = 4,
+                                              .height = 4,
+                                          }));
     std::cerr << "FAIL: TensorRT detector enqueue failure was not mapped\n";
     ++failures;
   } catch (const DetectorError& error) {
@@ -305,11 +308,11 @@ void fake_runtime_detector_contract() {
   try {
     const std::vector<float> chw(1 * 3 * 8 * 8, 0.5F);
     (void)detector.detect(CameraId::Left, DetectorFrame(PreprocessedChwFrame{
-                                            .data = chw,
-                                            .input_size = 8,
-                                            .src_width = 4,
-                                            .src_height = 4,
-                                        }));
+                                              .data = chw,
+                                              .input_size = 8,
+                                              .src_width = 4,
+                                              .src_height = 4,
+                                          }));
     std::cerr << "FAIL: TensorRT detector accepted CPU preprocessed frame\n";
     ++failures;
   } catch (const DetectorError& error) {

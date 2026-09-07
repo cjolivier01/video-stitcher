@@ -1,5 +1,7 @@
 #include "reco/io/gpu_decode.hpp"
 
+#include "rules_cc/cc/runfiles/runfiles.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -8,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -60,24 +63,23 @@ void expect_gpu_decode_error(Function&& function, std::string_view fragment,
   }
 }
 
-bool ends_with(std::string_view value, std::string_view suffix) {
-  return value.size() >= suffix.size() && value.substr(value.size() - suffix.size()) == suffix;
-}
-
-std::filesystem::path find_fake_runtime_runfile(std::string_view runtime_name) {
-  const char* runfiles = std::getenv("TEST_SRCDIR");
-  if (runfiles == nullptr || runfiles[0] == '\0') {
-    throw std::runtime_error("TEST_SRCDIR is not set");
+std::filesystem::path resolve_runfile(std::string_view path) {
+  const char* workspace = std::getenv("TEST_WORKSPACE");
+  if (workspace == nullptr || workspace[0] == '\0') {
+    throw std::runtime_error("TEST_WORKSPACE is not set");
   }
-  for (const auto& entry : std::filesystem::recursive_directory_iterator(runfiles)) {
-    const auto filename = entry.path().filename().string();
-    if (filename.find(runtime_name) != std::string::npos &&
-        (ends_with(filename, ".so") || ends_with(filename, ".dylib") ||
-         ends_with(filename, ".dll"))) {
-      return entry.path();
-    }
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(&error));
+  if (!runfiles) {
+    throw std::runtime_error("failed to initialize Bazel runfiles: " + error);
   }
-  throw std::runtime_error("fake runtime runfile not found");
+  const auto logical_path = std::string(workspace) + "/" + std::string(path);
+  const auto resolved = std::filesystem::path(runfiles->Rlocation(logical_path));
+  if (resolved.empty() || !std::filesystem::is_regular_file(resolved)) {
+    throw std::runtime_error(std::string(path) + " runfile not found");
+  }
+  return resolved;
 }
 
 void set_environment(const char* name, const std::string& value) {
@@ -741,7 +743,7 @@ void runtime_failures_are_reported() {
 
 int run_tests() {
 #if defined(__linux__) || defined(__APPLE__) || defined(_WIN32)
-  const auto source_runtime = find_fake_runtime_runfile("fake_gstreamer_runtime");
+  const auto source_runtime = resolve_runfile("cpp/tests/libfake_gstreamer_runtime.so");
   auto runtime = source_runtime;
 #if defined(_WIN32)
   const auto unicode_runtime_directory =
@@ -757,7 +759,7 @@ int run_tests() {
   set_path_environment("RECO_GSTAPP_DYLIB_PATH", runtime);
   set_path_environment("RECO_GLIB_DYLIB_PATH", runtime);
 #if defined(__linux__)
-  const auto nvbufsurface = find_fake_runtime_runfile("fake_nvbufsurface.so");
+  const auto nvbufsurface = resolve_runfile("cpp/tests/libfake_nvbufsurface.so");
   set_environment("RECO_NVBUFSURFACE_DYLIB_PATH", nvbufsurface.string());
   set_environment("RECO_NVDS_UTILS_DYLIB_PATH", nvbufsurface.string());
 #endif

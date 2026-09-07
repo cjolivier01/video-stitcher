@@ -2305,6 +2305,157 @@ bool guardian_worker_group_has_other_members(pid_t worker_pid) {
   const auto scan = scan_linux_worker_group(worker_pid);
   return !scan.valid || scan.has_other_members;
 }
+
+struct LinuxSessionScan {
+  bool valid = false;
+  bool has_other_members = false;
+};
+
+bool terminate_linux_session_process(pid_t process_id, pid_t session_id) {
+#if defined(SYS_pidfd_open) && defined(SYS_pidfd_send_signal)
+  const auto descriptor = static_cast<int>(::syscall(SYS_pidfd_open, process_id, 0U));
+  if (descriptor < 0) {
+    return errno == ENOENT || errno == ESRCH;
+  }
+  errno = 0;
+  const auto observed_session = ::getsid(process_id);
+  const auto session_error = errno;
+  bool terminated = false;
+  if (observed_session == session_id) {
+    terminated = ::syscall(SYS_pidfd_send_signal, descriptor, SIGKILL, nullptr, 0U) == 0 ||
+                 errno == ENOENT || errno == ESRCH;
+  } else if (observed_session >= 0) {
+    terminated = true;
+  } else {
+    terminated = observed_session < 0 && (session_error == ENOENT || session_error == ESRCH);
+  }
+  const auto close_error = ::close(descriptor);
+  return terminated && close_error == 0;
+#else
+  (void)process_id;
+  (void)session_id;
+  return false;
+#endif
+}
+
+LinuxSessionScan scan_linux_owned_session(pid_t session_id, pid_t owner_pid, pid_t supervisor_pid) {
+#if !defined(SYS_getdents64)
+  (void)session_id;
+  (void)owner_pid;
+  (void)supervisor_pid;
+  return {};
+#else
+  LinuxSessionScan result{};
+  const auto directory = ::open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (directory < 0) {
+    return result;
+  }
+  struct LinuxDirectoryEntry {
+    std::uint64_t inode;
+    std::int64_t offset;
+    unsigned short record_length;
+    unsigned char type;
+    char name[1];
+  };
+  alignas(std::uint64_t) std::array<char, 8192> entries{};
+  bool valid = true;
+  while (valid && !result.has_other_members) {
+    const auto count = ::syscall(SYS_getdents64, directory, entries.data(), entries.size());
+    if (count == 0) {
+      break;
+    }
+    if (count < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      valid = false;
+      break;
+    }
+    std::size_t offset = 0;
+    while (offset < static_cast<std::size_t>(count)) {
+      const auto* entry = reinterpret_cast<const LinuxDirectoryEntry*>(entries.data() + offset);
+      constexpr auto name_offset = offsetof(LinuxDirectoryEntry, name);
+      if (entry->record_length <= name_offset ||
+          entry->record_length > static_cast<std::size_t>(count) - offset) {
+        valid = false;
+        break;
+      }
+      bool numeric = entry->name[0] != '\0';
+      bool terminated = false;
+      std::size_t name_length = 0;
+      for (std::size_t index = 0; index < entry->record_length - name_offset; ++index) {
+        const auto character = entry->name[index];
+        if (character == '\0') {
+          terminated = true;
+          break;
+        }
+        if (character < '0' || character > '9') {
+          numeric = false;
+          break;
+        }
+        ++name_length;
+      }
+      if (numeric && terminated) {
+        std::uint64_t encoded_process_id = 0;
+        const auto [id_end, id_error] =
+            std::from_chars(entry->name, entry->name + name_length, encoded_process_id);
+        if (id_error != std::errc{} || id_end != entry->name + name_length ||
+            encoded_process_id == 0 ||
+            encoded_process_id > static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max())) {
+          valid = false;
+          break;
+        }
+        const auto process_id = static_cast<pid_t>(encoded_process_id);
+        if (process_id != owner_pid && process_id != supervisor_pid) {
+          errno = 0;
+          const auto observed_session = ::getsid(process_id);
+          if (observed_session == session_id) {
+            result.has_other_members = true;
+            if (!terminate_linux_session_process(process_id, session_id)) {
+              valid = false;
+            }
+            break;
+          }
+          if (observed_session < 0 && errno != ENOENT && errno != ESRCH && errno != EPERM) {
+            valid = false;
+            break;
+          }
+        }
+      }
+      offset += entry->record_length;
+    }
+  }
+  const auto close_error = ::close(directory);
+  result.valid = valid && close_error == 0;
+  return result;
+#endif
+}
+
+bool guardian_wait_for_owned_linux_session_cleanup(pid_t supervisor_pid) {
+  constexpr timespec kSessionPollPause{.tv_sec = 0, .tv_nsec = 2'000'000};
+  constexpr std::size_t kMaximumConsecutiveScanFailures = 50;
+  const auto owner_pid = ::getpid();
+  const auto session_id = ::getsid(0);
+  if (session_id != owner_pid) {
+    return false;
+  }
+
+  std::size_t consecutive_failures = 0;
+  while (true) {
+    const auto scan = scan_linux_owned_session(session_id, owner_pid, supervisor_pid);
+    if (!scan.valid) {
+      if (++consecutive_failures >= kMaximumConsecutiveScanFailures) {
+        return false;
+      }
+    } else {
+      consecutive_failures = 0;
+      if (!scan.has_other_members) {
+        return true;
+      }
+    }
+    (void)::nanosleep(&kSessionPollPause, nullptr);
+  }
+}
 #elif defined(__APPLE__)
 using ProcListPids = int (*)(std::uint32_t, std::uint32_t, void*, int);
 using ProcPidRusage = int (*)(int, int, rusage_info_t*);
@@ -2658,7 +2809,9 @@ bool guardian_write_exact(int descriptor, const void* value, std::size_t size) {
   }
 
   bool cleanup_certified = true;
-#if defined(__APPLE__)
+#if defined(__linux__)
+  cleanup_certified = guardian_wait_for_owned_linux_session_cleanup(supervisor_pid);
+#elif defined(__APPLE__)
   cleanup_certified = guardian_wait_for_owned_session_cleanup(supervisor_pid);
 #else
   guardian_wait_for_worker_group_cleanup(supervisor_pid);
