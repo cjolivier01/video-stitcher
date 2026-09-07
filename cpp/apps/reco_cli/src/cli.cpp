@@ -613,6 +613,40 @@ public:
   return relative_path_identifies_windows_handle(directory, destination_name, source, false);
 }
 
+[[nodiscard]] DWORD link_open_file(HANDLE handle, HANDLE directory, std::wstring_view link_name) {
+  const auto filename_bytes = link_name.size() * sizeof(wchar_t);
+  struct NativeLinkInfo {
+    BOOLEAN replace_if_exists;
+    HANDLE root_directory;
+    ULONG filename_length;
+    wchar_t filename[1];
+  };
+  static_assert(offsetof(NativeLinkInfo, replace_if_exists) ==
+                offsetof(FILE_LINK_INFO, ReplaceIfExists));
+  static_assert(offsetof(NativeLinkInfo, root_directory) ==
+                offsetof(FILE_LINK_INFO, RootDirectory));
+  static_assert(offsetof(NativeLinkInfo, filename_length) ==
+                offsetof(FILE_LINK_INFO, FileNameLength));
+  static_assert(offsetof(NativeLinkInfo, filename) == offsetof(FILE_LINK_INFO, FileName));
+  const auto info_bytes = sizeof(FILE_LINK_INFO) + filename_bytes;
+  std::vector<std::max_align_t> storage(
+      (info_bytes + sizeof(std::max_align_t) - 1U) / sizeof(std::max_align_t), std::max_align_t{});
+  auto* raw = reinterpret_cast<std::byte*>(storage.data());
+  const BOOLEAN replace_if_exists = FALSE;
+  const HANDLE root_directory = directory;
+  const auto filename_length = static_cast<ULONG>(filename_bytes);
+  std::memcpy(raw + offsetof(NativeLinkInfo, replace_if_exists), &replace_if_exists,
+              sizeof(replace_if_exists));
+  std::memcpy(raw + offsetof(NativeLinkInfo, root_directory), &root_directory,
+              sizeof(root_directory));
+  std::memcpy(raw + offsetof(NativeLinkInfo, filename_length), &filename_length,
+              sizeof(filename_length));
+  std::memcpy(raw + offsetof(NativeLinkInfo, filename), link_name.data(), filename_bytes);
+  constexpr ULONG kFileLinkInformation = 11;
+  return set_windows_file_information(handle, storage.data(), static_cast<ULONG>(info_bytes),
+                                      kFileLinkInformation);
+}
+
 void rename_open_file(HANDLE handle, HANDLE directory, std::wstring_view destination_name,
                       const std::filesystem::path& destination, bool allow_reparse_point = false,
                       bool replace_existing = true) {
@@ -745,8 +779,6 @@ void publish_windows_output(
   constexpr ULONG sharing = FILE_SHARE_READ;
   constexpr ULONG options =
       FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT;
-  const auto resolved_destination =
-      resolved_directory / std::filesystem::path(std::wstring(destination_name));
   std::random_device random;
   constexpr wchar_t hex[] = L"0123456789abcdef";
   constexpr int maximum_replace_attempts = 200;
@@ -762,14 +794,12 @@ void publish_windows_output(
     std::wstring rollback_name(destination_name);
     rollback_name += L".rollback.";
     rollback_name.append(token.begin(), token.end());
-    const auto resolved_rollback = resolved_directory / std::filesystem::path(rollback_name);
     DWORD current_error = ERROR_SUCCESS;
     const HANDLE current = open_windows_file_relative(directory, destination_name, access, sharing,
                                                       FILE_OPEN, options, current_error);
     UniqueWindowsHandle retained_current(current);
     std::optional<BY_HANDLE_FILE_INFORMATION> expected_destination_identity;
     bool current_is_reparse_point = false;
-    DWORD current_reparse_tag = 0;
     if (current != INVALID_HANDLE_VALUE) {
       FILE_ATTRIBUTE_TAG_INFO attributes{};
       if (GetFileInformationByHandleEx(current, FileAttributeTagInfo, &attributes,
@@ -778,7 +808,6 @@ void publish_windows_output(
                          static_cast<int>(GetLastError()));
       }
       current_is_reparse_point = (attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-      current_reparse_tag = attributes.ReparseTag;
       BY_HANDLE_FILE_INFORMATION current_identity{};
       if (GetFileInformationByHandle(current, &current_identity) == 0) {
         throw_file_error("cannot inspect calibration output identity", destination,
@@ -832,36 +861,8 @@ void publish_windows_output(
       return;
     }
 
-    std::optional<std::filesystem::path> expected_symlink_target;
-    if (current_is_reparse_point) {
-      if (current_reparse_tag != IO_REPARSE_TAG_SYMLINK) {
-        throw std::runtime_error(
-            "cannot atomically retain unsupported calibration output reparse point: " +
-            destination.string());
-      }
-      std::error_code symlink_error;
-      expected_symlink_target = std::filesystem::read_symlink(resolved_destination, symlink_error);
-      if (symlink_error) {
-        throw std::filesystem::filesystem_error(
-            "cannot inspect calibration output symlink for atomic replacement",
-            resolved_destination, symlink_error);
-      }
-      if (!relative_path_identifies_windows_handle(directory, destination_name, current, true)) {
-        throw WindowsPublicationIdentityError(
-            "calibration output symlink identity changed while retaining atomic rollback");
-      }
-      std::filesystem::create_symlink(*expected_symlink_target, resolved_rollback, symlink_error);
-      if (symlink_error) {
-        if (symlink_error == std::errc::file_exists && attempt + 1 < maximum_replace_attempts) {
-          continue;
-        }
-        throw std::filesystem::filesystem_error(
-            "cannot retain calibration output symlink for atomic replacement", resolved_rollback,
-            symlink_error);
-      }
-    } else if (CreateHardLinkW(resolved_rollback.c_str(), resolved_destination.c_str(), nullptr) ==
-               0) {
-      const auto link_error = GetLastError();
+    const auto link_error = link_open_file(current, directory, rollback_name);
+    if (link_error != ERROR_SUCCESS) {
       if ((link_error == ERROR_FILE_EXISTS || link_error == ERROR_ALREADY_EXISTS) &&
           attempt + 1 < maximum_replace_attempts) {
         continue;
@@ -874,24 +875,12 @@ void publish_windows_output(
                                                        FILE_OPEN, options, rollback_error);
     UniqueWindowsHandle retained_rollback(rollback);
     BY_HANDLE_FILE_INFORMATION displaced_identity{};
-    bool displaced_matches_expected =
+    const bool displaced_matches_expected =
         rollback != INVALID_HANDLE_VALUE && expected_destination_identity.has_value() &&
-        GetFileInformationByHandle(rollback, &displaced_identity) != 0;
-    if (displaced_matches_expected && current_is_reparse_point) {
-      FILE_ATTRIBUTE_TAG_INFO rollback_attributes{};
-      std::error_code symlink_error;
-      const auto rollback_target = std::filesystem::read_symlink(resolved_rollback, symlink_error);
-      displaced_matches_expected =
-          GetFileInformationByHandleEx(rollback, FileAttributeTagInfo, &rollback_attributes,
-                                       sizeof(rollback_attributes)) != 0 &&
-          (rollback_attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 &&
-          rollback_attributes.ReparseTag == IO_REPARSE_TAG_SYMLINK && !symlink_error &&
-          expected_symlink_target.has_value() && rollback_target == *expected_symlink_target &&
-          relative_path_identifies_windows_handle(directory, destination_name, current, true);
-    } else if (displaced_matches_expected) {
-      displaced_matches_expected =
-          same_windows_file_identity(*expected_destination_identity, displaced_identity);
-    }
+        GetFileInformationByHandle(rollback, &displaced_identity) != 0 &&
+        same_windows_file_identity(*expected_destination_identity, displaced_identity) &&
+        relative_path_identifies_windows_handle(directory, destination_name, current,
+                                                current_is_reparse_point);
     if (!displaced_matches_expected) {
       throw WindowsPublicationIdentityError(
           "calibration output identity changed while retaining atomic rollback");
