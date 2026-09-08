@@ -403,7 +403,7 @@ void compiles_once_and_synchronizes_each_render(const std::filesystem::path& cud
   expect_eq(nvrtc_control.create_count(), 1, "render never recompiles the kernel");
   expect_eq(cuda_control.launch_count(), 2, "one fused launch per render");
   expect_eq(cuda_control.synchronize_count(), 2, "each render synchronizes before return");
-  expect_eq(cuda_control.pointer_attribute_count(), 66,
+  expect_eq(cuda_control.pointer_attribute_count(), 70,
             "each render validates legacy pointers and the VMM output provenance");
   expect_eq(cuda_control.memory_access_count(), 2,
             "each render validates the complete VMM output access range");

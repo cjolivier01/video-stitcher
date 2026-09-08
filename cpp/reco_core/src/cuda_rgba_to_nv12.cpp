@@ -315,6 +315,9 @@ void CudaRgbaToNv12Converter::convert(const CudaRgbaFrameView& input,
   if (input_span.aliases(output_y_span) || input_span.aliases(output_uv_span)) {
     throw std::invalid_argument("CUDA RGBA-to-NV12 input and output memory must not overlap");
   }
+  if (output_y_span.aliases(output_uv_span)) {
+    throw std::invalid_argument("CUDA RGBA-to-NV12 Y and UV output memory must not overlap");
+  }
 
   auto input_ptr = input.plane().ptr();
   auto input_pitch = checked_pitch(input.plane().pitch_bytes());

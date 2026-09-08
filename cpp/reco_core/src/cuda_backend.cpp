@@ -53,6 +53,8 @@ constexpr int kPointerAttributeRangeStartAddress = 11;
 constexpr int kPointerAttributeRangeSize = 12;
 constexpr int kPointerAttributeMapped = 13;
 constexpr int kPointerAttributeAccessFlags = 16;
+constexpr int kPointerAttributeMappingSize = 18;
+constexpr int kPointerAttributeMappingBaseAddress = 19;
 constexpr int kPointerAttributeMemoryBlockId = 20;
 constexpr unsigned int kMemAllocationTypePinned = 1;
 constexpr unsigned int kMemLocationTypeDevice = 1;
@@ -503,6 +505,29 @@ void validate_access_flags(std::uint64_t access_flags, CudaSpanAccess required_a
   }
 }
 
+struct VmmProvenanceRange {
+  unsigned long long memory_block_id = 0;
+  CudaDevicePtr mapping_base = 0;
+  std::size_t mapping_size = 0;
+  std::size_t first_offset = 0;
+  std::size_t last_offset = 0;
+};
+
+void append_vmm_provenance_range(std::vector<VmmProvenanceRange>& ranges,
+                                 VmmProvenanceRange range) {
+  if (!ranges.empty()) {
+    auto& previous = ranges.back();
+    if (previous.memory_block_id == range.memory_block_id &&
+        previous.mapping_base == range.mapping_base &&
+        previous.mapping_size == range.mapping_size &&
+        previous.last_offset + 1U == range.first_offset) {
+      previous.last_offset = range.last_offset;
+      return;
+    }
+  }
+  ranges.push_back(range);
+}
+
 } // namespace
 
 struct CudaValidatedSpan::State {
@@ -510,14 +535,14 @@ struct CudaValidatedSpan::State {
         std::uintptr_t context_id_in, int device_ordinal_in, CudaSpanAccess access_in,
         CudaDevicePtr validated_range_base_in, std::size_t validated_range_bytes_in,
         std::vector<CUmemGenericAllocationHandle> allocation_handles_in,
-        std::vector<unsigned long long> memory_block_ids_in, bool is_vmm_in,
+        std::vector<VmmProvenanceRange> vmm_provenance_ranges_in, bool is_vmm_in,
         bool vmm_identity_complete_in)
       : backend(std::move(backend_in)), ptr(ptr_in), size(size_in), context_id(context_id_in),
         device_ordinal(device_ordinal_in), access(access_in),
         validated_range_base(validated_range_base_in),
         validated_range_bytes(validated_range_bytes_in),
         allocation_handles(std::move(allocation_handles_in)),
-        memory_block_ids(std::move(memory_block_ids_in)), is_vmm(is_vmm_in),
+        vmm_provenance_ranges(std::move(vmm_provenance_ranges_in)), is_vmm(is_vmm_in),
         vmm_identity_complete(vmm_identity_complete_in) {}
 
   State(const State&) = delete;
@@ -541,7 +566,7 @@ struct CudaValidatedSpan::State {
   CudaDevicePtr validated_range_base = 0;
   std::size_t validated_range_bytes = 0;
   std::vector<CUmemGenericAllocationHandle> allocation_handles;
-  std::vector<unsigned long long> memory_block_ids;
+  std::vector<VmmProvenanceRange> vmm_provenance_ranges;
   bool is_vmm = false;
   bool vmm_identity_complete = false;
 };
@@ -623,10 +648,21 @@ bool CudaValidatedSpan::aliases(const CudaValidatedSpan& other) const {
   if (!state_->vmm_identity_complete || !other.state_->vmm_identity_complete) {
     return true;
   }
-  for (const auto block_id : state_->memory_block_ids) {
-    if (std::find(other.state_->memory_block_ids.begin(), other.state_->memory_block_ids.end(),
-                  block_id) != other.state_->memory_block_ids.end()) {
-      return true;
+  for (const auto& range : state_->vmm_provenance_ranges) {
+    for (const auto& other_range : other.state_->vmm_provenance_ranges) {
+      if (range.memory_block_id != other_range.memory_block_id) {
+        continue;
+      }
+      // CUDA identifies the physical allocation but does not expose a retained mapping's
+      // cuMemMap offset. Distinct mappings of one allocation must therefore fail closed.
+      if (range.mapping_base != other_range.mapping_base ||
+          range.mapping_size != other_range.mapping_size) {
+        return true;
+      }
+      if (range.first_offset <= other_range.last_offset &&
+          other_range.first_offset <= range.last_offset) {
+        return true;
+      }
     }
   }
   return false;
@@ -1292,7 +1328,7 @@ CudaValidatedSpan CudaBackend::retain_device_span(CudaDevicePtr ptr, std::size_t
   CudaDevicePtr validated_range_base = ptr;
   std::size_t validated_range_bytes = accessible_bytes;
   std::vector<CUmemGenericAllocationHandle> allocation_handles;
-  std::vector<unsigned long long> memory_block_ids;
+  std::vector<VmmProvenanceRange> vmm_provenance_ranges;
   bool vmm_identity_complete = pointer_context == nullptr;
   if (pointer_context != nullptr) {
     unsigned int access_flags = 0;
@@ -1345,14 +1381,32 @@ CudaValidatedSpan CudaBackend::retain_device_span(CudaDevicePtr ptr, std::size_t
 
         if (vmm_identity_complete) {
           unsigned long long block_id = 0;
+          std::size_t mapping_size = 0;
+          CudaDevicePtr mapping_base = 0;
           if (impl_->cu_pointer_get_attribute(&block_id, kPointerAttributeMemoryBlockId, region) ==
-              kCudaSuccess) {
-            if (std::find(memory_block_ids.begin(), memory_block_ids.end(), block_id) ==
-                memory_block_ids.end()) {
-              memory_block_ids.push_back(block_id);
+                  kCudaSuccess &&
+              impl_->cu_pointer_get_attribute(&mapping_size, kPointerAttributeMappingSize,
+                                              region) == kCudaSuccess &&
+              impl_->cu_pointer_get_attribute(&mapping_base, kPointerAttributeMappingBaseAddress,
+                                              region) == kCudaSuccess) {
+            const auto region_remaining = std::numeric_limits<CudaDevicePtr>::max() - region;
+            const auto region_last = region + std::min(granularity_ptr - 1U, region_remaining);
+            const auto covered_first = std::max(ptr, region);
+            const auto covered_last = std::min(last, region_last);
+            if (mapping_size == 0 || covered_first < mapping_base || covered_last < mapping_base ||
+                covered_first - mapping_base >= mapping_size ||
+                covered_last - mapping_base >= mapping_size) {
+              throw std::runtime_error("CUDA VMM mapping metadata does not cover the device span");
             }
+            append_vmm_provenance_range(
+                vmm_provenance_ranges,
+                {.memory_block_id = block_id,
+                 .mapping_base = mapping_base,
+                 .mapping_size = mapping_size,
+                 .first_offset = static_cast<std::size_t>(covered_first - mapping_base),
+                 .last_offset = static_cast<std::size_t>(covered_last - mapping_base)});
           } else {
-            memory_block_ids.clear();
+            vmm_provenance_ranges.clear();
             vmm_identity_complete = false;
           }
         }
@@ -1394,7 +1448,7 @@ CudaValidatedSpan CudaBackend::retain_device_span(CudaDevicePtr ptr, std::size_t
     state = std::make_shared<CudaValidatedSpan::State>(
         impl_, ptr, accessible_bytes, reinterpret_cast<std::uintptr_t>(retained_context),
         device_ordinal, required_access, validated_range_base, validated_range_bytes,
-        std::move(allocation_handles), std::move(memory_block_ids), pointer_context == nullptr,
+        std::move(allocation_handles), std::move(vmm_provenance_ranges), pointer_context == nullptr,
         vmm_identity_complete);
   } catch (...) {
     for (const auto handle : allocation_handles) {

@@ -30,6 +30,7 @@ constexpr std::uint64_t kNoAccessAllocation = 0xE0000U;
 constexpr std::uint64_t kReadOnlyAllocation = 0xF0000U;
 constexpr std::uint64_t kContextIndependentMapping = 0x100000U;
 constexpr std::uint64_t kPhysicalAliasMapping = 0x110000U;
+constexpr std::uint64_t kUnknownPhysicalIdentityMapping = 0x120000U;
 thread_local void* current_context = nullptr;
 std::atomic<int> retain_count{0};
 std::atomic<int> launch_count{0};
@@ -192,7 +193,8 @@ RECO_FAKE_CUDA_EXPORT int cuPointerGetAttribute(void* data, int attribute, std::
   case 1:
     *static_cast<void**>(data) =
         base == kForeignContextAllocation ? reinterpret_cast<void*>(kForeignContextIdentity)
-        : base == kContextIndependentMapping || base == kPhysicalAliasMapping
+        : base == kContextIndependentMapping || base == kPhysicalAliasMapping ||
+                base == kUnknownPhysicalIdentityMapping
             ? nullptr
             : reinterpret_cast<void*>(kContextIdentity);
     return 0;
@@ -220,6 +222,13 @@ RECO_FAKE_CUDA_EXPORT int cuPointerGetAttribute(void* data, int attribute, std::
     return 0;
   case 19:
     *static_cast<std::uint64_t*>(data) = base;
+    return 0;
+  case 20:
+    if (base == kUnknownPhysicalIdentityMapping) {
+      return 1;
+    }
+    *static_cast<unsigned long long*>(data) =
+        base == kContextIndependentMapping || base == kPhysicalAliasMapping ? 0xB10CU : base;
     return 0;
   default:
     return 1;
@@ -294,7 +303,8 @@ RECO_FAKE_CUDA_EXPORT int cuMemGetAllocationGranularity(std::size_t* granularity
 RECO_FAKE_CUDA_EXPORT int cuMemGetAccess(std::uint64_t* flags, const void*, std::uint64_t pointer) {
   const auto base = allocation_base(pointer);
   if (flags == nullptr || current_context != reinterpret_cast<void*>(kContextIdentity) ||
-      (base != kContextIndependentMapping && base != kPhysicalAliasMapping)) {
+      (base != kContextIndependentMapping && base != kPhysicalAliasMapping &&
+       base != kUnknownPhysicalIdentityMapping)) {
     return 1;
   }
   *flags = 3U;
@@ -303,7 +313,8 @@ RECO_FAKE_CUDA_EXPORT int cuMemGetAccess(std::uint64_t* flags, const void*, std:
 RECO_FAKE_CUDA_EXPORT int cuMemRetainAllocationHandle(std::uint64_t* handle, void* address) {
   const auto base = allocation_base(reinterpret_cast<std::uintptr_t>(address));
   if (handle == nullptr || current_context != reinterpret_cast<void*>(kContextIdentity) ||
-      (base != kContextIndependentMapping && base != kPhysicalAliasMapping)) {
+      (base != kContextIndependentMapping && base != kPhysicalAliasMapping &&
+       base != kUnknownPhysicalIdentityMapping)) {
     return 1;
   }
   *handle = 0x2904U;
@@ -367,6 +378,7 @@ using namespace reco::core;
 
 constexpr CudaDevicePtr kContextIndependentMapping = 0x100000U;
 constexpr CudaDevicePtr kPhysicalAliasMapping = 0x110000U;
+constexpr CudaDevicePtr kUnknownPhysicalIdentityMapping = 0x120000U;
 
 static_assert(!std::is_copy_constructible_v<CudaRgbaToNv12Converter>);
 static_assert(!std::is_copy_assignable_v<CudaRgbaToNv12Converter>);
@@ -695,6 +707,29 @@ void rejects_physical_vmm_aliases(const std::filesystem::path& cuda_runtime,
       },
       "overlap", "distinct VMM mappings of one physical allocation are rejected");
   expect_eq(cuda_control.launch_count(), 0, "physical alias rejection prevents conversion");
+
+  expect_throws<std::invalid_argument>(
+      [&] {
+        converter.convert(rgba_frame(0x10000U, context),
+                          nv12_frame(kContextIndependentMapping, kPhysicalAliasMapping, context));
+      },
+      "Y and UV", "physical aliasing between distinct VMM output mappings is rejected");
+  expect_eq(cuda_control.launch_count(), 0, "aliased VMM outputs do not launch the converter");
+
+  converter.convert(
+      rgba_frame(0x10000U, context),
+      nv12_frame(kContextIndependentMapping, kContextIndependentMapping + 0x800U, context));
+  expect_eq(cuda_control.launch_count(), 1,
+            "disjoint Y and UV ranges in one VMM mapping remain supported");
+
+  expect_throws<std::invalid_argument>(
+      [&] {
+        converter.convert(
+            rgba_frame(0x10000U, context),
+            nv12_frame(kContextIndependentMapping, kUnknownPhysicalIdentityMapping, context));
+      },
+      "Y and UV", "unknown VMM output identity fails closed");
+  expect_eq(cuda_control.launch_count(), 1, "unknown VMM identity does not launch the converter");
 }
 
 void rejects_invalid_configuration(const std::filesystem::path& cuda_runtime,
@@ -757,6 +792,9 @@ void rejects_unsafe_frames(const std::filesystem::path& cuda_runtime,
   expect_throws<std::invalid_argument>(
       [&] { converter.convert(input, nv12_frame(0x70000U, input.plane().ptr(), context)); },
       "overlap", "input and UV overlap");
+  expect_throws<std::invalid_argument>(
+      [&] { converter.convert(input, nv12_frame(0x60000U, 0x60000U, context)); }, "overlap",
+      "Y and UV outputs overlap");
   expect_throws<std::invalid_argument>(
       [&] { converter.convert(rgba_frame(0x80000U, context), output); }, "device memory",
       "host input pointer");
