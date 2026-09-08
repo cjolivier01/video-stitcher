@@ -63,6 +63,12 @@ public:
   /// Renders one stereo frame and waits for its stream event before returning.
   void render(const CudaNv12FrameView& left, const CudaNv12FrameView& right,
               const CudaRgbaFrameView& output, const CudaStitchViewport& viewport = {}) const;
+  /// Acquires the renderer's shared CUDA stream for an ordered multi-kernel frame batch.
+  [[nodiscard]] CudaExecutionBatch begin_batch() const;
+  /// Enqueues rendering without waiting; all borrowed frame owners must outlive `batch.wait()`.
+  void enqueue(CudaExecutionBatch& batch, const CudaNv12FrameView& left,
+               const CudaNv12FrameView& right, const CudaRgbaFrameView& output,
+               const CudaStitchViewport& viewport = {}) const;
 
   /// Process-local CUDA context identity accepted by this renderer.
   [[nodiscard]] CudaContextId context_id() const;

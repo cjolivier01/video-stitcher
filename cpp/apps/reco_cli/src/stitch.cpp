@@ -611,11 +611,13 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
            decoded.frames->right.rotation_degrees != 180)) {
         throw std::runtime_error("90/270-degree stereo input rotation is not supported");
       }
-      renderer.render(left_frame.view(), right_frame.view(), rgba,
-                      {.flip_left_180 = decoded.frames->left.rotation_degrees == 180,
-                       .flip_right_180 = decoded.frames->right.rotation_degrees == 180});
       auto encoded = encoder.acquire_frame();
-      converter.convert(rgba, encoded.view());
+      auto batch = renderer.begin_batch();
+      renderer.enqueue(batch, left_frame.view(), right_frame.view(), rgba,
+                       {.flip_left_180 = decoded.frames->left.rotation_degrees == 180,
+                        .flip_right_180 = decoded.frames->right.rotation_degrees == 180});
+      converter.enqueue(batch, rgba, encoded.view());
+      batch.wait();
       const auto source_frame_index = decoded.frames->left.frame_index;
       if (previous_source_frame_index.has_value() &&
           source_frame_index <= *previous_source_frame_index) {

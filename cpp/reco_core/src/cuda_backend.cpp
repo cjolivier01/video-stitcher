@@ -637,6 +637,42 @@ struct CudaExecutionStream::State {
   std::mutex submission_mutex;
 };
 
+struct CudaExecutionBatch::Impl {
+  explicit Impl(std::shared_ptr<CudaExecutionStream::State> stream_in)
+      : stream(std::move(stream_in)), submission_lock(stream->submission_mutex) {
+    previous_context = stream->backend->current_context();
+    stream->backend->set_current_context(stream->context);
+    active = true;
+  }
+
+  Impl(const Impl&) = delete;
+  Impl& operator=(const Impl&) = delete;
+
+  ~Impl() { abandon(); }
+
+  void abandon() noexcept {
+    if (!active) {
+      return;
+    }
+    if (launch_submitted) {
+      (void)stream->backend->cu_stream_synchronize(stream->stream);
+    }
+    stream->backend->restore_context_noexcept(previous_context);
+    active = false;
+    if (submission_lock.owns_lock()) {
+      submission_lock.unlock();
+    }
+  }
+
+  std::shared_ptr<CudaExecutionStream::State> stream;
+  std::unique_lock<std::mutex> submission_lock;
+  CUcontext previous_context = nullptr;
+  bool active = false;
+  bool launch_submitted = false;
+  std::vector<CudaValidatedSpan> retained_spans;
+  std::vector<std::shared_ptr<void>> retained_modules;
+};
+
 CudaExecutionStream::CudaExecutionStream(std::shared_ptr<State> state) : state_(std::move(state)) {}
 
 std::uintptr_t CudaExecutionStream::context_id() const {
@@ -651,6 +687,62 @@ int CudaExecutionStream::device_ordinal() const {
     throw std::logic_error("cannot inspect an empty CUDA execution stream");
   }
   return state_->device_ordinal;
+}
+
+CudaExecutionBatch CudaExecutionStream::begin_batch() const {
+  if (state_ == nullptr) {
+    throw std::logic_error("cannot begin a batch on an empty CUDA execution stream");
+  }
+  return CudaExecutionBatch(state_);
+}
+
+CudaExecutionBatch::CudaExecutionBatch(std::shared_ptr<CudaExecutionStream::State> stream)
+    : impl_(std::make_unique<Impl>(std::move(stream))) {}
+
+CudaExecutionBatch::~CudaExecutionBatch() = default;
+
+CudaExecutionBatch::operator bool() const { return impl_ != nullptr && impl_->active; }
+
+void CudaExecutionBatch::retain(CudaValidatedSpan span) {
+  if (!*this) {
+    throw std::logic_error("cannot retain a CUDA span in a completed execution batch");
+  }
+  if (!span) {
+    throw std::invalid_argument("CUDA execution batch cannot retain an empty span");
+  }
+  impl_->retained_spans.push_back(std::move(span));
+}
+
+void CudaExecutionBatch::wait() {
+  if (!*this) {
+    throw std::logic_error("cannot wait on a completed CUDA execution batch");
+  }
+  auto& state = *impl_;
+  if (!state.launch_submitted) {
+    state.stream->backend->restore_context(state.previous_context);
+    state.active = false;
+    state.submission_lock.unlock();
+    return;
+  }
+
+  try {
+    check_cuda("cuEventRecord", state.stream->backend->cu_event_record(
+                                    state.stream->completion_event, state.stream->stream));
+    check_cuda("cuEventSynchronize",
+               state.stream->backend->cu_event_synchronize(state.stream->completion_event));
+  } catch (...) {
+    state.abandon();
+    throw;
+  }
+
+  state.active = false;
+  try {
+    state.stream->backend->restore_context(state.previous_context);
+  } catch (...) {
+    state.submission_lock.unlock();
+    throw;
+  }
+  state.submission_lock.unlock();
 }
 
 CudaValidatedSpan::CudaValidatedSpan(std::shared_ptr<State> state) : state_(std::move(state)) {}
@@ -964,43 +1056,36 @@ void CudaKernel::launch_and_synchronize(const CudaLaunchConfig& config,
 void CudaKernel::launch_and_synchronize(const CudaExecutionStream& stream,
                                         const CudaLaunchConfig& config,
                                         std::span<void*> args) const {
+  auto batch = stream.begin_batch();
+  enqueue(batch, config, args);
+  batch.wait();
+}
+
+void CudaKernel::enqueue(CudaExecutionBatch& batch, const CudaLaunchConfig& config,
+                         std::span<void*> args) const {
   if (!*this) {
     throw std::invalid_argument("CUDA kernel launch requires a live kernel");
   }
-  const auto stream_state = stream.state_;
-  if (stream_state == nullptr) {
-    throw std::invalid_argument("CUDA kernel launch requires a live execution stream");
+  if (!batch) {
+    throw std::invalid_argument("CUDA kernel launch requires a live execution batch");
   }
   validate_dim3(config.grid, "grid");
   validate_dim3(config.block, "block");
+  auto& batch_state = *batch.impl_;
   const auto& backend = module_state_->backend;
-  if (stream_state->backend != backend || stream_state->context != module_state_->context) {
-    throw std::invalid_argument("CUDA kernel and execution stream must share one context");
+  if (batch_state.stream->backend != backend ||
+      batch_state.stream->context != module_state_->context) {
+    throw std::invalid_argument("CUDA kernel and execution batch must share one context");
   }
 
-  std::lock_guard<std::mutex> lock(stream_state->submission_mutex);
-  const CUcontext previous_context = backend->current_context();
-  backend->set_current_context(module_state_->context);
+  batch_state.retained_modules.push_back(module_state_);
   void** kernel_args = args.empty() ? nullptr : args.data();
-  bool launch_submitted = false;
-  try {
-    check_cuda("cuLaunchKernel",
-               backend->cu_launch_kernel(static_cast<CUfunction>(function_), config.grid.x,
-                                         config.grid.y, config.grid.z, config.block.x,
-                                         config.block.y, config.block.z, config.shared_memory_bytes,
-                                         stream_state->stream, kernel_args, nullptr));
-    launch_submitted = true;
-    check_cuda("cuEventRecord",
-               backend->cu_event_record(stream_state->completion_event, stream_state->stream));
-    check_cuda("cuEventSynchronize", backend->cu_event_synchronize(stream_state->completion_event));
-  } catch (...) {
-    if (launch_submitted) {
-      (void)backend->cu_stream_synchronize(stream_state->stream);
-    }
-    backend->restore_context_noexcept(previous_context);
-    throw;
-  }
-  backend->restore_context(previous_context);
+  check_cuda("cuLaunchKernel",
+             backend->cu_launch_kernel(static_cast<CUfunction>(function_), config.grid.x,
+                                       config.grid.y, config.grid.z, config.block.x, config.block.y,
+                                       config.block.z, config.shared_memory_bytes,
+                                       batch_state.stream->stream, kernel_args, nullptr));
+  batch_state.launch_submitted = true;
 }
 
 void CudaKernel::launch(const CudaLaunchConfig& config, std::span<void*> args) const {

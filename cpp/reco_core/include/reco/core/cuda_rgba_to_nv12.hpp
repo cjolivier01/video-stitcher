@@ -45,6 +45,9 @@ public:
 
   /// Converts one borrowed frame and waits for completion before either view may be released.
   void convert(const CudaRgbaFrameView& input, const CudaNv12FrameView& output) const;
+  /// Enqueues conversion without waiting; both borrowed frame owners must outlive `batch.wait()`.
+  void enqueue(CudaExecutionBatch& batch, const CudaRgbaFrameView& input,
+               const CudaNv12FrameView& output) const;
 
   /// Process-local CUDA context identity accepted by this converter.
   [[nodiscard]] CudaContextId context_id() const;

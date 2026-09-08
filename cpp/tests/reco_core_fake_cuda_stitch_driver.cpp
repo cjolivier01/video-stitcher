@@ -57,6 +57,12 @@ std::atomic<int> event_destroy_count{0};
 std::atomic<int> event_record_count{0};
 std::atomic<int> event_synchronize_count{0};
 std::atomic<int> surface_busy_count{0};
+std::atomic<bool> converter_output_busy{false};
+std::atomic<std::uint64_t> converter_output_y{0};
+std::atomic<std::uint64_t> converter_output_uv{0};
+std::atomic<int> appsrc_push_count{0};
+std::atomic<int> appsrc_rejected_push_count{0};
+std::atomic<int> appsrc_push_sequence{0};
 std::atomic<std::uintptr_t> last_launch_stream{0};
 std::atomic<bool> stream_live{false};
 std::atomic<bool> event_live{false};
@@ -123,6 +129,12 @@ RECO_FAKE_CUDA_EXPORT void recoFakeCudaStitchReset() {
   event_record_count = 0;
   event_synchronize_count = 0;
   surface_busy_count = 0;
+  converter_output_busy = false;
+  converter_output_y = 0;
+  converter_output_uv = 0;
+  appsrc_push_count = 0;
+  appsrc_rejected_push_count = 0;
+  appsrc_push_sequence = 0;
   last_launch_stream = 0;
   launch_sequences.fill(0);
   event_record_sequences.fill(0);
@@ -167,6 +179,26 @@ RECO_FAKE_CUDA_EXPORT int recoFakeCudaStitchEventSynchronizeCount() {
   return event_synchronize_count.load();
 }
 RECO_FAKE_CUDA_EXPORT int recoFakeCudaStitchSurfaceBusyCount() { return surface_busy_count.load(); }
+RECO_FAKE_CUDA_EXPORT int recoFakeCudaStitchAppsrcPush(std::uint64_t y_ptr, std::uint64_t uv_ptr) {
+  if (y_ptr != converter_output_y.load() || uv_ptr != converter_output_uv.load() || y_ptr == 0U ||
+      uv_ptr == 0U) {
+    return -1;
+  }
+  if (converter_output_busy.load()) {
+    ++appsrc_rejected_push_count;
+    return 0;
+  }
+  ++appsrc_push_count;
+  appsrc_push_sequence = ++sequence;
+  return 1;
+}
+RECO_FAKE_CUDA_EXPORT int recoFakeCudaStitchAppsrcPushCount() { return appsrc_push_count.load(); }
+RECO_FAKE_CUDA_EXPORT int recoFakeCudaStitchAppsrcRejectedPushCount() {
+  return appsrc_rejected_push_count.load();
+}
+RECO_FAKE_CUDA_EXPORT int recoFakeCudaStitchAppsrcPushSequence() {
+  return appsrc_push_sequence.load();
+}
 RECO_FAKE_CUDA_EXPORT std::uintptr_t recoFakeCudaStitchLastLaunchStream() {
   return last_launch_stream.load();
 }
@@ -350,6 +382,7 @@ RECO_FAKE_CUDA_EXPORT int cuStreamSynchronize(void* stream) {
   }
   ++stream_synchronize_count;
   surface_busy_count = 0;
+  converter_output_busy = false;
   return 0;
 }
 
@@ -407,6 +440,7 @@ RECO_FAKE_CUDA_EXPORT int cuEventSynchronize(void* event) {
     last_synchronize_sequence = event_synchronize_sequences[static_cast<std::size_t>(index)];
   }
   surface_busy_count = 0;
+  converter_output_busy = false;
   return 0;
 }
 
@@ -527,6 +561,10 @@ RECO_FAKE_CUDA_EXPORT int cuLaunchKernel(void* function, unsigned int grid_x, un
     captured_float[13] = right.color[2];
     captured_float[14] = static_cast<float>(*static_cast<const std::uint32_t*>(parameters[5]));
     captured_float[15] = static_cast<float>(*static_cast<const std::uint32_t*>(parameters[6]));
+  } else {
+    converter_output_y = *static_cast<const std::uint64_t*>(parameters[2]);
+    converter_output_uv = *static_cast<const std::uint64_t*>(parameters[4]);
+    converter_output_busy = true;
   }
   if (shared_memory != 0U) {
     return 1;

@@ -251,6 +251,12 @@ struct FakeCudaControl {
     event_synchronize_count_fn =
         library.symbol<int (*)()>("recoFakeCudaStitchEventSynchronizeCount");
     surface_busy_count_fn = library.symbol<int (*)()>("recoFakeCudaStitchSurfaceBusyCount");
+    appsrc_push_fn =
+        library.symbol<int (*)(std::uint64_t, std::uint64_t)>("recoFakeCudaStitchAppsrcPush");
+    appsrc_push_count_fn = library.symbol<int (*)()>("recoFakeCudaStitchAppsrcPushCount");
+    appsrc_rejected_push_count_fn =
+        library.symbol<int (*)()>("recoFakeCudaStitchAppsrcRejectedPushCount");
+    appsrc_push_sequence_fn = library.symbol<int (*)()>("recoFakeCudaStitchAppsrcPushSequence");
     last_launch_stream_fn =
         library.symbol<std::uintptr_t (*)()>("recoFakeCudaStitchLastLaunchStream");
     launch_sequence_at_fn = library.symbol<int (*)(int)>("recoFakeCudaStitchLaunchSequenceAt");
@@ -291,6 +297,12 @@ struct FakeCudaControl {
   int event_record_count() const { return event_record_count_fn(); }
   int event_synchronize_count() const { return event_synchronize_count_fn(); }
   int surface_busy_count() const { return surface_busy_count_fn(); }
+  int appsrc_push(CudaDevicePtr y_ptr, CudaDevicePtr uv_ptr) const {
+    return appsrc_push_fn(y_ptr, uv_ptr);
+  }
+  int appsrc_push_count() const { return appsrc_push_count_fn(); }
+  int appsrc_rejected_push_count() const { return appsrc_rejected_push_count_fn(); }
+  int appsrc_push_sequence() const { return appsrc_push_sequence_fn(); }
   std::uintptr_t last_launch_stream() const { return last_launch_stream_fn(); }
   int launch_sequence_at(int index) const { return launch_sequence_at_fn(index); }
   int event_record_sequence_at(int index) const { return event_record_sequence_at_fn(index); }
@@ -327,6 +339,10 @@ struct FakeCudaControl {
   int (*event_record_count_fn)() = nullptr;
   int (*event_synchronize_count_fn)() = nullptr;
   int (*surface_busy_count_fn)() = nullptr;
+  int (*appsrc_push_fn)(std::uint64_t, std::uint64_t) = nullptr;
+  int (*appsrc_push_count_fn)() = nullptr;
+  int (*appsrc_rejected_push_count_fn)() = nullptr;
+  int (*appsrc_push_sequence_fn)() = nullptr;
   std::uintptr_t (*last_launch_stream_fn)() = nullptr;
   int (*launch_sequence_at_fn)(int) = nullptr;
   int (*event_record_sequence_at_fn)(int) = nullptr;
@@ -529,32 +545,46 @@ void renderer_and_converter_share_ordered_stream(const std::filesystem::path& cu
       const auto right = nv12_frame(0x30000U, context);
       const auto rgba = rgba_frame(0x50000U, context);
       const auto encoded = nv12_frame(0x70000U, context);
-      renderer.render(left, right, rgba);
-      converter.convert(rgba, encoded);
+      auto batch = renderer.begin_batch();
+      renderer.enqueue(batch, left, right, rgba);
+      converter.enqueue(batch, rgba, encoded);
 
       expect_eq(cuda_control.launch_count(), 2, "render and conversion each launch once");
       expect_eq(cuda_control.synchronize_count(), 0,
                 "render-convert chain never synchronizes the CUDA context");
       expect_eq(cuda_control.stream_synchronize_count(), 0,
-                "successful render-convert chain uses only event completion");
-      expect_eq(cuda_control.event_record_count(), 2,
-                "render and conversion each record stream completion");
-      expect_eq(cuda_control.event_synchronize_count(), 2,
-                "render and conversion each preserve borrowed-surface lifetime");
+                "render-convert enqueue does not drain its CUDA stream");
+      expect_eq(cuda_control.event_record_count(), 0,
+                "render enqueue does not create an intermediate completion boundary");
+      expect_eq(cuda_control.event_synchronize_count(), 0,
+                "conversion enqueue remains asynchronous before the frame boundary");
+      expect_eq(cuda_control.surface_busy_count(), 2,
+                "both transform kernels remain queued before the frame boundary");
+      expect_eq(cuda_control.appsrc_push(encoded.y_plane().ptr(), encoded.uv_plane().ptr()), 0,
+                "appsrc rejects an NV12 surface with incomplete CUDA writes");
+      expect_eq(cuda_control.appsrc_rejected_push_count(), 1,
+                "premature encoder publication is observable");
+
+      batch.wait();
+      expect_eq(cuda_control.event_record_count(), 1,
+                "the render-convert batch records one frame completion event");
+      expect_eq(cuda_control.event_synchronize_count(), 1,
+                "the render-convert batch performs one host event wait");
+      expect_eq(cuda_control.surface_busy_count(), 0,
+                "the frame boundary completes all queued surface writes");
+      expect_eq(cuda_control.appsrc_push(encoded.y_plane().ptr(), encoded.uv_plane().ptr()), 1,
+                "appsrc accepts the completed NV12 surface");
+      expect_eq(cuda_control.appsrc_push_count(), 1,
+                "only completed output reaches encoder publication");
       expect_true(cuda_control.last_launch_stream() != 0,
                   "both kernels launch on an explicit CUDA stream");
-      expect_true(cuda_control.launch_sequence_at(0) < cuda_control.event_record_sequence_at(0) &&
-                      cuda_control.event_record_sequence_at(0) <
-                          cuda_control.event_synchronize_sequence_at(0),
-                  "render launch is recorded and completed in order");
       expect_true(
-          cuda_control.event_synchronize_sequence_at(0) < cuda_control.launch_sequence_at(1) &&
-              cuda_control.launch_sequence_at(1) < cuda_control.event_record_sequence_at(1) &&
-              cuda_control.event_record_sequence_at(1) <
-                  cuda_control.event_synchronize_sequence_at(1),
-          "conversion follows completed render work on the shared stream");
-      expect_eq(cuda_control.surface_busy_count(), 0,
-                "NVMM handoff cannot observe an in-flight output surface");
+          cuda_control.launch_sequence_at(0) < cuda_control.launch_sequence_at(1) &&
+              cuda_control.launch_sequence_at(1) < cuda_control.event_record_sequence_at(0) &&
+              cuda_control.event_record_sequence_at(0) <
+                  cuda_control.event_synchronize_sequence_at(0) &&
+              cuda_control.event_synchronize_sequence_at(0) < cuda_control.appsrc_push_sequence(),
+          "render launch precedes conversion, one completion boundary, and appsrc publication");
     }
     expect_eq(cuda_control.stream_destroy_count(), 0,
               "converter retains the stream after renderer destruction");
@@ -597,6 +627,39 @@ void completion_failures_drain_before_surface_release(const std::filesystem::pat
             "event-wait recovery drains only the execution stream");
   expect_eq(cuda_control.surface_busy_count(), 0,
             "event-wait recovery completes borrowed-surface work");
+}
+
+void abandoned_batch_drains_before_borrowed_surfaces_release(
+    const std::filesystem::path& cuda_runtime, const std::filesystem::path& nvrtc_runtime,
+    const FakeCudaControl& cuda_control) {
+  auto backend = CudaBackend::load(cuda_runtime.string());
+  auto renderer = CudaStereoStitchRenderer::create(config(), backend,
+                                                   NvrtcCompiler::load(nvrtc_runtime.string()));
+  auto converter = CudaRgbaToNv12Converter::create({.width = 4, .height = 2}, backend,
+                                                   NvrtcCompiler::load(nvrtc_runtime.string()));
+  const auto context = renderer.context_id();
+  const auto left = nv12_frame(0x10000U, context);
+  const auto right = nv12_frame(0x30000U, context);
+  const auto rgba = rgba_frame(0x50000U, context);
+
+  cuda_control.reset();
+  {
+    auto batch = renderer.begin_batch();
+    renderer.enqueue(batch, left, right, rgba);
+    expect_invalid_argument(
+        [&] { converter.enqueue(batch, rgba, nv12_frame(0x70000U, context + 1U)); }, "context",
+        "conversion validation failure is reported after a queued render");
+    expect_eq(cuda_control.surface_busy_count(), 1,
+              "queued render remains retained until the abandoned batch drains");
+    expect_eq(cuda_control.event_record_count(), 0,
+              "failed batch does not publish a partial completion event");
+  }
+  expect_eq(cuda_control.synchronize_count(), 0,
+            "abandoned batch does not synchronize the CUDA context");
+  expect_eq(cuda_control.stream_synchronize_count(), 1,
+            "abandoned batch drains only its execution stream");
+  expect_eq(cuda_control.surface_busy_count(), 0,
+            "abandoned batch completes queued work before releasing retained surfaces");
 }
 
 void render_synchronizes_before_restoring_the_caller_context(
@@ -1001,6 +1064,10 @@ int main() {
   });
   run_case("completion failures drain before surface release", [&] {
     completion_failures_drain_before_surface_release(cuda_runtime, nvrtc_runtime, cuda_control);
+  });
+  run_case("abandoned batch drains before surface release", [&] {
+    abandoned_batch_drains_before_borrowed_surfaces_release(cuda_runtime, nvrtc_runtime,
+                                                            cuda_control);
   });
   run_case("configuration validation", [&] {
     rejects_invalid_configuration_before_compilation(cuda_runtime, nvrtc_runtime, nvrtc_control);

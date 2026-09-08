@@ -302,6 +302,16 @@ void CudaRgbaToNv12Converter::convert(const CudaRgbaFrameView& input,
   if (!impl_) {
     throw std::logic_error("cannot use a moved-from CUDA RGBA-to-NV12 converter");
   }
+  auto batch = impl_->execution_stream.begin_batch();
+  enqueue(batch, input, output);
+  batch.wait();
+}
+
+void CudaRgbaToNv12Converter::enqueue(CudaExecutionBatch& batch, const CudaRgbaFrameView& input,
+                                      const CudaNv12FrameView& output) const {
+  if (!impl_) {
+    throw std::logic_error("cannot use a moved-from CUDA RGBA-to-NV12 converter");
+  }
   const auto& state = *impl_;
   std::lock_guard<std::mutex> lock(state.convert_mutex);
   validate_frame(state.config, state.context_id, input, output);
@@ -320,6 +330,9 @@ void CudaRgbaToNv12Converter::convert(const CudaRgbaFrameView& input,
   if (output_y_span.aliases(output_uv_span)) {
     throw std::invalid_argument("CUDA RGBA-to-NV12 Y and UV output memory must not overlap");
   }
+  batch.retain(input_span);
+  batch.retain(output_y_span);
+  batch.retain(output_uv_span);
 
   auto input_ptr = input.plane().ptr();
   auto input_pitch = checked_pitch(input.plane().pitch_bytes());
@@ -339,11 +352,11 @@ void CudaRgbaToNv12Converter::convert(const CudaRgbaFrameView& input,
                       static_cast<std::uint32_t>((chroma_columns % kBlockWidth) != 0U);
   const auto grid_y =
       chroma_rows / kBlockHeight + static_cast<std::uint32_t>((chroma_rows % kBlockHeight) != 0U);
-  state.kernel.launch_and_synchronize(state.execution_stream,
-                                      {.grid = {grid_x, grid_y, 1},
-                                       .block = {kBlockWidth, kBlockHeight, 1},
-                                       .shared_memory_bytes = 0},
-                                      std::span<void*>(arguments));
+  state.kernel.enqueue(batch,
+                       {.grid = {grid_x, grid_y, 1},
+                        .block = {kBlockWidth, kBlockHeight, 1},
+                        .shared_memory_bytes = 0},
+                       std::span<void*>(arguments));
 }
 
 CudaContextId CudaRgbaToNv12Converter::context_id() const {

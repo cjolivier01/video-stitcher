@@ -566,6 +566,22 @@ CudaStereoStitchRenderer::~CudaStereoStitchRenderer() = default;
 void CudaStereoStitchRenderer::render(const CudaNv12FrameView& left, const CudaNv12FrameView& right,
                                       const CudaRgbaFrameView& output,
                                       const CudaStitchViewport& viewport) const {
+  auto batch = begin_batch();
+  enqueue(batch, left, right, output, viewport);
+  batch.wait();
+}
+
+CudaExecutionBatch CudaStereoStitchRenderer::begin_batch() const {
+  if (!impl_) {
+    throw std::logic_error("cannot use a moved-from CUDA stitch renderer");
+  }
+  return impl_->execution_stream.begin_batch();
+}
+
+void CudaStereoStitchRenderer::enqueue(CudaExecutionBatch& batch, const CudaNv12FrameView& left,
+                                       const CudaNv12FrameView& right,
+                                       const CudaRgbaFrameView& output,
+                                       const CudaStitchViewport& viewport) const {
   if (!impl_) {
     throw std::logic_error("cannot use a moved-from CUDA stitch renderer");
   }
@@ -603,6 +619,10 @@ void CudaStereoStitchRenderer::render(const CudaNv12FrameView& left, const CudaN
       throw std::invalid_argument("CUDA stitch input and RGBA output memory must not overlap");
     }
   }
+  for (const auto& input_span : input_spans) {
+    batch.retain(input_span);
+  }
+  batch.retain(output_span);
 
   auto left_params = make_plane_params(left, state.config.calibration.left, state.left_basis,
                                        viewport.flip_left_180);
@@ -617,11 +637,11 @@ void CudaStereoStitchRenderer::render(const CudaNv12FrameView& left, const CudaN
                                  &output_pitch, &output_width, &output_height};
   const auto grid_x = (output_width + kBlockWidth - 1U) / kBlockWidth;
   const auto grid_y = (output_height + kBlockHeight - 1U) / kBlockHeight;
-  state.kernel.launch_and_synchronize(state.execution_stream,
-                                      {.grid = {grid_x, grid_y, 1},
-                                       .block = {kBlockWidth, kBlockHeight, 1},
-                                       .shared_memory_bytes = 0},
-                                      std::span<void*>(arguments));
+  state.kernel.enqueue(batch,
+                       {.grid = {grid_x, grid_y, 1},
+                        .block = {kBlockWidth, kBlockHeight, 1},
+                        .shared_memory_bytes = 0},
+                       std::span<void*>(arguments));
 }
 
 CudaContextId CudaStereoStitchRenderer::context_id() const {
