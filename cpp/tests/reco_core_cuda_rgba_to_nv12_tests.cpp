@@ -26,6 +26,8 @@ constexpr std::uint64_t kUndersizedAllocation = 0xA0000U;
 constexpr std::uint64_t kForeignContextAllocation = 0xB0000U;
 constexpr std::uint64_t kForeignDeviceAllocation = 0xC0000U;
 constexpr std::uint64_t kUnmappedAllocation = 0xD0000U;
+constexpr std::uint64_t kNoAccessAllocation = 0xE0000U;
+constexpr std::uint64_t kReadOnlyAllocation = 0xF0000U;
 thread_local void* current_context = nullptr;
 std::atomic<int> retain_count{0};
 std::atomic<int> launch_count{0};
@@ -196,11 +198,21 @@ RECO_FAKE_CUDA_EXPORT int cuPointerGetAttribute(void* data, int attribute, std::
   case 9:
     *static_cast<int*>(data) = base == kForeignDeviceAllocation ? 1 : 0;
     return 0;
+  case 11:
+    *static_cast<std::uint64_t*>(data) = base;
+    return 0;
+  case 12:
+    *static_cast<std::size_t*>(data) = allocation_size(base);
+    return 0;
   case 13:
     *static_cast<unsigned int*>(data) = base == kUnmappedAllocation ? 0U : 1U;
     return 0;
+  case 16:
+    *static_cast<unsigned int*>(data) =
+        base == kNoAccessAllocation ? 0U : (base == kReadOnlyAllocation ? 1U : 3U);
+    return 0;
   case 18:
-    *static_cast<std::size_t*>(data) = allocation_size(base);
+    *static_cast<std::size_t*>(data) = kAllocationSize;
     return 0;
   case 19:
     *static_cast<std::uint64_t*>(data) = base;
@@ -545,8 +557,8 @@ void compiles_once_and_synchronizes(const std::filesystem::path& cuda_runtime,
   expect_eq(nvrtc_control.create_count(), 1, "conversion does not recompile");
   expect_eq(cuda_control.launch_count(), 2, "one kernel launch per conversion");
   expect_eq(cuda_control.synchronize_count(), 2, "each conversion synchronizes before return");
-  expect_eq(cuda_control.pointer_attribute_count(), 36,
-            "each conversion validates all three pointers through six CUDA attributes");
+  expect_eq(cuda_control.pointer_attribute_count(), 42,
+            "each conversion validates all three pointers through seven CUDA attributes");
   expect_true(cuda_control.launch_sequence() < cuda_control.synchronize_sequence(),
               "kernel launch precedes synchronization");
   expect_eq(cuda_control.captured_u64(0), input.plane().ptr(), "input pointer propagated");
@@ -568,6 +580,32 @@ void compiles_once_and_synchronizes(const std::filesystem::path& cuda_runtime,
   expect_near(cuda_control.captured_color(4), 0.0F, 1.0e-6F, "full luma offset");
   expect_near(cuda_control.captured_color(5), 1.0F, 1.0e-6F, "full chroma scale");
   expect_near(cuda_control.captured_color(6), 127.5F, 1.0e-6F, "full chroma center");
+}
+
+void enforces_device_access_permissions(const std::filesystem::path& cuda_runtime,
+                                        const std::filesystem::path& nvrtc_runtime,
+                                        const FakeCudaControl& cuda_control) {
+  auto converter = create_converter({.width = 34, .height = 18}, cuda_runtime, nvrtc_runtime);
+  const auto context = converter.context_id();
+  const auto output = nv12_frame(0x40000U, 0x50000U, context);
+  cuda_control.reset();
+
+  converter.convert(rgba_frame(0xF0000U, context), output);
+  expect_eq(cuda_control.launch_count(), 1, "read-only RGBA input is accepted");
+  expect_throws<std::invalid_argument>(
+      [&] { converter.convert(rgba_frame(0xE0000U, context), output); }, "reads",
+      "inaccessible RGBA input is rejected");
+  expect_throws<std::invalid_argument>(
+      [&] {
+        converter.convert(rgba_frame(0x10000U, context), nv12_frame(0xF0000U, 0x70000U, context));
+      },
+      "writes", "read-only Y output is rejected");
+  expect_throws<std::invalid_argument>(
+      [&] {
+        converter.convert(rgba_frame(0x10000U, context), nv12_frame(0x60000U, 0xF0000U, context));
+      },
+      "writes", "read-only UV output is rejected");
+  expect_eq(cuda_control.launch_count(), 1, "denied converter access never launches");
 }
 
 void rejects_invalid_configuration(const std::filesystem::path& cuda_runtime,
@@ -847,6 +885,8 @@ int main() {
            [&] { rejects_invalid_configuration(cuda_runtime, nvrtc_runtime, nvrtc_control); });
   run_case("frame contract validation",
            [&] { rejects_unsafe_frames(cuda_runtime, nvrtc_runtime, cuda_control); });
+  run_case("device access validation",
+           [&] { enforces_device_access_permissions(cuda_runtime, nvrtc_runtime, cuda_control); });
   run_case("moved-from converter",
            [&] { moved_from_converter_is_diagnosed(cuda_runtime, nvrtc_runtime); });
   run_case("hardware parity", hardware_parity_if_available);

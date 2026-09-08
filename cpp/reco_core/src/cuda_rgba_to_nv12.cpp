@@ -212,9 +212,11 @@ bool spans_overlap(const CudaPitchedPlaneView& lhs, const CudaPitchedPlaneView& 
 }
 
 void validate_plane_allocation(const CudaBackend& backend, const CudaPitchedPlaneView& plane,
-                               std::string_view label, int device_ordinal) {
+                               std::string_view label, CudaSpanAccess required_access,
+                               int device_ordinal) {
   try {
-    backend.validate_device_span(plane.ptr(), plane.accessible_bytes(), device_ordinal);
+    backend.validate_device_span(plane.ptr(), plane.accessible_bytes(), required_access,
+                                 device_ordinal);
   } catch (const std::invalid_argument& error) {
     throw std::invalid_argument("CUDA RGBA-to-NV12 " + std::string(label) +
                                 " plane is invalid: " + error.what());
@@ -302,12 +304,12 @@ void CudaRgbaToNv12Converter::convert(const CudaRgbaFrameView& input,
   const auto& state = *impl_;
   std::lock_guard<std::mutex> lock(state.convert_mutex);
   validate_frame(state.config, state.context_id, input, output);
-  validate_plane_allocation(state.backend, input.plane(), "RGBA input",
+  validate_plane_allocation(state.backend, input.plane(), "RGBA input", CudaSpanAccess::Read,
                             state.config.device_ordinal);
-  validate_plane_allocation(state.backend, output.y_plane(), "Y output",
+  validate_plane_allocation(state.backend, output.y_plane(), "Y output", CudaSpanAccess::ReadWrite,
                             state.config.device_ordinal);
   validate_plane_allocation(state.backend, output.uv_plane(), "UV output",
-                            state.config.device_ordinal);
+                            CudaSpanAccess::ReadWrite, state.config.device_ordinal);
 
   auto input_ptr = input.plane().ptr();
   auto input_pitch = checked_pitch(input.plane().pitch_bytes());
