@@ -1251,7 +1251,12 @@ CudaValidatedSpan CudaBackend::retain_device_span(CudaDevicePtr ptr, std::size_t
                 &handle, reinterpret_cast<void*>(static_cast<std::uintptr_t>(region))));
         if (std::find(allocation_handles.begin(), allocation_handles.end(), handle) ==
             allocation_handles.end()) {
-          allocation_handles.push_back(handle);
+          try {
+            allocation_handles.push_back(handle);
+          } catch (...) {
+            (void)impl_->cu_mem_release(handle);
+            throw;
+          }
         } else {
           check_cuda("cuMemRelease", impl_->cu_mem_release(handle));
         }

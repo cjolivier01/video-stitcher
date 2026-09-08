@@ -32,6 +32,8 @@ struct CudaEglFrame {
 };
 
 thread_local void* current_context = nullptr;
+thread_local void* fail_set_current_target = nullptr;
+thread_local bool fail_set_current_once = false;
 int primary_context_retain_count = 0;
 
 constexpr std::uintptr_t kDefaultBase = 0x40000000;
@@ -63,6 +65,15 @@ std::uintptr_t allocation_base(std::uintptr_t pointer) {
 } // namespace
 
 extern "C" RECO_TEST_EXPORT int recoFakeRuntimeMarker() { return RECO_FAKE_CUDA_DRIVER_MARKER; }
+
+extern "C" RECO_TEST_EXPORT void recoFakeCudaFailNextSetCurrent(std::uintptr_t context) {
+  fail_set_current_target = reinterpret_cast<void*>(context);
+  fail_set_current_once = true;
+}
+
+extern "C" RECO_TEST_EXPORT std::uintptr_t recoFakeCudaCurrentContext() {
+  return reinterpret_cast<std::uintptr_t>(current_context);
+}
 
 extern "C" int cuInit(unsigned int) { return 0; }
 
@@ -143,6 +154,10 @@ extern "C" int cuCtxGetCurrent(void** context) {
 }
 
 extern "C" int cuCtxSetCurrent(void* context) {
+  if (fail_set_current_once && context == fail_set_current_target) {
+    fail_set_current_once = false;
+    return 901;
+  }
   current_context = context;
   return 0;
 }

@@ -338,6 +338,14 @@ public:
     }
   }
 
+  void restore() {
+    if (!functions_) {
+      return;
+    }
+    check_cuda("cuCtxSetCurrent (restore)", functions_->context_set_current(previous_));
+    functions_.reset();
+  }
+
 private:
   std::shared_ptr<CudaFunctions> functions_;
   CudaContext previous_ = nullptr;
@@ -467,6 +475,7 @@ bool release_surface_mapping(CudaMappingState& mapping) noexcept {
       mapping.cleanup_failure = SurfaceCleanupFailure::CudaUnmap;
       return false;
     }
+    context.restore();
     mapping.surface = nullptr;
     mapping.cleanup_failure = SurfaceCleanupFailure::None;
     mapping.cleanup_cuda_result = kCudaSuccess;
@@ -947,6 +956,7 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info, std::shared_ptr<
     direct_owner->decoder_owner = std::move(owner);
     direct_owner->runtime = info.runtime;
     direct_owner->cuda = std::move(cuda);
+    context.restore();
     return make_frame(y_ptr, uv_ptr, y_provenance, uv_provenance, direct_owner);
   }
 
@@ -967,6 +977,7 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info, std::shared_ptr<
     if (!same_frame_info(existing->frame_info, info)) {
       throw NvmmError("NvBufSurface metadata changed while its CUDA mapping remained active");
     }
+    context.restore();
     return make_frame(existing->y_ptr, existing->uv_ptr, existing->y_provenance,
                       existing->uv_provenance, acquire_mapping_lease(existing, registry));
   }
@@ -1005,6 +1016,7 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info, std::shared_ptr<
       mapping->uv_ptr = uv_ptr;
       mapping->y_provenance = y_provenance;
       mapping->uv_provenance = uv_provenance;
+      context.restore();
       auto lease = acquire_mapping_lease(mapping, registry);
       return make_frame(y_ptr, uv_ptr, y_provenance, uv_provenance, std::move(lease));
     } catch (...) {
@@ -1063,6 +1075,7 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info, std::shared_ptr<
     mapping->uv_ptr = uv_ptr;
     mapping->y_provenance = y_provenance;
     mapping->uv_provenance = uv_provenance;
+    context.restore();
     auto lease = acquire_mapping_lease(mapping, registry);
     return make_frame(y_ptr, uv_ptr, y_provenance, uv_provenance, std::move(lease));
   } catch (...) {

@@ -724,6 +724,67 @@ void failed_cleanup_poisoning_retains_surface_owners() {
 #endif
 }
 
+void context_restoration_failures_are_fail_closed() {
+#if defined(__linux__)
+  const auto cuda_driver = find_fake_runtime_runfile("fake_cuda_driver");
+  void* library = dlopen(cuda_driver.c_str(), RTLD_NOW | RTLD_LOCAL);
+  if (library == nullptr) {
+    throw std::runtime_error("failed to load fake CUDA driver controls");
+  }
+  struct LibraryCloser {
+    void* library;
+    ~LibraryCloser() { (void)dlclose(library); }
+  } closer{library};
+  const auto symbol = [library](const char* name) {
+    void* value = dlsym(library, name);
+    if (value == nullptr) {
+      throw std::runtime_error(std::string("missing fake CUDA control ") + name);
+    }
+    return value;
+  };
+  const auto set_current = reinterpret_cast<int (*)(void*)>(symbol("cuCtxSetCurrent"));
+  const auto fail_next_set =
+      reinterpret_cast<void (*)(std::uintptr_t)>(symbol("recoFakeCudaFailNextSetCurrent"));
+  const auto current_context =
+      reinterpret_cast<std::uintptr_t (*)()>(symbol("recoFakeCudaCurrentContext"));
+  constexpr std::uintptr_t kCallerContext = 0xBEEF;
+
+  auto direct_params = make_params();
+  direct_params.data_ptr = reinterpret_cast<void*>(0x40000000);
+  auto direct_surface = make_surface(direct_params);
+  direct_surface.mem_type = abi::kMemCudaDevice;
+  expect_eq(set_current(reinterpret_cast<void*>(kCallerContext)), 0,
+            "fake caller CUDA context is selected");
+  fail_next_set(kCallerContext);
+  expect_nvmm_error_contains(
+      [&] {
+        (void)map_nvmm_frame_to_cuda(extract_info(&direct_surface), std::make_shared<int>(30));
+      },
+      "cuCtxSetCurrent (restore)", "mapping reports caller CUDA context restoration failure");
+  expect_eq(current_context(), kCallerContext,
+            "mapping unwind retries caller CUDA context restoration");
+
+  auto mapped_params = make_params();
+  auto mapped_surface = make_surface(mapped_params);
+  auto mapped = map_nvmm_frame_to_cuda(extract_info(&mapped_surface), std::make_shared<int>(31));
+  expect_eq(set_current(reinterpret_cast<void*>(kCallerContext)), 0,
+            "cleanup caller CUDA context is selected");
+  fail_next_set(kCallerContext);
+  mapped.owner.reset();
+  expect_true(mapped_params.mapped_addr.cuda_ptr == nullptr,
+              "cleanup unmaps the CUDA buffer before restoration failure");
+  expect_eq(current_context(), kCallerContext,
+            "cleanup unwind retries caller CUDA context restoration");
+  expect_nvmm_error_contains(
+      [&] {
+        (void)map_nvmm_frame_to_cuda(extract_info(&mapped_surface), std::make_shared<int>(32));
+      },
+      "failed to select CUDA device 0 context during cleanup",
+      "cleanup restoration failure poisons the stale mapping");
+  expect_eq(set_current(nullptr), 0, "fake CUDA caller context is cleared");
+#endif
+}
+
 } // namespace
 
 int main() {
@@ -735,5 +796,6 @@ int main() {
   concurrent_mapping_cleanup_is_serialized();
   independent_surfaces_keep_independent_runtime_mappings();
   failed_cleanup_poisoning_retains_surface_owners();
+  context_restoration_failures_are_fail_closed();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
