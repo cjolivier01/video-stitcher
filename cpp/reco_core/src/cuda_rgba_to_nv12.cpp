@@ -211,6 +211,16 @@ bool spans_overlap(const CudaPitchedPlaneView& lhs, const CudaPitchedPlaneView& 
   return lhs.ptr() <= rhs_last && rhs.ptr() <= lhs_last;
 }
 
+void validate_plane_allocation(const CudaBackend& backend, const CudaPitchedPlaneView& plane,
+                               std::string_view label, int device_ordinal) {
+  try {
+    backend.validate_device_span(plane.ptr(), plane.accessible_bytes(), device_ordinal);
+  } catch (const std::invalid_argument& error) {
+    throw std::invalid_argument("CUDA RGBA-to-NV12 " + std::string(label) +
+                                " plane is invalid: " + error.what());
+  }
+}
+
 void validate_frame(const CudaRgbaToNv12Config& config, CudaContextId context_id,
                     const CudaRgbaFrameView& input, const CudaNv12FrameView& output) {
   if (input.width() != config.width || input.height() != config.height ||
@@ -242,11 +252,14 @@ std::uint64_t checked_pitch(std::size_t pitch) {
 } // namespace
 
 struct CudaRgbaToNv12Converter::Impl {
-  Impl(CudaRgbaToNv12Config config_in, CudaContextId context_id_in, CudaKernel kernel_in)
-      : config(config_in), context_id(context_id_in), kernel(std::move(kernel_in)) {}
+  Impl(CudaRgbaToNv12Config config_in, CudaContextId context_id_in, CudaBackend backend_in,
+       CudaKernel kernel_in)
+      : config(config_in), context_id(context_id_in), backend(std::move(backend_in)),
+        kernel(std::move(kernel_in)) {}
 
   CudaRgbaToNv12Config config;
   CudaContextId context_id = 0;
+  CudaBackend backend;
   CudaKernel kernel;
   mutable std::mutex convert_mutex;
 };
@@ -269,7 +282,8 @@ CudaRgbaToNv12Converter CudaRgbaToNv12Converter::create(CudaRgbaToNv12Config con
   const auto compiled = compiler.compile(kCudaSource, "reco_cuda_rgba_to_nv12.cu", options);
   auto module = backend.load_module_from_ptx(compiled.ptx, config.device_ordinal);
   auto kernel = module.load_kernel(kKernelName);
-  return CudaRgbaToNv12Converter(std::make_unique<Impl>(config, context_id, std::move(kernel)));
+  return CudaRgbaToNv12Converter(
+      std::make_unique<Impl>(config, context_id, std::move(backend), std::move(kernel)));
 }
 
 CudaRgbaToNv12Converter::CudaRgbaToNv12Converter(std::unique_ptr<Impl> impl)
@@ -288,6 +302,12 @@ void CudaRgbaToNv12Converter::convert(const CudaRgbaFrameView& input,
   const auto& state = *impl_;
   std::lock_guard<std::mutex> lock(state.convert_mutex);
   validate_frame(state.config, state.context_id, input, output);
+  validate_plane_allocation(state.backend, input.plane(), "RGBA input",
+                            state.config.device_ordinal);
+  validate_plane_allocation(state.backend, output.y_plane(), "Y output",
+                            state.config.device_ordinal);
+  validate_plane_allocation(state.backend, output.uv_plane(), "UV output",
+                            state.config.device_ordinal);
 
   auto input_ptr = input.plane().ptr();
   auto input_pitch = checked_pitch(input.plane().pitch_bytes());
