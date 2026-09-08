@@ -1066,13 +1066,13 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
         std::cerr << "symlink rollback failure: " << error.what() << '\n';
       }
     }
-    expect_true(rollback_hook_failed, "symlink post-publication failure is reported");
+    expect_true(rollback_hook_failed, "symlink publication fault is reported");
     expect_true(std::filesystem::is_symlink(rollback_destination),
-                "symlink rollback restores the destination link");
+                "symlink publication fault preserves the destination link");
     expect_true(std::filesystem::read_symlink(rollback_destination) == victim,
-                "symlink rollback restores the original target");
+                "symlink publication fault preserves the original target");
     expect_eq(read_text_file(victim), std::string("victim must not change\n"),
-              "symlink rollback does not modify the original target");
+              "symlink publication fault does not modify the original target");
   }
   if (!temporary_symlink_error) {
     expect_true(std::filesystem::is_symlink(predictable_temporary),
@@ -1247,12 +1247,12 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
           std::string_view::npos;
     }
     expect_true(throwing_hook_propagated, force_fallback
-                                              ? "throwing fallback hook propagates after rollback"
-                                              : "throwing exchange hook propagates after rollback");
+                                              ? "throwing fallback publication hook propagates"
+                                              : "throwing publication hook propagates");
     expect_eq(read_text_file(throwing_hook_destination),
               std::string("throwing hook original output\n"),
-              force_fallback ? "throwing fallback hook restores the original output"
-                             : "throwing exchange hook restores the original output");
+              force_fallback ? "throwing fallback hook preserves the original output"
+                             : "throwing hook preserves the original output");
 
     const auto missing_destination =
         root.path() / (force_fallback ? "throwing-fallback-new.json" : "throwing-primary-new.json");
@@ -1268,9 +1268,9 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
           std::string_view(error.what()).find("synthetic after-publication hook failure") !=
           std::string_view::npos;
     }
-    expect_true(throwing_hook_propagated, "throwing new-output hook propagates after rollback");
+    expect_true(throwing_hook_propagated, "throwing new-output publication hook propagates");
     expect_true(!std::filesystem::exists(missing_destination),
-                "throwing new-output hook removes the published output");
+                "throwing new-output hook leaves no output");
   }
 #endif
 
@@ -2199,26 +2199,31 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
   }
 
   const auto windows_post_publish_destination = root.path() / "windows-post-publish-race.json";
+  const auto windows_post_publish_retained =
+      root.path() / "windows-post-publish-race-retained.json";
+  write_text_file(windows_post_publish_destination, "Windows pre-commit original output\n");
   bool windows_post_publish_hook_ran = false;
   bool windows_post_publish_substitution_blocked = false;
   detail::write_calibration_json_atomically(
       R"json({"writer":"windows-post-publish-race"})json", windows_post_publish_destination,
       left_input, right_input, {}, {}, {}, false, [&] {
         windows_post_publish_hook_ran = true;
-        std::error_code remove_error;
-        std::filesystem::remove(windows_post_publish_destination, remove_error);
-        windows_post_publish_substitution_blocked = static_cast<bool>(remove_error);
-        if (!remove_error) {
-          write_text_file(windows_post_publish_destination,
-                          "Windows post-publication replacement\n");
+        std::error_code rename_error;
+        std::filesystem::rename(windows_post_publish_destination, windows_post_publish_retained,
+                                rename_error);
+        windows_post_publish_substitution_blocked = static_cast<bool>(rename_error);
+        if (!rename_error) {
+          write_text_file(windows_post_publish_destination, "Windows pre-commit replacement\n");
         }
       });
-  expect_true(windows_post_publish_hook_ran, "Windows post-publication race hook runs");
+  expect_true(windows_post_publish_hook_ran, "Windows final commit gate hook runs");
   expect_true(windows_post_publish_substitution_blocked,
-              "Windows post-publication substitution is blocked by the retained output handle");
+              "Windows final commit gate blocks destination substitution");
   expect_eq(read_text_file(windows_post_publish_destination),
             std::string("{\"writer\":\"windows-post-publish-race\"}\n"),
-            "Windows post-publication race preserves the published output");
+            "Windows final commit gate publishes the intended output");
+  expect_true(!std::filesystem::exists(windows_post_publish_retained),
+              "blocked Windows final commit race creates no retained substitute");
 
   const auto windows_replace_race_destination = root.path() / "windows-replace-race.json";
   const auto windows_replace_race_retained = root.path() / "windows-replace-race-retained.json";
@@ -2297,94 +2302,6 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
   expect_true(!std::filesystem::exists(windows_source_race_substitute),
               "published Windows temporary name no longer exists");
 
-  const auto windows_rollback_race_destination = root.path() / "windows-rollback-race.json";
-  const auto windows_rollback_race_published = root.path() / "windows-rollback-race-published.json";
-  write_text_file(windows_rollback_race_destination, "Windows rollback original output\n");
-  bool windows_rollback_race_hook_ran = false;
-  bool windows_rollback_race_blocked = false;
-  bool windows_rollback_failure_reported = false;
-  try {
-    detail::write_calibration_json_atomically(
-        R"json({"writer":"windows-rollback-race"})json", windows_rollback_race_destination,
-        left_input, right_input, {}, {}, {}, false,
-        [] { throw std::runtime_error("synthetic Windows rollback race"); }, {},
-        std::chrono::seconds(2), {},
-        [&](const std::filesystem::path&) {
-          windows_rollback_race_hook_ran = true;
-          std::error_code rename_error;
-          std::filesystem::rename(windows_rollback_race_destination,
-                                  windows_rollback_race_published, rename_error);
-          windows_rollback_race_blocked = static_cast<bool>(rename_error);
-          if (!rename_error) {
-            write_text_file(windows_rollback_race_destination,
-                            "Windows rollback concurrent replacement\n");
-          }
-        });
-  } catch (const std::exception& error) {
-    windows_rollback_failure_reported =
-        std::string_view(error.what()).find("synthetic Windows rollback race") !=
-        std::string_view::npos;
-  }
-  expect_true(windows_rollback_race_hook_ran, "Windows rollback race hook runs");
-  expect_true(windows_rollback_race_blocked,
-              "Windows rollback destination race is blocked by the published handle");
-  expect_true(windows_rollback_failure_reported,
-              "Windows rollback reports the original post-publication failure");
-  expect_eq(read_text_file(windows_rollback_race_destination),
-            std::string("Windows rollback original output\n"),
-            "Windows rollback restores the original output");
-  expect_true(!std::filesystem::exists(windows_rollback_race_published),
-              "blocked Windows rollback race moves no published output");
-  bool windows_rollback_original_retained = false;
-  for (const auto& entry : std::filesystem::directory_iterator(root.path())) {
-    if (entry.path().filename().wstring().starts_with(L"windows-rollback-race.json.rollback.") &&
-        read_text_file(entry.path()) == "Windows rollback original output\n") {
-      windows_rollback_original_retained = true;
-    }
-  }
-  expect_true(!windows_rollback_original_retained,
-              "successful Windows rollback leaves no retained original output");
-
-  const auto windows_rollback_source_destination =
-      root.path() / "windows-rollback-source-race.json";
-  const auto windows_rollback_source_retained =
-      root.path() / "windows-rollback-source-race-retained.json";
-  write_text_file(windows_rollback_source_destination, "Windows rollback-source original output\n");
-  std::filesystem::path windows_rollback_source_substitute;
-  bool windows_rollback_source_blocked = false;
-  bool windows_rollback_source_failure_reported = false;
-  try {
-    detail::write_calibration_json_atomically(
-        R"json({"writer":"windows-rollback-source-race"})json", windows_rollback_source_destination,
-        left_input, right_input, {}, {}, {}, false,
-        [] { throw std::runtime_error("synthetic Windows rollback-source race"); }, {},
-        std::chrono::seconds(2), {},
-        [&](const std::filesystem::path& displaced) {
-          windows_rollback_source_substitute = displaced;
-          std::error_code rename_error;
-          std::filesystem::rename(displaced, windows_rollback_source_retained, rename_error);
-          windows_rollback_source_blocked = static_cast<bool>(rename_error);
-          if (!rename_error) {
-            write_text_file(windows_rollback_source_substitute,
-                            "Windows rollback-source concurrent replacement\n");
-          }
-        });
-  } catch (const std::exception& error) {
-    windows_rollback_source_failure_reported =
-        std::string_view(error.what()).find("synthetic Windows rollback-source race") !=
-        std::string_view::npos;
-  }
-  expect_true(windows_rollback_source_blocked,
-              "Windows rollback source race is blocked by the retained rollback handle");
-  expect_true(windows_rollback_source_failure_reported,
-              "Windows rollback-source path reports the original post-publication failure");
-  expect_eq(read_text_file(windows_rollback_source_destination),
-            std::string("Windows rollback-source original output\n"),
-            "Windows rollback-source path restores the original output");
-  expect_true(!std::filesystem::exists(windows_rollback_source_retained),
-              "blocked Windows rollback-source race moves no original output");
-  expect_true(!std::filesystem::exists(windows_rollback_source_substitute),
-              "successful Windows rollback consumes the retained rollback name");
 #endif
 
   const auto commit_alias_destination = root.path() / "commit-input-alias-output.json";
@@ -2411,7 +2328,8 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
     if (filename.starts_with("match.json.tmp.") || filename.starts_with("blocked.json.tmp.") ||
         filename.starts_with("raced-match.json.tmp.") ||
         filename.find(".publish.") != std::string::npos ||
-        filename.find(".quarantine.") != std::string::npos) {
+        filename.find(".quarantine.") != std::string::npos ||
+        filename.find(".rollback.") != std::string::npos) {
       orphaned_temporary = true;
     }
   }

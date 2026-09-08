@@ -607,51 +607,8 @@ public:
          same_windows_file_identity(source_identity, destination_identity);
 }
 
-[[nodiscard]] bool published_path_identifies_handle(HANDLE directory,
-                                                    std::wstring_view destination_name,
-                                                    HANDLE source) {
-  return relative_path_identifies_windows_handle(directory, destination_name, source, false);
-}
-
-[[nodiscard]] DWORD link_open_file(HANDLE handle, HANDLE directory, std::wstring_view link_name,
-                                   bool replace_existing = false) {
-  const auto filename_bytes = link_name.size() * sizeof(wchar_t);
-  // winternl.h does not expose FILE_LINK_INFORMATION. FileLinkInformation
-  // reads the first byte as ReplaceIfExists; FileLinkInformationEx reads the
-  // same storage as a flags word.
-  struct NativeLinkInfo {
-    ULONG flags;
-    HANDLE root_directory;
-    ULONG filename_length;
-    wchar_t filename[1];
-  };
-  static_assert(std::is_standard_layout_v<NativeLinkInfo>);
-  static_assert(sizeof(ULONG) == 4U);
-  const auto info_bytes = offsetof(NativeLinkInfo, filename) + filename_bytes;
-  std::vector<std::max_align_t> storage(
-      (info_bytes + sizeof(std::max_align_t) - 1U) / sizeof(std::max_align_t), std::max_align_t{});
-  auto* raw = reinterpret_cast<std::byte*>(storage.data());
-  constexpr ULONG kReplaceIfExists = 0x00000001;
-  constexpr ULONG kPosixSemantics = 0x00000002;
-  const ULONG flags = replace_existing ? kReplaceIfExists | kPosixSemantics : 0U;
-  const HANDLE root_directory = directory;
-  const auto filename_length = static_cast<ULONG>(filename_bytes);
-  std::memcpy(raw + offsetof(NativeLinkInfo, flags), &flags, sizeof(flags));
-  std::memcpy(raw + offsetof(NativeLinkInfo, root_directory), &root_directory,
-              sizeof(root_directory));
-  std::memcpy(raw + offsetof(NativeLinkInfo, filename_length), &filename_length,
-              sizeof(filename_length));
-  std::memcpy(raw + offsetof(NativeLinkInfo, filename), link_name.data(), filename_bytes);
-  constexpr ULONG kFileLinkInformation = 11;
-  constexpr ULONG kFileLinkInformationEx = 72;
-  return set_windows_file_information(handle, storage.data(), static_cast<ULONG>(info_bytes),
-                                      replace_existing ? kFileLinkInformationEx
-                                                       : kFileLinkInformation);
-}
-
 void rename_open_file(HANDLE handle, HANDLE directory, std::wstring_view destination_name,
-                      const std::filesystem::path& destination, bool allow_reparse_point = false,
-                      bool replace_existing = true) {
+                      const std::filesystem::path& destination, bool replace_existing) {
   const auto filename_bytes = destination_name.size() * sizeof(wchar_t);
   struct ExtendedRenameInfo {
     DWORD flags;
@@ -693,11 +650,6 @@ void rename_open_file(HANDLE handle, HANDLE directory, std::wstring_view destina
     replace_error = set_windows_file_information(
         handle, storage.data(), static_cast<ULONG>(info_bytes), kFileRenameInformationEx);
     if (replace_error == ERROR_SUCCESS) {
-      if (!relative_path_identifies_windows_handle(directory, destination_name, handle,
-                                                   allow_reparse_point)) {
-        throw WindowsPublicationIdentityError(
-            "published calibration output does not identify the temporary file");
-      }
       return;
     }
     if (replace_error == ERROR_INVALID_FUNCTION || replace_error == ERROR_NOT_SUPPORTED ||
@@ -742,11 +694,6 @@ void rename_open_file(HANDLE handle, HANDLE directory, std::wstring_view destina
     replace_error = set_windows_file_information(
         handle, storage.data(), static_cast<ULONG>(info_bytes), kFileRenameInformation);
     if (replace_error == ERROR_SUCCESS) {
-      if (!relative_path_identifies_windows_handle(directory, destination_name, handle,
-                                                   allow_reparse_point)) {
-        throw WindowsPublicationIdentityError(
-            "published calibration output does not identify the temporary file");
-      }
       return;
     }
     if (replace_error != ERROR_SHARING_VIOLATION && replace_error != ERROR_ACCESS_DENIED) {
@@ -766,41 +713,26 @@ void rename_open_file(HANDLE handle, HANDLE directory, std::wstring_view destina
                                     sizeof(disposition)) != 0;
 }
 
-struct WindowsDisplacedOutput {
-  std::wstring name;
-  UniqueWindowsHandle handle;
-};
-
-void publish_windows_output(
-    HANDLE directory, const std::filesystem::path& resolved_directory,
-    std::wstring_view destination_name, std::wstring_view temporary_name, HANDLE& temporary_handle,
-    const std::filesystem::path& destination, bool& destination_published,
-    std::optional<WindowsDisplacedOutput>& displaced_output,
-    const std::function<void(const std::filesystem::path&)>& before_replace) {
-  constexpr ACCESS_MASK access = DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+void publish_windows_output(HANDLE directory, const std::filesystem::path& resolved_directory,
+                            std::wstring_view destination_name, std::wstring_view temporary_name,
+                            HANDLE& temporary_handle, const std::filesystem::path& destination,
+                            bool& destination_published,
+                            const std::function<void(const std::filesystem::path&)>& before_replace,
+                            const std::function<void()>& final_commit_gate) {
+  constexpr ACCESS_MASK access = FILE_READ_ATTRIBUTES | SYNCHRONIZE;
   constexpr ULONG sharing = FILE_SHARE_READ;
   constexpr ULONG options =
       FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT;
-  std::random_device random;
-  constexpr wchar_t hex[] = L"0123456789abcdef";
   constexpr int maximum_replace_attempts = 200;
   constexpr DWORD retry_delay_ms = 10;
   for (int attempt = 0; attempt < maximum_replace_attempts; ++attempt) {
     if (!path_identifies_windows_handle(resolved_directory, directory, true)) {
       throw std::runtime_error("calibration output directory identity changed before replacement");
     }
-    std::array<wchar_t, 32> token{};
-    for (auto& digit : token) {
-      digit = hex[random() & 0x0fU];
-    }
-    std::wstring rollback_name(destination_name);
-    rollback_name += L".rollback.";
-    rollback_name.append(token.begin(), token.end());
     DWORD current_error = ERROR_SUCCESS;
     const HANDLE current = open_windows_file_relative(directory, destination_name, access, sharing,
                                                       FILE_OPEN, options, current_error);
     UniqueWindowsHandle retained_current(current);
-    std::optional<BY_HANDLE_FILE_INFORMATION> expected_destination_identity;
     bool current_is_reparse_point = false;
     if (current != INVALID_HANDLE_VALUE) {
       FILE_ATTRIBUTE_TAG_INFO attributes{};
@@ -810,12 +742,6 @@ void publish_windows_output(
                          static_cast<int>(GetLastError()));
       }
       current_is_reparse_point = (attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-      BY_HANDLE_FILE_INFORMATION current_identity{};
-      if (GetFileInformationByHandle(current, &current_identity) == 0) {
-        throw_file_error("cannot inspect calibration output identity", destination,
-                         static_cast<int>(GetLastError()));
-      }
-      expected_destination_identity = current_identity;
     } else if (current_error != ERROR_FILE_NOT_FOUND && current_error != ERROR_PATH_NOT_FOUND) {
       if ((current_error == ERROR_SHARING_VIOLATION || current_error == ERROR_ACCESS_DENIED) &&
           attempt + 1 < maximum_replace_attempts) {
@@ -844,8 +770,11 @@ void publish_windows_output(
     }
 
     if (current == INVALID_HANDLE_VALUE) {
+      if (final_commit_gate) {
+        final_commit_gate();
+      }
       try {
-        rename_open_file(temporary_handle, directory, destination_name, destination, false, false);
+        rename_open_file(temporary_handle, directory, destination_name, destination, false);
         destination_published = true;
       } catch (const std::system_error& error) {
         if (error.code().value() == ERROR_FILE_EXISTS ||
@@ -855,68 +784,25 @@ void publish_windows_output(
         }
         throw;
       }
-      if (!path_identifies_windows_handle(resolved_directory, directory, true) ||
-          !published_path_identifies_handle(directory, destination_name, temporary_handle)) {
-        throw WindowsPublicationIdentityError(
-            "Windows create-new calibration output changed publication identity");
-      }
       return;
     }
 
-    const auto link_error = link_open_file(current, directory, rollback_name);
-    if (link_error != ERROR_SUCCESS) {
-      if ((link_error == ERROR_FILE_EXISTS || link_error == ERROR_ALREADY_EXISTS) &&
-          attempt + 1 < maximum_replace_attempts) {
-        continue;
-      }
-      throw_file_error("cannot retain calibration output for atomic replacement", destination,
-                       static_cast<int>(link_error));
-    }
-    DWORD rollback_error = ERROR_SUCCESS;
-    const HANDLE rollback = open_windows_file_relative(directory, rollback_name, access, sharing,
-                                                       FILE_OPEN, options, rollback_error);
-    UniqueWindowsHandle retained_rollback(rollback);
-    BY_HANDLE_FILE_INFORMATION displaced_identity{};
-    const bool displaced_matches_expected =
-        rollback != INVALID_HANDLE_VALUE && expected_destination_identity.has_value() &&
-        GetFileInformationByHandle(rollback, &displaced_identity) != 0 &&
-        same_windows_file_identity(*expected_destination_identity, displaced_identity) &&
-        relative_path_identifies_windows_handle(directory, destination_name, current,
-                                                current_is_reparse_point);
-    if (!displaced_matches_expected) {
-      throw WindowsPublicationIdentityError(
-          "calibration output identity changed while retaining atomic rollback");
-    }
-    displaced_output = WindowsDisplacedOutput{.name = std::move(rollback_name),
-                                              .handle = std::move(retained_rollback)};
-    retained_current = UniqueWindowsHandle{};
-    try {
-      rename_open_file(temporary_handle, directory, destination_name, destination, false, true);
-      destination_published = true;
-    } catch (...) {
-      (void)discard_open_file(displaced_output->handle.get());
-      displaced_output.reset();
-      throw;
+    if (final_commit_gate) {
+      final_commit_gate();
     }
     if (!path_identifies_windows_handle(resolved_directory, directory, true) ||
-        !published_path_identifies_handle(directory, destination_name, temporary_handle) ||
-        !relative_path_identifies_windows_handle(directory, displaced_output->name,
-                                                 displaced_output->handle.get(), true)) {
-      try {
-        rename_open_file(displaced_output->handle.get(), directory, destination_name, destination,
-                         true, true);
-        destination_published = false;
-      } catch (...) {
-        throw WindowsPublicationIdentityError(
-            "atomic calibration output replacement changed identity and rollback failed");
-      }
-      displaced_output.reset();
+        !relative_path_identifies_windows_handle(directory, temporary_name, temporary_handle,
+                                                 false) ||
+        !relative_path_identifies_windows_handle(directory, destination_name, current,
+                                                 current_is_reparse_point)) {
       throw WindowsPublicationIdentityError(
-          "atomic calibration output replacement changed publication identity");
+          "calibration output identity changed at the Windows commit boundary");
     }
+    rename_open_file(temporary_handle, directory, destination_name, destination, true);
+    destination_published = true;
     return;
   }
-  throw std::runtime_error("cannot create unique displaced calibration output for " +
+  throw std::runtime_error("cannot retain calibration output for atomic replacement: " +
                            destination.string());
 }
 #elif defined(__linux__)
@@ -2171,10 +2057,9 @@ void write_calibration_json_atomically_impl(
     const std::function<void()>& before_publish,
     std::span<const std::filesystem::path> lens_profiles,
     const std::function<void()>& before_commit, bool force_rename_fallback,
-    const std::function<void()>& after_publish, const std::function<void()>& on_lock_contention,
-    std::chrono::milliseconds lock_timeout,
-    const std::function<void(const std::filesystem::path&)>& before_windows_publish_replace,
-    const std::function<void(const std::filesystem::path&)>& before_windows_rollback_replace) {
+    const std::function<void()>& publication_fault_hook,
+    const std::function<void()>& on_lock_contention, std::chrono::milliseconds lock_timeout,
+    const std::function<void(const std::filesystem::path&)>& before_windows_publish_replace) {
   std::string contents(json);
   contents.push_back('\n');
 #if defined(_WIN32)
@@ -2198,7 +2083,6 @@ void write_calibration_json_atomically_impl(
   std::filesystem::path temporary;
   bool temporary_exists = false;
   bool destination_published = false;
-  std::optional<WindowsDisplacedOutput> displaced_output;
   try {
     temporary = create_exclusive_temporary(destination, output_directory.handle.get(), handle);
     temporary_exists = true;
@@ -2229,126 +2113,32 @@ void write_calibration_json_atomically_impl(
         error.has_value()) {
       throw std::runtime_error("refusing to publish calibration output: " + *error);
     }
+    const auto final_commit_gate = [&] {
+      if (publication_fault_hook) {
+        publication_fault_hook();
+      }
+      left_reservation.verify_unchanged(left_input, "left video input");
+      right_reservation.verify_unchanged(right_input, "right video input");
+      for (std::size_t index = 0; index < profile_reservations.size(); ++index) {
+        profile_reservations[index].verify_unchanged(
+            lens_profiles[index], index == 0 ? "left lens profile" : "right lens profile");
+      }
+      if (const auto error = reco::calibrate::validate_calibration_output_identity(
+              left_input, right_input, destination, lens_profiles);
+          error.has_value()) {
+        throw std::runtime_error("refusing to publish calibration output: " + *error);
+      }
+    };
     const auto temporary_name = temporary.filename().wstring();
     publish_windows_output(output_directory.handle.get(), output_directory.resolved_path,
                            destination_name, temporary_name, handle, destination,
-                           destination_published, displaced_output, before_windows_publish_replace);
+                           destination_published, before_windows_publish_replace,
+                           final_commit_gate);
     temporary_exists = false;
     destination_published = true;
-    std::string rollback_failure_detail;
-    const auto rollback_publication = [&]() noexcept {
-      if (!destination_published) {
-        return false;
-      }
-      try {
-        if (displaced_output.has_value()) {
-          if (!published_path_identifies_handle(output_directory.handle.get(), destination_name,
-                                                handle) ||
-              !relative_path_identifies_windows_handle(output_directory.handle.get(),
-                                                       displaced_output->name,
-                                                       displaced_output->handle.get(), true)) {
-            return false;
-          }
-          if (before_windows_rollback_replace) {
-            before_windows_rollback_replace(output_directory.resolved_path /
-                                            displaced_output->name);
-          }
-          if (!published_path_identifies_handle(output_directory.handle.get(), destination_name,
-                                                handle) ||
-              !relative_path_identifies_windows_handle(output_directory.handle.get(),
-                                                       displaced_output->name,
-                                                       displaced_output->handle.get(), true)) {
-            destination_published = published_path_identifies_handle(output_directory.handle.get(),
-                                                                     destination_name, handle);
-            return false;
-          }
-          const auto restore_error =
-              link_open_file(displaced_output->handle.get(), output_directory.handle.get(),
-                             destination_name, true);
-          if (restore_error != ERROR_SUCCESS) {
-            throw_file_error("cannot relink displaced calibration output for rollback", destination,
-                             static_cast<int>(restore_error));
-          }
-          destination_published = false;
-          if (!relative_path_identifies_windows_handle(output_directory.handle.get(),
-                                                       destination_name,
-                                                       displaced_output->handle.get(), true)) {
-            return false;
-          }
-          if (!discard_open_file(displaced_output->handle.get())) {
-            throw_file_error("cannot remove displaced calibration output rollback link",
-                             output_directory.resolved_path / displaced_output->name,
-                             static_cast<int>(GetLastError()));
-          }
-          displaced_output.reset();
-        } else {
-          rename_open_file(handle, output_directory.handle.get(), temporary_name, temporary, false,
-                           false);
-          temporary_exists = relative_path_identifies_windows_handle(output_directory.handle.get(),
-                                                                     temporary_name, handle, false);
-          destination_published = false;
-          if (!temporary_exists) {
-            return false;
-          }
-        }
-        return true;
-      } catch (const std::exception& error) {
-        rollback_failure_detail = error.what();
-        return false;
-      } catch (...) {
-        rollback_failure_detail = "unknown rollback error";
-        return false;
-      }
-    };
-    try {
-      if (after_publish) {
-        after_publish();
-      }
-    } catch (...) {
-      if (!rollback_publication()) {
-        throw std::runtime_error(
-            "post-publication hook failed and calibration output rollback failed: " +
-            rollback_failure_detail);
-      }
-      throw;
-    }
-    if (!published_path_identifies_handle(output_directory.handle.get(), destination_name,
-                                          handle)) {
-      const bool rolled_back = rollback_publication();
-      throw std::runtime_error(
-          rolled_back ? "published calibration output identity changed after publication"
-                      : "published calibration output identity changed after publication and "
-                        "calibration output rollback failed");
-    }
-    if (displaced_output.has_value()) {
-      if (!discard_open_file(displaced_output->handle.get())) {
-        if (!rollback_publication()) {
-          throw std::runtime_error(
-              "cannot remove displaced calibration output and rollback failed");
-        }
-        throw std::runtime_error("cannot remove displaced calibration output");
-      }
-      displaced_output.reset();
-    }
-    if (CloseHandle(handle) == 0) {
-      handle = INVALID_HANDLE_VALUE;
-      throw_file_error("failed to close calibration output", destination,
-                       static_cast<int>(GetLastError()));
-    }
+    (void)CloseHandle(handle);
     handle = INVALID_HANDLE_VALUE;
   } catch (...) {
-    if (!destination_published && displaced_output.has_value()) {
-      try {
-        rename_open_file(displaced_output->handle.get(), output_directory.handle.get(),
-                         destination_name, destination, true, false);
-        if (relative_path_identifies_windows_handle(output_directory.handle.get(), destination_name,
-                                                    displaced_output->handle.get(), true)) {
-          displaced_output.reset();
-        }
-      } catch (...) {
-        // A concurrent replacement owns the destination; retain the displaced output by name.
-      }
-    }
     if (handle != INVALID_HANDLE_VALUE) {
       const bool retained_temporary =
           temporary_exists && !temporary.empty() &&
@@ -2365,7 +2155,6 @@ void write_calibration_json_atomically_impl(
   }
 #elif defined(__linux__)
   (void)before_windows_publish_replace;
-  (void)before_windows_rollback_replace;
   const auto left_identity = pin_input_identity(left_input, "left video input");
   const auto right_identity = pin_input_identity(right_input, "right video input");
   std::vector<PinnedFileIdentity> profile_identities;
@@ -2400,7 +2189,7 @@ void write_calibration_json_atomically_impl(
   std::string publication_name;
   bool publication_exists = false;
   bool commit_hook_ran = false;
-  bool after_publish_hook_ran = false;
+  bool publication_fault_hook_ran = false;
   try {
     temporary = create_exclusive_temporary_at(directory_descriptor.get(), destination);
     temporary_exists = true;
@@ -2454,15 +2243,15 @@ void write_calibration_json_atomically_impl(
         throw;
       }
     };
-    const auto run_after_publish_hook = [&] {
-      if (!after_publish_hook_ran && after_publish) {
-        after_publish();
+    const auto run_publication_fault_hook = [&] {
+      if (!publication_fault_hook_ran && publication_fault_hook) {
+        publication_fault_hook();
       }
-      after_publish_hook_ran = true;
+      publication_fault_hook_ran = true;
     };
-    const auto run_after_publish_or_rollback = [&](const auto& rollback) {
+    const auto run_publication_fault_or_rollback = [&](const auto& rollback) {
       try {
-        run_after_publish_hook();
+        run_publication_fault_hook();
       } catch (...) {
         if (!rollback()) {
           throw std::runtime_error(
@@ -2498,7 +2287,7 @@ void write_calibration_json_atomically_impl(
             return unlink_descriptor_entry_safely(directory_descriptor.get(), destination_name,
                                                   temporary.descriptor.get(), destination);
           };
-          run_after_publish_or_rollback(rollback_link_if_unchanged);
+          run_publication_fault_or_rollback(rollback_link_if_unchanged);
           validate_published_or_rollback(rollback_link_if_unchanged);
           if (temporary_name_identifies_descriptor(directory_descriptor.get(), publication_name,
                                                    temporary.descriptor.get())) {
@@ -2549,7 +2338,7 @@ void write_calibration_json_atomically_impl(
               directory_descriptor.get(), publication_name, temporary.descriptor.get());
           return rolled_back;
         };
-        run_after_publish_or_rollback(rollback_exchange_if_unchanged);
+        run_publication_fault_or_rollback(rollback_exchange_if_unchanged);
         if (!temporary_name_identifies_descriptor(directory_descriptor.get(), destination_name,
                                                   temporary.descriptor.get()) ||
             !directory_entry_matches_snapshot(directory_descriptor.get(), publication_name,
@@ -2627,7 +2416,7 @@ void write_calibration_json_atomically_impl(
             directory_descriptor.get(), temporary.name, temporary.descriptor.get());
         return rolled_back;
       };
-      run_after_publish_or_rollback(rollback_fallback_if_unchanged);
+      run_publication_fault_or_rollback(rollback_fallback_if_unchanged);
       if (!temporary_name_identifies_descriptor(directory_descriptor.get(), destination_name,
                                                 temporary.descriptor.get()) ||
           (exchanged && (!displaced_snapshot.has_value() ||
@@ -2685,10 +2474,9 @@ void write_calibration_json_atomically_impl(
   }
 #else
   (void)before_windows_publish_replace;
-  (void)before_windows_rollback_replace;
   (void)force_rename_fallback;
 #if !defined(__APPLE__)
-  (void)after_publish;
+  (void)publication_fault_hook;
   (void)on_lock_contention;
   (void)lock_timeout;
 #endif
@@ -2785,8 +2573,8 @@ void write_calibration_json_atomically_impl(
         return rolled_back;
       };
       try {
-        if (after_publish) {
-          after_publish();
+        if (publication_fault_hook) {
+          publication_fault_hook();
         }
       } catch (...) {
         if (!rollback_new_output()) {
@@ -2836,8 +2624,8 @@ void write_calibration_json_atomically_impl(
         return rolled_back;
       };
       try {
-        if (after_publish) {
-          after_publish();
+        if (publication_fault_hook) {
+          publication_fault_hook();
         }
       } catch (...) {
         if (!rollback_exchange_if_unchanged()) {
@@ -3964,14 +3752,13 @@ void write_calibration_json_atomically(
     const std::function<void()>& before_publish,
     std::span<const std::filesystem::path> lens_profiles,
     const std::function<void()>& before_commit, bool force_rename_fallback,
-    const std::function<void()>& after_publish, const std::function<void()>& on_lock_contention,
-    std::chrono::milliseconds lock_timeout,
-    const std::function<void(const std::filesystem::path&)>& before_windows_publish_replace,
-    const std::function<void(const std::filesystem::path&)>& before_windows_rollback_replace) {
-  write_calibration_json_atomically_impl(
-      json, destination, left_input, right_input, before_publish, lens_profiles, before_commit,
-      force_rename_fallback, after_publish, on_lock_contention, lock_timeout,
-      before_windows_publish_replace, before_windows_rollback_replace);
+    const std::function<void()>& publication_fault_hook,
+    const std::function<void()>& on_lock_contention, std::chrono::milliseconds lock_timeout,
+    const std::function<void(const std::filesystem::path&)>& before_windows_publish_replace) {
+  write_calibration_json_atomically_impl(json, destination, left_input, right_input, before_publish,
+                                         lens_profiles, before_commit, force_rename_fallback,
+                                         publication_fault_hook, on_lock_contention, lock_timeout,
+                                         before_windows_publish_replace);
 }
 
 } // namespace detail

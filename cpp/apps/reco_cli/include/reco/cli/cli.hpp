@@ -180,18 +180,19 @@ resolve_calibration_worker(const std::filesystem::path& executable_path);
 
 /// Publishes serialized calibration JSON after rechecking that it cannot replace an input or
 /// selected lens profile. The trailing controls are deterministic race hooks for publication
-/// tests; production callers leave them at their defaults.
+/// tests; production callers leave them at their defaults. On Windows, `publication_fault_hook`
+/// runs at the final protected pre-commit boundary because an open destination cannot be rolled
+/// back atomically.
 void write_calibration_json_atomically(
     std::string_view json, const std::filesystem::path& destination,
     const std::filesystem::path& left_input, const std::filesystem::path& right_input,
     const std::function<void()>& before_publish = {},
     std::span<const std::filesystem::path> lens_profiles = {},
     const std::function<void()>& before_commit = {}, bool force_rename_fallback = false,
-    const std::function<void()>& after_publish = {},
+    const std::function<void()>& publication_fault_hook = {},
     const std::function<void()>& on_lock_contention = {},
     std::chrono::milliseconds lock_timeout = std::chrono::seconds(2),
-    const std::function<void(const std::filesystem::path&)>& before_windows_publish_replace = {},
-    const std::function<void(const std::filesystem::path&)>& before_windows_rollback_replace = {});
+    const std::function<void(const std::filesystem::path&)>& before_windows_publish_replace = {});
 
 } // namespace detail
 
