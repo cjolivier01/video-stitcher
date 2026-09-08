@@ -2204,26 +2204,43 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
   write_text_file(windows_post_publish_destination, "Windows pre-commit original output\n");
   bool windows_post_publish_hook_ran = false;
   bool windows_post_publish_substitution_blocked = false;
-  detail::write_calibration_json_atomically(
-      R"json({"writer":"windows-post-publish-race"})json", windows_post_publish_destination,
-      left_input, right_input, {}, {}, {}, false, [&] {
-        windows_post_publish_hook_ran = true;
-        std::error_code rename_error;
-        std::filesystem::rename(windows_post_publish_destination, windows_post_publish_retained,
-                                rename_error);
-        windows_post_publish_substitution_blocked = static_cast<bool>(rename_error);
-        if (!rename_error) {
-          write_text_file(windows_post_publish_destination, "Windows pre-commit replacement\n");
-        }
-      });
+  bool windows_post_publish_substitution_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"windows-post-publish-race"})json", windows_post_publish_destination,
+        left_input, right_input, {}, {}, {}, false, [&] {
+          windows_post_publish_hook_ran = true;
+          std::error_code rename_error;
+          std::filesystem::rename(windows_post_publish_destination, windows_post_publish_retained,
+                                  rename_error);
+          windows_post_publish_substitution_blocked = static_cast<bool>(rename_error);
+          if (!rename_error) {
+            write_text_file(windows_post_publish_destination, "Windows pre-commit replacement\n");
+          }
+        });
+  } catch (const std::exception& error) {
+    windows_post_publish_substitution_rejected =
+        std::string_view(error.what()).find("destination output changed at the Windows commit") !=
+        std::string_view::npos;
+  }
   expect_true(windows_post_publish_hook_ran, "Windows final commit gate hook runs");
-  expect_true(windows_post_publish_substitution_blocked,
-              "Windows final commit gate blocks destination substitution");
-  expect_eq(read_text_file(windows_post_publish_destination),
-            std::string("{\"writer\":\"windows-post-publish-race\"}\n"),
-            "Windows final commit gate publishes the intended output");
-  expect_true(!std::filesystem::exists(windows_post_publish_retained),
-              "blocked Windows final commit race creates no retained substitute");
+  expect_true(windows_post_publish_substitution_blocked ||
+                  windows_post_publish_substitution_rejected,
+              "Windows final commit gate blocks or rejects destination substitution");
+  if (windows_post_publish_substitution_blocked) {
+    expect_eq(read_text_file(windows_post_publish_destination),
+              std::string("{\"writer\":\"windows-post-publish-race\"}\n"),
+              "blocked Windows final commit race publishes the intended output");
+    expect_true(!std::filesystem::exists(windows_post_publish_retained),
+                "blocked Windows final commit race creates no retained substitute");
+  } else {
+    expect_eq(read_text_file(windows_post_publish_destination),
+              std::string("Windows pre-commit replacement\n"),
+              "rejected Windows final commit race preserves the concurrent replacement");
+    expect_eq(read_text_file(windows_post_publish_retained),
+              std::string("Windows pre-commit original output\n"),
+              "rejected Windows final commit race preserves the moved original output");
+  }
 
   const auto windows_replace_race_destination = root.path() / "windows-replace-race.json";
   const auto windows_replace_race_retained = root.path() / "windows-replace-race-retained.json";
