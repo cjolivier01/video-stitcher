@@ -468,12 +468,6 @@ KernelViewParams make_view_params(const CudaStitchRendererConfig& config,
   return params;
 }
 
-bool spans_overlap(const CudaPitchedPlaneView& lhs, const CudaPitchedPlaneView& rhs) {
-  const auto lhs_last = lhs.ptr() + lhs.address_span_bytes() - 1U;
-  const auto rhs_last = rhs.ptr() + rhs.address_span_bytes() - 1U;
-  return lhs.ptr() <= rhs_last && rhs.ptr() <= lhs_last;
-}
-
 void validate_frame_provenance(const CudaNv12FrameView& frame, const CameraParams& camera,
                                CudaContextId context_id, int device_ordinal,
                                std::string_view label) {
@@ -491,12 +485,21 @@ void validate_frame_provenance(const CudaNv12FrameView& frame, const CameraParam
   }
 }
 
-void validate_plane_allocation(const CudaBackend& backend, const CudaPitchedPlaneView& plane,
-                               std::string_view label, CudaSpanAccess required_access,
-                               int device_ordinal) {
+CudaValidatedSpan validate_plane_allocation(const CudaBackend& backend,
+                                            const CudaPitchedPlaneView& plane,
+                                            std::string_view label, CudaSpanAccess required_access,
+                                            int device_ordinal) {
   try {
-    backend.validate_device_span(plane.ptr(), plane.accessible_bytes(), required_access,
-                                 device_ordinal);
+    if (const auto* validation = plane.driver_validation(); validation != nullptr) {
+      if (!validation->permits(required_access)) {
+        throw std::invalid_argument(required_access == CudaSpanAccess::ReadWrite
+                                        ? "CUDA device span does not permit device writes"
+                                        : "CUDA device span does not permit device reads");
+      }
+      return *validation;
+    }
+    return backend.retain_device_span(plane.ptr(), plane.address_span_bytes(), required_access,
+                                      device_ordinal);
   } catch (const std::invalid_argument& error) {
     throw std::invalid_argument("CUDA stitch " + std::string(label) +
                                 " plane is invalid: " + error.what());
@@ -578,19 +581,21 @@ void CudaStereoStitchRenderer::render(const CudaNv12FrameView& left, const CudaN
   if (output.device_ordinal() != state.config.device_ordinal) {
     throw std::invalid_argument("CUDA stitch RGBA output belongs to a different CUDA device");
   }
-  validate_plane_allocation(state.backend, left.y_plane(), "left Y", CudaSpanAccess::Read,
-                            state.config.device_ordinal);
-  validate_plane_allocation(state.backend, left.uv_plane(), "left UV", CudaSpanAccess::Read,
-                            state.config.device_ordinal);
-  validate_plane_allocation(state.backend, right.y_plane(), "right Y", CudaSpanAccess::Read,
-                            state.config.device_ordinal);
-  validate_plane_allocation(state.backend, right.uv_plane(), "right UV", CudaSpanAccess::Read,
-                            state.config.device_ordinal);
-  validate_plane_allocation(state.backend, output.plane(), "RGBA output", CudaSpanAccess::ReadWrite,
-                            state.config.device_ordinal);
-  for (const auto* input_plane :
-       {&left.y_plane(), &left.uv_plane(), &right.y_plane(), &right.uv_plane()}) {
-    if (spans_overlap(*input_plane, output.plane())) {
+  const std::array<CudaValidatedSpan, 4> input_spans{
+      validate_plane_allocation(state.backend, left.y_plane(), "left Y", CudaSpanAccess::Read,
+                                state.config.device_ordinal),
+      validate_plane_allocation(state.backend, left.uv_plane(), "left UV", CudaSpanAccess::Read,
+                                state.config.device_ordinal),
+      validate_plane_allocation(state.backend, right.y_plane(), "right Y", CudaSpanAccess::Read,
+                                state.config.device_ordinal),
+      validate_plane_allocation(state.backend, right.uv_plane(), "right UV", CudaSpanAccess::Read,
+                                state.config.device_ordinal),
+  };
+  const auto output_span =
+      validate_plane_allocation(state.backend, output.plane(), "RGBA output",
+                                CudaSpanAccess::ReadWrite, state.config.device_ordinal);
+  for (const auto& input_span : input_spans) {
+    if (input_span.aliases(output_span)) {
       throw std::invalid_argument("CUDA stitch input and RGBA output memory must not overlap");
     }
   }

@@ -386,16 +386,16 @@ public:
   GstreamerPipelineResources(const GstreamerPipelineResources&) = delete;
   GstreamerPipelineResources& operator=(const GstreamerPipelineResources&) = delete;
 
-  void interrupt() noexcept {
+  [[nodiscard]] bool interrupt() noexcept {
     std::lock_guard lock(mutex_);
     if (interrupted_ || closed_ || pipeline == nullptr) {
-      return;
+      return true;
     }
-    interrupted_ = true;
     if (void* flush = api_->event_new_flush_start(); flush != nullptr) {
       // gst_element_send_event takes ownership of the event, including on failure.
-      (void)api_->element_send_event(pipeline, flush);
+      interrupted_ = api_->element_send_event(pipeline, flush) != 0;
     }
+    return interrupted_;
   }
 
   void close() noexcept {
@@ -977,11 +977,11 @@ public:
   [[nodiscard]] bool gpu_resident() const override { return true; }
 
   void request_stop() noexcept override {
-    const bool already_requested = stop_requested_.exchange(true, std::memory_order_acq_rel);
+    stop_requested_.store(true, std::memory_order_release);
     // Every racing caller attempts the idempotent interrupt. This avoids a caller observing the
     // stop flag in the interval before the first caller has flushed the pipeline.
-    resources_->interrupt();
-    if (already_requested) {
+    const bool interrupted = resources_->interrupt();
+    if (!interrupted || stop_drain_started_.exchange(true, std::memory_order_acq_rel)) {
       return;
     }
     // Flush first: NVIDIA GStreamer elements can otherwise retain a streaming-pad lock while a
@@ -1391,7 +1391,7 @@ private:
     // Frame leases defer NULL and unref, but they must not leave a destroyed source decoding in
     // PLAYING. Both operations are internally synchronized and idempotent for partial startup and
     // repeated request_stop/destructor paths.
-    resources_->interrupt();
+    (void)resources_->interrupt();
     pipeline_lifetime_->release_source();
   }
 
@@ -1425,6 +1425,7 @@ private:
   std::uint16_t rotation_degrees_ = 0;
   std::optional<std::string> terminal_error_;
   std::atomic<bool> stop_requested_{false};
+  std::atomic<bool> stop_drain_started_{false};
   bool ended_ = false;
 };
 

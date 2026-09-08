@@ -156,17 +156,17 @@ struct NvmmCudaFrame {
   core::CudaDevicePtr uv_ptr = 0;
   std::size_t y_pitch = 0;
   std::size_t uv_pitch = 0;
-  /// Bytes accessible from the Y pointer within its driver-reported mapping and plane allocation.
+  /// Bytes accessible from the Y pointer within its driver-validated range and plane allocation.
   std::size_t y_accessible_bytes = 0;
-  /// Bytes accessible from the UV pointer within its driver-reported mapping and plane allocation.
+  /// Bytes accessible from the UV pointer within its driver-validated range and plane allocation.
   std::size_t uv_accessible_bytes = 0;
-  /// Base address of the CUDA mapping containing the Y plane.
+  /// Base of the validated Y range (the allocation base for context-owned memory).
   core::CudaDevicePtr y_mapping_base = 0;
-  /// Base address of the CUDA mapping containing the UV plane.
+  /// Base of the validated UV range (the allocation base for context-owned memory).
   core::CudaDevicePtr uv_mapping_base = 0;
-  /// Driver-reported byte size of the CUDA mapping containing the Y plane.
+  /// Bytes in the validated Y range (the allocation size for context-owned memory).
   std::size_t y_mapping_bytes = 0;
-  /// Driver-reported byte size of the CUDA mapping containing the UV plane.
+  /// Bytes in the validated UV range (the allocation size for context-owned memory).
   std::size_t uv_mapping_bytes = 0;
   std::uint32_t width = 0;
   std::uint32_t height = 0;
@@ -180,6 +180,11 @@ struct NvmmCudaFrame {
   /// Exact NvBufSurface provider retained through mapping cleanup.
   std::shared_ptr<const NvbufSurfaceRuntime> runtime;
   std::shared_ptr<void> owner;
+  // Appended to preserve the public aggregate's legacy positional prefix.
+  /// Retained whole-span driver validation for the Y plane.
+  core::CudaValidatedSpan y_validation;
+  /// Retained whole-span driver validation for the UV plane.
+  core::CudaValidatedSpan uv_validation;
 };
 
 // Compatibility overload for the DeepStream 7.1 Jetson ABI used by the

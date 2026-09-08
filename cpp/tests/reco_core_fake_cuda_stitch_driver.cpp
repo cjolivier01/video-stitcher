@@ -27,12 +27,16 @@ constexpr std::uint64_t kUnmappedAllocation = 0xD0000U;
 constexpr std::uint64_t kNoAccessAllocation = 0xE0000U;
 constexpr std::uint64_t kReadOnlyAllocation = 0xF0000U;
 constexpr std::uint64_t kContextIndependentMapping = 0x50000U;
+constexpr std::uint64_t kPhysicalAliasMapping = 0x60000U;
+constexpr std::uint64_t kSplitAccessMapping = 0x100000U;
 thread_local void* current_context = nullptr;
 std::atomic<int> retain_count{0};
 std::atomic<int> release_count{0};
 std::atomic<int> launch_count{0};
 std::atomic<int> synchronize_count{0};
 std::atomic<int> pointer_attribute_count{0};
+std::atomic<int> memory_access_count{0};
+std::atomic<bool> fail_module_load{false};
 std::atomic<int> sequence{0};
 std::atomic<int> last_launch_sequence{0};
 std::atomic<int> last_synchronize_sequence{0};
@@ -77,6 +81,8 @@ RECO_FAKE_CUDA_EXPORT void recoFakeCudaStitchReset() {
   launch_count = 0;
   synchronize_count = 0;
   pointer_attribute_count = 0;
+  memory_access_count = 0;
+  fail_module_load = false;
   sequence = 0;
   last_launch_sequence = 0;
   last_synchronize_sequence = 0;
@@ -94,8 +100,20 @@ RECO_FAKE_CUDA_EXPORT int recoFakeCudaStitchSynchronizeSequence() {
 RECO_FAKE_CUDA_EXPORT int recoFakeCudaStitchPointerAttributeCount() {
   return pointer_attribute_count.load();
 }
+RECO_FAKE_CUDA_EXPORT int recoFakeCudaStitchMemoryAccessCount() {
+  return memory_access_count.load();
+}
 RECO_FAKE_CUDA_EXPORT int recoFakeCudaStitchRetainCount() { return retain_count.load(); }
 RECO_FAKE_CUDA_EXPORT int recoFakeCudaStitchReleaseCount() { return release_count.load(); }
+RECO_FAKE_CUDA_EXPORT void recoFakeCudaStitchSetCurrentContext(std::uintptr_t context) {
+  current_context = reinterpret_cast<void*>(context);
+}
+RECO_FAKE_CUDA_EXPORT std::uintptr_t recoFakeCudaStitchCurrentContext() {
+  return reinterpret_cast<std::uintptr_t>(current_context);
+}
+RECO_FAKE_CUDA_EXPORT void recoFakeCudaStitchFailModuleLoad(int fail) {
+  fail_module_load = fail != 0;
+}
 RECO_FAKE_CUDA_EXPORT std::uint64_t recoFakeCudaStitchCapturedU64(int index) {
   return index >= 0 && static_cast<std::size_t>(index) < captured_u64.size()
              ? captured_u64[static_cast<std::size_t>(index)]
@@ -221,8 +239,10 @@ RECO_FAKE_CUDA_EXPORT int cuPointerGetAttribute(void* data, int attribute, std::
     *static_cast<void**>(data) =
         base == kForeignContextAllocation
             ? reinterpret_cast<void*>(kForeignContextIdentity)
-            : (base == kContextIndependentMapping ? nullptr
-                                                  : reinterpret_cast<void*>(kContextIdentity));
+            : (base == kContextIndependentMapping || base == kPhysicalAliasMapping ||
+                       base == kSplitAccessMapping || base == kSplitAccessMapping + 0x1000U
+                   ? nullptr
+                   : reinterpret_cast<void*>(kContextIdentity));
     return 0;
   case 2:
     *static_cast<unsigned int*>(data) = base == kHostAllocation ? 1U : 2U;
@@ -256,7 +276,7 @@ RECO_FAKE_CUDA_EXPORT int cuPointerGetAttribute(void* data, int attribute, std::
 
 RECO_FAKE_CUDA_EXPORT int cuModuleLoadData(void** module, const void* image) {
   if (module == nullptr || image == nullptr || retain_count.load() <= 0 ||
-      current_context != reinterpret_cast<void*>(kContextIdentity)) {
+      current_context != reinterpret_cast<void*>(kContextIdentity) || fail_module_load.load()) {
     return 1;
   }
   *module = reinterpret_cast<void*>(0x1234U);
@@ -319,7 +339,36 @@ RECO_FAKE_CUDA_EXPORT int cuMemsetD8_v2(std::uint64_t, unsigned char, std::size_
 RECO_FAKE_CUDA_EXPORT int cuMemcpy2D_v2(const void*) { return 1; }
 RECO_FAKE_CUDA_EXPORT int cuMemcpyDtoH_v2(void*, std::uint64_t, std::size_t) { return 1; }
 RECO_FAKE_CUDA_EXPORT int cuMemGetInfo_v2(std::size_t*, std::size_t*) { return 1; }
-RECO_FAKE_CUDA_EXPORT int cuMemGetAllocationGranularity(std::size_t*, const void*, unsigned int) {
+RECO_FAKE_CUDA_EXPORT int cuMemGetAllocationGranularity(std::size_t* granularity, const void*,
+                                                        unsigned int option) {
+  if (granularity == nullptr || option != 0U) {
+    return 1;
+  }
+  *granularity = kAllocationAlignment;
+  return 0;
+}
+RECO_FAKE_CUDA_EXPORT int cuMemGetAccess(std::uint64_t* flags, const void*, std::uint64_t pointer) {
+  if (flags == nullptr || current_context != reinterpret_cast<void*>(kContextIdentity)) {
+    return 1;
+  }
+  ++memory_access_count;
+  *flags = pointer == kSplitAccessMapping + kAllocationAlignment ? 0U : 3U;
+  return 0;
+}
+RECO_FAKE_CUDA_EXPORT int cuMemRetainAllocationHandle(std::uint64_t* handle, void* address) {
+  if (handle == nullptr || current_context != reinterpret_cast<void*>(kContextIdentity)) {
+    return 1;
+  }
+  const auto pointer = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(address));
+  const auto base = allocation_base(pointer);
+  if (base == kContextIndependentMapping || base == kPhysicalAliasMapping) {
+    *handle = 0x500U;
+    return 0;
+  }
+  if (base == kSplitAccessMapping || base == kSplitAccessMapping + kAllocationAlignment) {
+    *handle = 0x1000U;
+    return 0;
+  }
   return 1;
 }
 RECO_FAKE_CUDA_EXPORT int cuMemAddressReserve(std::uint64_t*, std::size_t, std::size_t,
@@ -340,6 +389,8 @@ RECO_FAKE_CUDA_EXPORT int cuMemMap(std::uint64_t, std::size_t, std::size_t, std:
 RECO_FAKE_CUDA_EXPORT int cuMemSetAccess(std::uint64_t, std::size_t, const void*, std::size_t) {
   return 1;
 }
-RECO_FAKE_CUDA_EXPORT int cuMemRelease(std::uint64_t) { return 1; }
+RECO_FAKE_CUDA_EXPORT int cuMemRelease(std::uint64_t handle) {
+  return handle == 0x500U || handle == 0x1000U ? 0 : 1;
+}
 RECO_FAKE_CUDA_EXPORT int cuMemUnmap(std::uint64_t, std::size_t) { return 1; }
 RECO_FAKE_CUDA_EXPORT int cuMemAddressFree(std::uint64_t, std::size_t) { return 1; }

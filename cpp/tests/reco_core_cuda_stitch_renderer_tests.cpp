@@ -1,4 +1,5 @@
 #include "reco/core/cuda_stitch_renderer.hpp"
+#include "reco/core/path.hpp"
 
 #include "rules_cc/cc/runfiles/runfiles.h"
 
@@ -215,8 +216,13 @@ struct FakeCudaControl {
     synchronize_sequence_fn = library.symbol<int (*)()>("recoFakeCudaStitchSynchronizeSequence");
     pointer_attribute_count_fn =
         library.symbol<int (*)()>("recoFakeCudaStitchPointerAttributeCount");
+    memory_access_count_fn = library.symbol<int (*)()>("recoFakeCudaStitchMemoryAccessCount");
     retain_count_fn = library.symbol<int (*)()>("recoFakeCudaStitchRetainCount");
     release_count_fn = library.symbol<int (*)()>("recoFakeCudaStitchReleaseCount");
+    set_current_context_fn =
+        library.symbol<void (*)(std::uintptr_t)>("recoFakeCudaStitchSetCurrentContext");
+    current_context_fn = library.symbol<std::uintptr_t (*)()>("recoFakeCudaStitchCurrentContext");
+    fail_module_load_fn = library.symbol<void (*)(int)>("recoFakeCudaStitchFailModuleLoad");
     captured_u64_fn = library.symbol<std::uint64_t (*)(int)>("recoFakeCudaStitchCapturedU64");
     captured_u32_fn = library.symbol<std::uint32_t (*)(int)>("recoFakeCudaStitchCapturedU32");
     captured_float_fn = library.symbol<float (*)(int)>("recoFakeCudaStitchCapturedFloat");
@@ -228,8 +234,12 @@ struct FakeCudaControl {
   int launch_sequence() const { return launch_sequence_fn(); }
   int synchronize_sequence() const { return synchronize_sequence_fn(); }
   int pointer_attribute_count() const { return pointer_attribute_count_fn(); }
+  int memory_access_count() const { return memory_access_count_fn(); }
   int retain_count() const { return retain_count_fn(); }
   int release_count() const { return release_count_fn(); }
+  void set_current_context(std::uintptr_t context) const { set_current_context_fn(context); }
+  std::uintptr_t current_context() const { return current_context_fn(); }
+  void fail_module_load(bool fail) const { fail_module_load_fn(fail ? 1 : 0); }
   std::uint64_t captured_u64(int index) const { return captured_u64_fn(index); }
   std::uint32_t captured_u32(int index) const { return captured_u32_fn(index); }
   float captured_float(int index) const { return captured_float_fn(index); }
@@ -241,8 +251,12 @@ struct FakeCudaControl {
   int (*launch_sequence_fn)() = nullptr;
   int (*synchronize_sequence_fn)() = nullptr;
   int (*pointer_attribute_count_fn)() = nullptr;
+  int (*memory_access_count_fn)() = nullptr;
   int (*retain_count_fn)() = nullptr;
   int (*release_count_fn)() = nullptr;
+  void (*set_current_context_fn)(std::uintptr_t) = nullptr;
+  std::uintptr_t (*current_context_fn)() = nullptr;
+  void (*fail_module_load_fn)(int) = nullptr;
   std::uint64_t (*captured_u64_fn)(int) = nullptr;
   std::uint32_t (*captured_u32_fn)(int) = nullptr;
   float (*captured_float_fn)(int) = nullptr;
@@ -332,6 +346,21 @@ void exact_path_backend_retains_primary_context_for_process_lifetime(
   expect_eq(cuda_control.retain_count(), 1, "repeated exact-path load does not retain again");
 }
 
+void exact_cuda_runtime_path_preserves_windows_unicode(const std::filesystem::path& cuda_runtime) {
+#if defined(_WIN32)
+  const auto directory = std::filesystem::temp_directory_path() /
+                         std::filesystem::path(std::u8string(u8"reco-cuda-\u663e\u793a"));
+  std::filesystem::create_directories(directory);
+  const auto copied_runtime = directory / cuda_runtime.filename();
+  std::filesystem::copy_file(cuda_runtime, copied_runtime,
+                             std::filesystem::copy_options::overwrite_existing);
+  auto backend = CudaBackend::load(path_to_utf8(copied_runtime));
+  expect_eq(backend.device_count(), 1, "Unicode CUDA runtime path loads exact driver");
+#else
+  (void)cuda_runtime;
+#endif
+}
+
 void compiles_once_and_synchronizes_each_render(const std::filesystem::path& cuda_runtime,
                                                 const std::filesystem::path& nvrtc_runtime,
                                                 const FakeCudaControl& cuda_control,
@@ -364,8 +393,10 @@ void compiles_once_and_synchronizes_each_render(const std::filesystem::path& cud
   expect_eq(nvrtc_control.create_count(), 1, "render never recompiles the kernel");
   expect_eq(cuda_control.launch_count(), 2, "one fused launch per render");
   expect_eq(cuda_control.synchronize_count(), 2, "each render synchronizes before return");
-  expect_eq(cuda_control.pointer_attribute_count(), 70,
-            "each render validates all five pointers through seven CUDA attributes");
+  expect_eq(cuda_control.pointer_attribute_count(), 64,
+            "each render validates legacy pointers and the VMM output provenance");
+  expect_eq(cuda_control.memory_access_count(), 2,
+            "each render validates the complete VMM output access range");
   expect_true(cuda_control.launch_sequence() < cuda_control.synchronize_sequence(),
               "launch precedes synchronization");
   expect_eq(cuda_control.captured_u64(0), left.y_plane().ptr(), "left Y pointer propagated");
@@ -401,6 +432,88 @@ void enforces_device_access_permissions(const std::filesystem::path& cuda_runtim
       [&] { renderer.render(nv12_frame(0x10000U, context), right, rgba_frame(0xF0000U, context)); },
       "writes", "read-only output is rejected");
   expect_eq(cuda_control.launch_count(), 1, "denied access never launches the kernel");
+}
+
+void rejects_split_vmm_permissions(const std::filesystem::path& cuda_runtime,
+                                   const FakeCudaControl& cuda_control) {
+  auto backend = CudaBackend::load(cuda_runtime.string());
+  cuda_control.reset();
+  expect_invalid_argument(
+      [&] { (void)backend.retain_device_span(0x100000U, 0x2000U, CudaSpanAccess::Read); }, "reads",
+      "inaccessible second VMM region is rejected");
+  expect_eq(cuda_control.memory_access_count(), 2,
+            "whole-span VMM validation reaches the inaccessible second region");
+}
+
+void rejects_physical_vmm_aliases(const std::filesystem::path& cuda_runtime,
+                                  const std::filesystem::path& nvrtc_runtime,
+                                  const FakeCudaControl& cuda_control) {
+  auto renderer = create_renderer(config(), cuda_runtime, nvrtc_runtime);
+  const auto context = renderer.context_id();
+  cuda_control.reset();
+  expect_invalid_argument(
+      [&] {
+        renderer.render(nv12_frame(0x60000U, context), nv12_frame(0x30000U, context),
+                        rgba_frame(0x50000U, context));
+      },
+      "overlap", "distinct virtual mappings of one physical allocation are rejected");
+  expect_eq(cuda_control.launch_count(), 0, "physical alias rejection prevents kernel launch");
+}
+
+void retained_span_validation_avoids_render_time_driver_queries(
+    const std::filesystem::path& cuda_runtime, const std::filesystem::path& nvrtc_runtime,
+    const FakeCudaControl& cuda_control) {
+  auto backend = CudaBackend::load(cuda_runtime.string());
+  auto renderer = CudaStereoStitchRenderer::create(config(), backend,
+                                                   NvrtcCompiler::load(nvrtc_runtime.string()));
+  const CudaNv12FrameView left(
+      CudaPitchedPlaneView(backend.retain_device_span(0x10000U, 12U, CudaSpanAccess::Read), 8, 4,
+                           2),
+      CudaPitchedPlaneView(backend.retain_device_span(0x11000U, 4U, CudaSpanAccess::Read), 8, 4, 1),
+      4, 2, YuvColorMatrix::Bt709, YuvColorRange::Limited);
+  const CudaNv12FrameView right(
+      CudaPitchedPlaneView(backend.retain_device_span(0x30000U, 12U, CudaSpanAccess::Read), 8, 4,
+                           2),
+      CudaPitchedPlaneView(backend.retain_device_span(0x31000U, 4U, CudaSpanAccess::Read), 8, 4, 1),
+      4, 2, YuvColorMatrix::Bt709, YuvColorRange::Limited);
+  const CudaRgbaFrameView output(
+      CudaPitchedPlaneView(backend.retain_device_span(0x50000U, 48U, CudaSpanAccess::ReadWrite), 32,
+                           16, 2),
+      4, 2);
+
+  cuda_control.reset();
+  renderer.render(left, right, output);
+  expect_eq(cuda_control.pointer_attribute_count(), 0,
+            "retained frame validation avoids render-time pointer queries");
+  expect_eq(cuda_control.memory_access_count(), 0,
+            "retained frame validation avoids render-time VMM granule queries");
+  expect_eq(cuda_control.launch_count(), 1, "retained validated spans render normally");
+}
+
+void renderer_construction_restores_callers_context(const std::filesystem::path& cuda_runtime,
+                                                    const std::filesystem::path& nvrtc_runtime,
+                                                    const FakeCudaControl& cuda_control) {
+  constexpr std::uintptr_t kCallerContext = 0xD00D0001U;
+  cuda_control.set_current_context(kCallerContext);
+  {
+    auto renderer = create_renderer(config(), cuda_runtime, nvrtc_runtime);
+    expect_eq(cuda_control.current_context(), kCallerContext,
+              "successful renderer construction restores caller context");
+  }
+  expect_eq(cuda_control.current_context(), kCallerContext,
+            "renderer destruction preserves caller context");
+
+  auto backend = CudaBackend::load(cuda_runtime.string());
+  cuda_control.fail_module_load(true);
+  try {
+    (void)backend.load_module_from_ptx("fake ptx");
+    expect_true(false, "failed module load throws");
+  } catch (const std::runtime_error&) {
+  }
+  cuda_control.fail_module_load(false);
+  expect_eq(cuda_control.current_context(), kCallerContext,
+            "failed module load restores caller context");
+  cuda_control.set_current_context(0);
 }
 
 void rejects_invalid_configuration_before_compilation(const std::filesystem::path& cuda_runtime,
@@ -636,6 +749,8 @@ int main() {
   run_case("exact-path CUDA context lifetime", [&] {
     exact_path_backend_retains_primary_context_for_process_lifetime(cuda_runtime, cuda_control);
   });
+  run_case("exact CUDA Windows Unicode path",
+           [&] { exact_cuda_runtime_path_preserves_windows_unicode(cuda_runtime); });
   run_case("compile once and synchronize", [&] {
     compiles_once_and_synchronizes_each_render(cuda_runtime, nvrtc_runtime, cuda_control,
                                                nvrtc_control);
@@ -647,6 +762,17 @@ int main() {
            [&] { rejects_unsafe_frame_contracts(cuda_runtime, nvrtc_runtime, cuda_control); });
   run_case("device access validation",
            [&] { enforces_device_access_permissions(cuda_runtime, nvrtc_runtime, cuda_control); });
+  run_case("split VMM access validation",
+           [&] { rejects_split_vmm_permissions(cuda_runtime, cuda_control); });
+  run_case("physical VMM alias validation",
+           [&] { rejects_physical_vmm_aliases(cuda_runtime, nvrtc_runtime, cuda_control); });
+  run_case("retained validation render path", [&] {
+    retained_span_validation_avoids_render_time_driver_queries(cuda_runtime, nvrtc_runtime,
+                                                               cuda_control);
+  });
+  run_case("renderer context restoration", [&] {
+    renderer_construction_restores_callers_context(cuda_runtime, nvrtc_runtime, cuda_control);
+  });
   run_case("moved-from renderer",
            [&] { moved_from_renderer_is_diagnosed(cuda_runtime, nvrtc_runtime); });
   run_case("hardware kernel smoke", hardware_kernel_smoke_if_available);

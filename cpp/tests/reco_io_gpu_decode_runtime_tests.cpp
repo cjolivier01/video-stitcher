@@ -380,17 +380,48 @@ void stop_flushes_a_blocked_appsink_read_before_teardown() {
   expect_true(read_returned.load(), "flushed appsink read returns end-of-stream");
   expect_true(!read_failed.load(), "flushed appsink read does not fail");
   source->request_stop();
-  const auto events = read_events(event_path);
+  auto events = read_events(event_path);
   expect_eq(count_event(events, "send-flush-start"), 1U,
             "repeated source stop does not flush the pipeline twice");
   expect_eq(count_event(events, "post-flush-drain"), 1U,
             "source stop drains queued appsink samples after the blocked pull exits");
+  source.reset();
+  events = read_events(event_path);
   const auto blocked = std::find(events.begin(), events.end(), "pull-blocked");
   const auto flushed = std::find(events.begin(), events.end(), "send-flush-start");
   const auto unblocked = std::find(events.begin(), events.end(), "pull-unblocked");
   const auto stopped = std::find(events.begin(), events.end(), "state-null");
-  expect_true(blocked < flushed && flushed < unblocked && unblocked < stopped,
+  expect_true(stopped != events.end() && blocked < flushed && flushed < unblocked &&
+                  unblocked < stopped,
               "flush unblocks the appsink pull before pipeline teardown");
+}
+
+void failed_flush_interrupts_can_be_retried() {
+  const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
+  for (const auto& [failure_scenario, failure_event] :
+       std::array<std::pair<std::string_view, std::string_view>, 2>{
+           {{"flush-event-null", "new-flush-start"}, {"flush-send-fail", "send-flush-failed"}}}) {
+    set_scenario(failure_scenario);
+    std::filesystem::remove(event_path);
+    auto source =
+        open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+
+    source->request_stop();
+    auto events = read_events(event_path);
+    expect_eq(count_event(events, failure_event), 1U,
+              "first stop observes the injected flush failure");
+    expect_eq(count_event(events, "send-flush-start"), 0U,
+              "failed flush attempt is not marked successful");
+
+    set_scenario("frame-eos");
+    source->request_stop();
+    source.reset();
+    events = read_events(event_path);
+    expect_eq(count_event(events, "send-flush-start"), 1U,
+              "second stop retries and dispatches the flush");
+    expect_eq(count_event(events, "state-null"), 1U,
+              "retried flush still permits final pipeline teardown");
+  }
 }
 
 void orientation_tags_are_preserved() {
@@ -1000,6 +1031,7 @@ int run_tests() {
   persistent_stereo_session_pairs_gstreamer_sources();
   early_stereo_stop_flushes_both_pipelines_before_teardown();
   stop_flushes_a_blocked_appsink_read_before_teardown();
+  failed_flush_interrupts_can_be_retried();
   orientation_tags_are_preserved();
   indexed_cadence_drives_frame_indices();
   indexed_decode_seeks_to_absolute_start_frame();

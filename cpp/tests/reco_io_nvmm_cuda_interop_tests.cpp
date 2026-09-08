@@ -320,6 +320,8 @@ void surface_array_mapping_retains_and_unmaps_owner() {
   expect_eq(mapped.context_id, static_cast<std::uintptr_t>(0xC0DA),
             "mapped CUDA context is driver-derived");
   expect_eq(mapped.device_ordinal, 0, "mapped CUDA device is driver-derived");
+  expect_true(static_cast<bool>(mapped.y_validation) && static_cast<bool>(mapped.uv_validation),
+              "mapped CUDA planes retain whole-span driver validation");
   expect_eq(mapped.width, 1278U, "mapped CUDA view uses visible width");
   expect_eq(mapped.gpu_id, 0U, "mapped GPU id");
   expect_eq(mapped_again.y_ptr, mapped.y_ptr, "duplicate map shares CUDA mapping");
@@ -334,6 +336,9 @@ void surface_array_mapping_retains_and_unmaps_owner() {
               "CUDA frame lease uses verified context");
     expect_eq(lease.view().y_plane().accessible_bytes(), 1280U * 720U,
               "CUDA frame lease uses verified Y capacity");
+    expect_true(lease.view().y_plane().driver_validation() != nullptr &&
+                    lease.view().uv_plane().driver_validation() != nullptr,
+                "CUDA frame lease carries mapping-time validation into the renderer");
     expect_true(lease.mapping().owner != nullptr, "CUDA frame lease retains mapping owner");
   }
   expect_nvmm_error([&] { (void)map_nvmm_frame_to_cuda(info, std::make_shared<int>(10)); },

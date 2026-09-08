@@ -24,6 +24,9 @@ public:
   CudaPitchedPlaneView(CudaDevicePtr ptr, std::size_t accessible_bytes, std::size_t pitch_bytes,
                        std::size_t row_bytes, std::uint32_t rows, CudaContextId context_id,
                        int device_ordinal = 0);
+  /// Creates a view backed by a retained whole-span CUDA driver validation.
+  CudaPitchedPlaneView(CudaValidatedSpan validation, std::size_t pitch_bytes, std::size_t row_bytes,
+                       std::uint32_t rows);
 
   /// First byte of the visible plane in CUDA device memory.
   [[nodiscard]] CudaDevicePtr ptr() const { return ptr_; }
@@ -41,6 +44,10 @@ public:
   [[nodiscard]] int device_ordinal() const { return device_ordinal_; }
   /// Minimum address span covering all visible rows and inter-row padding.
   [[nodiscard]] std::size_t address_span_bytes() const { return address_span_bytes_; }
+  /// Driver validation retained with this view, or null for a structural-only borrowed view.
+  [[nodiscard]] const CudaValidatedSpan* driver_validation() const {
+    return validation_ ? &validation_ : nullptr;
+  }
 
 private:
   CudaDevicePtr ptr_ = 0;
@@ -51,6 +58,7 @@ private:
   CudaContextId context_id_ = 0;
   int device_ordinal_ = 0;
   std::size_t address_span_bytes_ = 0;
+  CudaValidatedSpan validation_;
 };
 
 /// Borrowed, 8-bit, 4:2:0 NV12 CUDA frame with independently pitched planes.

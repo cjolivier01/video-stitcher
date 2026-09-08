@@ -121,6 +121,7 @@ struct CudaPitchedAllocation {
 class CudaSharedMemory;
 class CudaModule;
 class CudaKernel;
+class CudaValidatedSpan;
 
 /// Optional non-throwing trace sink for explicit CUDA backend operations.
 class CudaBackendTraceSink {
@@ -167,6 +168,17 @@ public:
   void copy_host_to_device_2d(const CudaHostToDevice2DCopy& copy) const;
   void copy_device_to_device_2d(const Cuda2DCopy& copy) const;
   void copy_device_to_host_2d(const CudaDeviceToHost2DCopy& copy) const;
+  /// Validates and retains the allocation identity covering a borrowed device span.
+  ///
+  /// Context-owned allocations are checked against their complete allocation range. CUDA VMM
+  /// mappings are checked at every minimum-granularity region and retain each physical allocation
+  /// handle, allowing consumers to detect aliases at distinct virtual addresses. The caller must
+  /// keep the virtual mapping live and its access permissions unchanged while the returned lease
+  /// is in use.
+  [[nodiscard]] CudaValidatedSpan retain_device_span(CudaDevicePtr ptr,
+                                                     std::size_t accessible_bytes,
+                                                     CudaSpanAccess required_access,
+                                                     int device_ordinal = 0) const;
   /// Validates that a claimed span is live device memory with the required device access.
   void validate_device_span(CudaDevicePtr ptr, std::size_t accessible_bytes,
                             CudaSpanAccess required_access, int device_ordinal = 0) const;
@@ -183,6 +195,7 @@ private:
   friend class CudaSharedMemory;
   friend class CudaModule;
   friend class CudaKernel;
+  friend class CudaValidatedSpan;
 
   struct Impl;
 
@@ -190,6 +203,34 @@ private:
                        std::shared_ptr<CudaBackendTraceSink> trace_sink = {});
   std::shared_ptr<Impl> impl_;
   std::shared_ptr<CudaBackendTraceSink> trace_sink_;
+};
+
+/// Retained proof that a complete CUDA device span was validated by the driver.
+///
+/// Copies share retained VMM allocation handles. `aliases` conservatively treats any spans backed
+/// by the same VMM physical allocation as aliases, even when their virtual addresses differ.
+class CudaValidatedSpan {
+public:
+  CudaValidatedSpan() = default;
+
+  [[nodiscard]] explicit operator bool() const { return state_ != nullptr; }
+  [[nodiscard]] CudaDevicePtr ptr() const;
+  [[nodiscard]] std::size_t size() const;
+  [[nodiscard]] std::uintptr_t context_id() const;
+  [[nodiscard]] int device_ordinal() const;
+  [[nodiscard]] CudaSpanAccess access() const;
+  [[nodiscard]] CudaDevicePtr validated_range_base() const;
+  [[nodiscard]] std::size_t validated_range_bytes() const;
+  [[nodiscard]] bool permits(CudaSpanAccess required_access) const;
+  [[nodiscard]] bool aliases(const CudaValidatedSpan& other) const;
+
+private:
+  friend class CudaBackend;
+
+  struct State;
+  explicit CudaValidatedSpan(std::shared_ptr<State> state);
+
+  std::shared_ptr<State> state_;
 };
 
 class CudaSharedMemory {

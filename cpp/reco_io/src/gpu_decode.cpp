@@ -197,12 +197,10 @@ NvmmCudaFrame map_gpu_decoded_frame_to_cuda(const GpuDecodedFrame& frame) {
 
 CudaNv12FrameLease map_gpu_decoded_frame_to_cuda_lease(const GpuDecodedFrame& frame) {
   auto mapped = map_gpu_decoded_frame_to_cuda(frame);
-  core::CudaPitchedPlaneView y_plane(
-      mapped.y_ptr, mapped.y_accessible_bytes, mapped.y_pitch, mapped.width, mapped.height,
-      static_cast<core::CudaContextId>(mapped.context_id), mapped.device_ordinal);
-  core::CudaPitchedPlaneView uv_plane(
-      mapped.uv_ptr, mapped.uv_accessible_bytes, mapped.uv_pitch, mapped.width, mapped.height / 2U,
-      static_cast<core::CudaContextId>(mapped.context_id), mapped.device_ordinal);
+  core::CudaPitchedPlaneView y_plane(mapped.y_validation, mapped.y_pitch, mapped.width,
+                                     mapped.height);
+  core::CudaPitchedPlaneView uv_plane(mapped.uv_validation, mapped.uv_pitch, mapped.width,
+                                      mapped.height / 2U);
   core::CudaNv12FrameView view(std::move(y_plane), std::move(uv_plane), mapped.width, mapped.height,
                                mapped.color_matrix, mapped.color_range);
   return CudaNv12FrameLease(std::move(mapped), std::move(view));

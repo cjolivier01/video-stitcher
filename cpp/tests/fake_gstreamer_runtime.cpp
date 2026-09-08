@@ -937,6 +937,9 @@ RECO_FAKE_EXPORT int gst_element_set_state(void* pipeline_pointer, int state) {
 
 RECO_FAKE_EXPORT void* gst_event_new_flush_start() {
   record("new-flush-start");
+  if (scenario() == "flush-event-null") {
+    return nullptr;
+  }
   return new FakeEvent;
 }
 
@@ -944,6 +947,10 @@ RECO_FAKE_EXPORT int gst_element_send_event(void* pipeline_pointer, void* event_
   std::unique_ptr<FakeEvent> event(static_cast<FakeEvent*>(event_pointer));
   if (pipeline_pointer == nullptr || event == nullptr ||
       event->type != FakeEvent::Type::FlushStart) {
+    return 0;
+  }
+  if (scenario() == "flush-send-fail") {
+    record("send-flush-failed");
     return 0;
   }
   auto* pipeline = static_cast<FakePipeline*>(pipeline_pointer);

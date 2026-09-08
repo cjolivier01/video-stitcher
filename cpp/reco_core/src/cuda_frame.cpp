@@ -88,6 +88,13 @@ CudaPitchedPlaneView::CudaPitchedPlaneView(CudaDevicePtr ptr, std::size_t access
   validate_device_address_span(ptr, accessible_bytes);
 }
 
+CudaPitchedPlaneView::CudaPitchedPlaneView(CudaValidatedSpan validation, std::size_t pitch_bytes,
+                                           std::size_t row_bytes, std::uint32_t rows)
+    : CudaPitchedPlaneView(validation.ptr(), validation.size(), pitch_bytes, row_bytes, rows,
+                           validation.context_id(), validation.device_ordinal()) {
+  validation_ = std::move(validation);
+}
+
 CudaNv12FrameView::CudaNv12FrameView(CudaPitchedPlaneView y_plane, CudaPitchedPlaneView uv_plane,
                                      std::uint32_t width, std::uint32_t height,
                                      YuvColorMatrix color_matrix, YuvColorRange color_range)

@@ -94,6 +94,7 @@ struct CudaPointerProvenance {
   core::CudaDevicePtr mapping_base = 0;
   std::size_t mapping_bytes = 0;
   std::size_t accessible_bytes = 0;
+  core::CudaValidatedSpan validation;
 };
 
 #if defined(__linux__)
@@ -216,17 +217,6 @@ using CudaDevice = int;
 using CudaContext = void*;
 using CudaGraphicsResource = void*;
 constexpr CudaResult kCudaSuccess = 0;
-constexpr int kCudaMemoryTypeDevice = 2;
-constexpr int kCudaPointerAttributeContext = 1;
-constexpr int kCudaPointerAttributeMemoryType = 2;
-constexpr int kCudaPointerAttributeDeviceOrdinal = 9;
-constexpr int kCudaPointerAttributeRangeStartAddress = 11;
-constexpr int kCudaPointerAttributeRangeSize = 12;
-constexpr int kCudaPointerAttributeMapped = 13;
-constexpr int kCudaPointerAttributeAccessFlags = 16;
-constexpr int kCudaPointerAttributeMappingSize = 18;
-constexpr int kCudaPointerAttributeMappingBase = 19;
-constexpr unsigned int kCudaMemAccessProtRead = 1;
 constexpr std::uint32_t kCudaEglFrameTypePitch = 1;
 constexpr std::uint32_t kCudaArrayFormatUnsignedInt8 = 1;
 constexpr std::uint32_t kCudaEglColorYuv420Semiplanar = 0x01;
@@ -278,20 +268,19 @@ struct CudaFunctions {
   using PrimaryContextRelease = CudaResult (*)(CudaDevice);
   using ContextGetCurrent = CudaResult (*)(CudaContext*);
   using ContextSetCurrent = CudaResult (*)(CudaContext);
-  using PointerGetAttribute = CudaResult (*)(void*, int, core::CudaDevicePtr);
   using RegisterEglImage = CudaResult (*)(CudaGraphicsResource*, void*, unsigned int);
   using GetMappedEglFrame = CudaResult (*)(CudaEglFrame*, CudaGraphicsResource, unsigned int,
                                            unsigned int);
   using UnregisterResource = CudaResult (*)(CudaGraphicsResource);
 
-  explicit CudaFunctions(const char* path) : library(path) {
+  explicit CudaFunctions(const char* path)
+      : library(path), span_backend(core::CudaBackend::load(path)) {
     init = library.symbol<Init>("cuInit");
     device_get = library.symbol<DeviceGet>("cuDeviceGet");
     primary_context_retain = library.symbol<PrimaryContextRetain>("cuDevicePrimaryCtxRetain");
     primary_context_release = library.symbol<PrimaryContextRelease>("cuDevicePrimaryCtxRelease");
     context_get_current = library.symbol<ContextGetCurrent>("cuCtxGetCurrent");
     context_set_current = library.symbol<ContextSetCurrent>("cuCtxSetCurrent");
-    pointer_get_attribute = library.symbol<PointerGetAttribute>("cuPointerGetAttribute");
     register_egl_image = library.symbol<RegisterEglImage>("cuGraphicsEGLRegisterImage");
     get_mapped_egl_frame = library.symbol<GetMappedEglFrame>("cuGraphicsResourceGetMappedEglFrame");
     unregister_resource = library.symbol<UnregisterResource>("cuGraphicsUnregisterResource");
@@ -307,13 +296,13 @@ struct CudaFunctions {
   }
 
   DynamicLibrary library;
+  core::CudaBackend span_backend;
   Init init = nullptr;
   DeviceGet device_get = nullptr;
   PrimaryContextRetain primary_context_retain = nullptr;
   PrimaryContextRelease primary_context_release = nullptr;
   ContextGetCurrent context_get_current = nullptr;
   ContextSetCurrent context_set_current = nullptr;
-  PointerGetAttribute pointer_get_attribute = nullptr;
   RegisterEglImage register_egl_image = nullptr;
   GetMappedEglFrame get_mapped_egl_frame = nullptr;
   UnregisterResource unregister_resource = nullptr;
@@ -354,71 +343,42 @@ private:
   CudaContext previous_ = nullptr;
 };
 
-template <typename T>
-T cuda_pointer_attribute(const std::shared_ptr<CudaFunctions>& cuda, int attribute,
-                         core::CudaDevicePtr pointer, const char* name) {
-  T value{};
-  check_cuda(name, cuda->pointer_get_attribute(&value, attribute, pointer));
-  return value;
-}
-
 CudaPointerProvenance validate_cuda_plane_pointer(const std::shared_ptr<CudaFunctions>& cuda,
                                                   core::CudaDevicePtr pointer, std::size_t pitch,
                                                   std::size_t row_bytes, std::uint32_t rows,
                                                   std::size_t plane_bytes, int expected_device,
                                                   const char* plane_name) {
-  const auto context = cuda_pointer_attribute<CudaContext>(
-      cuda, kCudaPointerAttributeContext, pointer, "cuPointerGetAttribute(CONTEXT)");
-  const auto memory_type = cuda_pointer_attribute<int>(
-      cuda, kCudaPointerAttributeMemoryType, pointer, "cuPointerGetAttribute(MEMORY_TYPE)");
-  const auto device = cuda_pointer_attribute<int>(cuda, kCudaPointerAttributeDeviceOrdinal, pointer,
-                                                  "cuPointerGetAttribute(DEVICE_ORDINAL)");
-  const auto mapped = cuda_pointer_attribute<int>(cuda, kCudaPointerAttributeMapped, pointer,
-                                                  "cuPointerGetAttribute(MAPPED)");
-  const auto access_flags = cuda_pointer_attribute<unsigned int>(
-      cuda, kCudaPointerAttributeAccessFlags, pointer, "cuPointerGetAttribute(ACCESS_FLAGS)");
-  if ((context != nullptr && context != cuda->primary_context) ||
-      memory_type != kCudaMemoryTypeDevice || device != expected_device || mapped == 0) {
+  if (rows == 0 || row_bytes == 0 || pitch < row_bytes ||
+      static_cast<std::uint64_t>(rows - 1U) * pitch >
+          std::numeric_limits<std::size_t>::max() - row_bytes) {
     throw NvmmError(std::string("NvBufSurface ") + plane_name +
-                    " plane is not memory on the expected device in the retained CUDA context");
+                    " plane has invalid CUDA dimensions");
   }
-  if ((access_flags & kCudaMemAccessProtRead) == 0U) {
-    throw NvmmError(std::string("NvBufSurface ") + plane_name +
-                    " plane is not readable from the expected CUDA device");
-  }
-  const auto mapping_size = cuda_pointer_attribute<std::size_t>(
-      cuda, context == nullptr ? kCudaPointerAttributeMappingSize : kCudaPointerAttributeRangeSize,
-      pointer,
-      context == nullptr ? "cuPointerGetAttribute(MAPPING_SIZE)"
-                         : "cuPointerGetAttribute(RANGE_SIZE)");
-  const auto mapping_base = cuda_pointer_attribute<core::CudaDevicePtr>(
-      cuda,
-      context == nullptr ? kCudaPointerAttributeMappingBase
-                         : kCudaPointerAttributeRangeStartAddress,
-      pointer,
-      context == nullptr ? "cuPointerGetAttribute(MAPPING_BASE_ADDR)"
-                         : "cuPointerGetAttribute(RANGE_START_ADDR)");
-  if (pointer < mapping_base) {
-    throw NvmmError(std::string("NvBufSurface ") + plane_name + " plane precedes its CUDA mapping");
-  }
-  const auto offset = pointer - mapping_base;
-  if (offset > mapping_size) {
-    throw NvmmError(std::string("NvBufSurface ") + plane_name + " plane exceeds its CUDA mapping");
-  }
-  const auto mapping_remaining = mapping_size - static_cast<std::size_t>(offset);
-  const auto accessible_bytes = std::min(plane_bytes, mapping_remaining);
   const auto required = static_cast<std::uint64_t>(rows - 1U) * pitch + row_bytes;
-  if (required > accessible_bytes) {
+  if (required > plane_bytes) {
     throw NvmmError(std::string("NvBufSurface ") + plane_name +
-                    " plane exceeds its CUDA mapping or plane allocation");
+                    " plane exceeds its declared allocation");
+  }
+  core::CudaValidatedSpan validation;
+  try {
+    validation = cuda->span_backend.retain_device_span(pointer, plane_bytes,
+                                                       core::CudaSpanAccess::Read, expected_device);
+  } catch (const std::exception& error) {
+    if (std::string_view(error.what()).find("does not permit device reads") !=
+        std::string_view::npos) {
+      throw NvmmError(std::string("NvBufSurface ") + plane_name +
+                      " plane is not readable from the expected CUDA device");
+    }
+    throw NvmmError(std::string("NvBufSurface ") + plane_name +
+                    " plane failed CUDA driver validation: " + error.what());
   }
   return {
-      .context_id =
-          reinterpret_cast<std::uintptr_t>(context == nullptr ? cuda->primary_context : context),
-      .device_ordinal = device,
-      .mapping_base = mapping_base,
-      .mapping_bytes = mapping_size,
-      .accessible_bytes = accessible_bytes,
+      .context_id = validation.context_id(),
+      .device_ordinal = validation.device_ordinal(),
+      .mapping_base = validation.validated_range_base(),
+      .mapping_bytes = validation.validated_range_bytes(),
+      .accessible_bytes = plane_bytes,
+      .validation = std::move(validation),
   };
 }
 
@@ -950,6 +910,8 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info, std::shared_ptr<
         .color_range = info.color_range,
         .runtime = info.runtime,
         .owner = std::move(mapped_owner),
+        .y_validation = y_provenance.validation,
+        .uv_validation = uv_provenance.validation,
     };
   };
 

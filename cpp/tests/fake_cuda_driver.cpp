@@ -1,6 +1,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 #ifndef RECO_FAKE_CUDA_DRIVER_MARKER
 #define RECO_FAKE_CUDA_DRIVER_MARKER 1
@@ -34,12 +35,21 @@ thread_local void* current_context = nullptr;
 int primary_context_retain_count = 0;
 
 constexpr std::uintptr_t kDefaultBase = 0x40000000;
+constexpr std::uintptr_t kContextIndependentBase = 0x50000000;
+constexpr std::uintptr_t kNoAccessBase = 0x51000000;
+constexpr std::uintptr_t kReadOnlyBase = 0x52000000;
 constexpr std::uintptr_t kYPlaneSize = 1280U * 720U;
 constexpr std::uintptr_t kAllocationSize = 1280U * 1080U;
+constexpr std::size_t kVmmGranularity = 0x10000U;
 
 std::uintptr_t allocation_base(std::uintptr_t pointer) {
   if (pointer >= kDefaultBase && pointer < kDefaultBase + kAllocationSize) {
     return kDefaultBase;
+  }
+  for (const auto base : {kContextIndependentBase, kNoAccessBase, kReadOnlyBase}) {
+    if (pointer >= base && pointer < base + kAllocationSize) {
+      return base;
+    }
   }
   if (pointer < 100U) {
     return pointer;
@@ -56,6 +66,14 @@ extern "C" RECO_TEST_EXPORT int recoFakeRuntimeMarker() { return RECO_FAKE_CUDA_
 
 extern "C" int cuInit(unsigned int) { return 0; }
 
+extern "C" int cuDeviceGetCount(int* count) {
+  if (count == nullptr) {
+    return 1;
+  }
+  *count = 1;
+  return 0;
+}
+
 extern "C" int cuDeviceGet(int* device, int ordinal) {
   if (device == nullptr || ordinal != 0) {
     return 1;
@@ -64,8 +82,39 @@ extern "C" int cuDeviceGet(int* device, int ordinal) {
   return 0;
 }
 
+extern "C" int cuDeviceGetAttribute(int* value, int attribute, int device) {
+  if (value == nullptr || device != 0) {
+    return 1;
+  }
+  if (attribute == 75) {
+    *value = 8;
+    return 0;
+  }
+  if (attribute == 76) {
+    *value = 6;
+    return 0;
+  }
+  return 1;
+}
+
+extern "C" int cuDeviceGetName(char* name, int length, int device) {
+  if (name == nullptr || length < 5 || device != 0) {
+    return 1;
+  }
+  std::memcpy(name, "fake", 5);
+  return 0;
+}
+
+extern "C" int cuDeviceGetUuid(void* uuid, int device) {
+  if (uuid == nullptr || device != 0) {
+    return 1;
+  }
+  std::memset(uuid, 0x42, 16);
+  return 0;
+}
+
 extern "C" int cuDevicePrimaryCtxRetain(void** context, int device) {
-  if (context == nullptr || device != 0 || primary_context_retain_count != 0) {
+  if (context == nullptr || device != 0) {
     return 1;
   }
   ++primary_context_retain_count;
@@ -74,11 +123,15 @@ extern "C" int cuDevicePrimaryCtxRetain(void** context, int device) {
 }
 
 extern "C" int cuDevicePrimaryCtxRelease(int device) {
-  if (device != 0 || primary_context_retain_count != 1) {
+  if (device != 0 || primary_context_retain_count <= 0) {
     return 1;
   }
   --primary_context_retain_count;
   return 0;
+}
+
+extern "C" int cuDevicePrimaryCtxRelease_v2(int device) {
+  return cuDevicePrimaryCtxRelease(device);
 }
 
 extern "C" int cuCtxGetCurrent(void** context) {
@@ -94,6 +147,18 @@ extern "C" int cuCtxSetCurrent(void* context) {
   return 0;
 }
 
+extern "C" int cuCtxGetDevice(int* device) {
+  if (device == nullptr || current_context != reinterpret_cast<void*>(0xC0DA)) {
+    return 1;
+  }
+  *device = 0;
+  return 0;
+}
+
+extern "C" int cuCtxSynchronize() {
+  return current_context == reinterpret_cast<void*>(0xC0DA) ? 0 : 1;
+}
+
 extern "C" int cuPointerGetAttribute(void* data, int attribute, std::uint64_t pointer) {
   if (data == nullptr || current_context != reinterpret_cast<void*>(0xC0DA)) {
     return 1;
@@ -101,9 +166,11 @@ extern "C" int cuPointerGetAttribute(void* data, int attribute, std::uint64_t po
   const auto base = allocation_base(static_cast<std::uintptr_t>(pointer));
   switch (attribute) {
   case 1:
-    *static_cast<void**>(data) = base == 11   ? reinterpret_cast<void*>(0xBAD)
-                                 : base == 14 ? nullptr
-                                              : reinterpret_cast<void*>(0xC0DA);
+    *static_cast<void**>(data) =
+        base == 11 ? reinterpret_cast<void*>(0xBAD)
+        : base == kContextIndependentBase || base == kNoAccessBase || base == kReadOnlyBase
+            ? nullptr
+            : reinterpret_cast<void*>(0xC0DA);
     return 0;
   case 2:
     *static_cast<int*>(data) = base == 9 ? 1 : 2;
@@ -121,7 +188,8 @@ extern "C" int cuPointerGetAttribute(void* data, int attribute, std::uint64_t po
     *static_cast<int*>(data) = 1;
     return 0;
   case 16:
-    *static_cast<unsigned int*>(data) = base == 15 ? 0U : (base == 16 ? 1U : 3U);
+    *static_cast<unsigned int*>(data) =
+        base == kNoAccessBase ? 0U : (base == kReadOnlyBase ? 1U : 3U);
     return 0;
   case 18:
     *static_cast<std::size_t*>(data) = kAllocationSize;
@@ -132,6 +200,74 @@ extern "C" int cuPointerGetAttribute(void* data, int attribute, std::uint64_t po
   default:
     return 1;
   }
+}
+
+extern "C" int cuMemGetAllocationGranularity(std::size_t* granularity, const void*,
+                                             unsigned int option) {
+  if (granularity == nullptr || option != 0U) {
+    return 1;
+  }
+  *granularity = kVmmGranularity;
+  return 0;
+}
+
+extern "C" int cuMemGetAccess(std::uint64_t* flags, const void*, std::uint64_t pointer) {
+  if (flags == nullptr || current_context != reinterpret_cast<void*>(0xC0DA)) {
+    return 1;
+  }
+  const auto base = allocation_base(static_cast<std::uintptr_t>(pointer));
+  *flags = base == kNoAccessBase ? 0U : (base == kReadOnlyBase ? 1U : 3U);
+  return base == kContextIndependentBase || base == kNoAccessBase || base == kReadOnlyBase ? 0 : 1;
+}
+
+extern "C" int cuMemRetainAllocationHandle(std::uint64_t* handle, void* address) {
+  if (handle == nullptr || current_context != reinterpret_cast<void*>(0xC0DA)) {
+    return 1;
+  }
+  const auto base = allocation_base(reinterpret_cast<std::uintptr_t>(address));
+  if (base != kContextIndependentBase && base != kNoAccessBase && base != kReadOnlyBase) {
+    return 1;
+  }
+  *handle = static_cast<std::uint64_t>(base);
+  return 0;
+}
+
+extern "C" int cuMemRelease(std::uint64_t handle) {
+  return handle == kContextIndependentBase || handle == kNoAccessBase || handle == kReadOnlyBase
+             ? 0
+             : 1;
+}
+
+extern "C" int cuMemAlloc_v2(std::uint64_t*, std::size_t) { return 1; }
+extern "C" int cuMemAllocPitch_v2(std::uint64_t*, std::size_t*, std::size_t, std::size_t,
+                                  unsigned int) {
+  return 1;
+}
+extern "C" int cuMemFree_v2(std::uint64_t) { return 1; }
+extern "C" int cuMemsetD8_v2(std::uint64_t, unsigned char, std::size_t) { return 1; }
+extern "C" int cuMemcpy2D_v2(const void*) { return 1; }
+extern "C" int cuMemcpyDtoH_v2(void*, std::uint64_t, std::size_t) { return 1; }
+extern "C" int cuMemGetInfo_v2(std::size_t*, std::size_t*) { return 1; }
+extern "C" int cuMemAddressReserve(std::uint64_t*, std::size_t, std::size_t, std::uint64_t,
+                                   std::uint64_t) {
+  return 1;
+}
+extern "C" int cuMemCreate(std::uint64_t*, std::size_t, const void*, std::uint64_t) { return 1; }
+extern "C" int cuMemExportToShareableHandle(void*, std::uint64_t, unsigned int, std::uint64_t) {
+  return 1;
+}
+extern "C" int cuMemMap(std::uint64_t, std::size_t, std::size_t, std::uint64_t, std::uint64_t) {
+  return 1;
+}
+extern "C" int cuMemSetAccess(std::uint64_t, std::size_t, const void*, std::size_t) { return 1; }
+extern "C" int cuMemUnmap(std::uint64_t, std::size_t) { return 1; }
+extern "C" int cuMemAddressFree(std::uint64_t, std::size_t) { return 1; }
+extern "C" int cuModuleLoadData(void**, const void*) { return 1; }
+extern "C" int cuModuleUnload(void*) { return 1; }
+extern "C" int cuModuleGetFunction(void**, void*, const char*) { return 1; }
+extern "C" int cuLaunchKernel(void*, unsigned int, unsigned int, unsigned int, unsigned int,
+                              unsigned int, unsigned int, unsigned int, void*, void**, void**) {
+  return 1;
 }
 
 extern "C" int cuGraphicsEGLRegisterImage(void** resource, void* image, unsigned int) {
