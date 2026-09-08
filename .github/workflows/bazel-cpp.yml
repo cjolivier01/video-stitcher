@@ -256,11 +256,13 @@ jobs:
           trap 'rm -rf "$work_dir"' EXIT
           ffmpeg -hide_banner -loglevel error \
             -f lavfi -i 'testsrc2=size=1920x720:rate=30:duration=2' \
+            -f lavfi -i 'sine=frequency=1000:sample_rate=48000:duration=2' \
             -filter_complex \
-            '[0:v]setpts=PTS+5/TB,split=2[left_src][right_src];[left_src]crop=1280:720:0:0,format=yuv420p[left];[right_src]crop=1280:720:640:0,format=yuv420p[right]' \
-            -map '[left]' -c:v libx264 -preset ultrafast -g 30 -bf 0 -movflags +faststart \
+            '[0:v]setpts=PTS+5/TB,split=2[left_src][right_src];[left_src]crop=1280:720:0:0,format=yuv420p[left];[right_src]crop=1280:720:640:0,format=yuv420p[right];[1:a]asetpts=PTS+5/TB[audio]' \
+            -map '[left]' -map '[audio]' -c:v libx264 -preset ultrafast -g 30 -bf 0 \
+            -c:a aac -movflags +faststart \
             "$work_dir/left.mp4" \
-            -map '[right]' -c:v libx264 -preset ultrafast -g 30 -bf 0 -movflags +faststart \
+            -map '[right]' -an -c:v libx264 -preset ultrafast -g 30 -bf 0 -movflags +faststart \
             "$work_dir/right.mp4"
           stream_start="$(ffprobe -v error -select_streams v:0 \
             -show_entries stream=start_time -of default=noprint_wrappers=1:nokey=1 \
@@ -296,6 +298,9 @@ jobs:
           test "$(ffprobe -v error -select_streams v:0 \
             -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1 \
             "$work_dir/stitched.mp4")" = "video"
+          test "$(ffprobe -v error -select_streams a:0 \
+            -show_entries stream=duration -of default=noprint_wrappers=1:nokey=1 \
+            "$work_dir/stitched.mp4")" = "0.100000"
 
           printf '%s\n' 'existing destination' >"$work_dir/cancelled.mp4"
           reco_binary="$(bazel --output_base="$RUNNER_TEMP/reco-bazel-output" info bazel-bin)/cpp/apps/reco_cli/reco"
