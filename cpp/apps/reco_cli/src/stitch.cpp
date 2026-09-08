@@ -901,13 +901,17 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
     cancellation.throw_if_requested();
     verify_retained_inputs(left_input, right_input, *calibration_source);
     cancellation.throw_if_requested();
-    output.commit();
+    output.commit([&] { return cancellation.requested(); });
+    cancellation.throw_if_requested();
     const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started);
     const auto rate = elapsed.count() > 0.0 ? static_cast<double>(frames) / elapsed.count() : 0.0;
     out << "Stitched " << frames << " frames to " << command.output << " in " << elapsed.count()
         << "s (" << rate << " fps, CUDA/NVMM/NVENC)\n";
     return 0;
   } catch (const StitchCancelled&) {
+    err << "cancelled\n";
+    return kCancelledExitCode;
+  } catch (const AtomicOutputCancelled&) {
     err << "cancelled\n";
     return kCancelledExitCode;
   } catch (const std::exception& error) {

@@ -9,6 +9,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <variant>
@@ -183,6 +184,12 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err,
 
 namespace detail {
 
+/// Raised when cancellation is observed before atomic output publication becomes irreversible.
+class AtomicOutputCancelled final : public std::runtime_error {
+public:
+  AtomicOutputCancelled() : std::runtime_error("atomic output publication cancelled") {}
+};
+
 /// Fixed descriptor headroom for output, one transient cursor, multimedia, and probe IPC.
 inline constexpr std::size_t kStitchTransientDescriptorReserve = 64;
 
@@ -229,7 +236,8 @@ public:
   /// Original temporary entry, exposed only for diagnostics and race tests.
   [[nodiscard]] const std::filesystem::path& temporary_path() const;
   /// Flushes, validates, and atomically publishes the retained file.
-  void commit();
+  /// Cancellation is sampled at the final rollback-capable publication boundary.
+  void commit(const CancellationRequested& cancellation_requested = {});
 
 private:
   struct Impl;
@@ -296,7 +304,8 @@ void write_calibration_json_atomically(
     const std::function<void()>& publication_fault_hook = {},
     const std::function<void()>& on_lock_contention = {},
     std::chrono::milliseconds lock_timeout = std::chrono::seconds(2),
-    const std::function<void(const std::filesystem::path&)>& before_windows_publish_replace = {});
+    const std::function<void(const std::filesystem::path&)>& before_windows_publish_replace = {},
+    const CancellationRequested& cancellation_requested = {});
 
 } // namespace detail
 

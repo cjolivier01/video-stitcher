@@ -2665,6 +2665,19 @@ void write_all(int descriptor, std::string_view contents, const std::filesystem:
 }
 #endif
 
+void throw_if_atomic_output_cancelled(const CancellationRequested& cancellation_requested) {
+  if (!cancellation_requested) {
+    return;
+  }
+  try {
+    if (!cancellation_requested()) {
+      return;
+    }
+  } catch (...) {
+  }
+  throw detail::AtomicOutputCancelled();
+}
+
 void write_calibration_json_atomically_impl(
     std::string_view json, const std::filesystem::path& destination,
     const std::filesystem::path& left_input, const std::filesystem::path& right_input,
@@ -2673,7 +2686,8 @@ void write_calibration_json_atomically_impl(
     const std::function<void()>& before_commit, bool force_rename_fallback,
     const std::function<void()>& publication_fault_hook,
     const std::function<void()>& on_lock_contention, std::chrono::milliseconds lock_timeout,
-    const std::function<void(const std::filesystem::path&)>& before_windows_publish_replace) {
+    const std::function<void(const std::filesystem::path&)>& before_windows_publish_replace,
+    const CancellationRequested& cancellation_requested) {
   std::string contents(json);
   contents.push_back('\n');
 #if defined(_WIN32)
@@ -2707,6 +2721,7 @@ void write_calibration_json_atomically_impl(
     if (before_publish) {
       before_publish();
     }
+    throw_if_atomic_output_cancelled(cancellation_requested);
     if (const auto error = reco::calibrate::validate_calibration_output_identity(
             left_input, right_input, destination, lens_profiles);
         error.has_value()) {
@@ -2715,6 +2730,7 @@ void write_calibration_json_atomically_impl(
     if (before_commit) {
       before_commit();
     }
+    throw_if_atomic_output_cancelled(cancellation_requested);
     left_reservation.verify_unchanged(left_input, "left video input");
     right_reservation.verify_unchanged(right_input, "right video input");
     for (std::size_t index = 0; index < profile_reservations.size(); ++index) {
@@ -2730,6 +2746,7 @@ void write_calibration_json_atomically_impl(
       if (publication_fault_hook) {
         publication_fault_hook();
       }
+      throw_if_atomic_output_cancelled(cancellation_requested);
       left_reservation.verify_unchanged(left_input, "left video input");
       right_reservation.verify_unchanged(right_input, "right video input");
       for (std::size_t index = 0; index < profile_reservations.size(); ++index) {
@@ -2814,6 +2831,7 @@ void write_calibration_json_atomically_impl(
     if (before_publish) {
       before_publish();
     }
+    throw_if_atomic_output_cancelled(cancellation_requested);
     if (!temporary_name_identifies_descriptor(directory_descriptor.get(), temporary.name,
                                               temporary.descriptor.get())) {
       temporary_exists = false;
@@ -2831,6 +2849,7 @@ void write_calibration_json_atomically_impl(
       if (!commit_hook_ran && before_commit) {
         before_commit();
       }
+      throw_if_atomic_output_cancelled(cancellation_requested);
       commit_hook_ran = true;
       if (const auto error =
               validate_pinned_output_identity(directory_descriptor.get(), destination_name,
@@ -2860,6 +2879,7 @@ void write_calibration_json_atomically_impl(
       if (!publication_fault_hook_ran && publication_fault_hook) {
         publication_fault_hook();
       }
+      throw_if_atomic_output_cancelled(cancellation_requested);
       publication_fault_hook_ran = true;
     };
     const auto run_publication_fault_or_rollback = [&](const auto& rollback) {
@@ -3089,7 +3109,6 @@ void write_calibration_json_atomically_impl(
   (void)before_windows_publish_replace;
   (void)force_rename_fallback;
 #if !defined(__APPLE__)
-  (void)publication_fault_hook;
   (void)on_lock_contention;
   (void)lock_timeout;
 #endif
@@ -3140,6 +3159,7 @@ void write_calibration_json_atomically_impl(
     if (before_publish) {
       before_publish();
     }
+    throw_if_atomic_output_cancelled(cancellation_requested);
 #if defined(__APPLE__)
     if (const auto error = validate_pinned_posix_output_identity_at(
             output_directory.get(), destination_name, left_identity, right_identity,
@@ -3154,6 +3174,7 @@ void write_calibration_json_atomically_impl(
     if (before_commit) {
       before_commit();
     }
+    throw_if_atomic_output_cancelled(cancellation_requested);
     left_identity.verify_unchanged();
     right_identity.verify_unchanged();
     for (const auto& profile : profile_identities) {
@@ -3189,6 +3210,7 @@ void write_calibration_json_atomically_impl(
         if (publication_fault_hook) {
           publication_fault_hook();
         }
+        throw_if_atomic_output_cancelled(cancellation_requested);
       } catch (...) {
         if (!rollback_new_output()) {
           throw std::runtime_error(
@@ -3240,6 +3262,7 @@ void write_calibration_json_atomically_impl(
         if (publication_fault_hook) {
           publication_fault_hook();
         }
+        throw_if_atomic_output_cancelled(cancellation_requested);
       } catch (...) {
         if (!rollback_exchange_if_unchanged()) {
           throw std::runtime_error(
@@ -3291,6 +3314,10 @@ void write_calibration_json_atomically_impl(
       throw_file_error("failed to publish calibration output", destination, errno);
     }
 #else
+    if (publication_fault_hook) {
+      publication_fault_hook();
+    }
+    throw_if_atomic_output_cancelled(cancellation_requested);
     if (::link(temporary.c_str(), destination.c_str()) != 0) {
       if (errno == EEXIST) {
         throw std::runtime_error(
@@ -3348,7 +3375,8 @@ void write_calibration_json_atomically_impl(
 
 void write_calibration_result(const reco::calibrate::CalibrationResult& result,
                               const reco::calibrate::GpuCalibrationRequest& request,
-                              const std::function<void()>& before_publish = {}) {
+                              const std::function<void()>& validate_inputs = {},
+                              const CancellationRequested& cancellation_requested = {}) {
   const auto json = reco::core::calibration_to_json(result.calibration);
   const auto reparsed = reco::core::parse_match_calibration_json(json);
   if (!reparsed.has_value() || !reparsed->validate().empty()) {
@@ -3368,7 +3396,9 @@ void write_calibration_result(const reco::calibrate::CalibrationResult& result,
   }
   detail::write_calibration_json_atomically(
       json, reco::core::path_from_utf8(request.output), reco::core::path_from_utf8(left_path),
-      reco::core::path_from_utf8(right_path), before_publish, profiles);
+      reco::core::path_from_utf8(right_path), validate_inputs, profiles, validate_inputs, false, {},
+      {}, std::chrono::seconds(2), {}, cancellation_requested);
+  throw_if_atomic_output_cancelled(cancellation_requested);
 }
 
 void write_calibration_result_summary(const reco::calibrate::CalibrationResult& result,
@@ -4695,7 +4725,7 @@ const std::filesystem::path& AtomicOutputFile::temporary_path() const {
   return impl_->temporary;
 }
 
-void AtomicOutputFile::commit() {
+void AtomicOutputFile::commit(const CancellationRequested& cancellation_requested) {
   if (!impl_) {
     throw std::runtime_error("stitch output transaction is empty");
   }
@@ -4761,6 +4791,7 @@ void AtomicOutputFile::commit() {
     if (impl_->publication_fault_hook) {
       impl_->publication_fault_hook();
     }
+    throw_if_atomic_output_cancelled(cancellation_requested);
     if (const auto error = validate_windows_stitch_output_identity(
             impl_->output_directory.handle.get(), impl_->destination.filename().wstring(),
             impl_->protected_paths);
@@ -4826,6 +4857,7 @@ void AtomicOutputFile::commit() {
         if (impl_->publication_fault_hook) {
           impl_->publication_fault_hook();
         }
+        throw_if_atomic_output_cancelled(cancellation_requested);
         if (!temporary_name_identifies_descriptor(impl_->directory_descriptor, destination_name,
                                                   impl_->descriptor)) {
           throw std::runtime_error("published stitch output identity changed");
@@ -4877,6 +4909,7 @@ void AtomicOutputFile::commit() {
         if (impl_->publication_fault_hook) {
           impl_->publication_fault_hook();
         }
+        throw_if_atomic_output_cancelled(cancellation_requested);
         if (!temporary_name_identifies_descriptor(impl_->directory_descriptor, destination_name,
                                                   impl_->descriptor) ||
             !directory_entry_matches_snapshot(impl_->staging_directory_descriptor,
@@ -4979,6 +5012,7 @@ void AtomicOutputFile::commit() {
         if (impl_->publication_fault_hook) {
           impl_->publication_fault_hook();
         }
+        throw_if_atomic_output_cancelled(cancellation_requested);
         if (!path_identifies_descriptor_at(impl_->directory_descriptor, destination_name,
                                            impl_->descriptor)) {
           throw std::runtime_error("published stitch output identity changed");
@@ -5029,6 +5063,7 @@ void AtomicOutputFile::commit() {
         if (impl_->publication_fault_hook) {
           impl_->publication_fault_hook();
         }
+        throw_if_atomic_output_cancelled(cancellation_requested);
         if (!path_identifies_descriptor_at(impl_->directory_descriptor, destination_name,
                                            impl_->descriptor) ||
             !posix_directory_entry_matches_snapshot(impl_->staging_directory_descriptor,
@@ -5089,6 +5124,10 @@ void AtomicOutputFile::commit() {
   if (::fsync(impl_->descriptor) != 0) {
     throw_file_error("cannot flush completed stitch output", impl_->temporary, errno);
   }
+  if (impl_->publication_fault_hook) {
+    impl_->publication_fault_hook();
+  }
+  throw_if_atomic_output_cancelled(cancellation_requested);
   if (::linkat(impl_->staging_directory_descriptor, impl_->temporary_name.c_str(),
                impl_->directory_descriptor, impl_->destination.filename().c_str(), 0) != 0) {
     throw_file_error("cannot publish completed stitch output", impl_->destination, errno);
@@ -5118,11 +5157,12 @@ void write_calibration_json_atomically(
     const std::function<void()>& before_commit, bool force_rename_fallback,
     const std::function<void()>& publication_fault_hook,
     const std::function<void()>& on_lock_contention, std::chrono::milliseconds lock_timeout,
-    const std::function<void(const std::filesystem::path&)>& before_windows_publish_replace) {
+    const std::function<void(const std::filesystem::path&)>& before_windows_publish_replace,
+    const CancellationRequested& cancellation_requested) {
   write_calibration_json_atomically_impl(json, destination, left_input, right_input, before_publish,
                                          lens_profiles, before_commit, force_rename_fallback,
                                          publication_fault_hook, on_lock_contention, lock_timeout,
-                                         before_windows_publish_replace);
+                                         before_windows_publish_replace, cancellation_requested);
 }
 
 } // namespace detail
@@ -5453,16 +5493,22 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err,
       }
       // Publish against the original user-visible entries while the descriptors used by the
       // worker remain pinned. This preserves both symlink and target identities through commit.
-      write_calibration_result(result, request, verify_pinned_inputs);
+      write_calibration_result(result, request, verify_pinned_inputs, cancellation_requested_now);
 #else
       const auto result =
           reco::calibrate::run_gpu_calibration(request, backends, cancellation_requested);
       if (cancellation_requested_now()) {
         throw reco::calibrate::CalibrationCancelled();
       }
-      write_calibration_result(result, request);
+      write_calibration_result(result, request, {}, cancellation_requested_now);
 #endif
+      if (cancellation_requested_now()) {
+        throw reco::calibrate::CalibrationCancelled();
+      }
       write_calibration_result_summary(result, request.output, out);
+    } catch (const detail::AtomicOutputCancelled&) {
+      err << "cancelled\n";
+      return kCancelledExitCode;
     } catch (const reco::calibrate::CalibrationCancelled&) {
       err << "cancelled\n";
       return kCancelledExitCode;

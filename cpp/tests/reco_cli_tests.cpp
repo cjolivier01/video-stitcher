@@ -1519,6 +1519,33 @@ void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
 #endif
 }
 
+void stitch_output_commit_cancellation_restores_previous_output() {
+  TemporaryDirectory root;
+  const auto destination = root.path() / "cancelled-stitch.mp4";
+  write_text_file(destination, "previous stitch output\n");
+
+  bool cancellation_requested = false;
+  bool final_publication_gate_reached = false;
+  bool cancellation_reported = false;
+  try {
+    detail::AtomicOutputFile output(destination, {}, [&] {
+      final_publication_gate_reached = true;
+      cancellation_requested = true;
+    });
+    write_text_descriptor(output.descriptor(), "cancelled replacement output\n");
+    output.commit([&] { return cancellation_requested; });
+  } catch (const detail::AtomicOutputCancelled&) {
+    cancellation_reported = true;
+  }
+
+  expect_true(final_publication_gate_reached,
+              "stitch cancellation is coordinated at the final publication gate");
+  expect_true(cancellation_reported, "stitch commit reports publication cancellation");
+  expect_eq(read_text_file(destination), std::string("previous stitch output\n"),
+            "cancelled stitch commit restores the previous output");
+  expect_no_stitch_output_artifacts(root.path(), "cancelled stitch commit rollback");
+}
+
 void preview_and_calibrate_parse_matches_rust_defaults() {
   const auto preview_command =
       expect_command(parse_args({"preview", "l.mp4", "r.mp4", "--calibration", "match.json",
@@ -3222,6 +3249,44 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
   expect_true(!orphaned_temporary, "calibration replacement leaves no temporary files");
 }
 
+void calibration_output_commit_cancellation_publishes_nothing() {
+  TemporaryDirectory root;
+  const auto destination = root.path() / "cancelled-match.json";
+  const auto left_input = root.path() / "left.mp4";
+  const auto right_input = root.path() / "right.mp4";
+  write_text_file(left_input, "left calibration input\n");
+  write_text_file(right_input, "right calibration input\n");
+
+  bool cancellation_requested = false;
+  bool final_publication_gate_reached = false;
+  bool cancellation_reported = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"cancelled"})json", destination, left_input, right_input, {}, {}, {},
+        false,
+        [&] {
+          final_publication_gate_reached = true;
+          cancellation_requested = true;
+        },
+        {}, std::chrono::seconds(2), {}, [&] { return cancellation_requested; });
+  } catch (const detail::AtomicOutputCancelled&) {
+    cancellation_reported = true;
+  }
+
+  expect_true(final_publication_gate_reached,
+              "calibration cancellation is coordinated at the final publication gate");
+  expect_true(cancellation_reported, "calibration publication reports cancellation");
+  expect_true(!std::filesystem::exists(destination),
+              "cancelled calibration publication leaves no output");
+  for (const auto& entry : std::filesystem::directory_iterator(root.path())) {
+    const auto filename = entry.path().filename().string();
+    expect_true(filename.find(".tmp.") == std::string::npos &&
+                    filename.find(".publish.") == std::string::npos &&
+                    filename.find(".rollback.") == std::string::npos,
+                "cancelled calibration publication leaves no transaction artifacts");
+  }
+}
+
 void command_execution_dispatches_available_stages() {
   const auto calibration_path = write_valid_calibration_file();
   std::ostringstream out;
@@ -3492,6 +3557,8 @@ int main(int argc, char** argv) {
                 stitch_descriptor_budget_is_checked_before_input_acquisition);
   run_test_case("stitch_output_transaction_is_descriptor_pinned_and_atomic",
                 stitch_output_transaction_is_descriptor_pinned_and_atomic);
+  run_test_case("stitch_output_commit_cancellation_restores_previous_output",
+                stitch_output_commit_cancellation_restores_previous_output);
   run_test_case("interrupt_request_unwinds_stitch_output_staging",
                 interrupt_request_unwinds_stitch_output_staging);
   run_test_case("preview_and_calibrate_parse_matches_rust_defaults",
@@ -3505,6 +3572,8 @@ int main(int argc, char** argv) {
                 probe_worker_discovery_handles_path_and_bzlmod_runfiles);
   run_test_case("calibration_output_replacement_is_exclusive_and_atomic",
                 calibration_output_replacement_is_exclusive_and_atomic);
+  run_test_case("calibration_output_commit_cancellation_publishes_nothing",
+                calibration_output_commit_cancellation_publishes_nothing);
   run_test_case("command_execution_dispatches_available_stages",
                 command_execution_dispatches_available_stages);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
