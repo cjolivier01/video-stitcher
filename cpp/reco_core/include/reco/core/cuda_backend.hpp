@@ -35,8 +35,12 @@ struct CudaComputeCapability {
 };
 
 struct CudaMemoryInfo {
+  /// Bytes currently available for CUDA allocations in the selected context.
   std::size_t free_bytes = 0;
+  /// Total bytes managed by CUDA for the selected device.
   std::size_t total_bytes = 0;
+  /// Whether the device shares physical memory with the host, as on Jetson.
+  bool integrated = false;
 };
 
 struct CudaDim3 {
@@ -162,7 +166,8 @@ public:
   void ensure_primary_context(int ordinal = 0) const;
   /// Returns the process-local identity of the retained primary context.
   [[nodiscard]] std::uintptr_t primary_context_id(int ordinal = 0) const;
-  [[nodiscard]] CudaMemoryInfo memory_info() const;
+  /// Returns current memory capacity and topology for the selected device.
+  [[nodiscard]] CudaMemoryInfo memory_info(int ordinal = 0) const;
   [[nodiscard]] CudaDeviceBuffer allocate(std::size_t bytes) const;
   /// Allocates 2D storage with a driver-selected pitch valid for `cuMemcpy2D`.
   [[nodiscard]] CudaPitchedAllocation allocate_pitched(std::size_t width_bytes, std::size_t height,

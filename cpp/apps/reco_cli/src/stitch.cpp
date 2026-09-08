@@ -10,6 +10,7 @@
 #include "reco/io/audio_passthrough.hpp"
 #include "reco/io/gpu_decode.hpp"
 #include "reco/io/gpu_encode.hpp"
+#include "reco/io/gpu_memory.hpp"
 #include "reco/io/gpu_video_probe.hpp"
 #include "reco/io/output.hpp"
 
@@ -51,6 +52,9 @@ constexpr auto kProbeTimeout = std::chrono::seconds(120);
 constexpr std::uint64_t kProbeTimeoutNs =
     std::chrono::duration_cast<std::chrono::nanoseconds>(kProbeTimeout).count();
 constexpr std::size_t kMaximumInputSegments = 4096;
+constexpr std::size_t kStitchDecodeSourceCapacity = 4;
+constexpr std::size_t kStitchStereoQueueCapacity = 4;
+constexpr std::size_t kStitchEncodePoolCapacity = 8;
 
 struct ProbedInput {
   std::vector<std::string> paths;
@@ -94,7 +98,7 @@ GpuFileDecodeConfig decode_config(const std::string& path, const GpuVideoProbe& 
       .codec = gpu_decode_codec_for_path(path),
       .elementary_stream = gpu_decode_path_is_elementary_stream(path),
       .container = gpu_decode_container_for_path(path),
-      .max_buffers = 4,
+      .max_buffers = static_cast<std::uint32_t>(kStitchDecodeSourceCapacity),
       .drop = false,
       .read_timeout_ns = 30'000'000'000ULL,
   };
@@ -399,14 +403,28 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
     const auto limit = window.frame_limit;
     const std::int64_t sync_offset =
         command.sync_offset != 0 ? command.sync_offset : calibration->sync_offset;
-    if (const auto sync_error =
-            validate_gpu_stereo_decode_config({.sync_offset = sync_offset, .queue_capacity = 4});
+    if (const auto sync_error = validate_gpu_stereo_decode_config(
+            {.sync_offset = sync_offset, .queue_capacity = kStitchStereoQueueCapacity});
         sync_error.has_value()) {
       throw std::runtime_error(*sync_error);
     }
     auto runtime = discover_nvbufsurface_runtime();
 
     auto backend = core::CudaBackend::create();
+    const auto memory_estimate = estimate_gpu_stitch_memory({
+        .output_width = command.width,
+        .output_height = command.height,
+        .left_width = left_probe.width,
+        .left_height = left_probe.height,
+        .right_width = right_probe.width,
+        .right_height = right_probe.height,
+        .decode_source_capacity = kStitchDecodeSourceCapacity,
+        .stereo_queue_capacity = kStitchStereoQueueCapacity,
+        .encode_pool_capacity = kStitchEncodePoolCapacity,
+    });
+    require_gpu_memory_preflight(
+        evaluate_gpu_memory_preflight(memory_estimate.total_bytes, backend.memory_info(0)),
+        "GPU stitch pipeline allocation");
     auto renderer = core::CudaStereoStitchRenderer::create({.calibration = *calibration,
                                                             .output_width = command.width,
                                                             .output_height = command.height,
@@ -473,13 +491,14 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
         .audio_caps = audio.has_value() ? audio->caps() : std::nullopt,
         .quality_value = command.quality_value,
         .device_ordinal = 0,
-        .pool_capacity = 8,
+        .pool_capacity = kStitchEncodePoolCapacity,
     };
     auto encoder = GpuVideoEncodeSession::open(std::move(encode_config), runtime);
     auto left = open_decode_source(left_input, start_frame, runtime);
     auto right = open_decode_source(right_input, start_frame, runtime);
-    GpuStereoDecodeSession decoder(std::move(left), std::move(right),
-                                   {.sync_offset = sync_offset, .queue_capacity = 4});
+    GpuStereoDecodeSession decoder(
+        std::move(left), std::move(right),
+        {.sync_offset = sync_offset, .queue_capacity = kStitchStereoQueueCapacity});
 
     std::optional<CompressedAudioPacket> pending_audio;
     bool audio_eos = false;

@@ -71,6 +71,7 @@ constexpr unsigned int kMemAccessFlagsProtRead = 1;
 constexpr unsigned int kMemAllocGranularityMinimum = 0;
 constexpr int kDeviceAttributeComputeCapabilityMajor = 75;
 constexpr int kDeviceAttributeComputeCapabilityMinor = 76;
+constexpr int kDeviceAttributeIntegrated = 18;
 constexpr std::size_t kMaximumDriverLibraryPathBytes = 32U * 1024U;
 
 struct CUuuid {
@@ -1172,10 +1173,19 @@ std::uintptr_t CudaBackend::primary_context_id(int ordinal) const {
   return identity;
 }
 
-CudaMemoryInfo CudaBackend::memory_info() const {
-  impl_->ensure_primary_context(0);
+CudaMemoryInfo CudaBackend::memory_info(int ordinal) const {
+  PrimaryContextScope scope(*impl_, ordinal);
   CudaMemoryInfo info;
   check_cuda("cuMemGetInfo_v2", impl_->cu_mem_get_info(&info.free_bytes, &info.total_bytes));
+  int integrated = 0;
+  check_cuda("cuDeviceGetAttribute (integrated)",
+             impl_->cu_device_get_attribute(&integrated, kDeviceAttributeIntegrated,
+                                            impl_->device(ordinal)));
+  if (integrated != 0 && integrated != 1) {
+    throw std::runtime_error("CUDA driver returned an invalid integrated-memory attribute");
+  }
+  info.integrated = integrated != 0;
+  scope.restore();
   return info;
 }
 

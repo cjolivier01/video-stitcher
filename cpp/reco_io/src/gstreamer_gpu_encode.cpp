@@ -1,5 +1,7 @@
 #include "reco/io/gpu_encode.hpp"
 
+#include "reco/io/gpu_memory.hpp"
+
 #include "reco/core/path.hpp"
 #if defined(_WIN32)
 #include "reco/core/windows_runtime_library.hpp"
@@ -845,6 +847,17 @@ GpuVideoEncodeSession::open(GpuEncodeConfig config,
                             std::shared_ptr<GpuEncodeTraceSink> trace_sink) {
   if (const auto error = validate_gpu_encode_config(config); error.has_value()) {
     throw GpuEncodeError(*error);
+  }
+  try {
+    const auto pool_bytes =
+        estimate_gpu_encode_pool_bytes(config.width, config.height, config.pool_capacity);
+    const auto memory = query_nvmm_cuda_memory_info(runtime, config.device_ordinal);
+    require_gpu_memory_preflight(evaluate_gpu_memory_preflight(pool_bytes, memory),
+                                 "GPU encode pool allocation");
+  } catch (const GpuEncodeError&) {
+    throw;
+  } catch (const std::exception& error) {
+    throw GpuEncodeError("GPU encode memory preflight failed: " + std::string(error.what()));
   }
   return GpuVideoEncodeSession(
       std::make_unique<Impl>(std::move(config), std::move(runtime), std::move(trace_sink)));

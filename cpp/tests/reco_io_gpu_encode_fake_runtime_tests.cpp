@@ -17,6 +17,10 @@
 #include <thread>
 #include <vector>
 
+#if defined(__linux__)
+#include <dlfcn.h>
+#endif
+
 namespace {
 
 using namespace reco::io;
@@ -109,6 +113,44 @@ std::filesystem::path find_probe_worker_runfile() {
   throw std::runtime_error("video probe worker runfile not found");
 }
 
+#if defined(__linux__)
+class FakeNvbufSurfaceControl final {
+public:
+  explicit FakeNvbufSurfaceControl(const std::filesystem::path& path) {
+    library_ = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (library_ == nullptr) {
+      throw std::runtime_error("failed to open fake NvBufSurface control library");
+    }
+    reset_ =
+        reinterpret_cast<void (*)()>(dlsym(library_, "recoFakeNvbufSurfaceResetAllocationCount"));
+    count_ = reinterpret_cast<std::uint64_t (*)()>(
+        dlsym(library_, "recoFakeNvbufSurfaceAllocationCount"));
+    if (reset_ == nullptr || count_ == nullptr) {
+      dlclose(library_);
+      library_ = nullptr;
+      throw std::runtime_error("fake NvBufSurface allocation controls are missing");
+    }
+  }
+
+  ~FakeNvbufSurfaceControl() {
+    if (library_ != nullptr) {
+      dlclose(library_);
+    }
+  }
+
+  FakeNvbufSurfaceControl(const FakeNvbufSurfaceControl&) = delete;
+  FakeNvbufSurfaceControl& operator=(const FakeNvbufSurfaceControl&) = delete;
+
+  void reset() const { reset_(); }
+  [[nodiscard]] std::uint64_t count() const { return count_(); }
+
+private:
+  void* library_ = nullptr;
+  void (*reset_)() = nullptr;
+  std::uint64_t (*count_)() = nullptr;
+};
+#endif
+
 void set_environment(const char* name, const std::string& value) {
 #if defined(_WIN32)
   _putenv_s(name, value.c_str());
@@ -198,6 +240,43 @@ GpuVideoEncodeSession open_session(const std::shared_ptr<const NvbufSurfaceRunti
                                    const std::shared_ptr<Trace>& trace = {}) {
   return GpuVideoEncodeSession::open(config(), runtime, trace);
 }
+
+#if defined(__linux__)
+void gpu_memory_preflight_prevents_partial_nvmm_pool_allocation(
+    const std::shared_ptr<const NvbufSurfaceRuntime>& runtime,
+    const FakeNvbufSurfaceControl& nvbuf) {
+  constexpr std::uint64_t mebibyte = 1024ULL * 1024ULL;
+  constexpr std::uint64_t gibibyte = 1024ULL * mebibyte;
+  set_scenario("encode-success");
+
+  set_environment("RECO_FAKE_CUDA_TOTAL_BYTES", std::to_string(8ULL * gibibyte));
+  set_environment("RECO_FAKE_CUDA_FREE_BYTES", std::to_string(64ULL * mebibyte));
+  set_environment("RECO_FAKE_CUDA_INTEGRATED", "0");
+  nvbuf.reset();
+  auto trace = std::make_shared<Trace>();
+  expect_encode_error([&] { (void)open_session(runtime, trace); }, "reduce output dimensions",
+                      "insufficient discrete GPU memory fails preflight");
+  expect_eq(nvbuf.count(), 0ULL, "failed preflight creates no NvBufSurface allocation");
+  expect_eq(trace->allocated.load(), 0U, "failed preflight publishes no pool allocation");
+
+  set_environment("RECO_FAKE_CUDA_FREE_BYTES", std::to_string(1536ULL * mebibyte));
+  set_environment("RECO_FAKE_CUDA_INTEGRATED", "1");
+  nvbuf.reset();
+  expect_encode_error([&] { (void)open_session(runtime); }, "integrated CUDA device",
+                      "integrated GPU keeps shared-memory safety reserve");
+  expect_eq(nvbuf.count(), 0ULL,
+            "integrated-memory preflight fails before the first NvBufSurface allocation");
+
+  set_environment("RECO_FAKE_CUDA_FREE_BYTES", std::to_string(6ULL * gibibyte));
+  set_environment("RECO_FAKE_CUDA_INTEGRATED", "0");
+  nvbuf.reset();
+  {
+    auto session = open_session(runtime);
+    session.abort();
+  }
+  expect_eq(nvbuf.count(), 8ULL, "normal GPU budget allocates the complete bounded pool");
+}
+#endif
 
 void startup_failures_release_partial_resources(
     const std::shared_ptr<const NvbufSurfaceRuntime>& runtime,
@@ -866,6 +945,9 @@ int main() {
   set_environment("RECO_NVBUFSURFACE_DYLIB_PATH", nvbufsurface.string());
   set_environment("RECO_NVDS_UTILS_DYLIB_PATH", nvbufsurface.string());
   set_environment("RECO_CUDA_DRIVER_DYLIB_PATH", cuda.string());
+  set_environment("RECO_FAKE_CUDA_TOTAL_BYTES", std::to_string(8ULL * 1024ULL * 1024ULL * 1024ULL));
+  set_environment("RECO_FAKE_CUDA_FREE_BYTES", std::to_string(6ULL * 1024ULL * 1024ULL * 1024ULL));
+  set_environment("RECO_FAKE_CUDA_INTEGRATED", "0");
   const auto event_path =
       std::filesystem::temp_directory_path() /
       ("reco_fake_gpu_encode_events_" +
@@ -873,7 +955,9 @@ int main() {
   set_environment("RECO_FAKE_GST_EVENT_PATH", event_path.string());
 
   try {
+    const FakeNvbufSurfaceControl nvbuf_control(nvbufsurface);
     const auto runtime = discover_nvbufsurface_runtime();
+    gpu_memory_preflight_prevents_partial_nvmm_pool_allocation(runtime, nvbuf_control);
     startup_failures_release_partial_resources(runtime, event_path);
     wrapped_callbacks_and_move_assignment_release_exactly_once(runtime);
     wrapping_and_push_failures_preserve_pool_ownership(runtime);

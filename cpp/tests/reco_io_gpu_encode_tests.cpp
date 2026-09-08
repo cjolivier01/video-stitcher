@@ -1,4 +1,5 @@
 #include "reco/io/gpu_encode.hpp"
+#include "reco/io/gpu_memory.hpp"
 
 #include <cstdlib>
 #include <iostream>
@@ -16,6 +17,18 @@ void expect_true(bool value, std::string_view message) {
   if (!value) {
     ++failures;
     std::cerr << "FAIL: " << message << '\n';
+  }
+}
+
+template <typename Function>
+void expect_overflow_error(Function&& function, std::string_view message) {
+  try {
+    function();
+    expect_true(false, message);
+  } catch (const std::overflow_error&) {
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: " << message << " threw unexpected exception: " << error.what() << '\n';
+    ++failures;
   }
 }
 
@@ -172,6 +185,106 @@ void compressed_audio_is_stream_copied_through_a_bounded_mux_branch() {
               "elementary video is retained as a silent timeline segment");
 }
 
+void gpu_memory_estimates_are_overflow_checked_and_topology_aware() {
+  const auto surface_4k = estimate_nvmm_nv12_surface_bytes(3840, 2160);
+  const auto pool_4k = estimate_gpu_encode_pool_bytes(3840, 2160, 8);
+  expect_true(surface_4k > static_cast<std::size_t>(3840) * 2160 * 3U / 2U,
+              "NVMM estimate includes alignment and allocation overhead");
+  expect_true(pool_4k == surface_4k * 8U, "encode pool estimate covers every surface");
+
+  const auto stitch = estimate_gpu_stitch_memory({
+      .output_width = 3840,
+      .output_height = 2160,
+      .left_width = 1920,
+      .left_height = 1080,
+      .right_width = 1920,
+      .right_height = 1080,
+      .decode_source_capacity = 4,
+      .stereo_queue_capacity = 4,
+      .encode_pool_capacity = 8,
+  });
+  expect_true(stitch.encode_pool_bytes == pool_4k, "stitch estimate includes encode pool");
+  expect_true(stitch.rgba_output_bytes >= static_cast<std::size_t>(3840) * 2160 * 4U,
+              "stitch estimate includes pitched RGBA output");
+  expect_true(stitch.decode_surfaces_bytes > stitch.rgba_output_bytes,
+              "stitch estimate reserves decoder and queue surfaces");
+  expect_true(stitch.total_bytes == stitch.encode_pool_bytes + stitch.rgba_output_bytes +
+                                        stitch.decode_surfaces_bytes,
+              "stitch estimate total includes every component");
+
+  constexpr std::size_t gibibyte = 1024ULL * 1024ULL * 1024ULL;
+  const auto discrete = evaluate_gpu_memory_preflight(
+      stitch.total_bytes,
+      {.free_bytes = 6U * gibibyte, .total_bytes = 8U * gibibyte, .integrated = false});
+  const auto integrated = evaluate_gpu_memory_preflight(
+      stitch.total_bytes,
+      {.free_bytes = 6U * gibibyte, .total_bytes = 8U * gibibyte, .integrated = true});
+  expect_true(integrated.safety_reserve_bytes > discrete.safety_reserve_bytes,
+              "integrated memory keeps a larger system safety reserve");
+  try {
+    require_gpu_memory_preflight(discrete, "test stitch");
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: normal discrete GPU budget was rejected: " << error.what() << '\n';
+    ++failures;
+  }
+
+  const auto stitch_8k = estimate_gpu_stitch_memory({
+      .output_width = 7680,
+      .output_height = 4320,
+      .left_width = 3840,
+      .left_height = 2160,
+      .right_width = 3840,
+      .right_height = 2160,
+      .decode_source_capacity = 4,
+      .stereo_queue_capacity = 4,
+      .encode_pool_capacity = 8,
+  });
+  try {
+    require_gpu_memory_preflight(
+        evaluate_gpu_memory_preflight(
+            stitch_8k.total_bytes,
+            {.free_bytes = 12U * gibibyte, .total_bytes = 16U * gibibyte, .integrated = false}),
+        "test 8K stitch");
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: 8K stitch was rejected despite sufficient GPU memory: " << error.what()
+              << '\n';
+    ++failures;
+  }
+
+  auto insufficient = integrated;
+  insufficient.available_free_bytes = integrated.required_free_bytes - 1U;
+  try {
+    require_gpu_memory_preflight(insufficient, "test stitch");
+    expect_true(false, "insufficient integrated budget is rejected");
+  } catch (const std::runtime_error& error) {
+    const auto message = std::string_view(error.what());
+    expect_true(message.find("shared system/GPU memory") != std::string_view::npos &&
+                    message.find("reduce output dimensions") != std::string_view::npos &&
+                    message.find("CPU fallback is disabled") != std::string_view::npos,
+                "insufficient budget reports integrated-memory remediation");
+  }
+
+  constexpr auto maximum_even_dimension = std::numeric_limits<std::uint32_t>::max() - 1U;
+  expect_overflow_error(
+      [&] {
+        (void)estimate_nvmm_nv12_surface_bytes(maximum_even_dimension, maximum_even_dimension);
+      },
+      "NVMM surface estimate rejects overflow");
+  expect_overflow_error(
+      [&] {
+        (void)estimate_gpu_encode_pool_bytes(3840, 2160, std::numeric_limits<std::size_t>::max());
+      },
+      "NVMM pool estimate rejects overflow");
+  expect_overflow_error(
+      [&] {
+        (void)evaluate_gpu_memory_preflight(std::numeric_limits<std::size_t>::max(),
+                                            {.free_bytes = std::numeric_limits<std::size_t>::max(),
+                                             .total_bytes = std::numeric_limits<std::size_t>::max(),
+                                             .integrated = false});
+      },
+      "safety-adjusted memory requirement rejects overflow");
+}
+
 } // namespace
 
 int main() {
@@ -179,6 +292,7 @@ int main() {
   pipeline_is_nvmm_and_hardware_only();
   codec_and_container_factories_are_explicit();
   compressed_audio_is_stream_copied_through_a_bounded_mux_branch();
+  gpu_memory_estimates_are_overflow_checked_and_topology_aware();
   if (failures != 0) {
     std::cerr << failures << " test(s) failed\n";
     return EXIT_FAILURE;
