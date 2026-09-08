@@ -2258,6 +2258,40 @@ void write_calibration_json_atomically_impl(
                                                                      destination_name, handle);
             return false;
           }
+          // Keep the no-delete-share handle through every observable hook, then
+          // revalidate through a delete-sharing handle so replacement can proceed.
+          BY_HANDLE_FILE_INFORMATION published_identity{};
+          if (GetFileInformationByHandle(handle, &published_identity) == 0) {
+            throw_file_error("cannot inspect published calibration output before rollback",
+                             destination, static_cast<int>(GetLastError()));
+          }
+          const HANDLE blocking_handle = std::exchange(handle, INVALID_HANDLE_VALUE);
+          if (CloseHandle(blocking_handle) == 0) {
+            throw_file_error("cannot release published calibration output for rollback",
+                             destination, static_cast<int>(GetLastError()));
+          }
+          DWORD rollback_target_error = ERROR_SUCCESS;
+          const HANDLE rollback_target = open_windows_file_relative(
+              output_directory.handle.get(), destination_name, FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN,
+              FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+              rollback_target_error);
+          if (rollback_target == INVALID_HANDLE_VALUE) {
+            throw_file_error("cannot revalidate published calibration output for rollback",
+                             destination, static_cast<int>(rollback_target_error));
+          }
+          UniqueWindowsHandle retained_rollback_target(rollback_target);
+          FILE_ATTRIBUTE_TAG_INFO rollback_target_attributes{};
+          BY_HANDLE_FILE_INFORMATION rollback_target_identity{};
+          if (GetFileInformationByHandleEx(rollback_target, FileAttributeTagInfo,
+                                           &rollback_target_attributes,
+                                           sizeof(rollback_target_attributes)) == 0 ||
+              (rollback_target_attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+              GetFileInformationByHandle(rollback_target, &rollback_target_identity) == 0 ||
+              !same_windows_file_identity(published_identity, rollback_target_identity)) {
+            throw WindowsPublicationIdentityError(
+                "published calibration output changed during rollback handoff");
+          }
           rename_open_file(displaced_output->handle.get(), output_directory.handle.get(),
                            destination_name, destination, true, true);
           destination_published = false;
