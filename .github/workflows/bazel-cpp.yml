@@ -87,6 +87,7 @@ jobs:
           //cpp/tests:reco_io_gpu_decode_session_tests
           //cpp/tests:reco_io_gstreamer_tests
           //cpp/tests:reco_io_nvmm_cuda_interop_tests
+          //cpp/tests:reco_io_stable_media_file_tests
       - name: Test GPU output with ASan
         run: >-
           bazel test --jobs=2 --local_test_jobs=1 --config=asan
@@ -160,6 +161,7 @@ jobs:
           //cpp/tests:reco_io_gpu_encode_runtime_tests
           //cpp/tests:reco_io_gstreamer_tests
           //cpp/tests:reco_io_nvmm_cuda_interop_tests
+          //cpp/tests:reco_io_stable_media_file_tests
       - name: Test process containment with TSan
         run: >-
           bazel test --jobs=2 --local_test_jobs=1 --config=tsan
