@@ -1,4 +1,5 @@
 #include "reco/cli/cli.hpp"
+#include "reco/cli/interrupt.hpp"
 
 #include "reco/calibrate/pipeline.hpp"
 #include "reco/core/path.hpp"
@@ -673,6 +674,89 @@ void expect_no_stitch_output_artifacts(const std::filesystem::path& directory,
   }
 }
 
+void interrupt_request_unwinds_stitch_output_staging() {
+  TemporaryDirectory root;
+  const auto destination = root.path() / "cancelled.mp4";
+  write_text_file(destination, "existing destination\n");
+
+#if defined(_WIN32)
+  {
+    detail::InterruptMonitor interrupts;
+    {
+      detail::AtomicOutputFile output(destination);
+      write_text_descriptor(output.descriptor(), "partial output\n");
+      expect_true(std::raise(SIGINT) == 0, "Windows CRT interrupt is delivered");
+      expect_true(interrupts.requested(), "Windows interrupt monitor records cancellation");
+    }
+  }
+#else
+  int ready[2]{};
+  if (::pipe(ready) != 0) {
+    throw std::system_error(errno, std::generic_category(), "cannot create interrupt test pipe");
+  }
+  const pid_t child = ::fork();
+  if (child == 0) {
+    (void)::close(ready[0]);
+    int status = 91;
+    try {
+      detail::InterruptMonitor interrupts;
+      {
+        detail::AtomicOutputFile output(destination);
+        write_text_descriptor(output.descriptor(), "partial output\n");
+        const char value = 1;
+        if (::write(ready[1], &value, 1) != 1) {
+          throw std::runtime_error("cannot signal interrupt child readiness");
+        }
+        while (!interrupts.requested()) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+      }
+      status = kCancelledExitCode;
+    } catch (...) {
+      status = 92;
+    }
+    (void)::close(ready[1]);
+    ::_exit(status);
+  }
+  (void)::close(ready[1]);
+  char value = 0;
+  const bool started =
+      child > 0 && read_byte_with_timeout(ready[0], value, std::chrono::seconds(5));
+  (void)::close(ready[0]);
+  expect_true(started, "interrupt child creates its retained staging output");
+  if (started) {
+    expect_true(::kill(child, SIGINT) == 0, "SIGINT is delivered to the stitch child");
+  }
+
+  int child_status = 0;
+  bool exited = false;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (child > 0 && std::chrono::steady_clock::now() < deadline) {
+    const auto result = ::waitpid(child, &child_status, WNOHANG);
+    if (result == child) {
+      exited = true;
+      break;
+    }
+    if (result < 0 && errno != EINTR) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  if (!exited && child > 0) {
+    (void)::kill(child, SIGKILL);
+    while (::waitpid(child, &child_status, 0) < 0 && errno == EINTR) {
+    }
+  }
+  expect_true(exited, "SIGINT child exits within the cancellation bound");
+  expect_true(exited && WIFEXITED(child_status) && WEXITSTATUS(child_status) == kCancelledExitCode,
+              "SIGINT child unwinds with the cancellation status");
+#endif
+
+  expect_true(read_text_file(destination) == "existing destination\n",
+              "cancellation preserves the existing destination");
+  expect_no_stitch_output_artifacts(root.path(), "cancellation");
+}
+
 template <typename T, typename U> void expect_eq(T actual, U expected, std::string_view message) {
   if (actual != expected) {
     std::cerr << "FAIL: " << message << " expected=" << expected << " actual=" << actual << '\n';
@@ -840,6 +924,33 @@ void stitch_frame_timing_preserves_source_gaps_and_rejects_overflow() {
     overflow_rejected = true;
   }
   expect_true(overflow_rejected, "terminal source frame index overflow is rejected");
+}
+
+void stitch_audio_is_clipped_by_presentation_time_at_the_video_boundary() {
+  const auto crossing = detail::clip_stitch_audio_duration(90U, 80U, 20U, 100U);
+  expect_eq(crossing.value_or(0), 10ULL,
+            "terminal audio duration is clipped from its presentation timestamp");
+
+  const auto outside = detail::clip_stitch_audio_duration(100U, 90U, 20U, 100U);
+  expect_true(!outside.has_value(),
+              "decode timestamp does not admit audio presented at the video boundary");
+
+  const auto dts_fallback = detail::clip_stitch_audio_duration(std::nullopt, 95U, 10U, 100U);
+  expect_eq(dts_fallback.value_or(0), 5ULL,
+            "decode timestamp is used only when presentation time is unavailable");
+
+  const auto contained = detail::clip_stitch_audio_duration(40U, 30U, 20U, 100U);
+  expect_eq(contained.value_or(0), 20ULL, "fully contained audio duration is unchanged");
+
+  bool unknown_duration_rejected = false;
+  try {
+    (void)detail::clip_stitch_audio_duration(40U, 30U, 0U, 100U);
+  } catch (const std::runtime_error& error) {
+    unknown_duration_rejected =
+        std::string_view(error.what()).find("duration is unknown") != std::string_view::npos;
+  }
+  expect_true(unknown_duration_rejected,
+              "unknown compressed duration fails closed at the final boundary");
 }
 
 void stitch_second_conversion_supports_the_unsigned_gstreamer_range() {
@@ -3086,6 +3197,17 @@ void command_execution_dispatches_available_stages() {
   out.clear();
   err.str("");
   err.clear();
+  const auto cancelled_stitch_status =
+      run_command(Command{stitch}, out, err, {}, [] { return true; });
+  expect_eq(cancelled_stitch_status, kCancelledExitCode,
+            "pre-cancelled stitch uses the cancellation exit status");
+  expect_true(out.str().empty(), "pre-cancelled stitch starts no runtime plan");
+  expect_eq(err.str(), std::string("cancelled\n"), "pre-cancelled stitch reports cancellation");
+
+  out.str("");
+  out.clear();
+  err.str("");
+  err.clear();
   stitch.no_zero_copy = true;
   const auto cpu_stitch_status = run_command(Command{stitch}, out, err);
   expect_eq(cpu_stitch_status, 2, "stitch no-zero-copy exits blocked");
@@ -3274,6 +3396,8 @@ int main(int argc, char** argv) {
   run_test_case("stitch_parse_matches_rust_defaults", stitch_parse_matches_rust_defaults);
   run_test_case("stitch_frame_timing_preserves_source_gaps_and_rejects_overflow",
                 stitch_frame_timing_preserves_source_gaps_and_rejects_overflow);
+  run_test_case("stitch_audio_is_clipped_by_presentation_time_at_the_video_boundary",
+                stitch_audio_is_clipped_by_presentation_time_at_the_video_boundary);
   run_test_case("stitch_second_conversion_supports_the_unsigned_gstreamer_range",
                 stitch_second_conversion_supports_the_unsigned_gstreamer_range);
   run_test_case("stitch_frame_window_uses_one_rounded_timeline",
@@ -3282,6 +3406,8 @@ int main(int argc, char** argv) {
                 stitch_descriptor_budget_is_checked_before_input_acquisition);
   run_test_case("stitch_output_transaction_is_descriptor_pinned_and_atomic",
                 stitch_output_transaction_is_descriptor_pinned_and_atomic);
+  run_test_case("interrupt_request_unwinds_stitch_output_staging",
+                interrupt_request_unwinds_stitch_output_staging);
   run_test_case("preview_and_calibrate_parse_matches_rust_defaults",
                 preview_and_calibrate_parse_matches_rust_defaults);
   run_test_case("live_command_parse_matches_rust_defaults",

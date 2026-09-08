@@ -5269,7 +5269,8 @@ std::string help_text() {
 }
 
 int run_command(const Command& command, std::ostream& out, std::ostream& err,
-                const std::filesystem::path& executable_path) {
+                const std::filesystem::path& executable_path,
+                const CancellationRequested& cancellation_requested) {
   if (std::holds_alternative<HelpCommand>(command)) {
     out << help_text() << '\n';
     return 0;
@@ -5438,6 +5439,10 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err,
   }
 
   if (const auto* stitch = std::get_if<StitchCommand>(&command)) {
+    if (cancellation_requested && cancellation_requested()) {
+      err << "cancelled\n";
+      return kCancelledExitCode;
+    }
     const auto backends = reco::calibrate::probe_calibration_backends();
     const auto plan = build_stitch_plan(*stitch, backends);
     write_runtime_plan(out, plan);
@@ -5445,7 +5450,7 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err,
       err << "error: " << *plan.blocked_reason << '\n';
       return 2;
     }
-    return detail::run_gpu_stitch(*stitch, executable_path, out, err);
+    return detail::run_gpu_stitch(*stitch, executable_path, out, err, cancellation_requested);
   }
 
   RuntimePlan runtime_plan;

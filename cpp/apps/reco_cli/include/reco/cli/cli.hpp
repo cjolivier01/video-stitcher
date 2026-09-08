@@ -166,13 +166,20 @@ struct HelpCommand {};
 using Command = std::variant<StitchCommand, PreviewCommand, CalibrateCommand, CameraCommand,
                              LibcameraCommand, GoproCommand, InfoCommand, HelpCommand>;
 
+/// Thread-safe, non-throwing cancellation query used by long-running command implementations.
+using CancellationRequested = std::function<bool()>;
+
+/// Conventional shell status returned when a command unwinds after cancellation.
+inline constexpr int kCancelledExitCode = 130;
+
 [[nodiscard]] std::variant<float, ParseError> parse_blend(std::string_view value);
 [[nodiscard]] std::variant<WxH, ParseError> parse_wxh(std::string_view value);
 [[nodiscard]] std::variant<Command, ParseError> parse_args(const std::vector<std::string>& args);
 [[nodiscard]] std::string_view command_name(const Command& command);
 [[nodiscard]] std::string help_text();
 int run_command(const Command& command, std::ostream& out, std::ostream& err,
-                const std::filesystem::path& executable_path = {});
+                const std::filesystem::path& executable_path = {},
+                const CancellationRequested& cancellation_requested = {});
 
 namespace detail {
 
@@ -259,6 +266,12 @@ struct StitchFrameWindow {
                                                            std::uint64_t first_source_frame_index,
                                                            std::uint32_t fps_numerator,
                                                            std::uint32_t fps_denominator);
+
+/// Returns a packet duration clipped to the final video boundary, or empty when presentation
+/// begins outside it. Unknown durations fail closed because stream-copy cannot split a packet.
+[[nodiscard]] std::optional<std::uint64_t>
+clip_stitch_audio_duration(std::optional<std::uint64_t> pts_ns, std::optional<std::uint64_t> dts_ns,
+                           std::uint64_t duration_ns, std::uint64_t video_duration_ns);
 
 /// Resolves the deployed video probe worker for CLI startup and hardening tests.
 [[nodiscard]] std::optional<std::filesystem::path>

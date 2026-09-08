@@ -297,6 +297,44 @@ jobs:
             -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1 \
             "$work_dir/stitched.mp4")" = "video"
 
+          printf '%s\n' 'existing destination' >"$work_dir/cancelled.mp4"
+          reco_binary="$(bazel --output_base="$RUNNER_TEMP/reco-bazel-output" info bazel-bin)/cpp/apps/reco_cli/reco"
+          "$reco_binary" stitch "$work_dir/left.mp4" "$work_dir/right.mp4" \
+            --calibration "$work_dir/match.json" \
+            --max-frames 60 \
+            --output "$work_dir/cancelled.mp4" \
+            >"$work_dir/cancelled.log" 2>&1 &
+          stitch_pid=$!
+          staging_ready=false
+          for _ in $(seq 1 100); do
+            if find "$work_dir" -maxdepth 1 -name '.reco-stitch-*' -print -quit | grep -q .; then
+              staging_ready=true
+              break
+            fi
+            kill -0 "$stitch_pid"
+            sleep 0.05
+          done
+          test "$staging_ready" = true
+          sleep 0.25
+          kill -INT "$stitch_pid"
+          if timeout 15s tail --pid="$stitch_pid" -f /dev/null; then
+            true
+          else
+            kill -KILL "$stitch_pid" || true
+            wait "$stitch_pid" || true
+            cat "$work_dir/cancelled.log"
+            exit 1
+          fi
+          if wait "$stitch_pid"; then
+            stitch_status=0
+          else
+            stitch_status=$?
+          fi
+          test "$stitch_status" = 130
+          test "$(cat "$work_dir/cancelled.mp4")" = 'existing destination'
+          test -z "$(find "$work_dir" -maxdepth 1 -name '.reco-stitch-*' -print -quit)"
+          grep -qx 'cancelled' "$work_dir/cancelled.log"
+
   jetson-nvmm-hardware-conditional:
     name: Bazel C++ Jetson NVMM stitch (hardware-conditional)
     if: >-

@@ -16,6 +16,7 @@
 #include "reco/io/stable_media_file.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -28,6 +29,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -390,6 +392,72 @@ void verify_retained_inputs(const ProbedInput& left, const ProbedInput& right,
   calibration.verify_unchanged();
 }
 
+bool cancellation_is_requested(const CancellationRequested& requested) noexcept {
+  if (!requested) {
+    return false;
+  }
+  try {
+    return requested();
+  } catch (...) {
+    return true;
+  }
+}
+
+class StitchCancelled final : public std::runtime_error {
+public:
+  StitchCancelled() : std::runtime_error("stitch cancelled") {}
+};
+
+class StitchCancellationRelay final {
+public:
+  StitchCancellationRelay(const CancellationRequested& requested, GpuStereoDecodeSession& decoder,
+                          AudioPassthroughSource* audio, GpuVideoEncodeSession& encoder)
+      : requested_(requested) {
+    if (!requested_) {
+      return;
+    }
+    worker_ = std::jthread([this, &decoder, audio, &encoder](std::stop_token stop) {
+      while (!stop.stop_requested()) {
+        if (cancellation_is_requested(requested_)) {
+          observed_.store(true, std::memory_order_release);
+          decoder.request_stop();
+          if (audio != nullptr) {
+            audio->request_stop();
+          }
+          encoder.abort();
+          return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+    });
+  }
+
+  StitchCancellationRelay(const StitchCancellationRelay&) = delete;
+  StitchCancellationRelay& operator=(const StitchCancellationRelay&) = delete;
+
+  ~StitchCancellationRelay() {
+    worker_.request_stop();
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+  }
+
+  [[nodiscard]] bool requested() const noexcept {
+    return observed_.load(std::memory_order_acquire) || cancellation_is_requested(requested_);
+  }
+
+  void throw_if_requested() const {
+    if (requested()) {
+      throw StitchCancelled();
+    }
+  }
+
+private:
+  const CancellationRequested& requested_;
+  std::atomic<bool> observed_{false};
+  std::jthread worker_;
+};
+
 } // namespace
 
 std::size_t stitch_descriptor_requirement(std::size_t input_segments) {
@@ -492,9 +560,31 @@ StitchFrameTiming derive_stitch_frame_timing(std::uint64_t source_frame_index,
   return {.pts_ns = pts, .duration_ns = next_pts - pts};
 }
 
+std::optional<std::uint64_t> clip_stitch_audio_duration(std::optional<std::uint64_t> pts_ns,
+                                                        std::optional<std::uint64_t> dts_ns,
+                                                        std::uint64_t duration_ns,
+                                                        std::uint64_t video_duration_ns) {
+  const auto presentation_timestamp = pts_ns.has_value() ? pts_ns : dts_ns;
+  if (!presentation_timestamp.has_value()) {
+    throw std::runtime_error("compressed audio packet has no finite presentation timestamp");
+  }
+  if (*presentation_timestamp >= video_duration_ns) {
+    return std::nullopt;
+  }
+  if (duration_ns == 0) {
+    throw std::runtime_error(
+        "compressed audio packet duration is unknown; cannot bound stream-copy output");
+  }
+  return std::min(duration_ns, video_duration_ns - *presentation_timestamp);
+}
+
 int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& executable_path,
-                   std::ostream& out, std::ostream& err) {
+                   std::ostream& out, std::ostream& err,
+                   const CancellationRequested& cancellation_requested) {
   try {
+    if (cancellation_is_requested(cancellation_requested)) {
+      throw StitchCancelled();
+    }
     reject_unported_stitch_options(command);
     auto left_paths = split_input_segments(command.left, "left");
     auto right_paths = split_input_segments(command.right, "right");
@@ -526,6 +616,9 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
                                .label = "the calibration file",
                                .stable_source = calibration_source});
     AtomicOutputFile output(output_path, {}, {}, protected_paths);
+    if (cancellation_is_requested(cancellation_requested)) {
+      throw StitchCancelled();
+    }
 
     auto calibration = core::parse_match_calibration_json(
         calibration_source->read_all(core::kMaxCalibrationFileSize));
@@ -541,6 +634,9 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
     auto left_input = probe_input(std::move(left_paths), std::move(left_sources), *worker, "left");
     auto right_input =
         probe_input(std::move(right_paths), std::move(right_sources), *worker, "right");
+    if (cancellation_is_requested(cancellation_requested)) {
+      throw StitchCancelled();
+    }
     require_exact_indexed_timeline(left_input, "left");
     require_exact_indexed_timeline(right_input, "right");
     const auto& left_probe = left_input.probes.front();
@@ -663,11 +759,14 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
     GpuStereoDecodeSession decoder(
         std::move(left), std::move(right),
         {.sync_offset = sync_offset, .queue_capacity = kStitchStereoQueueCapacity});
+    StitchCancellationRelay cancellation(cancellation_requested, decoder,
+                                         audio.has_value() ? &*audio : nullptr, encoder);
 
     std::optional<CompressedAudioPacket> pending_audio;
     bool audio_eos = false;
-    const auto forward_audio_before = [&](std::uint64_t video_duration_ns) {
+    const auto forward_audio_before = [&](std::uint64_t video_duration_ns, bool final_boundary) {
       while (audio.has_value() && !audio_eos) {
+        cancellation.throw_if_requested();
         if (!pending_audio.has_value()) {
           auto read = audio->read();
           if (read.status == AudioPassthroughStatus::EndOfStream) {
@@ -679,13 +778,19 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
           }
           pending_audio = std::move(*read.packet);
         }
-        const auto timestamp = pending_audio->timestamp_ns();
-        if (!timestamp.has_value()) {
-          throw std::runtime_error("compressed audio packet has no finite timestamp");
-        }
-        if (*timestamp >= video_duration_ns) {
+        if (!final_boundary && pending_audio->duration_ns == 0) {
           break;
         }
+        const auto clipped_duration =
+            clip_stitch_audio_duration(pending_audio->pts_ns, pending_audio->dts_ns,
+                                       pending_audio->duration_ns, video_duration_ns);
+        if (!clipped_duration.has_value()) {
+          break;
+        }
+        if (!final_boundary && *clipped_duration != pending_audio->duration_ns) {
+          break;
+        }
+        pending_audio->duration_ns = *clipped_duration;
         encoder.submit_audio_packet(std::move(*pending_audio));
         pending_audio.reset();
       }
@@ -693,14 +798,17 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
 
     const auto started = std::chrono::steady_clock::now();
     std::uint64_t frames = 0;
+    std::uint64_t video_duration_ns = 0;
     std::optional<std::uint64_t> first_source_frame_index;
     std::optional<std::uint64_t> previous_source_frame_index;
     while (!limit.has_value() || frames < *limit) {
+      cancellation.throw_if_requested();
       auto decoded = decoder.read();
       if (decoded.status == GpuStereoDecodeStatus::EndOfStream) {
         break;
       }
       if (decoded.status == GpuStereoDecodeStatus::Stopped || !decoded.frames.has_value()) {
+        cancellation.throw_if_requested();
         throw std::runtime_error("stereo decoder stopped before end-of-stream");
       }
       auto left_frame = map_gpu_decoded_frame_to_cuda_lease(decoded.frames->left);
@@ -730,29 +838,45 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
           derive_stitch_frame_timing(source_frame_index, *first_source_frame_index,
                                      left_probe.fps_numerator, left_probe.fps_denominator);
       encoder.submit_frame(std::move(encoded), timing.pts_ns, timing.duration_ns);
-      forward_audio_before(timing.pts_ns + timing.duration_ns);
+      video_duration_ns = timing.pts_ns + timing.duration_ns;
+      forward_audio_before(video_duration_ns, false);
       previous_source_frame_index = source_frame_index;
       ++frames;
     }
     decoder.request_stop();
+    if (frames == 0) {
+      encoder.abort();
+      if (audio.has_value()) {
+        audio->request_stop();
+      }
+      throw std::runtime_error("stereo inputs produced no aligned video frames");
+    }
+    forward_audio_before(video_duration_ns, true);
     if (audio.has_value()) {
       audio->request_stop();
     }
-    if (frames == 0) {
-      encoder.abort();
-      throw std::runtime_error("stereo inputs produced no aligned video frames");
-    }
+    cancellation.throw_if_requested();
     encoder.finish();
+    cancellation.throw_if_requested();
     verify_muxed_gpu_video_output(output.verification_source(), *codec, format, *worker,
                                   kProbeTimeout);
+    cancellation.throw_if_requested();
     verify_retained_inputs(left_input, right_input, *calibration_source);
+    cancellation.throw_if_requested();
     output.commit();
     const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started);
     const auto rate = elapsed.count() > 0.0 ? static_cast<double>(frames) / elapsed.count() : 0.0;
     out << "Stitched " << frames << " frames to " << command.output << " in " << elapsed.count()
         << "s (" << rate << " fps, CUDA/NVMM/NVENC)\n";
     return 0;
+  } catch (const StitchCancelled&) {
+    err << "cancelled\n";
+    return kCancelledExitCode;
   } catch (const std::exception& error) {
+    if (cancellation_is_requested(cancellation_requested)) {
+      err << "cancelled\n";
+      return kCancelledExitCode;
+    }
     err << "error: " << error.what() << '\n';
     return 2;
   }
