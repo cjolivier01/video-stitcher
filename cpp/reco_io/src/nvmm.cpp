@@ -3,6 +3,7 @@
 #include "reco/io/detail/nvbufsurface_7_1.hpp"
 #include "reco/io/detail/nvbufsurface_9_1.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <filesystem>
@@ -66,18 +67,22 @@ std::pair<Nv12ColorMatrix, Nv12ColorRange> color_description(std::uint32_t forma
   }
 }
 
-std::uint64_t plane_end(std::uint32_t offset, std::uint32_t pitch, std::uint32_t height) {
-  return static_cast<std::uint64_t>(offset) + static_cast<std::uint64_t>(pitch) * height;
-}
-
 bool same_frame_info(const NvmmFrameInfo& lhs, const NvmmFrameInfo& rhs) {
   return lhs.abi == rhs.abi && lhs.memory_type == rhs.memory_type && lhs.gpu_id == rhs.gpu_id &&
          lhs.dmabuf_fd == rhs.dmabuf_fd && lhs.cuda_base_ptr == rhs.cuda_base_ptr &&
          lhs.width == rhs.width && lhs.height == rhs.height && lhs.y_offset == rhs.y_offset &&
-         lhs.y_pitch == rhs.y_pitch && lhs.uv_offset == rhs.uv_offset &&
-         lhs.uv_pitch == rhs.uv_pitch && lhs.total_size == rhs.total_size &&
-         lhs.color_matrix == rhs.color_matrix && lhs.color_range == rhs.color_range &&
-         lhs.surface_ptr == rhs.surface_ptr;
+         lhs.y_pitch == rhs.y_pitch && lhs.y_size == rhs.y_size && lhs.uv_offset == rhs.uv_offset &&
+         lhs.uv_pitch == rhs.uv_pitch && lhs.uv_size == rhs.uv_size &&
+         lhs.total_size == rhs.total_size && lhs.color_matrix == rhs.color_matrix &&
+         lhs.color_range == rhs.color_range && lhs.surface_ptr == rhs.surface_ptr;
+}
+
+std::pair<std::uint32_t, std::uint32_t> effective_plane_sizes(const NvmmFrameInfo& info) {
+  if (info.y_size == 0 && info.uv_size == 0 && info.uv_offset >= info.y_offset &&
+      info.total_size >= info.uv_offset) {
+    return {info.uv_offset - info.y_offset, info.total_size - info.uv_offset};
+  }
+  return {info.y_size, info.uv_size};
 }
 
 core::CudaDevicePtr checked_device_pointer(void* base, std::uint32_t offset) {
@@ -90,6 +95,15 @@ core::CudaDevicePtr checked_device_pointer(void* base, std::uint32_t offset) {
   }
   return value + offset;
 }
+
+struct CudaPointerProvenance {
+  std::uintptr_t context_id = 0;
+  int device_ordinal = -1;
+  core::CudaDevicePtr mapping_base = 0;
+  std::size_t mapping_bytes = 0;
+  std::size_t accessible_bytes = 0;
+  core::CudaValidatedSpan validation;
+};
 
 #if defined(__linux__)
 class DynamicLibrary {
@@ -211,13 +225,6 @@ using CudaDevice = int;
 using CudaContext = void*;
 using CudaGraphicsResource = void*;
 constexpr CudaResult kCudaSuccess = 0;
-constexpr int kCudaMemoryTypeDevice = 2;
-constexpr int kCudaPointerAttributeContext = 1;
-constexpr int kCudaPointerAttributeMemoryType = 2;
-constexpr int kCudaPointerAttributeDeviceOrdinal = 9;
-constexpr int kCudaPointerAttributeMapped = 13;
-constexpr int kCudaPointerAttributeMappingSize = 18;
-constexpr int kCudaPointerAttributeMappingBase = 19;
 constexpr std::uint32_t kCudaEglFrameTypePitch = 1;
 constexpr std::uint32_t kCudaArrayFormatUnsignedInt8 = 1;
 constexpr std::uint32_t kCudaEglColorYuv420Semiplanar = 0x01;
@@ -269,20 +276,19 @@ struct CudaFunctions {
   using PrimaryContextRelease = CudaResult (*)(CudaDevice);
   using ContextGetCurrent = CudaResult (*)(CudaContext*);
   using ContextSetCurrent = CudaResult (*)(CudaContext);
-  using PointerGetAttribute = CudaResult (*)(void*, int, core::CudaDevicePtr);
   using RegisterEglImage = CudaResult (*)(CudaGraphicsResource*, void*, unsigned int);
   using GetMappedEglFrame = CudaResult (*)(CudaEglFrame*, CudaGraphicsResource, unsigned int,
                                            unsigned int);
   using UnregisterResource = CudaResult (*)(CudaGraphicsResource);
 
-  explicit CudaFunctions(const char* path) : library(path) {
+  explicit CudaFunctions(const char* path)
+      : library(path), span_backend(core::CudaBackend::load(path)) {
     init = library.symbol<Init>("cuInit");
     device_get = library.symbol<DeviceGet>("cuDeviceGet");
     primary_context_retain = library.symbol<PrimaryContextRetain>("cuDevicePrimaryCtxRetain");
     primary_context_release = library.symbol<PrimaryContextRelease>("cuDevicePrimaryCtxRelease");
     context_get_current = library.symbol<ContextGetCurrent>("cuCtxGetCurrent");
     context_set_current = library.symbol<ContextSetCurrent>("cuCtxSetCurrent");
-    pointer_get_attribute = library.symbol<PointerGetAttribute>("cuPointerGetAttribute");
     register_egl_image = library.symbol<RegisterEglImage>("cuGraphicsEGLRegisterImage");
     get_mapped_egl_frame = library.symbol<GetMappedEglFrame>("cuGraphicsResourceGetMappedEglFrame");
     unregister_resource = library.symbol<UnregisterResource>("cuGraphicsUnregisterResource");
@@ -298,18 +304,19 @@ struct CudaFunctions {
   }
 
   DynamicLibrary library;
+  core::CudaBackend span_backend;
   Init init = nullptr;
   DeviceGet device_get = nullptr;
   PrimaryContextRetain primary_context_retain = nullptr;
   PrimaryContextRelease primary_context_release = nullptr;
   ContextGetCurrent context_get_current = nullptr;
   ContextSetCurrent context_set_current = nullptr;
-  PointerGetAttribute pointer_get_attribute = nullptr;
   RegisterEglImage register_egl_image = nullptr;
   GetMappedEglFrame get_mapped_egl_frame = nullptr;
   UnregisterResource unregister_resource = nullptr;
   CudaDevice device = 0;
   CudaContext primary_context = nullptr;
+  std::atomic<bool> context_restore_failed = false;
 };
 
 std::shared_ptr<CudaFunctions> cuda_functions() {
@@ -323,6 +330,16 @@ std::shared_ptr<CudaFunctions> cuda_functions() {
   return functions;
 }
 
+void require_healthy_cuda_context(const std::shared_ptr<CudaFunctions>& functions) {
+  if (functions->context_restore_failed.load(std::memory_order_acquire)) {
+    throw NvmmError(
+        "CUDA caller context restoration previously failed during NvBufSurface cleanup");
+  }
+  if (!functions->span_backend.context_healthy()) {
+    throw NvmmError(functions->span_backend.context_health_error());
+  }
+}
+
 class DeviceZeroContext {
 public:
   explicit DeviceZeroContext(const std::shared_ptr<CudaFunctions>& functions)
@@ -334,9 +351,23 @@ public:
   DeviceZeroContext(const DeviceZeroContext&) = delete;
   DeviceZeroContext& operator=(const DeviceZeroContext&) = delete;
 
-  ~DeviceZeroContext() {
-    if (functions_) {
-      (void)functions_->context_set_current(previous_);
+  ~DeviceZeroContext() { restore_noexcept(); }
+
+  void restore() {
+    if (!functions_) {
+      return;
+    }
+    check_cuda("cuCtxSetCurrent (restore)", functions_->context_set_current(previous_));
+    functions_.reset();
+  }
+
+  void restore_noexcept() noexcept {
+    if (!functions_) {
+      return;
+    }
+    auto functions = std::move(functions_);
+    if (functions->context_set_current(previous_) != kCudaSuccess) {
+      functions->context_restore_failed.store(true, std::memory_order_release);
     }
   }
 
@@ -345,42 +376,43 @@ private:
   CudaContext previous_ = nullptr;
 };
 
-template <typename T>
-T cuda_pointer_attribute(const std::shared_ptr<CudaFunctions>& cuda, int attribute,
-                         core::CudaDevicePtr pointer, const char* name) {
-  T value{};
-  check_cuda(name, cuda->pointer_get_attribute(&value, attribute, pointer));
-  return value;
-}
-
-void validate_cuda_plane_pointer(const std::shared_ptr<CudaFunctions>& cuda,
-                                 core::CudaDevicePtr pointer, std::size_t pitch, std::uint32_t rows,
-                                 const char* plane_name) {
-  const auto context = cuda_pointer_attribute<CudaContext>(
-      cuda, kCudaPointerAttributeContext, pointer, "cuPointerGetAttribute(CONTEXT)");
-  const auto memory_type = cuda_pointer_attribute<int>(
-      cuda, kCudaPointerAttributeMemoryType, pointer, "cuPointerGetAttribute(MEMORY_TYPE)");
-  const auto device = cuda_pointer_attribute<int>(cuda, kCudaPointerAttributeDeviceOrdinal, pointer,
-                                                  "cuPointerGetAttribute(DEVICE_ORDINAL)");
-  const auto mapped = cuda_pointer_attribute<int>(cuda, kCudaPointerAttributeMapped, pointer,
-                                                  "cuPointerGetAttribute(MAPPED)");
-  const auto mapping_size = cuda_pointer_attribute<std::size_t>(
-      cuda, kCudaPointerAttributeMappingSize, pointer, "cuPointerGetAttribute(MAPPING_SIZE)");
-  const auto mapping_base = cuda_pointer_attribute<core::CudaDevicePtr>(
-      cuda, kCudaPointerAttributeMappingBase, pointer, "cuPointerGetAttribute(MAPPING_BASE_ADDR)");
-  if (context != cuda->primary_context || memory_type != kCudaMemoryTypeDevice || device != 0 ||
-      mapped == 0) {
+CudaPointerProvenance validate_cuda_plane_pointer(const std::shared_ptr<CudaFunctions>& cuda,
+                                                  core::CudaDevicePtr pointer, std::size_t pitch,
+                                                  std::size_t row_bytes, std::uint32_t rows,
+                                                  std::size_t plane_bytes, int expected_device,
+                                                  const char* plane_name) {
+  if (rows == 0 || row_bytes == 0 || pitch < row_bytes ||
+      static_cast<std::uint64_t>(rows - 1U) * pitch >
+          std::numeric_limits<std::size_t>::max() - row_bytes) {
     throw NvmmError(std::string("NvBufSurface ") + plane_name +
-                    " plane is not device-0 memory in the retained CUDA context");
+                    " plane has invalid CUDA dimensions");
   }
-  const auto required = static_cast<std::uint64_t>(pitch) * rows;
-  if (pointer < mapping_base) {
-    throw NvmmError(std::string("NvBufSurface ") + plane_name + " plane precedes its CUDA mapping");
+  const auto required = static_cast<std::uint64_t>(rows - 1U) * pitch + row_bytes;
+  if (required > plane_bytes) {
+    throw NvmmError(std::string("NvBufSurface ") + plane_name +
+                    " plane exceeds its declared allocation");
   }
-  const auto offset = pointer - mapping_base;
-  if (offset > mapping_size || required > static_cast<std::uint64_t>(mapping_size - offset)) {
-    throw NvmmError(std::string("NvBufSurface ") + plane_name + " plane exceeds its CUDA mapping");
+  core::CudaValidatedSpan validation;
+  try {
+    validation = cuda->span_backend.retain_device_span(pointer, plane_bytes,
+                                                       core::CudaSpanAccess::Read, expected_device);
+  } catch (const std::exception& error) {
+    if (std::string_view(error.what()).find("does not permit device reads") !=
+        std::string_view::npos) {
+      throw NvmmError(std::string("NvBufSurface ") + plane_name +
+                      " plane is not readable from the expected CUDA device");
+    }
+    throw NvmmError(std::string("NvBufSurface ") + plane_name +
+                    " plane failed CUDA driver validation: " + error.what());
   }
+  return {
+      .context_id = validation.context_id(),
+      .device_ordinal = validation.device_ordinal(),
+      .mapping_base = validation.validated_range_base(),
+      .mapping_bytes = validation.validated_range_bytes(),
+      .accessible_bytes = plane_bytes,
+      .validation = std::move(validation),
+  };
 }
 
 enum class SurfaceMappingKind {
@@ -419,6 +451,8 @@ struct CudaMappingState {
   CudaGraphicsResource graphics_resource = nullptr;
   core::CudaDevicePtr y_ptr = 0;
   core::CudaDevicePtr uv_ptr = 0;
+  CudaPointerProvenance y_provenance;
+  CudaPointerProvenance uv_provenance;
   SurfaceMappingKind kind = SurfaceMappingKind::CudaBuffer;
   std::size_t active_leases = 0;
   SurfaceCleanupFailure cleanup_failure = SurfaceCleanupFailure::None;
@@ -445,6 +479,7 @@ std::string cleanup_failure_message(const CudaMappingState& mapping) {
 }
 
 bool release_surface_mapping(CudaMappingState& mapping) noexcept {
+  bool resources_released = false;
   try {
     DeviceZeroContext context(mapping.cuda);
     if (mapping.kind == SurfaceMappingKind::EglImage) {
@@ -453,27 +488,46 @@ bool release_surface_mapping(CudaMappingState& mapping) noexcept {
         if (result != kCudaSuccess) {
           mapping.cleanup_failure = SurfaceCleanupFailure::CudaUnregister;
           mapping.cleanup_cuda_result = result;
+          context.restore_noexcept();
           return false;
         }
         mapping.graphics_resource = nullptr;
       }
       if (mapping.functions->unmap_egl(mapping.surface, 0) != 0) {
         mapping.cleanup_failure = SurfaceCleanupFailure::EglUnmap;
+        context.restore_noexcept();
         return false;
       }
     } else if (mapping.functions->unmap_cuda == nullptr ||
                mapping.functions->unmap_cuda(mapping.surface, 0) != 0) {
       mapping.cleanup_failure = SurfaceCleanupFailure::CudaUnmap;
+      context.restore_noexcept();
       return false;
     }
+    resources_released = true;
+    context.restore();
     mapping.surface = nullptr;
     mapping.cleanup_failure = SurfaceCleanupFailure::None;
     mapping.cleanup_cuda_result = kCudaSuccess;
     return true;
   } catch (const std::exception&) {
+    if (resources_released) {
+      mapping.cuda->context_restore_failed.store(true, std::memory_order_release);
+      mapping.surface = nullptr;
+      mapping.cleanup_failure = SurfaceCleanupFailure::None;
+      mapping.cleanup_cuda_result = kCudaSuccess;
+      return true;
+    }
     mapping.cleanup_failure = SurfaceCleanupFailure::Context;
     return false;
   } catch (...) {
+    if (resources_released) {
+      mapping.cuda->context_restore_failed.store(true, std::memory_order_release);
+      mapping.surface = nullptr;
+      mapping.cleanup_failure = SurfaceCleanupFailure::None;
+      mapping.cleanup_cuda_result = kCudaSuccess;
+      return true;
+    }
     mapping.cleanup_failure = SurfaceCleanupFailure::Unknown;
     return false;
   }
@@ -631,6 +685,8 @@ NvmmFrameInfo extract_frame_info(const void* mapped_data, NvbufSurfaceAbi select
                                            reinterpret_cast<std::uintptr_t>(params.data_ptr)),
       .color_matrix = color_matrix,
       .color_range = color_range,
+      .y_size = planes.psize[0],
+      .uv_size = planes.psize[1],
   };
   if (const auto error = validate_nvmm_frame_info(info); error.has_value()) {
     throw NvmmError(*error);
@@ -803,8 +859,14 @@ std::optional<std::string> validate_nvmm_frame_info(const NvmmFrameInfo& info) {
   if (info.y_pitch != info.uv_pitch) {
     return "NV12 Y and UV pitches must match for the CUDA/NPP path";
   }
-  const auto y_end = plane_end(info.y_offset, info.y_pitch, info.height);
-  const auto uv_end = plane_end(info.uv_offset, info.uv_pitch, info.height / 2U);
+  const auto y_required = static_cast<std::uint64_t>(info.y_pitch) * info.height;
+  const auto uv_required = static_cast<std::uint64_t>(info.uv_pitch) * (info.height / 2U);
+  const auto [y_size, uv_size] = effective_plane_sizes(info);
+  if (y_size < y_required || uv_size < uv_required) {
+    return "NV12 plane allocation is smaller than its pitched extent";
+  }
+  const auto y_end = static_cast<std::uint64_t>(info.y_offset) + y_size;
+  const auto uv_end = static_cast<std::uint64_t>(info.uv_offset) + uv_size;
   if (info.uv_offset < y_end) {
     return "NV12 planes overlap";
   }
@@ -838,7 +900,7 @@ bool is_nvmm_cuda_interop_available() {
 #if defined(__linux__)
   try {
     (void)nvbuf_functions();
-    (void)cuda_functions();
+    require_healthy_cuda_context(cuda_functions());
     return true;
   } catch (...) {
     return false;
@@ -852,7 +914,7 @@ std::string nvmm_cuda_interop_availability_error() {
 #if defined(__linux__)
   try {
     (void)nvbuf_functions();
-    (void)cuda_functions();
+    require_healthy_cuda_context(cuda_functions());
     return {};
   } catch (const std::exception& error) {
     return error.what();
@@ -862,20 +924,32 @@ std::string nvmm_cuda_interop_availability_error() {
 #endif
 }
 
-NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info, std::shared_ptr<void> owner) {
+NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& provided_info,
+                                     std::shared_ptr<void> owner) {
   if (!owner) {
     throw NvmmError("NvBufSurface CUDA mapping requires a retained decoder owner");
   }
-  if (const auto error = validate_nvmm_frame_info(info); error.has_value()) {
+  if (const auto error = validate_nvmm_frame_info(provided_info); error.has_value()) {
     throw NvmmError(*error);
   }
-  const auto current = extract_nvmm_frame_info(info.surface_ptr, info.abi);
+  const auto current = extract_nvmm_frame_info(provided_info.surface_ptr, provided_info.abi);
+  auto info = provided_info;
+  if (info.y_size == 0 && info.uv_size == 0) {
+    info.y_size = current.y_size;
+    info.uv_size = current.uv_size;
+  }
   if (!same_frame_info(info, current)) {
     throw NvmmError("NvBufSurface metadata changed before CUDA mapping");
   }
 
   auto make_frame = [&](core::CudaDevicePtr y_ptr, core::CudaDevicePtr uv_ptr,
+                        const CudaPointerProvenance& y_provenance,
+                        const CudaPointerProvenance& uv_provenance,
                         std::shared_ptr<void> mapped_owner) {
+    if (y_provenance.context_id != uv_provenance.context_id ||
+        y_provenance.device_ordinal != uv_provenance.device_ordinal) {
+      throw NvmmError("NvBufSurface CUDA planes do not share one context and device");
+    }
     return NvmmCudaFrame{
         .y_ptr = y_ptr,
         .uv_ptr = uv_ptr,
@@ -887,6 +961,17 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info, std::shared_ptr<
         .color_matrix = info.color_matrix,
         .color_range = info.color_range,
         .owner = std::move(mapped_owner),
+        .y_accessible_bytes = y_provenance.accessible_bytes,
+        .uv_accessible_bytes = uv_provenance.accessible_bytes,
+        .y_mapping_base = y_provenance.mapping_base,
+        .uv_mapping_base = uv_provenance.mapping_base,
+        .y_mapping_bytes = y_provenance.mapping_bytes,
+        .uv_mapping_bytes = uv_provenance.mapping_bytes,
+        .context_id = y_provenance.context_id,
+        .device_ordinal = y_provenance.device_ordinal,
+        .runtime = info.runtime,
+        .y_validation = y_provenance.validation,
+        .uv_validation = uv_provenance.validation,
     };
   };
 
@@ -907,18 +992,24 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info, std::shared_ptr<
     }
   }
   auto cuda = cuda_functions();
+  require_healthy_cuda_context(cuda);
   DeviceZeroContext context(cuda);
   if (info.memory_type == NvmmMemoryType::CudaDevice) {
     void* base = direct_cuda_data_ptr(info);
     const auto y_ptr = checked_device_pointer(base, info.y_offset);
     const auto uv_ptr = checked_device_pointer(base, info.uv_offset);
-    validate_cuda_plane_pointer(cuda, y_ptr, info.y_pitch, info.height, "Y");
-    validate_cuda_plane_pointer(cuda, uv_ptr, info.uv_pitch, info.height / 2U, "UV");
+    const auto y_provenance =
+        validate_cuda_plane_pointer(cuda, y_ptr, info.y_pitch, info.width, info.height, info.y_size,
+                                    static_cast<int>(info.gpu_id), "Y");
+    const auto uv_provenance =
+        validate_cuda_plane_pointer(cuda, uv_ptr, info.uv_pitch, info.width, info.height / 2U,
+                                    info.uv_size, static_cast<int>(info.gpu_id), "UV");
     auto direct_owner = std::make_shared<DirectCudaOwner>();
     direct_owner->decoder_owner = std::move(owner);
-    direct_owner->cuda = std::move(cuda);
     direct_owner->runtime = info.runtime;
-    return make_frame(y_ptr, uv_ptr, direct_owner);
+    direct_owner->cuda = std::move(cuda);
+    context.restore();
+    return make_frame(y_ptr, uv_ptr, y_provenance, uv_provenance, direct_owner);
   }
 
   auto registry = mapping_registry();
@@ -938,7 +1029,9 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info, std::shared_ptr<
     if (!same_frame_info(existing->frame_info, info)) {
       throw NvmmError("NvBufSurface metadata changed while its CUDA mapping remained active");
     }
-    return make_frame(existing->y_ptr, existing->uv_ptr, acquire_mapping_lease(existing, registry));
+    context.restore();
+    return make_frame(existing->y_ptr, existing->uv_ptr, existing->y_provenance,
+                      existing->uv_provenance, acquire_mapping_lease(existing, registry));
   }
 
   if (mapped_cuda_buffer_handle(info) != nullptr || mapped_egl_image(info) != nullptr) {
@@ -965,12 +1058,19 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info, std::shared_ptr<
       void* base = mapped_cuda_buffer_ptr(info);
       const auto y_ptr = checked_device_pointer(base, info.y_offset);
       const auto uv_ptr = checked_device_pointer(base, info.uv_offset);
-      validate_cuda_plane_pointer(cuda, y_ptr, info.y_pitch, info.height, "Y");
-      validate_cuda_plane_pointer(cuda, uv_ptr, info.uv_pitch, info.height / 2U, "UV");
+      const auto y_provenance =
+          validate_cuda_plane_pointer(cuda, y_ptr, info.y_pitch, info.width, info.height,
+                                      info.y_size, static_cast<int>(info.gpu_id), "Y");
+      const auto uv_provenance =
+          validate_cuda_plane_pointer(cuda, uv_ptr, info.uv_pitch, info.width, info.height / 2U,
+                                      info.uv_size, static_cast<int>(info.gpu_id), "UV");
       mapping->y_ptr = y_ptr;
       mapping->uv_ptr = uv_ptr;
+      mapping->y_provenance = y_provenance;
+      mapping->uv_provenance = uv_provenance;
+      context.restore();
       auto lease = acquire_mapping_lease(mapping, registry);
-      return make_frame(y_ptr, uv_ptr, std::move(lease));
+      return make_frame(y_ptr, uv_ptr, y_provenance, uv_provenance, std::move(lease));
     } catch (...) {
       if (release_surface_mapping(*mapping)) {
         registry->mappings.erase(info.surface_ptr);
@@ -1017,12 +1117,19 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info, std::shared_ptr<
 
     const auto y_ptr = checked_device_pointer(egl_frame.frame.pitches[0], 0);
     const auto uv_ptr = checked_device_pointer(egl_frame.frame.pitches[1], 0);
-    validate_cuda_plane_pointer(cuda, y_ptr, info.y_pitch, info.height, "Y");
-    validate_cuda_plane_pointer(cuda, uv_ptr, info.uv_pitch, info.height / 2U, "UV");
+    const auto y_provenance =
+        validate_cuda_plane_pointer(cuda, y_ptr, info.y_pitch, info.width, info.height, info.y_size,
+                                    static_cast<int>(info.gpu_id), "Y");
+    const auto uv_provenance =
+        validate_cuda_plane_pointer(cuda, uv_ptr, info.uv_pitch, info.width, info.height / 2U,
+                                    info.uv_size, static_cast<int>(info.gpu_id), "UV");
     mapping->y_ptr = y_ptr;
     mapping->uv_ptr = uv_ptr;
+    mapping->y_provenance = y_provenance;
+    mapping->uv_provenance = uv_provenance;
+    context.restore();
     auto lease = acquire_mapping_lease(mapping, registry);
-    return make_frame(y_ptr, uv_ptr, std::move(lease));
+    return make_frame(y_ptr, uv_ptr, y_provenance, uv_provenance, std::move(lease));
   } catch (...) {
     if (release_surface_mapping(*mapping)) {
       registry->mappings.erase(info.surface_ptr);

@@ -1,5 +1,6 @@
 #include "reco/calibrate/pipeline.hpp"
 #include "reco/core/cuda_backend.hpp"
+#include "reco/core/cuda_stitch_renderer.hpp"
 #include "reco/io/gpu_decode.hpp"
 #include "reco/io/gstreamer.hpp"
 #include "reco/io/nvmm.hpp"
@@ -19,6 +20,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -66,6 +68,26 @@ void expect_near(double actual, double expected, double tolerance, std::string_v
 
 bool require_gpu() {
   const char* value = std::getenv("RECO_REQUIRE_CUDA_TEST");
+  return value != nullptr && std::string_view(value) == "1";
+}
+
+std::optional<NvmmMemoryType> required_nvmm_memory_type() {
+  const char* value = std::getenv("RECO_EXPECT_NVMM_MEMORY_TYPE");
+  if (value == nullptr || value[0] == '\0') {
+    return std::nullopt;
+  }
+  const std::string_view type(value);
+  if (type == "cuda-device") {
+    return NvmmMemoryType::CudaDevice;
+  }
+  if (type == "surface-array") {
+    return NvmmMemoryType::SurfaceArray;
+  }
+  throw std::runtime_error("RECO_EXPECT_NVMM_MEMORY_TYPE must be cuda-device or surface-array");
+}
+
+bool require_jetson_render() {
+  const char* value = std::getenv("RECO_REQUIRE_JETSON_NVMM_TEST");
   return value != nullptr && std::string_view(value) == "1";
 }
 
@@ -157,8 +179,8 @@ CalibrationConfig config() {
   return result;
 }
 
-void verify_frame_identity(const std::filesystem::path& path, NvbufSurfaceAbi abi,
-                           std::string_view side) {
+void verify_frame_identity(CudaBackend& backend, const std::filesystem::path& path,
+                           NvbufSurfaceAbi abi, std::string_view side) {
   auto source = open_gstreamer_gpu_file_decode_source(decode_config(path), abi);
   expect_true(source->gpu_resident(), std::string(side) + " decoder reports GPU residency");
   expect_true(source->pipeline().find("nvv4l2decoder") != std::string_view::npos,
@@ -181,12 +203,80 @@ void verify_frame_identity(const std::filesystem::path& path, NvbufSurfaceAbi ab
               kFramePtsNs[index], std::string(side) + " presentation timestamp");
     expect_eq(decoded.frame->visible_width, kWidth, std::string(side) + " visible width");
     expect_eq(decoded.frame->visible_height, kHeight, std::string(side) + " visible height");
+    if (const auto expected_memory_type = required_nvmm_memory_type();
+        expected_memory_type.has_value()) {
+      expect_true(decoded.frame->nvmm.memory_type == *expected_memory_type,
+                  std::string(side) + " decoder uses the required NVMM memory type");
+    }
     const auto mapped = map_gpu_decoded_frame_to_cuda(*decoded.frame);
     expect_true(mapped.y_ptr != 0 && mapped.uv_ptr != 0,
                 std::string(side) + " frame maps to CUDA without host staging");
+    backend.validate_device_span(mapped.y_ptr, mapped.y_accessible_bytes, CudaSpanAccess::Read,
+                                 mapped.device_ordinal);
+    backend.validate_device_span(mapped.uv_ptr, mapped.uv_accessible_bytes, CudaSpanAccess::Read,
+                                 mapped.device_ordinal);
     expect_eq(mapped.width, kWidth, std::string(side) + " CUDA frame width");
     expect_eq(mapped.height, kHeight, std::string(side) + " CUDA frame height");
   }
+}
+
+void render_jetson_imported_frames(CudaBackend& backend, const std::filesystem::path& left_path,
+                                   const std::filesystem::path& right_path, NvbufSurfaceAbi abi) {
+  if (!require_jetson_render()) {
+    return;
+  }
+  auto left_source = open_gstreamer_gpu_file_decode_source(decode_config(left_path), abi);
+  auto right_source = open_gstreamer_gpu_file_decode_source(decode_config(right_path), abi);
+  auto left_decoded = left_source->read();
+  auto right_decoded = right_source->read();
+  if (left_decoded.status != GpuDecodeFrameStatus::Frame || !left_decoded.frame.has_value() ||
+      right_decoded.status != GpuDecodeFrameStatus::Frame || !right_decoded.frame.has_value()) {
+    throw std::runtime_error("Jetson NVMM render did not decode a stereo frame pair");
+  }
+  expect_true(left_decoded.frame->nvmm.memory_type == NvmmMemoryType::SurfaceArray,
+              "Jetson left decoder produces NVBUF_MEM_SURFACE_ARRAY");
+  expect_true(right_decoded.frame->nvmm.memory_type == NvmmMemoryType::SurfaceArray,
+              "Jetson right decoder produces NVBUF_MEM_SURFACE_ARRAY");
+
+  auto left = map_gpu_decoded_frame_to_cuda_lease(*left_decoded.frame);
+  auto right = map_gpu_decoded_frame_to_cuda_lease(*right_decoded.frame);
+  MatchCalibration match;
+  match.left = camera();
+  match.right = camera();
+  match.layout.camera_axis_offset = 0.25;
+  match.layout.intersect = 0.5;
+  constexpr std::uint32_t output_width = 64;
+  constexpr std::uint32_t output_height = 32;
+  auto renderer = CudaStereoStitchRenderer::create(
+      {.calibration = match, .output_width = output_width, .output_height = output_height}, backend,
+      NvrtcCompiler::create());
+  auto output_storage = backend.allocate_pitched(output_width * 4U, output_height, 4);
+  std::vector<std::uint8_t> initial(output_width * output_height * 4U, 0xCD);
+  backend.copy_host_to_device_2d({.src = initial.data(),
+                                  .src_pitch = output_width * 4U,
+                                  .dst = output_storage.buffer.ptr(),
+                                  .dst_pitch = output_storage.pitch,
+                                  .width_bytes = output_width * 4U,
+                                  .height = output_height});
+  const CudaRgbaFrameView output(CudaPitchedPlaneView(output_storage.buffer.ptr(),
+                                                      output_storage.buffer.size(),
+                                                      output_storage.pitch, output_width * 4U,
+                                                      output_height, renderer.context_id()),
+                                 output_width, output_height);
+  renderer.render(left.view(), right.view(), output);
+  std::vector<std::uint8_t> rendered(initial.size());
+  backend.copy_device_to_host_2d({.dst = rendered.data(),
+                                  .dst_pitch = output_width * 4U,
+                                  .src = output_storage.buffer.ptr(),
+                                  .src_pitch = output_storage.pitch,
+                                  .width_bytes = output_width * 4U,
+                                  .height = output_height});
+  expect_true(rendered != initial, "Jetson imported NVMM frames produce CUDA output");
+  bool all_alpha_written = true;
+  for (std::size_t index = 3; index < rendered.size(); index += 4) {
+    all_alpha_written = all_alpha_written && rendered[index] == 255U;
+  }
+  expect_true(all_alpha_written, "Jetson imported NVMM frames render every output pixel in CUDA");
 }
 
 struct CopyShape {
@@ -439,10 +529,10 @@ void decoded_video_matches_rust_golden(const std::filesystem::path& left,
   expect_true(golden.at("frame_pts_ns") == kFramePtsNs,
               "golden records selected presentation timestamps");
 
-  verify_frame_identity(left, abi, "left");
-  verify_frame_identity(right, abi, "right");
-
   auto backend = CudaBackend::create();
+  verify_frame_identity(backend, left, abi, "left");
+  verify_frame_identity(backend, right, abi, "right");
+  render_jetson_imported_frames(backend, left, right, abi);
   auto first_trace = std::make_shared<DeviceToHostTrace>();
   const auto first = calibrate_once(backend, left, right, abi, first_trace);
   auto second_trace = std::make_shared<DeviceToHostTrace>();

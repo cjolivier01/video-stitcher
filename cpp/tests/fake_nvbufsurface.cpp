@@ -15,8 +15,18 @@ namespace abi = reco::io::detail::nvbufsurface_9_1;
 namespace {
 
 void* mapped_device_pointer(std::uint64_t descriptor) {
-  return descriptor == 17 ? reinterpret_cast<void*>(0x40000000)
-                          : reinterpret_cast<void*>(descriptor);
+  switch (descriptor) {
+  case 14:
+    return reinterpret_cast<void*>(0x50000000);
+  case 15:
+    return reinterpret_cast<void*>(0x51000000);
+  case 16:
+    return reinterpret_cast<void*>(0x52000000);
+  case 17:
+    return reinterpret_cast<void*>(0x40000000);
+  default:
+    return reinterpret_cast<void*>(descriptor);
+  }
 }
 
 #if !defined(RECO_FAKE_NVBUFSURFACE_7_1)

@@ -1,8 +1,10 @@
 #include "reco/core/cuda_backend.hpp"
+#include "reco/core/path.hpp"
 #include "reco/core/windows_runtime_library.hpp"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -27,12 +29,31 @@ using CUfunction = void*;
 using CUmodule = void*;
 using CUresult = int;
 using CUstream = void*;
-using CUdeviceptr = std::uint64_t;
-using CUmemGenericAllocationHandle = std::uint64_t;
+#if defined(_WIN32)
+#define RECO_CUDA_API __stdcall
+#else
+#define RECO_CUDA_API
+#endif
+
+using CUdeviceptr = unsigned long long;
+using CUmemGenericAllocationHandle = unsigned long long;
+using CudaMemAccessFlags = unsigned long long;
+
+static_assert(sizeof(void*) == 8, "the CUDA backend supports only 64-bit targets");
+static_assert(sizeof(CUdeviceptr) == sizeof(void*));
+static_assert(sizeof(CUmemGenericAllocationHandle) == 8);
 
 constexpr CUresult kCudaSuccess = 0;
 constexpr unsigned int kMemoryTypeHost = 1;
 constexpr unsigned int kMemoryTypeDevice = 2;
+constexpr int kPointerAttributeContext = 1;
+constexpr int kPointerAttributeMemoryType = 2;
+constexpr int kPointerAttributeDeviceOrdinal = 9;
+constexpr int kPointerAttributeRangeStartAddress = 11;
+constexpr int kPointerAttributeRangeSize = 12;
+constexpr int kPointerAttributeMapped = 13;
+constexpr int kPointerAttributeAccessFlags = 16;
+constexpr int kPointerAttributeMemoryBlockId = 20;
 constexpr unsigned int kMemAllocationTypePinned = 1;
 constexpr unsigned int kMemLocationTypeDevice = 1;
 #if defined(_WIN32)
@@ -41,7 +62,11 @@ constexpr unsigned int kMemHandleType = 2;
 constexpr unsigned int kMemHandleType = 1;
 #endif
 constexpr unsigned int kMemAccessFlagsProtReadWrite = 3;
+constexpr unsigned int kMemAccessFlagsProtRead = 1;
 constexpr unsigned int kMemAllocGranularityMinimum = 0;
+constexpr int kDeviceAttributeComputeCapabilityMajor = 75;
+constexpr int kDeviceAttributeComputeCapabilityMinor = 76;
+constexpr std::size_t kMaximumDriverLibraryPathBytes = 32U * 1024U;
 
 struct CUuuid {
   std::uint8_t bytes[16];
@@ -86,14 +111,14 @@ struct CudaMemcpy2D {
 
 class DynamicLibrary {
 public:
-  explicit DynamicLibrary(const char* name) {
+  explicit DynamicLibrary(std::string name) : name_(std::move(name)) {
 #if defined(_WIN32)
-    handle_ = detail::load_windows_runtime_library(name);
+    handle_ = detail::load_windows_runtime_library(path_from_utf8(name_));
 #else
-    handle_ = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+    handle_ = dlopen(name_.c_str(), RTLD_NOW | RTLD_LOCAL);
 #endif
     if (handle_ == nullptr) {
-      throw std::runtime_error(std::string("failed to load ") + name);
+      throw std::runtime_error("failed to load " + name_);
     }
   }
 
@@ -125,8 +150,17 @@ public:
   }
 
 private:
+  std::string name_;
   void* handle_ = nullptr;
 };
+
+std::string default_cuda_driver_name() {
+#if defined(_WIN32)
+  return "nvcuda.dll";
+#else
+  return "libcuda.so.1";
+#endif
+}
 
 [[noreturn]] void throw_cuda(const char* function, CUresult result) {
   throw std::runtime_error(std::string(function) + " returned CUDA error " +
@@ -136,6 +170,14 @@ private:
 void check_cuda(const char* function, CUresult result) {
   if (result != kCudaSuccess) {
     throw_cuda(function, result);
+  }
+}
+
+void check_cuda_pointer(const char* function, CUresult result) {
+  if (result != kCudaSuccess) {
+    throw std::invalid_argument(std::string(function) +
+                                " rejected the CUDA device pointer (error " +
+                                std::to_string(result) + ")");
   }
 }
 
@@ -166,6 +208,14 @@ void validate_no_nul(std::string_view value, const char* name) {
   if (std::find(value.begin(), value.end(), '\0') != value.end()) {
     throw std::invalid_argument(std::string("CUDA ") + name + " must not contain NUL bytes");
   }
+}
+
+std::string validated_driver_library_path(std::string_view library_path) {
+  validate_no_nul(library_path, "driver library path");
+  if (library_path.size() > kMaximumDriverLibraryPathBytes) {
+    throw std::invalid_argument("CUDA driver library path exceeds 32768 bytes");
+  }
+  return std::string(library_path);
 }
 
 void validate_ptx(std::string_view ptx) {
@@ -223,15 +273,12 @@ CudaShareableHandle invalid_shareable_handle() {
 } // namespace
 
 struct CudaBackend::Impl {
-  explicit Impl()
-#if defined(_WIN32)
-      : driver("nvcuda.dll") {
-#else
-      : driver("libcuda.so.1") {
-#endif
+  explicit Impl(std::string driver_path) : driver(std::move(driver_path)) {
     cu_init = driver.symbol<decltype(cu_init)>("cuInit");
     cu_device_get_count = driver.symbol<decltype(cu_device_get_count)>("cuDeviceGetCount");
     cu_device_get = driver.symbol<decltype(cu_device_get)>("cuDeviceGet");
+    cu_device_get_attribute =
+        driver.symbol<decltype(cu_device_get_attribute)>("cuDeviceGetAttribute");
     cu_device_get_name = driver.symbol<decltype(cu_device_get_name)>("cuDeviceGetName");
     cu_device_get_uuid = driver.symbol<decltype(cu_device_get_uuid)>("cuDeviceGetUuid");
     cu_device_primary_ctx_retain =
@@ -249,8 +296,13 @@ struct CudaBackend::Impl {
     cu_memcpy_2d = driver.symbol<decltype(cu_memcpy_2d)>("cuMemcpy2D_v2");
     cu_memcpy_dtoh = driver.symbol<decltype(cu_memcpy_dtoh)>("cuMemcpyDtoH_v2");
     cu_mem_get_info = driver.symbol<decltype(cu_mem_get_info)>("cuMemGetInfo_v2");
+    cu_pointer_get_attribute =
+        driver.symbol<decltype(cu_pointer_get_attribute)>("cuPointerGetAttribute");
     cu_mem_get_allocation_granularity =
         driver.symbol<decltype(cu_mem_get_allocation_granularity)>("cuMemGetAllocationGranularity");
+    cu_mem_get_access = driver.symbol<decltype(cu_mem_get_access)>("cuMemGetAccess");
+    cu_mem_retain_allocation_handle =
+        driver.symbol<decltype(cu_mem_retain_allocation_handle)>("cuMemRetainAllocationHandle");
     cu_mem_address_reserve = driver.symbol<decltype(cu_mem_address_reserve)>("cuMemAddressReserve");
     cu_mem_create = driver.symbol<decltype(cu_mem_create)>("cuMemCreate");
     cu_mem_export_to_shareable_handle =
@@ -283,7 +335,18 @@ struct CudaBackend::Impl {
     return device;
   }
 
+  void require_healthy_context() const {
+    if (context_restore_failed.load(std::memory_order_acquire)) {
+      throw std::runtime_error("CUDA caller context restoration previously failed");
+    }
+  }
+
+  void mark_context_restore_failed() noexcept {
+    context_restore_failed.store(true, std::memory_order_release);
+  }
+
   void ensure_primary_context(int ordinal) {
+    require_healthy_context();
     const CUdevice requested_device = device(ordinal);
     CUcontext context = nullptr;
     {
@@ -308,21 +371,39 @@ struct CudaBackend::Impl {
   void ensure_current_context_for_copy() { ensure_primary_context(0); }
 
   CUcontext current_context() {
+    require_healthy_context();
     CUcontext current = nullptr;
     check_cuda("cuCtxGetCurrent", cu_ctx_get_current(&current));
     return current;
   }
 
   void set_current_context(CUcontext context) {
+    require_healthy_context();
     check_cuda("cuCtxSetCurrent", cu_ctx_set_current(context));
+  }
+
+  void restore_context(CUcontext context) {
+    const auto result = cu_ctx_set_current(context);
+    if (result != kCudaSuccess) {
+      mark_context_restore_failed();
+      throw_cuda("cuCtxSetCurrent (restore)", result);
+    }
+  }
+
+  void restore_context_noexcept(CUcontext context) noexcept {
+    if (cu_ctx_set_current(context) != kCudaSuccess) {
+      mark_context_restore_failed();
+    }
   }
 
   DynamicLibrary driver;
   std::mutex context_mutex;
   std::unordered_map<int, CUcontext> retained_contexts;
+  std::atomic<bool> context_restore_failed{false};
   CUresult (*cu_init)(unsigned int) = nullptr;
   CUresult (*cu_device_get_count)(int*) = nullptr;
   CUresult (*cu_device_get)(CUdevice*, int) = nullptr;
+  CUresult (*cu_device_get_attribute)(int*, int, CUdevice) = nullptr;
   CUresult (*cu_device_get_name)(char*, int, CUdevice) = nullptr;
   CUresult (*cu_device_get_uuid)(CUuuid*, CUdevice) = nullptr;
   CUresult (*cu_device_primary_ctx_retain)(CUcontext*, CUdevice) = nullptr;
@@ -339,21 +420,29 @@ struct CudaBackend::Impl {
   CUresult (*cu_memcpy_2d)(const CudaMemcpy2D*) = nullptr;
   CUresult (*cu_memcpy_dtoh)(void*, CUdeviceptr, std::size_t) = nullptr;
   CUresult (*cu_mem_get_info)(std::size_t*, std::size_t*) = nullptr;
-  CUresult (*cu_mem_get_allocation_granularity)(std::size_t*, const CudaMemAllocationProp*,
-                                                unsigned int) = nullptr;
-  CUresult (*cu_mem_address_reserve)(CUdeviceptr*, std::size_t, std::size_t, CUdeviceptr,
-                                     std::uint64_t) = nullptr;
-  CUresult (*cu_mem_create)(CUmemGenericAllocationHandle*, std::size_t,
-                            const CudaMemAllocationProp*, std::uint64_t) = nullptr;
-  CUresult (*cu_mem_export_to_shareable_handle)(void*, CUmemGenericAllocationHandle, unsigned int,
-                                                std::uint64_t) = nullptr;
-  CUresult (*cu_mem_map)(CUdeviceptr, std::size_t, std::size_t, CUmemGenericAllocationHandle,
-                         std::uint64_t) = nullptr;
-  CUresult (*cu_mem_set_access)(CUdeviceptr, std::size_t, const CudaMemAccessDesc*,
-                                std::size_t) = nullptr;
-  CUresult (*cu_mem_release)(CUmemGenericAllocationHandle) = nullptr;
-  CUresult (*cu_mem_unmap)(CUdeviceptr, std::size_t) = nullptr;
-  CUresult (*cu_mem_address_free)(CUdeviceptr, std::size_t) = nullptr;
+  CUresult(RECO_CUDA_API* cu_pointer_get_attribute)(void*, int, CUdeviceptr) = nullptr;
+  CUresult(RECO_CUDA_API* cu_mem_get_allocation_granularity)(std::size_t*,
+                                                             const CudaMemAllocationProp*,
+                                                             unsigned int) = nullptr;
+  CUresult(RECO_CUDA_API* cu_mem_get_access)(CudaMemAccessFlags*, const CudaMemLocation*,
+                                             CUdeviceptr) = nullptr;
+  CUresult(RECO_CUDA_API* cu_mem_retain_allocation_handle)(CUmemGenericAllocationHandle*,
+                                                           void*) = nullptr;
+  CUresult(RECO_CUDA_API* cu_mem_address_reserve)(CUdeviceptr*, std::size_t, std::size_t,
+                                                  CUdeviceptr, unsigned long long) = nullptr;
+  CUresult(RECO_CUDA_API* cu_mem_create)(CUmemGenericAllocationHandle*, std::size_t,
+                                         const CudaMemAllocationProp*,
+                                         unsigned long long) = nullptr;
+  CUresult(RECO_CUDA_API* cu_mem_export_to_shareable_handle)(void*, CUmemGenericAllocationHandle,
+                                                             unsigned int,
+                                                             unsigned long long) = nullptr;
+  CUresult(RECO_CUDA_API* cu_mem_map)(CUdeviceptr, std::size_t, std::size_t,
+                                      CUmemGenericAllocationHandle, unsigned long long) = nullptr;
+  CUresult(RECO_CUDA_API* cu_mem_set_access)(CUdeviceptr, std::size_t, const CudaMemAccessDesc*,
+                                             std::size_t) = nullptr;
+  CUresult(RECO_CUDA_API* cu_mem_release)(CUmemGenericAllocationHandle) = nullptr;
+  CUresult(RECO_CUDA_API* cu_mem_unmap)(CUdeviceptr, std::size_t) = nullptr;
+  CUresult(RECO_CUDA_API* cu_mem_address_free)(CUdeviceptr, std::size_t) = nullptr;
   CUresult (*cu_module_load_data)(CUmodule*, const void*) = nullptr;
   CUresult (*cu_module_unload)(CUmodule) = nullptr;
   CUresult (*cu_module_get_function)(CUfunction*, CUmodule, const char*) = nullptr;
@@ -361,6 +450,187 @@ struct CudaBackend::Impl {
                                unsigned int, unsigned int, unsigned int, CUstream, void**,
                                void**) = nullptr;
 };
+
+#undef RECO_CUDA_API
+
+namespace {
+
+template <typename Backend> class PrimaryContextScope {
+public:
+  PrimaryContextScope(Backend& backend, int device_ordinal)
+      : backend_(&backend), previous_(backend.current_context()) {
+    try {
+      backend_->ensure_primary_context(device_ordinal);
+      current_ = backend_->current_context();
+    } catch (...) {
+      backend_->restore_context_noexcept(previous_);
+      throw;
+    }
+  }
+
+  PrimaryContextScope(const PrimaryContextScope&) = delete;
+  PrimaryContextScope& operator=(const PrimaryContextScope&) = delete;
+
+  ~PrimaryContextScope() {
+    if (backend_ != nullptr) {
+      backend_->restore_context_noexcept(previous_);
+    }
+  }
+
+  [[nodiscard]] CUcontext current() const { return current_; }
+
+  void restore() {
+    if (backend_ == nullptr) {
+      return;
+    }
+    backend_->restore_context(previous_);
+    backend_ = nullptr;
+  }
+
+private:
+  Backend* backend_ = nullptr;
+  CUcontext previous_ = nullptr;
+  CUcontext current_ = nullptr;
+};
+
+void validate_access_flags(std::uint64_t access_flags, CudaSpanAccess required_access) {
+  if ((access_flags & kMemAccessFlagsProtRead) == 0U) {
+    throw std::invalid_argument("CUDA device span does not permit device reads");
+  }
+  if (required_access == CudaSpanAccess::ReadWrite &&
+      (access_flags & kMemAccessFlagsProtReadWrite) != kMemAccessFlagsProtReadWrite) {
+    throw std::invalid_argument("CUDA device span does not permit device writes");
+  }
+}
+
+} // namespace
+
+struct CudaValidatedSpan::State {
+  State(std::shared_ptr<CudaBackend::Impl> backend_in, CudaDevicePtr ptr_in, std::size_t size_in,
+        std::uintptr_t context_id_in, int device_ordinal_in, CudaSpanAccess access_in,
+        CudaDevicePtr validated_range_base_in, std::size_t validated_range_bytes_in,
+        std::vector<CUmemGenericAllocationHandle> allocation_handles_in,
+        std::vector<unsigned long long> memory_block_ids_in, bool is_vmm_in,
+        bool vmm_identity_complete_in)
+      : backend(std::move(backend_in)), ptr(ptr_in), size(size_in), context_id(context_id_in),
+        device_ordinal(device_ordinal_in), access(access_in),
+        validated_range_base(validated_range_base_in),
+        validated_range_bytes(validated_range_bytes_in),
+        allocation_handles(std::move(allocation_handles_in)),
+        memory_block_ids(std::move(memory_block_ids_in)), is_vmm(is_vmm_in),
+        vmm_identity_complete(vmm_identity_complete_in) {}
+
+  State(const State&) = delete;
+  State& operator=(const State&) = delete;
+
+  ~State() {
+    if (backend == nullptr) {
+      return;
+    }
+    for (const auto handle : allocation_handles) {
+      (void)backend->cu_mem_release(handle);
+    }
+  }
+
+  std::shared_ptr<CudaBackend::Impl> backend;
+  CudaDevicePtr ptr = 0;
+  std::size_t size = 0;
+  std::uintptr_t context_id = 0;
+  int device_ordinal = -1;
+  CudaSpanAccess access = CudaSpanAccess::Read;
+  CudaDevicePtr validated_range_base = 0;
+  std::size_t validated_range_bytes = 0;
+  std::vector<CUmemGenericAllocationHandle> allocation_handles;
+  std::vector<unsigned long long> memory_block_ids;
+  bool is_vmm = false;
+  bool vmm_identity_complete = false;
+};
+
+CudaValidatedSpan::CudaValidatedSpan(std::shared_ptr<State> state) : state_(std::move(state)) {}
+
+CudaDevicePtr CudaValidatedSpan::ptr() const {
+  if (!state_) {
+    throw std::logic_error("cannot inspect an empty CUDA validated span");
+  }
+  return state_->ptr;
+}
+
+std::size_t CudaValidatedSpan::size() const {
+  if (!state_) {
+    throw std::logic_error("cannot inspect an empty CUDA validated span");
+  }
+  return state_->size;
+}
+
+std::uintptr_t CudaValidatedSpan::context_id() const {
+  if (!state_) {
+    throw std::logic_error("cannot inspect an empty CUDA validated span");
+  }
+  return state_->context_id;
+}
+
+int CudaValidatedSpan::device_ordinal() const {
+  if (!state_) {
+    throw std::logic_error("cannot inspect an empty CUDA validated span");
+  }
+  return state_->device_ordinal;
+}
+
+CudaSpanAccess CudaValidatedSpan::access() const {
+  if (!state_) {
+    throw std::logic_error("cannot inspect an empty CUDA validated span");
+  }
+  return state_->access;
+}
+
+CudaDevicePtr CudaValidatedSpan::validated_range_base() const {
+  if (!state_) {
+    throw std::logic_error("cannot inspect an empty CUDA validated span");
+  }
+  return state_->validated_range_base;
+}
+
+std::size_t CudaValidatedSpan::validated_range_bytes() const {
+  if (!state_) {
+    throw std::logic_error("cannot inspect an empty CUDA validated span");
+  }
+  return state_->validated_range_bytes;
+}
+
+bool CudaValidatedSpan::permits(CudaSpanAccess required_access) const {
+  if (!state_) {
+    return false;
+  }
+  if (required_access == CudaSpanAccess::Read) {
+    return state_->access == CudaSpanAccess::Read || state_->access == CudaSpanAccess::ReadWrite;
+  }
+  return required_access == CudaSpanAccess::ReadWrite &&
+         state_->access == CudaSpanAccess::ReadWrite;
+}
+
+bool CudaValidatedSpan::aliases(const CudaValidatedSpan& other) const {
+  if (!state_ || !other.state_) {
+    throw std::logic_error("cannot compare an empty CUDA validated span");
+  }
+  const auto this_last = state_->ptr + state_->size - 1U;
+  const auto other_last = other.state_->ptr + other.state_->size - 1U;
+  if (state_->ptr <= other_last && other.state_->ptr <= this_last) {
+    return true;
+  }
+  if (!state_->is_vmm || !other.state_->is_vmm) {
+    return false;
+  }
+  if (!state_->vmm_identity_complete || !other.state_->vmm_identity_complete) {
+    return true;
+  }
+  for (const auto block_id : state_->memory_block_ids) {
+    if (std::find(other.state_->memory_block_ids.begin(), other.state_->memory_block_ids.end(),
+                  block_id) != other.state_->memory_block_ids.end()) {
+      return true;
+    }
+  }
+  return false;
+}
 
 struct CudaModule::State {
   State(std::shared_ptr<CudaBackend::Impl> backend_in, CUcontext context_in, CUmodule module_in)
@@ -382,10 +652,10 @@ struct CudaModule::State {
       try {
         check_cuda("cuModuleUnload", backend->cu_module_unload(module));
       } catch (...) {
-        backend->set_current_context(previous_context);
+        backend->restore_context_noexcept(previous_context);
         throw;
       }
-      backend->set_current_context(previous_context);
+      backend->restore_context(previous_context);
     } catch (...) {
     }
   }
@@ -483,7 +753,7 @@ void CudaSharedMemory::reset() {
     (void)unmap_result;
     const auto free_result = backend_->cu_mem_address_free(ptr_, size_);
     (void)free_result;
-    backend_->set_current_context(previous_context);
+    backend_->restore_context(previous_context);
   } catch (...) {
   }
   ptr_ = 0;
@@ -521,10 +791,10 @@ CudaKernel CudaModule::load_kernel(std::string_view function_name) const {
     check_cuda("cuModuleGetFunction", state->backend->cu_module_get_function(
                                           &function, state->module, terminated_name.data()));
   } catch (...) {
-    state->backend->set_current_context(previous_context);
+    state->backend->restore_context_noexcept(previous_context);
     throw;
   }
-  state->backend->set_current_context(previous_context);
+  state->backend->restore_context(previous_context);
   return CudaKernel(state, function);
 }
 
@@ -548,6 +818,31 @@ CudaKernel& CudaKernel::operator=(CudaKernel&& other) noexcept {
 
 CudaKernel::~CudaKernel() { reset(); }
 
+void CudaKernel::launch_and_synchronize(const CudaLaunchConfig& config,
+                                        std::span<void*> args) const {
+  if (!*this) {
+    throw std::invalid_argument("CUDA kernel launch requires a live kernel");
+  }
+  validate_dim3(config.grid, "grid");
+  validate_dim3(config.block, "block");
+  const auto& backend = module_state_->backend;
+  const CUcontext previous_context = backend->current_context();
+  backend->set_current_context(module_state_->context);
+  void** kernel_args = args.empty() ? nullptr : args.data();
+  try {
+    check_cuda("cuLaunchKernel",
+               backend->cu_launch_kernel(static_cast<CUfunction>(function_), config.grid.x,
+                                         config.grid.y, config.grid.z, config.block.x,
+                                         config.block.y, config.block.z, config.shared_memory_bytes,
+                                         nullptr, kernel_args, nullptr));
+    check_cuda("cuCtxSynchronize", backend->cu_ctx_synchronize());
+  } catch (...) {
+    backend->restore_context_noexcept(previous_context);
+    throw;
+  }
+  backend->restore_context(previous_context);
+}
+
 void CudaKernel::launch(const CudaLaunchConfig& config, std::span<void*> args) const {
   if (!*this) {
     throw std::invalid_argument("CUDA kernel launch requires a live kernel");
@@ -565,10 +860,10 @@ void CudaKernel::launch(const CudaLaunchConfig& config, std::span<void*> args) c
                                          config.block.y, config.block.z, config.shared_memory_bytes,
                                          nullptr, kernel_args, nullptr));
   } catch (...) {
-    backend->set_current_context(previous_context);
+    backend->restore_context_noexcept(previous_context);
     throw;
   }
-  backend->set_current_context(previous_context);
+  backend->restore_context(previous_context);
 }
 
 void CudaKernel::synchronize() const {
@@ -581,10 +876,10 @@ void CudaKernel::synchronize() const {
   try {
     check_cuda("cuCtxSynchronize", backend->cu_ctx_synchronize());
   } catch (...) {
-    backend->set_current_context(previous_context);
+    backend->restore_context_noexcept(previous_context);
     throw;
   }
-  backend->set_current_context(previous_context);
+  backend->restore_context(previous_context);
 }
 
 void CudaKernel::reset() {
@@ -613,9 +908,35 @@ std::string CudaBackend::availability_error() {
   }
 }
 
+std::string CudaBackend::availability_error(std::string_view library_path) {
+  try {
+    const auto backend =
+        CudaBackend(std::make_shared<Impl>(validated_driver_library_path(library_path)));
+    if (backend.device_count() <= 0) {
+      return "CUDA driver loaded but no CUDA devices were reported";
+    }
+    return {};
+  } catch (const std::exception& error) {
+    return error.what();
+  }
+}
+
 CudaBackend CudaBackend::create() {
-  static const std::shared_ptr<Impl> impl = std::make_shared<Impl>();
+  static const std::shared_ptr<Impl> impl = std::make_shared<Impl>(default_cuda_driver_name());
   return CudaBackend(impl);
+}
+
+CudaBackend CudaBackend::load(std::string_view library_path) {
+  const auto path = validated_driver_library_path(library_path);
+  static std::mutex cache_mutex;
+  static std::unordered_map<std::string, std::shared_ptr<Impl>> cache;
+  std::lock_guard<std::mutex> lock(cache_mutex);
+  if (const auto it = cache.find(path); it != cache.end()) {
+    return CudaBackend(it->second);
+  }
+  auto impl = std::make_shared<Impl>(path);
+  cache.emplace(path, impl);
+  return CudaBackend(std::move(impl));
 }
 
 CudaBackend::CudaBackend(std::shared_ptr<Impl> impl,
@@ -627,6 +948,17 @@ CudaBackend CudaBackend::with_trace_sink(std::shared_ptr<CudaBackendTraceSink> t
     throw std::invalid_argument("CUDA trace sink must be non-null");
   }
   return CudaBackend(impl_, std::move(trace_sink));
+}
+
+bool CudaBackend::context_healthy() const noexcept {
+  return !impl_->context_restore_failed.load(std::memory_order_acquire);
+}
+
+std::string CudaBackend::context_health_error() const {
+  if (context_healthy()) {
+    return {};
+  }
+  return "CUDA caller context restoration previously failed";
 }
 
 int CudaBackend::device_count() const {
@@ -651,8 +983,34 @@ CudaDeviceInfo CudaBackend::device_info(int ordinal) const {
   return info;
 }
 
+CudaComputeCapability CudaBackend::compute_capability(int ordinal) const {
+  const CUdevice device = impl_->device(ordinal);
+  CudaComputeCapability capability;
+  check_cuda("cuDeviceGetAttribute (compute capability major)",
+             impl_->cu_device_get_attribute(&capability.major,
+                                            kDeviceAttributeComputeCapabilityMajor, device));
+  check_cuda("cuDeviceGetAttribute (compute capability minor)",
+             impl_->cu_device_get_attribute(&capability.minor,
+                                            kDeviceAttributeComputeCapabilityMinor, device));
+  if (capability.major <= 0 || capability.minor < 0 || capability.minor > 9) {
+    throw std::runtime_error("CUDA driver returned an invalid compute capability");
+  }
+  return capability;
+}
+
 void CudaBackend::ensure_primary_context(int ordinal) const {
   impl_->ensure_primary_context(ordinal);
+}
+
+std::uintptr_t CudaBackend::primary_context_id(int ordinal) const {
+  PrimaryContextScope scope(*impl_, ordinal);
+  const auto context = scope.current();
+  if (context == nullptr) {
+    throw std::runtime_error("CUDA primary context identity is null");
+  }
+  const auto identity = reinterpret_cast<std::uintptr_t>(context);
+  scope.restore();
+  return identity;
 }
 
 CudaMemoryInfo CudaBackend::memory_info() const {
@@ -880,10 +1238,183 @@ void CudaBackend::copy_device_to_host_2d(const CudaDeviceToHost2DCopy& copy) con
   }
 }
 
-CudaModule CudaBackend::load_module_from_ptx(std::string_view ptx) const {
+CudaValidatedSpan CudaBackend::retain_device_span(CudaDevicePtr ptr, std::size_t accessible_bytes,
+                                                  CudaSpanAccess required_access,
+                                                  int device_ordinal) const {
+  if (ptr == 0 || accessible_bytes == 0) {
+    throw std::invalid_argument("CUDA device span requires a non-zero pointer and size");
+  }
+  if (device_ordinal < 0) {
+    throw std::invalid_argument("CUDA device span ordinal must be non-negative");
+  }
+  if (required_access != CudaSpanAccess::Read && required_access != CudaSpanAccess::ReadWrite) {
+    throw std::invalid_argument("CUDA device span access requirement is invalid");
+  }
+  if (accessible_bytes - 1U > std::numeric_limits<CudaDevicePtr>::max() - ptr) {
+    throw std::overflow_error("CUDA device span address overflows the device pointer");
+  }
+
+  PrimaryContextScope scope(*impl_, device_ordinal);
+  const CUcontext retained_context = scope.current();
+  if (retained_context == nullptr) {
+    throw std::runtime_error("CUDA device span validation did not establish a context");
+  }
+
+  CUcontext pointer_context = nullptr;
+  unsigned int memory_type = 0;
+  int pointer_device = -1;
+  unsigned int mapped = 0;
+  check_cuda_pointer(
+      "cuPointerGetAttribute(CONTEXT)",
+      impl_->cu_pointer_get_attribute(&pointer_context, kPointerAttributeContext, ptr));
+  check_cuda_pointer(
+      "cuPointerGetAttribute(MEMORY_TYPE)",
+      impl_->cu_pointer_get_attribute(&memory_type, kPointerAttributeMemoryType, ptr));
+  check_cuda_pointer(
+      "cuPointerGetAttribute(DEVICE_ORDINAL)",
+      impl_->cu_pointer_get_attribute(&pointer_device, kPointerAttributeDeviceOrdinal, ptr));
+  check_cuda_pointer("cuPointerGetAttribute(MAPPED)",
+                     impl_->cu_pointer_get_attribute(&mapped, kPointerAttributeMapped, ptr));
+  // CUDA VMM mappings are context-independent and report a null owning context.
+  if (pointer_context != nullptr && pointer_context != retained_context) {
+    throw std::invalid_argument("CUDA device span belongs to a different CUDA context");
+  }
+  if (memory_type != kMemoryTypeDevice) {
+    throw std::invalid_argument("CUDA device span does not reference device memory");
+  }
+  if (pointer_device != device_ordinal) {
+    throw std::invalid_argument("CUDA device span belongs to a different CUDA device");
+  }
+  if (mapped == 0U) {
+    throw std::invalid_argument("CUDA device span is not mapped to a live allocation");
+  }
+
+  CudaDevicePtr validated_range_base = ptr;
+  std::size_t validated_range_bytes = accessible_bytes;
+  std::vector<CUmemGenericAllocationHandle> allocation_handles;
+  std::vector<unsigned long long> memory_block_ids;
+  bool vmm_identity_complete = pointer_context == nullptr;
+  if (pointer_context != nullptr) {
+    unsigned int access_flags = 0;
+    check_cuda_pointer(
+        "cuPointerGetAttribute(ACCESS_FLAGS)",
+        impl_->cu_pointer_get_attribute(&access_flags, kPointerAttributeAccessFlags, ptr));
+    validate_access_flags(access_flags, required_access);
+
+    std::size_t allocation_size = 0;
+    CUdeviceptr allocation_base = 0;
+    check_cuda_pointer(
+        "cuPointerGetAttribute(RANGE_SIZE)",
+        impl_->cu_pointer_get_attribute(&allocation_size, kPointerAttributeRangeSize, ptr));
+    check_cuda_pointer(
+        "cuPointerGetAttribute(RANGE_START_ADDR)",
+        impl_->cu_pointer_get_attribute(&allocation_base, kPointerAttributeRangeStartAddress, ptr));
+    if (ptr < allocation_base) {
+      throw std::invalid_argument("CUDA device span precedes its allocation");
+    }
+    const auto allocation_offset = ptr - allocation_base;
+    if (allocation_offset > allocation_size ||
+        accessible_bytes > allocation_size - static_cast<std::size_t>(allocation_offset)) {
+      throw std::invalid_argument("CUDA device span exceeds its allocation or mapping");
+    }
+    validated_range_base = allocation_base;
+    validated_range_bytes = allocation_size;
+  } else {
+    const CudaMemAllocationProp prop = {
+        .type = kMemAllocationTypePinned,
+        .location = {.type = kMemLocationTypeDevice, .id = device_ordinal},
+    };
+    std::size_t granularity = 0;
+    check_cuda(
+        "cuMemGetAllocationGranularity",
+        impl_->cu_mem_get_allocation_granularity(&granularity, &prop, kMemAllocGranularityMinimum));
+    if (granularity == 0 || granularity > std::numeric_limits<CudaDevicePtr>::max()) {
+      throw std::runtime_error("CUDA VMM allocation granularity is invalid");
+    }
+    const auto granularity_ptr = static_cast<CudaDevicePtr>(granularity);
+    const auto last = ptr + static_cast<CudaDevicePtr>(accessible_bytes - 1U);
+    auto region = ptr - ptr % granularity_ptr;
+    const auto last_region = last - last % granularity_ptr;
+    const CudaMemLocation location = {.type = kMemLocationTypeDevice, .id = device_ordinal};
+    try {
+      for (;;) {
+        CudaMemAccessFlags access_flags = 0;
+        check_cuda_pointer("cuMemGetAccess",
+                           impl_->cu_mem_get_access(&access_flags, &location, region));
+        validate_access_flags(access_flags, required_access);
+
+        if (vmm_identity_complete) {
+          unsigned long long block_id = 0;
+          if (impl_->cu_pointer_get_attribute(&block_id, kPointerAttributeMemoryBlockId, region) ==
+              kCudaSuccess) {
+            if (std::find(memory_block_ids.begin(), memory_block_ids.end(), block_id) ==
+                memory_block_ids.end()) {
+              memory_block_ids.push_back(block_id);
+            }
+          } else {
+            memory_block_ids.clear();
+            vmm_identity_complete = false;
+          }
+        }
+
+        CUmemGenericAllocationHandle handle = 0;
+        check_cuda_pointer(
+            "cuMemRetainAllocationHandle",
+            impl_->cu_mem_retain_allocation_handle(
+                &handle, reinterpret_cast<void*>(static_cast<std::uintptr_t>(region))));
+        if (std::find(allocation_handles.begin(), allocation_handles.end(), handle) ==
+            allocation_handles.end()) {
+          try {
+            allocation_handles.push_back(handle);
+          } catch (...) {
+            (void)impl_->cu_mem_release(handle);
+            throw;
+          }
+        } else {
+          check_cuda("cuMemRelease", impl_->cu_mem_release(handle));
+        }
+        if (region == last_region) {
+          break;
+        }
+        if (region > std::numeric_limits<CudaDevicePtr>::max() - granularity_ptr) {
+          throw std::overflow_error("CUDA VMM validation region overflows the device pointer");
+        }
+        region += granularity_ptr;
+      }
+    } catch (...) {
+      for (const auto handle : allocation_handles) {
+        (void)impl_->cu_mem_release(handle);
+      }
+      throw;
+    }
+  }
+
+  std::shared_ptr<CudaValidatedSpan::State> state;
+  try {
+    state = std::make_shared<CudaValidatedSpan::State>(
+        impl_, ptr, accessible_bytes, reinterpret_cast<std::uintptr_t>(retained_context),
+        device_ordinal, required_access, validated_range_base, validated_range_bytes,
+        std::move(allocation_handles), std::move(memory_block_ids), pointer_context == nullptr,
+        vmm_identity_complete);
+  } catch (...) {
+    for (const auto handle : allocation_handles) {
+      (void)impl_->cu_mem_release(handle);
+    }
+    throw;
+  }
+  scope.restore();
+  return CudaValidatedSpan(std::move(state));
+}
+
+void CudaBackend::validate_device_span(CudaDevicePtr ptr, std::size_t accessible_bytes,
+                                       CudaSpanAccess required_access, int device_ordinal) const {
+  (void)retain_device_span(ptr, accessible_bytes, required_access, device_ordinal);
+}
+
+CudaModule CudaBackend::load_module_from_ptx(std::string_view ptx, int device_ordinal) const {
   validate_ptx(ptx);
-  impl_->ensure_current_context_for_copy();
-  const CUcontext context = impl_->current_context();
+  PrimaryContextScope scope(*impl_, device_ordinal);
+  const CUcontext context = scope.current();
   if (context == nullptr) {
     throw std::runtime_error("CUDA kernel load did not establish a current context");
   }
@@ -893,19 +1424,22 @@ CudaModule CudaBackend::load_module_from_ptx(std::string_view ptx) const {
   }
   CUmodule module = nullptr;
   check_cuda("cuModuleLoadData", impl_->cu_module_load_data(&module, terminated_ptx.data()));
+  std::shared_ptr<CudaModule::State> state;
   try {
-    return CudaModule(std::make_shared<CudaModule::State>(impl_, context, module));
+    state = std::make_shared<CudaModule::State>(impl_, context, module);
   } catch (...) {
     CudaModule::State::unload(impl_, context, module);
     throw;
   }
+  scope.restore();
+  return CudaModule(std::move(state));
 }
 
-CudaKernel CudaBackend::load_kernel_from_ptx(std::string_view ptx,
-                                             std::string_view function_name) const {
+CudaKernel CudaBackend::load_kernel_from_ptx(std::string_view ptx, std::string_view function_name,
+                                             int device_ordinal) const {
   validate_ptx(ptx);
   validate_no_nul(function_name, "kernel function name");
-  return load_module_from_ptx(ptx).load_kernel(function_name);
+  return load_module_from_ptx(ptx, device_ordinal).load_kernel(function_name);
 }
 
 void CudaBackend::synchronize() const {

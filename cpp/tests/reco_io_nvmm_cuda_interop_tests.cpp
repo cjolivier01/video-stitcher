@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #if defined(__linux__)
@@ -22,6 +23,9 @@ namespace abi = reco::io::detail::nvbufsurface_9_1;
 namespace abi7 = reco::io::detail::nvbufsurface_7_1;
 
 namespace {
+
+static_assert(!std::is_copy_constructible_v<CudaNv12FrameLease>);
+static_assert(std::is_nothrow_move_constructible_v<CudaNv12FrameLease>);
 
 int failures = 0;
 
@@ -307,12 +311,36 @@ void surface_array_mapping_retains_and_unmaps_owner() {
   expect_eq(mapped.uv_ptr, 0x40000000U + 1280U * 720U, "mapped UV pointer");
   expect_eq(mapped.y_pitch, 1280U, "mapped Y pitch");
   expect_eq(mapped.uv_pitch, 1280U, "mapped UV pitch");
+  expect_eq(mapped.y_accessible_bytes, 1280U * 720U,
+            "mapped Y capacity comes from plane and driver bounds");
+  expect_eq(mapped.uv_accessible_bytes, 1280U * 360U,
+            "mapped UV capacity comes from plane and driver bounds");
+  expect_eq(mapped.y_mapping_base, 0x40000000U, "mapped Y allocation base");
+  expect_eq(mapped.y_mapping_bytes, 1280U * 1080U, "mapped Y allocation size");
+  expect_eq(mapped.context_id, static_cast<std::uintptr_t>(0xC0DA),
+            "mapped CUDA context is driver-derived");
+  expect_eq(mapped.device_ordinal, 0, "mapped CUDA device is driver-derived");
+  expect_true(static_cast<bool>(mapped.y_validation) && static_cast<bool>(mapped.uv_validation),
+              "mapped CUDA planes retain whole-span driver validation");
   expect_eq(mapped.width, 1278U, "mapped CUDA view uses visible width");
   expect_eq(mapped.gpu_id, 0U, "mapped GPU id");
   expect_eq(mapped_again.y_ptr, mapped.y_ptr, "duplicate map shares CUDA mapping");
   expect_true(mapped.color_matrix == Nv12ColorMatrix::Bt709, "BT.709 metadata preserved");
   expect_true(mapped.color_range == Nv12ColorRange::Limited, "limited range preserved");
   expect_true(params.mapped_addr.cuda_ptr != nullptr, "runtime CUDA mapping remains live");
+  {
+    auto lease = map_gpu_decoded_frame_to_cuda_lease(decoded);
+    expect_eq(lease.view().width(), 1278U, "CUDA frame lease preserves visible width");
+    expect_eq(lease.view().height(), 720U, "CUDA frame lease preserves visible height");
+    expect_eq(lease.view().context_id(), static_cast<reco::core::CudaContextId>(0xC0DA),
+              "CUDA frame lease uses verified context");
+    expect_eq(lease.view().y_plane().accessible_bytes(), 1280U * 720U,
+              "CUDA frame lease uses verified Y capacity");
+    expect_true(lease.view().y_plane().driver_validation() != nullptr &&
+                    lease.view().uv_plane().driver_validation() != nullptr,
+                "CUDA frame lease carries mapping-time validation into the renderer");
+    expect_true(lease.mapping().owner != nullptr, "CUDA frame lease retains mapping owner");
+  }
   expect_nvmm_error([&] { (void)map_nvmm_frame_to_cuda(info, std::make_shared<int>(10)); },
                     "duplicate map with different owner rejected");
   params.color_format = abi::kColorNv12;
@@ -339,8 +367,22 @@ void surface_array_mapping_retains_and_unmaps_owner() {
   expect_true(decoder_lifetime.expired(), "mapping releases decoder owner");
   expect_true(runtime_alive_during_decoder_release,
               "mapped runtime outlives decoder-owner destruction");
-  expect_true(runtime_lifetime.expired(), "mapping releases NvBufSurface runtime");
   expect_true(params.mapped_addr.cuda_ptr == nullptr, "mapping owner unmaps CUDA buffer");
+  expect_true(!runtime_lifetime.expired(), "CUDA frame retains its explicit runtime handle");
+  mapped.runtime.reset();
+  mapped_again.runtime.reset();
+  expect_true(runtime_lifetime.expired(), "CUDA frames release NvBufSurface runtime");
+
+  auto legacy_info = extract_info(&surface);
+  legacy_info.y_size = 0;
+  legacy_info.uv_size = 0;
+  auto legacy_mapping = map_nvmm_frame_to_cuda(legacy_info, std::make_shared<int>(33));
+  expect_eq(legacy_mapping.y_accessible_bytes, 1280U * 720U,
+            "legacy metadata receives the re-extracted Y plane size");
+  expect_eq(legacy_mapping.uv_accessible_bytes, 1280U * 360U,
+            "legacy metadata receives the re-extracted UV plane size");
+  legacy_mapping.owner.reset();
+  expect_true(params.mapped_addr.cuda_ptr == nullptr, "legacy metadata mapping unmaps cleanly");
 
   params = make_params();
   surface = make_surface(params);
@@ -398,6 +440,32 @@ void surface_array_mapping_retains_and_unmaps_owner() {
     expect_true(params.mapped_addr.cuda_ptr == nullptr,
                 "invalid CUDA pointer mapping rolls back cleanly");
   }
+
+  params = make_params();
+  params.buffer_desc = 14;
+  surface = make_surface(params);
+  auto context_independent =
+      map_nvmm_frame_to_cuda(extract_info(&surface), std::make_shared<int>(27));
+  expect_eq(context_independent.context_id, static_cast<std::uintptr_t>(0xC0DA),
+            "context-independent mapping uses retained primary-context identity");
+  context_independent.owner.reset();
+
+  params = make_params();
+  params.buffer_desc = 15;
+  surface = make_surface(params);
+  expect_nvmm_error_contains(
+      [&] { (void)map_nvmm_frame_to_cuda(extract_info(&surface), std::make_shared<int>(28)); },
+      "not readable", "PROT_NONE CUDA mapping is rejected");
+  expect_true(params.mapped_addr.cuda_ptr == nullptr,
+              "inaccessible CUDA mapping rolls back cleanly");
+
+  params = make_params();
+  params.buffer_desc = 16;
+  surface = make_surface(params);
+  auto read_only = map_nvmm_frame_to_cuda(extract_info(&surface), std::make_shared<int>(29));
+  expect_true(read_only.y_ptr != 0 && read_only.uv_ptr != 0,
+              "read-only decoded mapping is accepted as a stitch input");
+  read_only.owner.reset();
 
   params = make_params();
   surface = make_surface(params);
@@ -488,7 +556,9 @@ void cuda_device_mapping_retains_context_and_owner() {
   mapped.owner.reset();
   expect_true(runtime_alive_during_decoder_release,
               "direct CUDA runtime outlives decoder-owner destruction");
-  expect_true(runtime_lifetime.expired(), "direct CUDA view releases NvBufSurface runtime");
+  expect_true(!runtime_lifetime.expired(), "direct CUDA frame retains its explicit runtime handle");
+  mapped.runtime.reset();
+  expect_true(runtime_lifetime.expired(), "direct CUDA frame releases NvBufSurface runtime");
 
   params = make_params();
   params.data_ptr = reinterpret_cast<void*>(9);
@@ -665,6 +735,77 @@ void failed_cleanup_poisoning_retains_surface_owners() {
 #endif
 }
 
+void context_restoration_failures_are_fail_closed() {
+#if defined(__linux__)
+  const auto cuda_driver = find_fake_runtime_runfile("fake_cuda_driver");
+  void* library = dlopen(cuda_driver.c_str(), RTLD_NOW | RTLD_LOCAL);
+  if (library == nullptr) {
+    throw std::runtime_error("failed to load fake CUDA driver controls");
+  }
+  struct LibraryCloser {
+    void* library;
+    ~LibraryCloser() { (void)dlclose(library); }
+  } closer{library};
+  const auto symbol = [library](const char* name) {
+    void* value = dlsym(library, name);
+    if (value == nullptr) {
+      throw std::runtime_error(std::string("missing fake CUDA control ") + name);
+    }
+    return value;
+  };
+  const auto set_current = reinterpret_cast<int (*)(void*)>(symbol("cuCtxSetCurrent"));
+  const auto fail_next_set =
+      reinterpret_cast<void (*)(std::uintptr_t)>(symbol("recoFakeCudaFailNextSetCurrent"));
+  const auto current_context =
+      reinterpret_cast<std::uintptr_t (*)()>(symbol("recoFakeCudaCurrentContext"));
+  constexpr std::uintptr_t kCallerContext = 0xBEEF;
+
+  auto direct_params = make_params();
+  direct_params.data_ptr = reinterpret_cast<void*>(0x40000000);
+  auto direct_surface = make_surface(direct_params);
+  direct_surface.mem_type = abi::kMemCudaDevice;
+  expect_eq(set_current(reinterpret_cast<void*>(kCallerContext)), 0,
+            "fake caller CUDA context is selected");
+  fail_next_set(kCallerContext);
+  expect_nvmm_error_contains(
+      [&] {
+        (void)map_nvmm_frame_to_cuda(extract_info(&direct_surface), std::make_shared<int>(30));
+      },
+      "cuCtxSetCurrent (restore)", "mapping reports caller CUDA context restoration failure");
+  expect_eq(current_context(), kCallerContext,
+            "mapping unwind retries caller CUDA context restoration");
+
+  auto mapped_params = make_params();
+  auto mapped_surface = make_surface(mapped_params);
+  auto mapped_owner = std::make_shared<int>(31);
+  std::weak_ptr<int> mapped_owner_lifetime = mapped_owner;
+  auto mapped = map_nvmm_frame_to_cuda(extract_info(&mapped_surface), mapped_owner);
+  mapped_owner.reset();
+  expect_eq(set_current(reinterpret_cast<void*>(kCallerContext)), 0,
+            "cleanup caller CUDA context is selected");
+  fail_next_set(kCallerContext);
+  mapped.owner.reset();
+  expect_true(mapped_params.mapped_addr.cuda_ptr == nullptr,
+              "cleanup unmaps the CUDA buffer before restoration failure");
+  expect_eq(current_context(), kCallerContext,
+            "cleanup unwind retries caller CUDA context restoration");
+  expect_true(mapped_owner_lifetime.expired(),
+              "completed cleanup releases its decoder owner after restoration failure");
+  expect_nvmm_error_contains(
+      [&] {
+        (void)map_nvmm_frame_to_cuda(extract_info(&mapped_surface), std::make_shared<int>(32));
+      },
+      "context restoration previously failed",
+      "cleanup restoration failure poisons CUDA context health without retaining the mapping");
+  expect_true(!is_nvmm_cuda_interop_available(),
+              "CUDA interop availability reflects poisoned context health");
+  expect_true(nvmm_cuda_interop_availability_error().find(
+                  "context restoration previously failed") != std::string::npos,
+              "CUDA interop availability reports the context restoration failure");
+  expect_eq(set_current(nullptr), 0, "fake CUDA caller context is cleared");
+#endif
+}
+
 } // namespace
 
 int main() {
@@ -676,5 +817,6 @@ int main() {
   concurrent_mapping_cleanup_is_serialized();
   independent_surfaces_keep_independent_runtime_mappings();
   failed_cleanup_poisoning_retains_surface_owners();
+  context_restoration_failures_are_fail_closed();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

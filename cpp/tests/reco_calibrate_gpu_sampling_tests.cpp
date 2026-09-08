@@ -76,7 +76,9 @@ GpuDecodedFrame metadata_frame(std::uint64_t frame_index) {
                    .total_size = 64 * 48,
                    .surface_ptr = reinterpret_cast<void*>(0x1000),
                    .abi = NvbufSurfaceAbi::DeepStream9_1,
-                   .memory_type = NvmmMemoryType::SurfaceArray},
+                   .memory_type = NvmmMemoryType::SurfaceArray,
+                   .y_size = 64 * 32,
+                   .uv_size = 64 * 16},
           .visible_width = 64,
           .visible_height = 32,
           .owner = std::make_shared<int>(1),
@@ -104,6 +106,7 @@ public:
   [[nodiscard]] const GpuFileDecodeConfig& config() const override { return config_; }
   [[nodiscard]] std::string_view pipeline() const override { return pipeline_; }
   [[nodiscard]] bool gpu_resident() const override { return gpu_resident_; }
+  void request_stop() noexcept override {}
   [[nodiscard]] GpuDecodeReadResult read() override {
     if (before_read_) {
       before_read_();
@@ -145,6 +148,7 @@ public:
   [[nodiscard]] const GpuFileDecodeConfig& config() const override { return config_; }
   [[nodiscard]] std::string_view pipeline() const override { return "fixture"; }
   [[nodiscard]] bool gpu_resident() const override { return true; }
+  void request_stop() noexcept override {}
   [[nodiscard]] GpuDecodeReadResult read() override {
     return {.status = GpuDecodeFrameStatus::Frame, .frame = std::nullopt};
   }

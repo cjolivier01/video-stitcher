@@ -146,6 +146,9 @@ struct NvmmFrameInfo {
   Nv12ColorMatrix color_matrix = Nv12ColorMatrix::Bt601;
   Nv12ColorRange color_range = Nv12ColorRange::Limited;
   std::shared_ptr<const NvbufSurfaceRuntime> runtime;
+  // Appended to preserve the public aggregate's legacy positional prefix.
+  std::uint32_t y_size = 0;
+  std::uint32_t uv_size = 0;
 };
 
 struct NvmmCudaFrame {
@@ -159,6 +162,29 @@ struct NvmmCudaFrame {
   Nv12ColorMatrix color_matrix = Nv12ColorMatrix::Bt601;
   Nv12ColorRange color_range = Nv12ColorRange::Limited;
   std::shared_ptr<void> owner;
+  // Appended to preserve the public aggregate's legacy positional prefix.
+  /// Bytes accessible from the Y pointer within its driver-validated range and plane allocation.
+  std::size_t y_accessible_bytes = 0;
+  /// Bytes accessible from the UV pointer within its driver-validated range and plane allocation.
+  std::size_t uv_accessible_bytes = 0;
+  /// Base of the validated Y range (the allocation base for context-owned memory).
+  core::CudaDevicePtr y_mapping_base = 0;
+  /// Base of the validated UV range (the allocation base for context-owned memory).
+  core::CudaDevicePtr uv_mapping_base = 0;
+  /// Bytes in the validated Y range (the allocation size for context-owned memory).
+  std::size_t y_mapping_bytes = 0;
+  /// Bytes in the validated UV range (the allocation size for context-owned memory).
+  std::size_t uv_mapping_bytes = 0;
+  /// Process-local identity of the CUDA context proven by the driver for both planes.
+  std::uintptr_t context_id = 0;
+  /// CUDA device ordinal proven by the driver for both planes.
+  int device_ordinal = -1;
+  /// Exact NvBufSurface provider retained through mapping cleanup.
+  std::shared_ptr<const NvbufSurfaceRuntime> runtime;
+  /// Retained whole-span driver validation for the Y plane.
+  core::CudaValidatedSpan y_validation;
+  /// Retained whole-span driver validation for the UV plane.
+  core::CudaValidatedSpan uv_validation;
 };
 
 // Compatibility overload for the DeepStream 7.1 Jetson ABI used by the

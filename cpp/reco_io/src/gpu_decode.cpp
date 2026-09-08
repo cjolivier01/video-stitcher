@@ -150,6 +150,18 @@ void GpuFileDecodeSource::seek_to_frame(std::uint64_t) {
   throw GpuDecodeError("GPU file decode source does not support indexed seeking");
 }
 
+std::optional<std::string> validate_gpu_stereo_decode_config(const GpuStereoDecodeConfig& config) {
+  if (config.sync_offset < -kMaximumGpuStereoSyncOffset ||
+      config.sync_offset > kMaximumGpuStereoSyncOffset) {
+    return "GPU stereo decode sync offset must be between -100000 and 100000 frames";
+  }
+  if (config.queue_capacity < kMinimumGpuStereoQueueCapacity ||
+      config.queue_capacity > kMaximumGpuStereoQueueCapacity) {
+    return "GPU stereo decode queue capacity must be between 1 and 16";
+  }
+  return std::nullopt;
+}
+
 std::optional<std::string> validate_gpu_decoded_frame(const GpuDecodedFrame& frame) {
   if (!frame.owner) {
     return "GPU decoded frame must retain its decoder buffer owner";
@@ -183,6 +195,17 @@ NvmmCudaFrame map_gpu_decoded_frame_to_cuda(const GpuDecodedFrame& frame) {
   return mapped;
 }
 
+CudaNv12FrameLease map_gpu_decoded_frame_to_cuda_lease(const GpuDecodedFrame& frame) {
+  auto mapped = map_gpu_decoded_frame_to_cuda(frame);
+  core::CudaPitchedPlaneView y_plane(mapped.y_validation, mapped.y_pitch, mapped.width,
+                                     mapped.height);
+  core::CudaPitchedPlaneView uv_plane(mapped.uv_validation, mapped.uv_pitch, mapped.width,
+                                      mapped.height / 2U);
+  core::CudaNv12FrameView view(std::move(y_plane), std::move(uv_plane), mapped.width, mapped.height,
+                               mapped.color_matrix, mapped.color_range);
+  return CudaNv12FrameLease(std::move(mapped), std::move(view));
+}
+
 std::string build_gstreamer_gpu_file_decode_pipeline(const GpuFileDecodeConfig& config) {
   if (const auto error = validate_gpu_file_decode_config(config); error.has_value()) {
     throw std::invalid_argument(*error);
@@ -201,7 +224,8 @@ std::string build_gstreamer_gpu_file_decode_pipeline(const GpuFileDecodeConfig& 
            << " ! video/x-raw(memory:NVMM),format=NV12"
            << " ! identity name=output_info silent=true"
            << " ! appsink name=sink emit-signals=false sync=false max-buffers="
-           << config.max_buffers << " drop=" << (config.drop ? "true" : "false");
+           << config.max_buffers << " drop=" << (config.drop ? "true" : "false")
+           << " wait-on-eos=false";
   return pipeline.str();
 }
 

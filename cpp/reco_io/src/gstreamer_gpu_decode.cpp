@@ -199,6 +199,8 @@ public:
   using ElementSetState = int (*)(void*, int);
   using ElementGetState = int (*)(void*, int*, int*, std::uint64_t);
   using ElementSeekSimple = int (*)(void*, int, int, std::int64_t);
+  using ElementSendEvent = int (*)(void*, void*);
+  using EventNewFlushStart = void* (*)();
   using ElementGetBus = void* (*)(void*);
   using ObjectUnref = void (*)(void*);
   using PadGetCurrentCaps = void* (*)(void*);
@@ -262,6 +264,8 @@ public:
     element_set_state = core_library->symbol<ElementSetState>("gst_element_set_state");
     element_get_state = core_library->symbol<ElementGetState>("gst_element_get_state");
     element_seek_simple = core_library->symbol<ElementSeekSimple>("gst_element_seek_simple");
+    element_send_event = core_library->symbol<ElementSendEvent>("gst_element_send_event");
+    event_new_flush_start = core_library->symbol<EventNewFlushStart>("gst_event_new_flush_start");
     element_get_bus = core_library->symbol<ElementGetBus>("gst_element_get_bus");
     object_unref = core_library->symbol<ObjectUnref>("gst_object_unref");
     pad_get_current_caps = core_library->symbol<PadGetCurrentCaps>("gst_pad_get_current_caps");
@@ -310,6 +314,8 @@ public:
   ElementSetState element_set_state = nullptr;
   ElementGetState element_get_state = nullptr;
   ElementSeekSimple element_seek_simple = nullptr;
+  ElementSendEvent element_send_event = nullptr;
+  EventNewFlushStart event_new_flush_start = nullptr;
   ElementGetBus element_get_bus = nullptr;
   ObjectUnref object_unref = nullptr;
   PadGetCurrentCaps pad_get_current_caps = nullptr;
@@ -373,10 +379,155 @@ std::pair<std::uint32_t, std::uint32_t> visible_dimensions(const std::shared_ptr
   return {static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height)};
 }
 
+class GstreamerPipelineResources {
+public:
+  explicit GstreamerPipelineResources(std::shared_ptr<GstreamerApi> api) : api_(std::move(api)) {}
+
+  GstreamerPipelineResources(const GstreamerPipelineResources&) = delete;
+  GstreamerPipelineResources& operator=(const GstreamerPipelineResources&) = delete;
+
+  [[nodiscard]] bool interrupt() noexcept {
+    std::lock_guard lock(mutex_);
+    if (interrupted_ || closed_ || pipeline == nullptr) {
+      return true;
+    }
+    if (void* flush = api_->event_new_flush_start(); flush != nullptr) {
+      // gst_element_send_event takes ownership of the event, including on failure.
+      interrupted_ = api_->element_send_event(pipeline, flush) != 0;
+    }
+    return interrupted_;
+  }
+
+  void close() noexcept {
+    std::lock_guard lock(mutex_);
+    if (closed_) {
+      return;
+    }
+    closed_ = true;
+    if (pipeline != nullptr) {
+      (void)api_->element_set_state(pipeline, kGstStateNull);
+    }
+    if (bus != nullptr) {
+      api_->object_unref(bus);
+      bus = nullptr;
+    }
+    if (output_info_pad != nullptr) {
+      if (output_info_probe_id != 0) {
+        api_->pad_remove_probe(output_info_pad, output_info_probe_id);
+        output_info_probe_id = 0;
+      }
+      api_->object_unref(output_info_pad);
+      output_info_pad = nullptr;
+    }
+    if (output_info != nullptr) {
+      api_->object_unref(output_info);
+      output_info = nullptr;
+    }
+    if (display_info_pad != nullptr) {
+      if (display_info_probe_id != 0) {
+        api_->pad_remove_probe(display_info_pad, display_info_probe_id);
+        display_info_probe_id = 0;
+      }
+      api_->object_unref(display_info_pad);
+      display_info_pad = nullptr;
+    }
+    if (display_info != nullptr) {
+      api_->object_unref(display_info);
+      display_info = nullptr;
+    }
+    if (sink != nullptr) {
+      api_->object_unref(sink);
+      sink = nullptr;
+    }
+    if (pipeline != nullptr) {
+      api_->object_unref(pipeline);
+      pipeline = nullptr;
+    }
+  }
+
+  void* pipeline = nullptr;
+  void* sink = nullptr;
+  void* display_info = nullptr;
+  void* display_info_pad = nullptr;
+  unsigned long display_info_probe_id = 0;
+  void* output_info = nullptr;
+  void* output_info_pad = nullptr;
+  unsigned long output_info_probe_id = 0;
+  void* bus = nullptr;
+
+private:
+  std::shared_ptr<GstreamerApi> api_;
+  std::mutex mutex_;
+  bool interrupted_ = false;
+  bool closed_ = false;
+};
+
+class GstreamerPipelineLifetime {
+public:
+  explicit GstreamerPipelineLifetime(std::shared_ptr<GstreamerPipelineResources> resources)
+      : resources_(std::move(resources)) {}
+
+  GstreamerPipelineLifetime(const GstreamerPipelineLifetime&) = delete;
+  GstreamerPipelineLifetime& operator=(const GstreamerPipelineLifetime&) = delete;
+
+  void acquire_frame() {
+    std::lock_guard lock(mutex_);
+    if (source_released_ || closing_) {
+      throw GpuDecodeError("GStreamer pipeline is closing before frame ownership transfer");
+    }
+    ++frame_leases_;
+  }
+
+  void release_frame() noexcept {
+    std::shared_ptr<GstreamerPipelineResources> close_resources;
+    {
+      std::lock_guard lock(mutex_);
+      if (frame_leases_ == 0) {
+        return;
+      }
+      --frame_leases_;
+      close_resources = take_resources_if_ready();
+    }
+    if (close_resources) {
+      close_resources->close();
+    }
+  }
+
+  void release_source() noexcept {
+    std::shared_ptr<GstreamerPipelineResources> close_resources;
+    {
+      std::lock_guard lock(mutex_);
+      source_released_ = true;
+      close_resources = take_resources_if_ready();
+    }
+    if (close_resources) {
+      close_resources->close();
+    }
+  }
+
+private:
+  std::shared_ptr<GstreamerPipelineResources> take_resources_if_ready() noexcept {
+    if (!source_released_ || frame_leases_ != 0 || closing_) {
+      return {};
+    }
+    closing_ = true;
+    return std::move(resources_);
+  }
+
+  std::mutex mutex_;
+  std::shared_ptr<GstreamerPipelineResources> resources_;
+  std::size_t frame_leases_ = 0;
+  bool source_released_ = false;
+  bool closing_ = false;
+};
+
 class GstSampleOwner {
 public:
-  GstSampleOwner(std::shared_ptr<GstreamerApi> api, void* sample)
-      : api_(std::move(api)), sample_(sample) {}
+  GstSampleOwner(std::shared_ptr<GstreamerApi> api,
+                 std::shared_ptr<GstreamerPipelineLifetime> pipeline_lifetime, void* sample)
+      : api_(std::move(api)), pipeline_lifetime_(std::move(pipeline_lifetime)), sample_(sample) {
+    pipeline_lifetime_->acquire_frame();
+  }
 
   GstSampleOwner(const GstSampleOwner&) = delete;
   GstSampleOwner& operator=(const GstSampleOwner&) = delete;
@@ -388,6 +539,7 @@ public:
     if (sample_ != nullptr) {
       api_->sample_unref(sample_);
     }
+    pipeline_lifetime_->release_frame();
   }
 
   void map_buffer(void* buffer) {
@@ -406,10 +558,29 @@ public:
 
 private:
   std::shared_ptr<GstreamerApi> api_;
+  std::shared_ptr<GstreamerPipelineLifetime> pipeline_lifetime_;
   void* sample_ = nullptr;
   void* buffer_ = nullptr;
   GstMapInfoAbi map_{};
   bool mapped_ = false;
+};
+
+class GstSampleGuard {
+public:
+  GstSampleGuard(GstreamerApi& api, void* sample) noexcept : api_(&api), sample_(sample) {}
+  GstSampleGuard(const GstSampleGuard&) = delete;
+  GstSampleGuard& operator=(const GstSampleGuard&) = delete;
+  ~GstSampleGuard() {
+    if (sample_ != nullptr) {
+      api_->sample_unref(sample_);
+    }
+  }
+
+  void release() noexcept { sample_ = nullptr; }
+
+private:
+  GstreamerApi* api_ = nullptr;
+  void* sample_ = nullptr;
 };
 
 enum class GeometryProbeFailure {
@@ -715,6 +886,8 @@ public:
       : config_(std::move(config)),
         pipeline_description_(build_gstreamer_gpu_file_decode_pipeline(config_)),
         runtime_(std::move(runtime)), abi_(abi), api_(std::move(api)),
+        resources_(std::make_shared<GstreamerPipelineResources>(api_)),
+        pipeline_lifetime_(std::make_shared<GstreamerPipelineLifetime>(resources_)),
         next_frame_index_(config_.start_frame_index.value_or(0U)) {}
 
   GstreamerGpuFileDecodeSource(const GstreamerGpuFileDecodeSource&) = delete;
@@ -744,6 +917,7 @@ public:
     }
 
     pipeline_ = api_->parse_launch(pipeline_description_.c_str(), &error);
+    resources_->pipeline = pipeline_;
     if (pipeline_ == nullptr || error != nullptr) {
       throw GpuDecodeError("GStreamer pipeline parse failed: " +
                            take_error(api_, error, "parse returned no pipeline"));
@@ -755,15 +929,18 @@ public:
       }
     }
     sink_ = api_->bin_get_by_name(pipeline_, "sink");
+    resources_->sink = sink_;
     if (sink_ == nullptr) {
       throw GpuDecodeError("GStreamer pipeline does not contain appsink 'sink'");
     }
     display_info_ = api_->bin_get_by_name(pipeline_, "display_info");
+    resources_->display_info = display_info_;
     if (display_info_ == nullptr) {
       throw GpuDecodeError(
           "GStreamer pipeline does not contain pre-decoder identity 'display_info'");
     }
     display_info_pad_ = api_->element_get_static_pad(display_info_, "src");
+    resources_->display_info_pad = display_info_pad_;
     if (display_info_pad_ == nullptr) {
       throw GpuDecodeError("GStreamer pre-decoder identity does not provide a source pad");
     }
@@ -773,16 +950,19 @@ public:
     display_info_probe_id_ = api_->pad_add_probe(
         display_info_pad_, kGstPadProbeTypeBuffer, &GeometryProbeState::on_predecoder_buffer,
         predecoder_callback_data.get(), &GeometryProbeState::destroy_callback_data);
+    resources_->display_info_probe_id = display_info_probe_id_;
     if (display_info_probe_id_ == 0) {
       geometry_probe_state_.reset();
       throw GpuDecodeError("failed to install GStreamer pre-decoder geometry probe");
     }
     (void)predecoder_callback_data.release();
     output_info_ = api_->bin_get_by_name(pipeline_, "output_info");
+    resources_->output_info = output_info_;
     if (output_info_ == nullptr) {
       throw GpuDecodeError("GStreamer pipeline does not contain output identity 'output_info'");
     }
     output_info_pad_ = api_->element_get_static_pad(output_info_, "src");
+    resources_->output_info_pad = output_info_pad_;
     if (output_info_pad_ == nullptr) {
       throw GpuDecodeError("GStreamer output identity does not provide a source pad");
     }
@@ -791,11 +971,13 @@ public:
     output_info_probe_id_ = api_->pad_add_probe(
         output_info_pad_, kGstPadProbeTypeBuffer, &GeometryProbeState::on_output_buffer,
         output_callback_data.get(), &GeometryProbeState::destroy_callback_data);
+    resources_->output_info_probe_id = output_info_probe_id_;
     if (output_info_probe_id_ == 0) {
       throw GpuDecodeError("failed to install GStreamer output geometry probe");
     }
     (void)output_callback_data.release();
     bus_ = api_->element_get_bus(pipeline_);
+    resources_->bus = bus_;
     if (bus_ == nullptr) {
       throw GpuDecodeError("GStreamer pipeline does not provide a message bus");
     }
@@ -812,8 +994,32 @@ public:
   [[nodiscard]] std::string_view pipeline() const override { return pipeline_description_; }
   [[nodiscard]] bool gpu_resident() const override { return true; }
 
+  void request_stop() noexcept override {
+    stop_requested_.store(true, std::memory_order_release);
+    // Every racing caller attempts the idempotent interrupt. This avoids a caller observing the
+    // stop flag in the interval before the first caller has flushed the pipeline.
+    const bool interrupted = resources_->interrupt();
+    if (!interrupted || stop_drain_started_.exchange(true, std::memory_order_acq_rel)) {
+      return;
+    }
+    // Flush first: NVIDIA GStreamer elements can otherwise retain a streaming-pad lock while a
+    // bounded appsink pull is active, making the subsequent NULL state transition deadlock.
+    // Wait out the bounded appsink poll. Pipeline ownership stays with the source until normal
+    // destruction so a stereo session can flush and join both decoders before either NVIDIA
+    // pipeline begins its NULL state transition.
+    std::lock_guard lock(read_mutex_);
+    ended_ = true;
+    for (void* sample = api_->app_sink_try_pull_sample(sink_, 0); sample != nullptr;
+         sample = api_->app_sink_try_pull_sample(sink_, 0)) {
+      api_->sample_unref(sample);
+    }
+  }
+
   void seek_to_frame(std::uint64_t frame_index) override {
     std::lock_guard lock(read_mutex_);
+    if (stop_requested_.load(std::memory_order_acquire)) {
+      throw GpuDecodeError("GStreamer GPU decode source has been stopped");
+    }
     if (terminal_error_.has_value()) {
       throw GpuDecodeError(*terminal_error_);
     }
@@ -831,6 +1037,10 @@ public:
     std::lock_guard lock(read_mutex_);
     if (terminal_error_.has_value()) {
       throw GpuDecodeError(*terminal_error_);
+    }
+    if (stop_requested_.load(std::memory_order_acquire)) {
+      ended_ = true;
+      return make_gpu_decode_eos();
     }
     throw_if_geometry_probe_failed();
     if (ended_) {
@@ -852,6 +1062,13 @@ public:
       const auto poll_timeout =
           std::min<std::uint64_t>(kSamplePollTimeoutNs, static_cast<std::uint64_t>(remaining));
       sample = api_->app_sink_try_pull_sample(sink_, poll_timeout);
+      if (stop_requested_.load(std::memory_order_acquire)) {
+        if (sample != nullptr) {
+          api_->sample_unref(sample);
+        }
+        ended_ = true;
+        return make_gpu_decode_eos();
+      }
       if (sample != nullptr) {
         break;
       }
@@ -868,7 +1085,9 @@ public:
       }
     }
 
-    auto owner = std::make_shared<GstSampleOwner>(api_, sample);
+    GstSampleGuard pulled_sample(*api_, sample);
+    auto owner = std::make_shared<GstSampleOwner>(api_, pipeline_lifetime_, sample);
+    pulled_sample.release();
     drain_pipeline_messages();
     throw_if_geometry_probe_failed();
     void* buffer = api_->sample_get_buffer(sample);
@@ -1189,46 +1408,11 @@ private:
   }
 
   void close() noexcept {
-    if (pipeline_ != nullptr) {
-      (void)api_->element_set_state(pipeline_, kGstStateNull);
-    }
-    if (bus_ != nullptr) {
-      api_->object_unref(bus_);
-      bus_ = nullptr;
-    }
-    if (output_info_pad_ != nullptr) {
-      if (output_info_probe_id_ != 0) {
-        api_->pad_remove_probe(output_info_pad_, output_info_probe_id_);
-        output_info_probe_id_ = 0;
-      }
-      api_->object_unref(output_info_pad_);
-      output_info_pad_ = nullptr;
-    }
-    if (output_info_ != nullptr) {
-      api_->object_unref(output_info_);
-      output_info_ = nullptr;
-    }
-    if (display_info_pad_ != nullptr) {
-      if (display_info_probe_id_ != 0) {
-        api_->pad_remove_probe(display_info_pad_, display_info_probe_id_);
-        display_info_probe_id_ = 0;
-      }
-      api_->object_unref(display_info_pad_);
-      display_info_pad_ = nullptr;
-    }
-    if (display_info_ != nullptr) {
-      api_->object_unref(display_info_);
-      display_info_ = nullptr;
-    }
-    geometry_probe_state_.reset();
-    if (sink_ != nullptr) {
-      api_->object_unref(sink_);
-      sink_ = nullptr;
-    }
-    if (pipeline_ != nullptr) {
-      api_->object_unref(pipeline_);
-      pipeline_ = nullptr;
-    }
+    // Frame leases defer NULL and unref, but they must not leave a destroyed source decoding in
+    // PLAYING. Both operations are internally synchronized and idempotent for partial startup and
+    // repeated request_stop/destructor paths.
+    (void)resources_->interrupt();
+    pipeline_lifetime_->release_source();
   }
 
   GpuFileDecodeConfig config_;
@@ -1236,6 +1420,8 @@ private:
   std::shared_ptr<const NvbufSurfaceRuntime> runtime_;
   NvbufSurfaceAbi abi_;
   std::shared_ptr<GstreamerApi> api_;
+  std::shared_ptr<GstreamerPipelineResources> resources_;
+  std::shared_ptr<GstreamerPipelineLifetime> pipeline_lifetime_;
   void* pipeline_ = nullptr;
   void* sink_ = nullptr;
   void* display_info_ = nullptr;
@@ -1258,6 +1444,8 @@ private:
   std::uint64_t frames_emitted_ = 0;
   std::uint16_t rotation_degrees_ = 0;
   std::optional<std::string> terminal_error_;
+  std::atomic<bool> stop_requested_{false};
+  std::atomic<bool> stop_drain_started_{false};
   bool ended_ = false;
 };
 

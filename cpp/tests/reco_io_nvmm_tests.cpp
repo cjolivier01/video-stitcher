@@ -134,8 +134,20 @@ void deepstream_7_1_compatibility_overload_uses_original_abi() {
   expect_eq(positional.dmabuf_fd, 42, "legacy positional frame-info fd preserved");
   expect_eq(positional.width, 1920U, "legacy positional frame-info width preserved");
 
+  auto owner = std::make_shared<int>(17);
+  NvmmCudaFrame cuda_positional{
+      0x1000, 0x2000, 2048, 2048, 1920, 1080, 0, Nv12ColorMatrix::Bt709, Nv12ColorRange::Full,
+      owner};
+  expect_eq(cuda_positional.width, 1920U, "legacy positional CUDA-frame width preserved");
+  expect_true(cuda_positional.color_matrix == Nv12ColorMatrix::Bt709,
+              "legacy positional CUDA-frame color matrix preserved");
+  expect_true(cuda_positional.owner == owner, "legacy positional CUDA-frame owner preserved");
+
   auto params = make_params_as<abi7::SurfaceParams>();
   auto surface = make_surface_as<abi7::Surface>(params);
+  positional.surface_ptr = &surface;
+  expect_true(!validate_nvmm_frame_info(positional).has_value(),
+              "legacy positional frame-info infers omitted plane sizes");
   const auto info = extract_nvmm_frame_info(&surface);
   expect_true(info.abi == NvbufSurfaceAbi::DeepStream7_1, "compatibility overload uses 7.1 ABI");
   expect_eq(info.width, 1920U, "7.1 width");

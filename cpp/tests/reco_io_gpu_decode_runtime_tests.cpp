@@ -123,6 +123,18 @@ std::size_t count_event(const std::vector<std::string>& events, std::string_view
   return count;
 }
 
+bool wait_for_event(const std::filesystem::path& path, std::string_view expected,
+                    std::chrono::steady_clock::duration timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (count_event(read_events(path), expected) != 0) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return false;
+}
+
 GpuFileDecodeConfig valid_config() {
   return {.path = "/data/left.mp4",
           .codec = GpuDecodeCodec::H264,
@@ -171,15 +183,14 @@ void production_source_retains_mapped_sample() {
 
   source.reset();
   events = read_events(event_path);
-  expect_eq(count_event(events, "state-null"), 1U, "source shutdown stops pipeline");
-  expect_eq(count_event(events, "remove-display-probe"), 1U,
-            "source shutdown removes the geometry callback");
-  expect_eq(count_event(events, "destroy-display-probe-data"), 1U,
-            "GStreamer owns and destroys the geometry callback state");
-  expect_eq(count_event(events, "remove-output-probe"), 1U,
-            "source shutdown removes the output metadata callback");
-  expect_eq(count_event(events, "destroy-output-probe-data"), 1U,
-            "GStreamer owns and destroys the output callback state");
+  expect_eq(count_event(events, "send-flush-start"), 1U,
+            "source destruction interrupts decoding while a frame is retained");
+  expect_eq(count_event(events, "state-null"), 0U,
+            "source shutdown defers pipeline stop while a frame is retained");
+  expect_eq(count_event(events, "remove-display-probe"), 0U,
+            "source shutdown retains the geometry callback with the pipeline");
+  expect_eq(count_event(events, "remove-output-probe"), 0U,
+            "source shutdown retains the output callback with the pipeline");
   expect_eq(count_event(events, "probe-leaked"), 0U,
             "geometry callback does not outlive its source");
   expect_eq(count_event(events, "unmap"), 0U,
@@ -189,9 +200,21 @@ void production_source_retains_mapped_sample() {
   events = read_events(event_path);
   expect_eq(count_event(events, "unmap"), 1U, "last frame owner unmaps GstBuffer");
   expect_eq(count_event(events, "sample-unref"), 1U, "last frame owner releases GstSample");
+  expect_eq(count_event(events, "state-null"), 1U,
+            "last frame release stops the deferred pipeline");
+  expect_eq(count_event(events, "remove-display-probe"), 1U,
+            "deferred shutdown removes the geometry callback");
+  expect_eq(count_event(events, "destroy-display-probe-data"), 1U,
+            "GStreamer owns and destroys the geometry callback state");
+  expect_eq(count_event(events, "remove-output-probe"), 1U,
+            "deferred shutdown removes the output metadata callback");
+  expect_eq(count_event(events, "destroy-output-probe-data"), 1U,
+            "GStreamer owns and destroys the output callback state");
   const auto unmap = std::find(events.begin(), events.end(), "unmap");
   const auto unref = std::find(events.begin(), events.end(), "sample-unref");
+  const auto state_null = std::find(events.begin(), events.end(), "state-null");
   expect_true(unmap < unref, "buffer is unmapped before sample release");
+  expect_true(unref < state_null, "sample is released before deferred pipeline teardown");
 
   source = open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
   auto frame = source->read();
@@ -204,6 +227,201 @@ void production_source_retains_mapped_sample() {
   events = read_events(event_path);
   expect_eq(count_event(events, "pull"), 3U,
             "idempotent EOS does not perform a third pull on either source");
+}
+
+void source_destruction_stops_decode_with_a_retained_frame() {
+  set_scenario("retained-frame-running");
+  const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
+  std::filesystem::remove(event_path);
+
+  auto source =
+      open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+  auto result = source->read();
+  expect_true(result.frame.has_value(), "retained-frame fixture returns a frame");
+  expect_true(wait_for_event(event_path, "decode-running", std::chrono::seconds(2)),
+              "retained-frame fixture starts background decoding");
+
+  const auto started = std::chrono::steady_clock::now();
+  source.reset();
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  expect_true(elapsed < std::chrono::seconds(2),
+              "source destruction interrupts retained-frame decoding promptly");
+  expect_true(wait_for_event(event_path, "decode-stopped", std::chrono::seconds(2)),
+              "source destruction stops fake background decoding");
+
+  auto events = read_events(event_path);
+  expect_eq(count_event(events, "send-flush-start"), 1U,
+            "source destruction flushes its PLAYING pipeline once");
+  expect_eq(count_event(events, "state-null"), 0U,
+            "retained frame still defers final NULL teardown");
+  const auto running_before_wait = count_event(events, "decode-running");
+  std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  events = read_events(event_path);
+  expect_eq(count_event(events, "decode-running"), running_before_wait,
+            "destroyed source performs no continued decoding");
+
+  result.frame.reset();
+  events = read_events(event_path);
+  expect_eq(count_event(events, "state-null"), 1U,
+            "retained-frame release performs deferred NULL teardown once");
+}
+
+void persistent_stereo_session_pairs_gstreamer_sources() {
+  set_scenario("frame-eos");
+  const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
+  std::filesystem::remove(event_path);
+
+  auto left_config = valid_config();
+  auto right_config = valid_config();
+  right_config.path = "/data/right.mp4";
+  GpuStereoDecodeConfig session_config{.queue_capacity = 1};
+  auto session = std::make_unique<GpuStereoDecodeSession>(
+      open_gstreamer_gpu_file_decode_source(std::move(left_config), NvbufSurfaceAbi::DeepStream9_1),
+      open_gstreamer_gpu_file_decode_source(std::move(right_config),
+                                            NvbufSurfaceAbi::DeepStream9_1),
+      session_config);
+
+  auto paired = session->read();
+  expect_true(paired.status == GpuStereoDecodeStatus::FramePair,
+              "persistent GStreamer stereo decode returns a frame pair");
+  expect_true(paired.frames.has_value(), "persistent GStreamer pair contains both frames");
+  if (paired.frames.has_value()) {
+    expect_eq(paired.frames->left.frame_index, 0U, "persistent left frame index");
+    expect_eq(paired.frames->right.frame_index, 0U, "persistent right frame index");
+    expect_true(paired.frames->left.owner != paired.frames->right.owner,
+                "persistent pair retains each decoder owner independently");
+  }
+  auto events = read_events(event_path);
+  expect_eq(count_event(events, "map"), 2U, "persistent stereo sources each map one NVMM frame");
+  expect_eq(count_event(events, "unmap"), 0U,
+            "persistent paired frames retain both mappings while owned");
+
+  expect_true(session->read().status == GpuStereoDecodeStatus::EndOfStream,
+              "persistent GStreamer stereo decode reports EOS after its pair");
+  events = read_events(event_path);
+  expect_eq(count_event(events, "unmap"), 0U,
+            "persistent pair remains mapped while retained across EOS");
+  session.reset();
+  events = read_events(event_path);
+  expect_eq(count_event(events, "state-null"), 0U,
+            "session destruction does not block on or stop retained frame owners");
+  paired.frames.reset();
+  events = read_events(event_path);
+  expect_eq(count_event(events, "unmap"), 2U,
+            "persistent pair release unmaps both decoder buffers");
+  expect_eq(count_event(events, "state-null"), 2U,
+            "persistent frame release stops both deferred GStreamer pipelines");
+}
+
+void early_stereo_stop_flushes_both_pipelines_before_teardown() {
+  set_scenario("frame-eos");
+  const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
+  std::filesystem::remove(event_path);
+
+  auto left_config = valid_config();
+  auto right_config = valid_config();
+  right_config.path = "/data/right.mp4";
+  auto session = std::make_unique<GpuStereoDecodeSession>(
+      open_gstreamer_gpu_file_decode_source(std::move(left_config), NvbufSurfaceAbi::DeepStream9_1),
+      open_gstreamer_gpu_file_decode_source(std::move(right_config),
+                                            NvbufSurfaceAbi::DeepStream9_1),
+      GpuStereoDecodeConfig{.queue_capacity = 1});
+
+  auto paired = session->read();
+  expect_true(paired.frames.has_value(), "early-stop fixture returns a retained frame pair");
+  session->request_stop();
+  expect_true(session->read().status == GpuStereoDecodeStatus::Stopped,
+              "early-stopped session reports the stopped status");
+
+  auto events = read_events(event_path);
+  expect_eq(count_event(events, "send-flush-start"), 2U,
+            "early stop flushes both GStreamer pipelines before teardown");
+  expect_eq(count_event(events, "state-null"), 0U,
+            "early stop keeps pipelines alive while returned frames are retained");
+  paired.frames.reset();
+  events = read_events(event_path);
+  expect_eq(count_event(events, "state-null"), 0U,
+            "returned-frame release leaves pipeline teardown to session destruction");
+
+  session.reset();
+  events = read_events(event_path);
+  expect_eq(count_event(events, "send-flush-start"), 2U,
+            "session destruction does not flush stopped pipelines twice");
+  expect_eq(count_event(events, "state-null"), 2U,
+            "session destruction closes both flushed pipelines once");
+}
+
+void stop_flushes_a_blocked_appsink_read_before_teardown() {
+  set_scenario("stop-blocked-read");
+  const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
+  std::filesystem::remove(event_path);
+  auto source =
+      open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+  std::atomic<bool> read_returned{false};
+  std::atomic<bool> read_failed{false};
+  std::thread reader([&] {
+    try {
+      const auto result = source->read();
+      read_returned = result.status == GpuDecodeFrameStatus::EndOfStream;
+    } catch (...) {
+      read_failed = true;
+    }
+  });
+  const bool pull_blocked = wait_for_event(event_path, "pull-blocked", std::chrono::seconds(2));
+  expect_true(pull_blocked, "stop fixture enters its blocking appsink pull");
+
+  const auto started = std::chrono::steady_clock::now();
+  source->request_stop();
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  reader.join();
+
+  expect_true(elapsed < std::chrono::seconds(2),
+              "source stop flushes and joins a blocked appsink pull promptly");
+  expect_true(read_returned.load(), "flushed appsink read returns end-of-stream");
+  expect_true(!read_failed.load(), "flushed appsink read does not fail");
+  source->request_stop();
+  auto events = read_events(event_path);
+  expect_eq(count_event(events, "send-flush-start"), 1U,
+            "repeated source stop does not flush the pipeline twice");
+  expect_eq(count_event(events, "post-flush-drain"), 1U,
+            "source stop drains queued appsink samples after the blocked pull exits");
+  source.reset();
+  events = read_events(event_path);
+  const auto blocked = std::find(events.begin(), events.end(), "pull-blocked");
+  const auto flushed = std::find(events.begin(), events.end(), "send-flush-start");
+  const auto unblocked = std::find(events.begin(), events.end(), "pull-unblocked");
+  const auto stopped = std::find(events.begin(), events.end(), "state-null");
+  expect_true(stopped != events.end() && blocked < flushed && flushed < unblocked &&
+                  unblocked < stopped,
+              "flush unblocks the appsink pull before pipeline teardown");
+}
+
+void failed_flush_interrupts_can_be_retried() {
+  const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
+  for (const auto& [failure_scenario, failure_event] :
+       std::array<std::pair<std::string_view, std::string_view>, 2>{
+           {{"flush-event-null", "new-flush-start"}, {"flush-send-fail", "send-flush-failed"}}}) {
+    set_scenario(failure_scenario);
+    std::filesystem::remove(event_path);
+    auto source =
+        open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+
+    source->request_stop();
+    auto events = read_events(event_path);
+    expect_eq(count_event(events, failure_event), 1U,
+              "first stop observes the injected flush failure");
+    expect_eq(count_event(events, "send-flush-start"), 0U,
+              "failed flush attempt is not marked successful");
+
+    set_scenario("frame-eos");
+    source->request_stop();
+    source.reset();
+    events = read_events(event_path);
+    expect_eq(count_event(events, "send-flush-start"), 1U,
+              "second stop retries and dispatches the flush");
+    expect_eq(count_event(events, "state-null"), 1U,
+              "retried flush still permits final pipeline teardown");
+  }
 }
 
 void orientation_tags_are_preserved() {
@@ -809,6 +1027,11 @@ int run_tests() {
   set_environment("RECO_FAKE_GST_EVENT_PATH", event_path.string());
 
   production_source_retains_mapped_sample();
+  source_destruction_stops_decode_with_a_retained_frame();
+  persistent_stereo_session_pairs_gstreamer_sources();
+  early_stereo_stop_flushes_both_pipelines_before_teardown();
+  stop_flushes_a_blocked_appsink_read_before_teardown();
+  failed_flush_interrupts_can_be_retried();
   orientation_tags_are_preserved();
   indexed_cadence_drives_frame_indices();
   indexed_decode_seeks_to_absolute_start_frame();

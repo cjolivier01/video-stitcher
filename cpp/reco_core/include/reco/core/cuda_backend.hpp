@@ -26,6 +26,14 @@ struct CudaDeviceInfo {
   std::array<std::uint8_t, 16> uuid{};
 };
 
+/// CUDA virtual architecture supported by one physical device.
+struct CudaComputeCapability {
+  /// Compute capability major version.
+  int major = 0;
+  /// Compute capability minor version.
+  int minor = 0;
+};
+
 struct CudaMemoryInfo {
   std::size_t free_bytes = 0;
   std::size_t total_bytes = 0;
@@ -70,6 +78,14 @@ struct CudaDeviceToHost2DCopy {
   std::size_t height = 0;
 };
 
+/// Device permissions required from a borrowed CUDA memory span.
+enum class CudaSpanAccess {
+  /// The selected CUDA device must be able to read the entire span.
+  Read,
+  /// The selected CUDA device must be able to read and write the entire span.
+  ReadWrite,
+};
+
 class CudaDeviceBuffer {
 public:
   CudaDeviceBuffer() = default;
@@ -105,6 +121,7 @@ struct CudaPitchedAllocation {
 class CudaSharedMemory;
 class CudaModule;
 class CudaKernel;
+class CudaValidatedSpan;
 
 /// Optional non-throwing trace sink for explicit CUDA backend operations.
 class CudaBackendTraceSink {
@@ -126,13 +143,24 @@ class CudaBackend {
 public:
   [[nodiscard]] static bool is_available();
   [[nodiscard]] static std::string availability_error();
+  /// Diagnoses an exact CUDA driver library without retaining it.
+  [[nodiscard]] static std::string availability_error(std::string_view library_path);
   [[nodiscard]] static CudaBackend create();
+  /// Loads an exact CUDA driver library path, primarily for explicit deployments and tests.
+  [[nodiscard]] static CudaBackend load(std::string_view library_path);
   /// Returns a backend view that reports explicit operations to `trace_sink`.
   [[nodiscard]] CudaBackend with_trace_sink(std::shared_ptr<CudaBackendTraceSink> trace_sink) const;
+  /// Whether caller CUDA context restoration has remained reliable for this loaded driver.
+  [[nodiscard]] bool context_healthy() const noexcept;
+  /// Sticky diagnostic after any caller CUDA context restoration failure.
+  [[nodiscard]] std::string context_health_error() const;
 
   [[nodiscard]] int device_count() const;
   [[nodiscard]] CudaDeviceInfo device_info(int ordinal = 0) const;
+  [[nodiscard]] CudaComputeCapability compute_capability(int ordinal = 0) const;
   void ensure_primary_context(int ordinal = 0) const;
+  /// Returns the process-local identity of the retained primary context.
+  [[nodiscard]] std::uintptr_t primary_context_id(int ordinal = 0) const;
   [[nodiscard]] CudaMemoryInfo memory_info() const;
   [[nodiscard]] CudaDeviceBuffer allocate(std::size_t bytes) const;
   /// Allocates 2D storage with a driver-selected pitch valid for `cuMemcpy2D`.
@@ -144,11 +172,27 @@ public:
   void copy_host_to_device_2d(const CudaHostToDevice2DCopy& copy) const;
   void copy_device_to_device_2d(const Cuda2DCopy& copy) const;
   void copy_device_to_host_2d(const CudaDeviceToHost2DCopy& copy) const;
+  /// Validates and retains the allocation identity covering a borrowed device span.
+  ///
+  /// Context-owned allocations are checked against their complete allocation range. CUDA VMM
+  /// mappings are checked at every minimum-granularity region and retain each physical allocation
+  /// handle. Physical memory-block identities detect aliases at distinct virtual addresses; when
+  /// an older driver cannot provide those identities, two distinct VMM spans compare as aliases so
+  /// consumers fail closed. The caller must keep the virtual mapping live and its access
+  /// permissions unchanged while the returned lease is in use.
+  [[nodiscard]] CudaValidatedSpan retain_device_span(CudaDevicePtr ptr,
+                                                     std::size_t accessible_bytes,
+                                                     CudaSpanAccess required_access,
+                                                     int device_ordinal = 0) const;
+  /// Validates that a claimed span is live device memory with the required device access.
+  void validate_device_span(CudaDevicePtr ptr, std::size_t accessible_bytes,
+                            CudaSpanAccess required_access, int device_ordinal = 0) const;
   /// Loads one PTX module that can resolve and share ownership across multiple kernels.
-  [[nodiscard]] CudaModule load_module_from_ptx(std::string_view ptx) const;
+  [[nodiscard]] CudaModule load_module_from_ptx(std::string_view ptx, int device_ordinal = 0) const;
   /// Compatibility helper that loads one PTX module and resolves one kernel from it.
   [[nodiscard]] CudaKernel load_kernel_from_ptx(std::string_view ptx,
-                                                std::string_view function_name) const;
+                                                std::string_view function_name,
+                                                int device_ordinal = 0) const;
   void synchronize() const;
 
 private:
@@ -156,6 +200,7 @@ private:
   friend class CudaSharedMemory;
   friend class CudaModule;
   friend class CudaKernel;
+  friend class CudaValidatedSpan;
 
   struct Impl;
 
@@ -163,6 +208,34 @@ private:
                        std::shared_ptr<CudaBackendTraceSink> trace_sink = {});
   std::shared_ptr<Impl> impl_;
   std::shared_ptr<CudaBackendTraceSink> trace_sink_;
+};
+
+/// Retained proof that a complete CUDA device span was validated by the driver.
+///
+/// Copies share retained VMM allocation handles and physical memory-block identities. `aliases`
+/// conservatively treats VMM spans with unknown physical identities as aliases.
+class CudaValidatedSpan {
+public:
+  CudaValidatedSpan() = default;
+
+  [[nodiscard]] explicit operator bool() const { return state_ != nullptr; }
+  [[nodiscard]] CudaDevicePtr ptr() const;
+  [[nodiscard]] std::size_t size() const;
+  [[nodiscard]] std::uintptr_t context_id() const;
+  [[nodiscard]] int device_ordinal() const;
+  [[nodiscard]] CudaSpanAccess access() const;
+  [[nodiscard]] CudaDevicePtr validated_range_base() const;
+  [[nodiscard]] std::size_t validated_range_bytes() const;
+  [[nodiscard]] bool permits(CudaSpanAccess required_access) const;
+  [[nodiscard]] bool aliases(const CudaValidatedSpan& other) const;
+
+private:
+  friend class CudaBackend;
+
+  struct State;
+  explicit CudaValidatedSpan(std::shared_ptr<State> state);
+
+  std::shared_ptr<State> state_;
 };
 
 class CudaSharedMemory {
@@ -243,6 +316,9 @@ public:
   [[nodiscard]] explicit operator bool() const {
     return module_state_ != nullptr && function_ != nullptr;
   }
+  /// Launches and synchronizes in one CUDA context scope before restoring the caller context.
+  /// Use this for kernels borrowing memory whose owners may be released when the call returns.
+  void launch_and_synchronize(const CudaLaunchConfig& config, std::span<void*> args) const;
   void launch(const CudaLaunchConfig& config, std::span<void*> args) const;
   void synchronize() const;
   void reset();

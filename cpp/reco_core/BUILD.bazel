@@ -1,5 +1,13 @@
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library")
 
+cc_library(
+    name = "windows_runtime_library",
+    srcs = ["src/windows_runtime_library.cpp"],
+    hdrs = ["include/reco/core/windows_runtime_library.hpp"],
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+)
+
 filegroup(
     name = "shader_assets",
     srcs = glob(["shaders/*.wgsl"]),
@@ -11,6 +19,9 @@ cc_library(
     srcs = [
         "src/calibration.cpp",
         "src/cuda_backend.cpp",
+        "src/cuda_frame.cpp",
+        "src/cuda_stitch_renderer.cpp",
+        "src/nvrtc_compiler.cpp",
         "src/path.cpp",
         "src/pipeline_event.cpp",
         "src/performance.cpp",
@@ -21,11 +32,13 @@ cc_library(
         "src/shader_catalog.cpp",
         "src/source.cpp",
         "src/telemetry.cpp",
-        "src/windows_runtime_library.cpp",
     ],
     hdrs = [
         "include/reco/core/calibration.hpp",
         "include/reco/core/cuda_backend.hpp",
+        "include/reco/core/cuda_frame.hpp",
+        "include/reco/core/cuda_stitch_renderer.hpp",
+        "include/reco/core/nvrtc_compiler.hpp",
         "include/reco/core/path.hpp",
         "include/reco/core/pipeline_event.hpp",
         "include/reco/core/performance.hpp",
@@ -38,12 +51,14 @@ cc_library(
         "include/reco/core/telemetry.hpp",
         "include/reco/core/video_format.hpp",
         "include/reco/core/viewport_position.hpp",
-        "include/reco/core/windows_runtime_library.hpp",
     ],
     includes = ["include"],
     visibility = ["//visibility:public"],
     data = [":shader_assets"],
-    deps = ["@nlohmann_json//:json"],
+    deps = [
+        ":windows_runtime_library",
+        "@nlohmann_json//:json",
+    ],
 )
 
 cc_binary(
