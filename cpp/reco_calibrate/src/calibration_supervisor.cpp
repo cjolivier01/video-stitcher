@@ -138,6 +138,35 @@ constexpr std::size_t kMaximumScratchRelativePathBytes = 4'096U;
 constexpr std::size_t kMaximumScratchTraversalComponents = 65'536U;
 constexpr std::string_view kAdmissionFileName = "reco-video-stitcher-calibration.lock";
 constexpr std::string_view kCgroupPrefix = "reco-calibration-";
+
+class CalibrationCancellationState {
+public:
+  explicit CalibrationCancellationState(
+      const CalibrationCancellationRequested& cancellation_requested)
+      : cancellation_requested_(cancellation_requested) {}
+
+  [[nodiscard]] bool poll() noexcept {
+    if (latched_) {
+      return true;
+    }
+    if (!cancellation_is_requested(cancellation_requested_)) {
+      return false;
+    }
+    latched_ = true;
+    cleanup_deadline_ = Clock::now() + kCleanupReserve;
+    return true;
+  }
+
+  [[nodiscard]] Clock::time_point
+  cleanup_deadline(Clock::time_point operation_deadline) const noexcept {
+    return latched_ ? std::min(operation_deadline, cleanup_deadline_) : operation_deadline;
+  }
+
+private:
+  const CalibrationCancellationRequested& cancellation_requested_;
+  bool latched_ = false;
+  Clock::time_point cleanup_deadline_ = Clock::time_point::max();
+};
 constexpr std::string_view kCleanupCgroupPrefix = "reco-calibration-cleanup-";
 constexpr std::string_view kSandboxPrefix = "reco-calibration-sandbox-";
 #if defined(__x86_64__)
@@ -463,6 +492,19 @@ private:
 [[nodiscard]] bool inject_stable_parent_failure(std::string_view point) noexcept {
   const char* configured = std::getenv("RECO_FAKE_CALIBRATION_STABLE_PARENT_FAILURE");
   return configured != nullptr && point == configured;
+}
+
+[[nodiscard]] int test_delay_milliseconds(const char* name) noexcept {
+  const char* configured = std::getenv(name);
+  if (configured == nullptr || configured[0] == '\0') {
+    return 0;
+  }
+  const std::string_view text(configured);
+  int value = 0;
+  const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+  return error == std::errc{} && end == text.data() + text.size() && value >= 0 && value <= 60'000
+             ? value
+             : 0;
 }
 
 void require_observable_child_status() {
@@ -797,7 +839,7 @@ void close_cgroup_cleanup_descriptors(int parent, int lifetime, int caller_pidfd
 
 [[noreturn]] void cgroup_cleanup_child(int parent, int lifetime, int caller_pidfd,
                                        int return_cgroup, const char* name,
-                                       const char* cleanup_name) noexcept {
+                                       const char* cleanup_name, int cleanup_delay_ms) noexcept {
   close_cgroup_cleanup_descriptors(parent, lifetime, caller_pidfd, return_cgroup);
 
   std::array<pollfd, 2> lifetime_events{
@@ -808,6 +850,11 @@ void close_cgroup_cleanup_descriptors(int parent, int lifetime, int caller_pidfd
   }
   (void)::close(lifetime);
   (void)::close(caller_pidfd);
+  if (cleanup_delay_ms > 0) {
+    pollfd delay{.fd = -1, .events = 0, .revents = 0};
+    while (::poll(&delay, 0, cleanup_delay_ms) < 0 && errno == EINTR) {
+    }
+  }
 
   while (true) {
     const auto directory = ::openat(parent, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
@@ -884,7 +931,8 @@ void close_cgroup_cleanup_descriptors(int parent, int lifetime, int caller_pidfd
 [[nodiscard]] OwnedProcess spawn_cgroup_cleanup_process(int parent, int cleanup_cgroup,
                                                         int return_cgroup, int lifetime,
                                                         int caller_pidfd, const char* name,
-                                                        const char* cleanup_name) {
+                                                        const char* cleanup_name,
+                                                        int cleanup_delay_ms) {
 #if !defined(SYS_clone3)
   (void)parent;
   (void)lifetime;
@@ -893,6 +941,7 @@ void close_cgroup_cleanup_descriptors(int parent, int lifetime, int caller_pidfd
   (void)return_cgroup;
   (void)name;
   (void)cleanup_name;
+  (void)cleanup_delay_ms;
   throw CalibrationExecutionError(
       "Linux clone3 is unavailable; calibration cgroup cleanup fails closed");
 #else
@@ -912,7 +961,8 @@ void close_cgroup_cleanup_descriptors(int parent, int lifetime, int caller_pidfd
   __sanitizer_syscall_post_impl_fork(result);
 #endif
   if (result == 0) {
-    cgroup_cleanup_child(parent, lifetime, caller_pidfd, return_cgroup, name, cleanup_name);
+    cgroup_cleanup_child(parent, lifetime, caller_pidfd, return_cgroup, name, cleanup_name,
+                         cleanup_delay_ms);
   }
   if (result < 0 || pidfd < 0) {
     throw CalibrationExecutionError(
@@ -925,8 +975,10 @@ void close_cgroup_cleanup_descriptors(int parent, int lifetime, int caller_pidfd
 class ExternalProcessAuthority {
 public:
   ExternalProcessAuthority() = default;
-  ExternalProcessAuthority(int descriptor, Clock::time_point cleanup_deadline)
-      : pidfd_(descriptor), cleanup_deadline_(cleanup_deadline) {}
+  ExternalProcessAuthority(int descriptor, Clock::time_point cleanup_deadline,
+                           const CalibrationCancellationState& cancellation_state)
+      : pidfd_(descriptor), cleanup_deadline_(cleanup_deadline),
+        cancellation_state_(&cancellation_state) {}
   ExternalProcessAuthority(const ExternalProcessAuthority&) = delete;
   ExternalProcessAuthority& operator=(const ExternalProcessAuthority&) = delete;
   ExternalProcessAuthority(ExternalProcessAuthority&&) noexcept = default;
@@ -935,8 +987,11 @@ public:
     if (pidfd_) {
       signal_pidfd_noexcept(pidfd_.get(), SIGKILL);
       pollfd item{.fd = pidfd_.get(), .events = POLLIN, .revents = 0};
-      while (Clock::now() < cleanup_deadline_) {
-        const auto result = ::poll(&item, 1, deadline_timeout(cleanup_deadline_));
+      const auto cleanup_deadline = cancellation_state_ == nullptr
+                                        ? cleanup_deadline_
+                                        : cancellation_state_->cleanup_deadline(cleanup_deadline_);
+      while (Clock::now() < cleanup_deadline) {
+        const auto result = ::poll(&item, 1, deadline_timeout(cleanup_deadline));
         if (result != 0) {
           break;
         }
@@ -947,6 +1002,7 @@ public:
 private:
   UniqueFd pidfd_;
   Clock::time_point cleanup_deadline_ = Clock::time_point::min();
+  const CalibrationCancellationState* cancellation_state_ = nullptr;
 };
 
 class AdmissionLock {
@@ -1250,8 +1306,11 @@ void scavenge_stale_calibration_cgroups(int parent) {
 
 class CgroupMemoryBoundary {
 public:
-  CgroupMemoryBoundary(std::uint64_t memory_limit, Clock::time_point teardown_deadline)
-      : teardown_deadline_(teardown_deadline) {
+  CgroupMemoryBoundary(std::uint64_t memory_limit, Clock::time_point teardown_deadline,
+                       CalibrationCancellationState& cancellation_state,
+                       const CalibrationCancellationRequested& cancellation_requested)
+      : teardown_deadline_(teardown_deadline), cancellation_state_(&cancellation_state),
+        cancellation_requested_(&cancellation_requested) {
     if (force_cgroup_unavailable_for_test()) {
       throw CalibrationExecutionError(
           "a delegated cgroup-v2 memory controller is required for calibration");
@@ -1314,7 +1373,16 @@ public:
       return;
     }
     cleanup_lifetime_.reset();
-    cleanup_process_.wait_until(teardown_deadline_);
+    if (cancellation_state_->poll()) {
+      finish_after_cancellation();
+      throw CalibrationCancelled();
+    }
+    try {
+      cleanup_process_.wait_until(teardown_deadline_, *cancellation_requested_);
+    } catch (const CalibrationCancelled&) {
+      finish_after_cancellation();
+      throw;
+    }
     const auto status = cleanup_process_.reap();
     if (!status.known || status.code != CLD_EXITED || status.status != EXIT_SUCCESS) {
       throw CalibrationExecutionError("calibration cgroup cleanup authority failed");
@@ -1323,6 +1391,16 @@ public:
   }
 
 private:
+  void finish_after_cancellation() noexcept {
+    try {
+      cleanup_process_.wait_until(cancellation_state_->cleanup_deadline(teardown_deadline_));
+      (void)cleanup_process_.reap();
+    } catch (...) {
+      cleanup_process_.detach_noexcept();
+    }
+    finished_ = true;
+  }
+
   [[nodiscard]] bool create_under(const std::filesystem::path& path, int return_cgroup,
                                   std::uint64_t memory_limit) {
     UniqueFd parent(::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
@@ -1383,7 +1461,8 @@ private:
     }
     auto cleanup = spawn_cgroup_cleanup_process(
         parent.get(), cleanup_directory.get(), return_cgroup, lifetime_read.get(),
-        caller_pidfd.get(), name.c_str(), cleanup_name.c_str());
+        caller_pidfd.get(), name.c_str(), cleanup_name.c_str(),
+        test_delay_milliseconds("RECO_FAKE_CALIBRATION_CGROUP_CLEANUP_DELAY_MS"));
     cleanup_removal.dismiss();
     lifetime_read.reset();
     caller_pidfd.reset();
@@ -1440,11 +1519,14 @@ private:
   ForkProtectedFd cleanup_lifetime_;
   OwnedProcess cleanup_process_;
   Clock::time_point teardown_deadline_;
+  CalibrationCancellationState* cancellation_state_ = nullptr;
+  const CalibrationCancellationRequested* cancellation_requested_ = nullptr;
   bool finished_ = false;
 };
 
-[[noreturn]] void executable_snapshot_child(int source, int channel,
-                                            const struct stat& expected) noexcept {
+[[noreturn]] void executable_snapshot_child(int source, int channel, const struct stat& expected,
+                                            Clock::time_point deadline,
+                                            int chunk_delay_ms) noexcept {
   close_cgroup_cleanup_descriptors(source, channel, source, channel);
 #if !defined(SYS_memfd_create)
   cgroup_cleanup_exit(EXIT_FAILURE);
@@ -1467,6 +1549,19 @@ private:
   std::uint64_t copied = 0;
   const auto expected_size = static_cast<std::uint64_t>(expected.st_size);
   while (copied < expected_size) {
+    if (Clock::now() >= deadline) {
+      (void)::close(snapshot);
+      cgroup_cleanup_exit(EXIT_FAILURE);
+    }
+    if (chunk_delay_ms > 0) {
+      pollfd delay{.fd = -1, .events = 0, .revents = 0};
+      while (::poll(&delay, 0, chunk_delay_ms) < 0 && errno == EINTR) {
+      }
+      if (Clock::now() >= deadline) {
+        (void)::close(snapshot);
+        cgroup_cleanup_exit(EXIT_FAILURE);
+      }
+    }
     const auto read_size =
         static_cast<std::size_t>(std::min<std::uint64_t>(buffer.size(), expected_size - copied));
     ssize_t received = -1;
@@ -1479,6 +1574,10 @@ private:
     }
     std::size_t offset = 0;
     while (offset < static_cast<std::size_t>(received)) {
+      if (Clock::now() >= deadline) {
+        (void)::close(snapshot);
+        cgroup_cleanup_exit(EXIT_FAILURE);
+      }
       ssize_t written = -1;
       do {
         written =
@@ -1582,8 +1681,10 @@ private:
 
 class PinnedExecutable {
 public:
-  PinnedExecutable(const std::filesystem::path& path, Clock::time_point deadline)
+  PinnedExecutable(const std::filesystem::path& path, Clock::time_point deadline,
+                   const CalibrationCancellationRequested& cancellation_requested)
       : display_path_(path.string()) {
+    throw_if_cancelled(cancellation_requested);
     if (!path.is_absolute()) {
       throw CalibrationExecutionError(
           "GPU calibration worker path must name an executable regular file");
@@ -1603,6 +1704,7 @@ public:
       throw CalibrationExecutionError(
           "GPU calibration worker executable must not carry file capabilities");
     }
+    throw_if_cancelled(cancellation_requested);
 
 #if !defined(SYS_clone3)
     throw CalibrationExecutionError("bounded executable snapshots require clone3");
@@ -1618,6 +1720,8 @@ public:
     arguments.flags = CLONE_PIDFD;
     arguments.pidfd = reinterpret_cast<std::uint64_t>(&pidfd);
     arguments.exit_signal = 0;
+    const auto snapshot_delay_ms =
+        test_delay_milliseconds("RECO_FAKE_CALIBRATION_EXECUTABLE_SNAPSHOT_DELAY_MS");
 #if defined(RECO_CALIBRATION_THREAD_SANITIZER)
     __sanitizer_syscall_pre_impl_fork();
 #endif
@@ -1627,7 +1731,8 @@ public:
 #endif
     if (child == 0) {
       (void)::close(parent_transport.get());
-      executable_snapshot_child(source.get(), child_transport.get(), before);
+      executable_snapshot_child(source.get(), child_transport.get(), before, deadline,
+                                snapshot_delay_ms);
     }
     if (child < 0 || pidfd < 0) {
       throw CalibrationExecutionError(errno_message("cannot create executable snapshot helper"));
@@ -1635,6 +1740,7 @@ public:
     OwnedProcess helper(child, pidfd, deadline);
     child_transport.reset();
     while (true) {
+      throw_if_cancelled(cancellation_requested);
       std::array<pollfd, 2> events{
           pollfd{.fd = parent_transport.get(), .events = POLLIN, .revents = 0},
           pollfd{.fd = helper.pidfd(), .events = POLLIN, .revents = 0},
@@ -1643,7 +1749,16 @@ public:
       if (polled < 0 && errno == EINTR) {
         continue;
       }
-      if (polled <= 0) {
+      if (polled < 0) {
+        throw CalibrationExecutionError(errno_message("cannot monitor executable snapshot"));
+      }
+      if (polled == 0) {
+        if (Clock::now() >= deadline) {
+          throw CalibrationExecutionError("calibration worker snapshot exceeded its deadline");
+        }
+        continue;
+      }
+      if (Clock::now() >= deadline) {
         throw CalibrationExecutionError("calibration worker snapshot exceeded its deadline");
       }
       if ((events[0].revents & POLLIN) != 0) {
@@ -1656,7 +1771,7 @@ public:
         throw CalibrationExecutionError("calibration executable snapshot helper failed");
       }
     }
-    helper.wait_until(deadline);
+    helper.wait_until(deadline, cancellation_requested);
     const auto helper_status = helper.reap();
     struct stat after{};
     struct stat snapshot{};
@@ -1675,6 +1790,7 @@ public:
         (::fcntl(descriptor_.get(), F_GET_SEALS) & seals) != seals) {
       throw CalibrationExecutionError("calibration worker changed while it was snapshotted");
     }
+    throw_if_cancelled(cancellation_requested);
 #endif
   }
 
@@ -2180,6 +2296,7 @@ void send_file_fd(int socket, const OwnedProcess& process, char marker, int file
 
 [[nodiscard]] ExternalProcessAuthority
 receive_worker_authority(int socket, const OwnedProcess& guardian, Clock::time_point deadline,
+                         const CalibrationCancellationState& cancellation_state,
                          const CalibrationCancellationRequested& cancellation_requested = {}) {
   wait_for_socket(socket, guardian, POLLIN, deadline, -1, 0, nullptr, cancellation_requested);
   char marker = '\0';
@@ -2227,7 +2344,7 @@ receive_worker_authority(int socket, const OwnedProcess& guardian, Clock::time_p
     }
     throw CalibrationExecutionError("calibration guardian returned invalid worker authority");
   }
-  return ExternalProcessAuthority(authority, deadline);
+  return ExternalProcessAuthority(authority, deadline, cancellation_state);
 }
 
 void write_plain_all(int descriptor, std::string_view bytes, Clock::time_point deadline) {
@@ -4110,18 +4227,23 @@ int run_calibration_guardian_fd(int descriptor, const char* executable,
 CalibrationResult
 run_gpu_calibration_supervised(const GpuCalibrationRequest& request,
                                const CalibrationCancellationRequested& cancellation_requested) {
-  throw_if_cancelled(cancellation_requested);
+  CalibrationCancellationState cancellation_state(cancellation_requested);
+  const CalibrationCancellationRequested latched_cancellation_requested = [&cancellation_state] {
+    return cancellation_state.poll();
+  };
+  throw_if_cancelled(latched_cancellation_requested);
   const auto timeout = std::chrono::nanoseconds(request.calibration_timeout_ns);
   if (timeout <= kCleanupReserve || Clock::time_point::max() - Clock::now() < timeout) {
     throw CalibrationExecutionError("calibration timeout is outside the supervisor clock range");
   }
   const auto deadline = Clock::now() + timeout;
   require_observable_child_status();
-  throw_if_cancelled(cancellation_requested);
+  throw_if_cancelled(latched_cancellation_requested);
   AdmissionLock admission;
   check_admission_headroom(request.calibration_host_memory_limit_bytes);
-  PinnedExecutable executable(std::filesystem::path(request.calibration_worker_path), deadline);
-  throw_if_cancelled(cancellation_requested);
+  PinnedExecutable executable(std::filesystem::path(request.calibration_worker_path), deadline,
+                              latched_cancellation_requested);
+  throw_if_cancelled(latched_cancellation_requested);
   auto worker_request = request;
   const auto open_retained_input = [](const std::string& path, std::string_view label,
                                       std::optional<CalibrationFileIdentity>& expected_identity) {
@@ -4151,7 +4273,7 @@ run_gpu_calibration_supervised(const GpuCalibrationRequest& request,
                                         worker_request.left.expected_identity);
   auto right_input = open_retained_input(right_open_path, "right calibration video",
                                          worker_request.right.expected_identity);
-  throw_if_cancelled(cancellation_requested);
+  throw_if_cancelled(latched_cancellation_requested);
   worker_request.left.retained_path = retained_descriptor_path(left_input.get());
   worker_request.right.retained_path = retained_descriptor_path(right_input.get());
   UniqueFd left_profile;
@@ -4177,48 +4299,49 @@ run_gpu_calibration_supervised(const GpuCalibrationRequest& request,
     }
   };
   const auto encoded_request = encode_calibration_worker_request(worker_request);
-  CgroupMemoryBoundary memory_boundary(request.calibration_host_memory_limit_bytes, deadline);
-  throw_if_cancelled(cancellation_requested);
+  CgroupMemoryBoundary memory_boundary(request.calibration_host_memory_limit_bytes, deadline,
+                                       cancellation_state, latched_cancellation_requested);
+  throw_if_cancelled(latched_cancellation_requested);
   try {
     auto listener = create_listener();
     auto guardian = spawn_guardian(executable, listener.address, deadline);
-    auto channel =
-        accept_authenticated(listener, guardian, deadline, 0, nullptr, cancellation_requested);
+    auto channel = accept_authenticated(listener, guardian, deadline, 0, nullptr,
+                                        latched_cancellation_requested);
     send_file_fd(channel.get(), guardian, 'L', admission.fd(), deadline, -1, 0, nullptr,
-                 cancellation_requested);
+                 latched_cancellation_requested);
     send_file_fd(channel.get(), guardian, 'X', executable.fd(), deadline, -1, 0, nullptr,
-                 cancellation_requested);
+                 latched_cancellation_requested);
     send_file_fd(channel.get(), guardian, 'C', memory_boundary.fd(), deadline, -1, 0, nullptr,
-                 cancellation_requested);
+                 latched_cancellation_requested);
     write_all(channel.get(), guardian, encoded_request, deadline, -1, 0, nullptr,
-              cancellation_requested);
+              latched_cancellation_requested);
     if (left_input) {
       send_file_fd(channel.get(), guardian, 'I', left_input.get(), deadline, -1, 0, nullptr,
-                   cancellation_requested);
+                   latched_cancellation_requested);
     }
     if (right_input) {
       send_file_fd(channel.get(), guardian, 'J', right_input.get(), deadline, -1, 0, nullptr,
-                   cancellation_requested);
+                   latched_cancellation_requested);
     }
     if (left_profile) {
       send_file_fd(channel.get(), guardian, 'K', left_profile.get(), deadline, -1, 0, nullptr,
-                   cancellation_requested);
+                   latched_cancellation_requested);
     }
     if (right_profile) {
       send_file_fd(channel.get(), guardian, 'M', right_profile.get(), deadline, -1, 0, nullptr,
-                   cancellation_requested);
+                   latched_cancellation_requested);
     }
     if (::shutdown(channel.get(), SHUT_WR) != 0) {
       throw CalibrationExecutionError("cannot finish the calibration guardian request");
     }
-    auto worker_authority =
-        receive_worker_authority(channel.get(), guardian, deadline, cancellation_requested);
+    auto worker_authority = receive_worker_authority(
+        channel.get(), guardian, deadline, cancellation_state, latched_cancellation_requested);
     (void)worker_authority;
     auto response = read_frame(channel.get(), guardian, deadline,
                                maximum_calibration_worker_success_frame_bytes(
                                    request.config.num_frames, request.config.akaze.max_keypoints),
-                               -1, 0, nullptr, cancellation_requested);
-    guardian.wait_until(deadline, cancellation_requested);
+                               -1, 0, nullptr, latched_cancellation_requested);
+    guardian.wait_until(deadline, latched_cancellation_requested);
     const auto status = guardian.reap();
     certify_channel_eof(channel.get());
     if (memory_boundary.oom_killed()) {
@@ -4237,7 +4360,7 @@ run_gpu_calibration_supervised(const GpuCalibrationRequest& request,
       throw CalibrationExecutionError("calibration guardian terminated abnormally");
     }
     auto result = decode_calibration_worker_response(response);
-    throw_if_cancelled(cancellation_requested);
+    throw_if_cancelled(latched_cancellation_requested);
     if (result.frames_used > request.config.num_frames ||
         result.per_frame.size() > request.config.num_frames) {
       throw CalibrationExecutionError(
@@ -4279,7 +4402,7 @@ run_gpu_calibration_supervised(const GpuCalibrationRequest& request,
                             worker_request.right.lens_profile_expected_identity);
     }
     memory_boundary.finish();
-    throw_if_cancelled(cancellation_requested);
+    throw_if_cancelled(latched_cancellation_requested);
     return result;
   } catch (...) {
     if (memory_boundary.oom_killed()) {

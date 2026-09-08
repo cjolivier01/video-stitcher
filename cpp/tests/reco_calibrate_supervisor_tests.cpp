@@ -598,13 +598,50 @@ void timeout_is_end_to_end_and_reaps_the_worker() {
   expect_true(elapsed < std::chrono::seconds(2), "timeout includes bounded teardown");
 }
 
+void cancellation_interrupts_executable_snapshot_before_launch() {
+  const auto guardian_marker = temporary_path("cancelled-snapshot-guardian.pid");
+  std::filesystem::remove(guardian_marker);
+  EnvironmentValue snapshot_delay("RECO_FAKE_CALIBRATION_EXECUTABLE_SNAPSHOT_DELAY_MS", "3000");
+  EnvironmentValue guardian_ready("RECO_FAKE_CALIBRATION_GUARDIAN_READY_PATH",
+                                  guardian_marker.string());
+  auto request = lifecycle_request_fixture();
+  request.calibration_timeout_ns = 3'600'000'000'000ULL;
+  std::size_t cancellation_checks = 0;
+
+  const auto started = std::chrono::steady_clock::now();
+  bool cancelled = false;
+  try {
+    (void)run_gpu_calibration(request, ready_backends(), [&] {
+      ++cancellation_checks;
+      return cancellation_checks >= 5U;
+    });
+  } catch (const CalibrationCancelled&) {
+    cancelled = true;
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: executable snapshot cancellation returned the wrong error: " << error.what()
+              << '\n';
+    ++failures;
+  }
+
+  expect_true(cancelled, "executable snapshot reports explicit cancellation");
+  expect_true(cancellation_checks >= 5U,
+              "executable snapshot polls cancellation after launching its helper");
+  expect_true(std::chrono::steady_clock::now() - started < std::chrono::seconds(2),
+              "executable snapshot cancellation does not wait for a delayed chunk");
+  expect_true(!wait_for_pid_marker(guardian_marker, std::chrono::milliseconds(100)).has_value(),
+              "executable snapshot cancellation occurs before guardian launch");
+  std::filesystem::remove(guardian_marker);
+}
+
 void cancellation_terminates_the_active_worker() {
   const auto marker = temporary_path("cancelled-worker.pid");
   std::filesystem::remove(marker);
   EnvironmentValue worker_marker("RECO_FAKE_CALIBRATION_WORKER_PID_PATH", marker.string());
+  EnvironmentValue cleanup_delay("RECO_FAKE_CALIBRATION_CGROUP_CLEANUP_DELAY_MS", "3000");
   Scenario scenario("timeout");
   auto request = lifecycle_request_fixture();
-  request.calibration_timeout_ns = 30'000'000'000ULL;
+  request.calibration_timeout_ns = 3'600'000'000'000ULL;
+  const auto cgroups_before = calibration_cgroups();
   std::atomic<bool> cancel{false};
   std::optional<pid_t> worker;
   std::thread requester([&] {
@@ -616,7 +653,7 @@ void cancellation_terminates_the_active_worker() {
   bool cancelled = false;
   try {
     (void)run_gpu_calibration(request, ready_backends(),
-                              [&] { return cancel.load(std::memory_order_acquire); });
+                              [&] { return cancel.exchange(false, std::memory_order_acq_rel); });
   } catch (const CalibrationCancelled&) {
     cancelled = true;
   } catch (const std::exception& error) {
@@ -633,6 +670,8 @@ void cancellation_terminates_the_active_worker() {
   if (worker.has_value()) {
     wait_for_process_removal(*worker, "active calibration cancellation removes the worker");
   }
+  expect_true(wait_for_cgroup_set(cgroups_before, std::chrono::seconds(5)),
+              "deferred cancellation cleanup removes its cgroups");
   std::filesystem::remove(marker);
 }
 
@@ -1563,6 +1602,8 @@ int main() {
   fake_worker = executable_runfile("cpp/tests/fake_calibration_worker");
   invalid_worker_paths_fail_before_launch();
 #if defined(__linux__)
+  run_case("executable snapshot cancellation",
+           cancellation_interrupts_executable_snapshot_before_launch);
   try {
     success_returns_the_bounded_result();
   } catch (const CalibrationExecutionError& error) {
