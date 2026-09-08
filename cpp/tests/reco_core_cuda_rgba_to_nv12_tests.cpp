@@ -31,7 +31,6 @@ std::atomic<int> retain_count{0};
 std::atomic<int> launch_count{0};
 std::atomic<int> synchronize_count{0};
 std::atomic<int> pointer_attribute_count{0};
-std::atomic<int> address_range_count{0};
 std::atomic<int> sequence{0};
 std::atomic<int> launch_sequence{0};
 std::atomic<int> synchronize_sequence{0};
@@ -57,7 +56,6 @@ RECO_FAKE_CUDA_EXPORT void recoFakeCudaRgbaToNv12Reset() {
   launch_count = 0;
   synchronize_count = 0;
   pointer_attribute_count = 0;
-  address_range_count = 0;
   sequence = 0;
   launch_sequence = 0;
   synchronize_sequence = 0;
@@ -71,9 +69,6 @@ RECO_FAKE_CUDA_EXPORT int recoFakeCudaRgbaToNv12SynchronizeCount() {
 }
 RECO_FAKE_CUDA_EXPORT int recoFakeCudaRgbaToNv12PointerAttributeCount() {
   return pointer_attribute_count.load();
-}
-RECO_FAKE_CUDA_EXPORT int recoFakeCudaRgbaToNv12AddressRangeCount() {
-  return address_range_count.load();
 }
 RECO_FAKE_CUDA_EXPORT int recoFakeCudaRgbaToNv12LaunchSequence() { return launch_sequence.load(); }
 RECO_FAKE_CUDA_EXPORT int recoFakeCudaRgbaToNv12SynchronizeSequence() {
@@ -204,22 +199,15 @@ RECO_FAKE_CUDA_EXPORT int cuPointerGetAttribute(void* data, int attribute, std::
   case 13:
     *static_cast<unsigned int*>(data) = base == kUnmappedAllocation ? 0U : 1U;
     return 0;
+  case 18:
+    *static_cast<std::size_t*>(data) = allocation_size(base);
+    return 0;
+  case 19:
+    *static_cast<std::uint64_t*>(data) = base;
+    return 0;
   default:
     return 1;
   }
-}
-RECO_FAKE_CUDA_EXPORT int cuMemGetAddressRange_v2(std::uint64_t* base, std::size_t* size,
-                                                  std::uint64_t pointer) {
-  ++address_range_count;
-  const auto pointer_base = allocation_base(pointer);
-  if (base == nullptr || size == nullptr ||
-      current_context != reinterpret_cast<void*>(kContextIdentity) || pointer == 0 ||
-      pointer_base == kFreedAllocation) {
-    return 1;
-  }
-  *base = pointer_base;
-  *size = allocation_size(pointer_base);
-  return 0;
 }
 RECO_FAKE_CUDA_EXPORT int cuModuleLoadData(void** module, const void* image) {
   if (module == nullptr || image == nullptr ||
@@ -435,7 +423,6 @@ struct FakeCudaControl {
         library.symbol<int (*)()>("recoFakeCudaRgbaToNv12SynchronizeSequence");
     pointer_attribute_count_fn =
         library.symbol<int (*)()>("recoFakeCudaRgbaToNv12PointerAttributeCount");
-    address_range_count_fn = library.symbol<int (*)()>("recoFakeCudaRgbaToNv12AddressRangeCount");
     captured_u64_fn = library.symbol<std::uint64_t (*)(int)>("recoFakeCudaRgbaToNv12CapturedU64");
     captured_u32_fn = library.symbol<std::uint32_t (*)(int)>("recoFakeCudaRgbaToNv12CapturedU32");
     captured_color_fn = library.symbol<float (*)(int)>("recoFakeCudaRgbaToNv12CapturedColor");
@@ -445,7 +432,6 @@ struct FakeCudaControl {
   int launch_count() const { return launch_count_fn(); }
   int synchronize_count() const { return synchronize_count_fn(); }
   int pointer_attribute_count() const { return pointer_attribute_count_fn(); }
-  int address_range_count() const { return address_range_count_fn(); }
   int launch_sequence() const { return launch_sequence_fn(); }
   int synchronize_sequence() const { return synchronize_sequence_fn(); }
   std::uint64_t captured_u64(int index) const { return captured_u64_fn(index); }
@@ -457,7 +443,6 @@ struct FakeCudaControl {
   int (*launch_count_fn)() = nullptr;
   int (*synchronize_count_fn)() = nullptr;
   int (*pointer_attribute_count_fn)() = nullptr;
-  int (*address_range_count_fn)() = nullptr;
   int (*launch_sequence_fn)() = nullptr;
   int (*synchronize_sequence_fn)() = nullptr;
   std::uint64_t (*captured_u64_fn)(int) = nullptr;
@@ -560,10 +545,8 @@ void compiles_once_and_synchronizes(const std::filesystem::path& cuda_runtime,
   expect_eq(nvrtc_control.create_count(), 1, "conversion does not recompile");
   expect_eq(cuda_control.launch_count(), 2, "one kernel launch per conversion");
   expect_eq(cuda_control.synchronize_count(), 2, "each conversion synchronizes before return");
-  expect_eq(cuda_control.pointer_attribute_count(), 24,
-            "each conversion validates all three pointers through four CUDA attributes");
-  expect_eq(cuda_control.address_range_count(), 6,
-            "each conversion validates all three pointer allocation bounds");
+  expect_eq(cuda_control.pointer_attribute_count(), 36,
+            "each conversion validates all three pointers through six CUDA attributes");
   expect_true(cuda_control.launch_sequence() < cuda_control.synchronize_sequence(),
               "kernel launch precedes synchronization");
   expect_eq(cuda_control.captured_u64(0), input.plane().ptr(), "input pointer propagated");

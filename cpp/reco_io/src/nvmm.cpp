@@ -924,10 +924,10 @@ allocate_nvmm_nv12_surface(std::uint32_t width, std::uint32_t height, std::uint3
   if (width == 0 || height == 0 || (width % 2U) != 0 || (height % 2U) != 0) {
     throw NvmmError("NV12 output dimensions must be non-zero and even");
   }
+#if defined(__linux__)
   if (!runtime || !runtime->state_ || !runtime->state_->functions) {
     throw NvmmError("NvBufSurface allocation requires a retained runtime binding");
   }
-#if defined(__linux__)
   auto functions = runtime->state_->functions;
   if (functions->create == nullptr || functions->destroy == nullptr) {
     throw NvmmError("the retained NvBufSurface runtime does not expose allocation APIs");
@@ -1038,6 +1038,7 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& provided_info,
     throw NvmmError("NvBufSurface metadata changed before CUDA mapping");
   }
 
+#if defined(__linux__)
   auto make_frame = [&](core::CudaDevicePtr y_ptr, core::CudaDevicePtr uv_ptr,
                         const CudaPointerProvenance& y_provenance,
                         const CudaPointerProvenance& uv_provenance,
@@ -1071,7 +1072,6 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& provided_info,
     };
   };
 
-#if defined(__linux__)
   std::shared_ptr<NvbufFunctions> functions;
   if (info.runtime) {
     if (const auto error = validate_nvbufsurface_runtime_provenance(info.runtime);
