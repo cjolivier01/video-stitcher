@@ -91,6 +91,24 @@ std::filesystem::path find_fake_runtime_runfile(std::string_view runtime_name) {
   throw std::runtime_error("fake runtime runfile not found: " + std::string(runtime_name));
 }
 
+std::filesystem::path find_probe_worker_runfile() {
+  const char* runfiles = std::getenv("TEST_SRCDIR");
+  if (runfiles == nullptr || runfiles[0] == '\0') {
+    throw std::runtime_error("TEST_SRCDIR is not set");
+  }
+#if defined(_WIN32)
+  constexpr std::string_view worker_name = "reco_video_probe_worker.exe";
+#else
+  constexpr std::string_view worker_name = "reco_video_probe_worker";
+#endif
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(runfiles)) {
+    if (entry.path().filename() == worker_name && std::filesystem::is_regular_file(entry.path())) {
+      return std::filesystem::absolute(entry.path());
+    }
+  }
+  throw std::runtime_error("video probe worker runfile not found");
+}
+
 void set_environment(const char* name, const std::string& value) {
 #if defined(_WIN32)
   _putenv_s(name, value.c_str());
@@ -423,21 +441,78 @@ void compressed_audio_packets_use_the_bounded_audio_appsrc(
             "audio appsrc receives terminal EOS before mux finalization");
 }
 
-void finalized_output_requires_a_discoverable_video_stream() {
-  set_scenario("encode-success");
-  verify_muxed_gpu_video_output("fake-output.mp4", std::chrono::milliseconds(5));
-  set_scenario("encoded-output-no-video");
-  expect_encode_error(
-      [&] { verify_muxed_gpu_video_output("fake-output.mp4", std::chrono::milliseconds(5)); },
-      "contains no video stream", "audio-only muxed output is rejected before publication");
-  for (const std::string_view scenario :
-       {"encoded-output-zero-duration", "encoded-output-zero-geometry"}) {
-    set_scenario(scenario);
-    expect_encode_error(
-        [&] { verify_muxed_gpu_video_output("fake-output.mp4", std::chrono::milliseconds(5)); },
-        "contains no decodable video samples",
-        "empty or malformed muxed video track is rejected before publication");
+void finalized_output_requires_a_compressed_video_sample(const std::filesystem::path& worker,
+                                                         const std::filesystem::path& event_path) {
+  auto output_path = event_path;
+  output_path.replace_extension(".mp4");
+  {
+    std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
+    output << "fake muxed output";
   }
+
+  std::filesystem::remove(event_path);
+  set_scenario("probe-exact-frame-count");
+  verify_muxed_gpu_video_output(output_path, Codec::H264, Format::Mp4, worker,
+                                std::chrono::seconds(10));
+  auto events = read_events(event_path);
+  expect_eq(count_event(events, "parse-probe"), 1U,
+            "output verification uses the parser-only worker topology");
+  expect_eq(count_event(events, "probe-codec-filter"), 1U,
+            "output verification selects a compressed video stream");
+  expect_eq(count_event(events, "probe-exact-codec-filter"), 1U,
+            "output verification selects only the configured video codec");
+  expect_eq(count_event(events, "probe-h264-parser"), 1U,
+            "output verification uses the explicit H.264 parser");
+  expect_eq(count_event(events, "probe-parsebin"), 0U,
+            "output verification does not autoplug parser or decoder factories");
+  expect_eq(count_event(events, "probe-decoder-caps"), 1U,
+            "output verification requires compressed access-unit caps");
+  expect_eq(count_event(events, "decoder-element"), 0U,
+            "output verification never constructs a decoder element");
+  expect_eq(count_event(events, "raw-video-caps"), 0U,
+            "output verification never requests decoded pixels");
+  expect_eq(count_event(events, "discover-audio"), 0U,
+            "output verification never invokes GstDiscoverer");
+
+  std::filesystem::remove(event_path);
+  set_scenario("probe-av1-exact-frame-count");
+  verify_muxed_gpu_video_output(output_path, Codec::AV1, Format::Mkv, worker,
+                                std::chrono::seconds(10));
+  events = read_events(event_path);
+  expect_eq(count_event(events, "probe-av1-parser"), 1U,
+            "AV1 output verification uses the explicit AV1 parser");
+  expect_eq(count_event(events, "probe-exact-codec-filter"), 1U,
+            "AV1 output verification selects only AV1 samples");
+  expect_eq(count_event(events, "decoder-element"), 0U,
+            "AV1 output verification never constructs a decoder");
+
+  std::filesystem::remove(event_path);
+  set_scenario("probe-exact-frame-count");
+  verify_muxed_gpu_video_output(output_path, Codec::H264, Format::Flv, worker,
+                                std::chrono::seconds(10));
+  events = read_events(event_path);
+  expect_eq(count_event(events, "probe-flv-demux"), 1U,
+            "FLV output verification uses the explicit compressed demuxer");
+  expect_eq(count_event(events, "decoder-element"), 0U,
+            "FLV output verification never constructs a decoder");
+
+  std::filesystem::remove(event_path);
+  set_scenario("probe-video-caps-zero-samples");
+  expect_encode_error(
+      [&] {
+        verify_muxed_gpu_video_output(output_path, Codec::H264, Format::Mp4, worker,
+                                      std::chrono::seconds(10));
+      },
+      "found no H.264, HEVC, or AV1 moving-video stream",
+      "video caps without a compressed sample are rejected before publication");
+  events = read_events(event_path);
+  expect_eq(count_event(events, "probe-codec-filter"), 1U,
+            "zero-sample fixture still exposes selected compressed video caps");
+  expect_eq(count_event(events, "probe-parsebin"), 0U,
+            "zero-sample verification does not enable autoplugging");
+  expect_eq(count_event(events, "decoder-element"), 0U,
+            "zero-sample verification does not fall back to a decoder");
+  std::filesystem::remove(output_path);
 }
 
 void compressed_audio_backpressure_bounds_packets_and_bytes(
@@ -782,6 +857,7 @@ int main() {
   const auto gstreamer = find_fake_runtime_runfile("fake_gstreamer_runtime");
   const auto nvbufsurface = find_fake_runtime_runfile("fake_nvbufsurface.so");
   const auto cuda = find_fake_runtime_runfile("fake_cuda_driver");
+  const auto probe_worker = find_probe_worker_runfile();
   set_environment("RECO_GSTREAMER_DYLIB_PATH", gstreamer.string());
   set_environment("RECO_GSTAPP_DYLIB_PATH", gstreamer.string());
   set_environment("RECO_GLIB_DYLIB_PATH", gstreamer.string());
@@ -808,7 +884,7 @@ int main() {
     concurrent_acquire_cannot_consume_final_eos(runtime, event_path);
     outstanding_leases_survive_session_destruction(runtime);
     compressed_audio_packets_use_the_bounded_audio_appsrc(runtime, event_path);
-    finalized_output_requires_a_discoverable_video_stream();
+    finalized_output_requires_a_compressed_video_sample(probe_worker, event_path);
     compressed_audio_backpressure_bounds_packets_and_bytes(runtime, event_path);
     compressed_audio_preserves_only_buffer_semantic_flags(runtime, event_path);
     finish_is_serialized_and_abort_interrupts_waits(runtime, event_path);

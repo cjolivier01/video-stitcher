@@ -47,7 +47,9 @@ namespace {
 
 using namespace reco::io;
 
-constexpr std::uint64_t kProbeTimeoutNs = 120'000'000'000ULL;
+constexpr auto kProbeTimeout = std::chrono::seconds(120);
+constexpr std::uint64_t kProbeTimeoutNs =
+    std::chrono::duration_cast<std::chrono::nanoseconds>(kProbeTimeout).count();
 constexpr std::size_t kMaximumInputSegments = 4096;
 
 struct ProbedInput {
@@ -556,7 +558,7 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
       throw std::runtime_error("stereo inputs produced no aligned video frames");
     }
     encoder.finish();
-    verify_muxed_gpu_video_output(core::path_to_utf8(output.verification_path()));
+    verify_muxed_gpu_video_output(output.temporary_path(), *codec, format, *worker, kProbeTimeout);
     output.commit();
     const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started);
     const auto rate = elapsed.count() > 0.0 ? static_cast<double>(frames) / elapsed.count() : 0.0;

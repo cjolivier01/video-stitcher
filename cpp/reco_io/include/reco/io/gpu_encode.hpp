@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -126,8 +127,13 @@ private:
 [[nodiscard]] std::optional<std::string> validate_gpu_encode_config(const GpuEncodeConfig& config);
 [[nodiscard]] std::string_view gstreamer_hardware_encoder_factory(Codec codec);
 [[nodiscard]] std::string build_gstreamer_gpu_encode_pipeline(const GpuEncodeConfig& config);
-/// Verifies that a finalized muxed file exposes at least one video stream without decoding it.
-void verify_muxed_gpu_video_output(std::string_view path,
+/// Verifies one parser-selected compressed video access unit in an isolated worker.
+///
+/// The worker uses only a demuxer, parser, compressed caps filters, and an appsink. It never
+/// instantiates a video decoder or materializes pixels. H.264, HEVC, and AV1 in MP4, fragmented
+/// MP4, Matroska, QuickTime, and FLV containers are supported.
+void verify_muxed_gpu_video_output(const std::filesystem::path& path, Codec codec, Format format,
+                                   const std::filesystem::path& probe_worker,
                                    std::chrono::milliseconds timeout = std::chrono::seconds(10));
 
 } // namespace reco::io

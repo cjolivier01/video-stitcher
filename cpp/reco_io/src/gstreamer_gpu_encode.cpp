@@ -50,12 +50,6 @@ struct GErrorAbi {
   char* message = nullptr;
 };
 
-struct GListAbi {
-  void* data = nullptr;
-  GListAbi* next = nullptr;
-  GListAbi* previous = nullptr;
-};
-
 struct GstMiniObjectAbi {
   std::uintptr_t type = 0;
   std::int32_t ref_count = 0;
@@ -246,93 +240,6 @@ public:
   MessageUnref message_unref = nullptr;
   ErrorFree error_free = nullptr;
   Free free = nullptr;
-};
-
-class GstreamerDiscoverApi {
-public:
-  using InitCheck = int (*)(int*, char***, GErrorAbi**);
-  using FilenameToUri = char* (*)(const char*, GErrorAbi**);
-  using DiscovererNew = void* (*)(std::uint64_t, GErrorAbi**);
-  using DiscovererDiscoverUri = void* (*)(void*, const char*, GErrorAbi**);
-  using DiscovererInfoGetResult = int (*)(const void*);
-  using DiscovererInfoGetDuration = std::uint64_t (*)(const void*);
-  using DiscovererInfoGetVideoStreams = void* (*)(void*);
-  using DiscovererVideoInfoGetWidth = std::uint32_t (*)(const void*);
-  using DiscovererVideoInfoGetHeight = std::uint32_t (*)(const void*);
-  using DiscovererStreamInfoListFree = void (*)(void*);
-  using ErrorFree = void (*)(GErrorAbi*);
-  using Free = void (*)(void*);
-  using GObjectUnref = void (*)(void*);
-
-  GstreamerDiscoverApi() {
-#if defined(_WIN32)
-    core = load_runtime_library("RECO_GSTREAMER_DYLIB_PATH", {"gstreamer-1.0-0.dll"}, "GStreamer");
-    glib = load_runtime_library("RECO_GLIB_DYLIB_PATH", {"libglib-2.0-0.dll", "glib-2.0-0.dll"},
-                                "GLib");
-    pbutils = load_runtime_library("RECO_GSTPBUTILS_DYLIB_PATH", {"gstpbutils-1.0-0.dll"},
-                                   "GStreamer PbUtils");
-    gobject = load_runtime_library("RECO_GOBJECT_DYLIB_PATH",
-                                   {"libgobject-2.0-0.dll", "gobject-2.0-0.dll"}, "GObject");
-#elif defined(__APPLE__)
-    core =
-        load_runtime_library("RECO_GSTREAMER_DYLIB_PATH",
-                             {"libgstreamer-1.0.0.dylib", "libgstreamer-1.0.dylib"}, "GStreamer");
-    glib = load_runtime_library("RECO_GLIB_DYLIB_PATH",
-                                {"libglib-2.0.0.dylib", "libglib-2.0.dylib"}, "GLib");
-    pbutils = load_runtime_library("RECO_GSTPBUTILS_DYLIB_PATH",
-                                   {"libgstpbutils-1.0.0.dylib", "libgstpbutils-1.0.dylib"},
-                                   "GStreamer PbUtils");
-    gobject = load_runtime_library("RECO_GOBJECT_DYLIB_PATH",
-                                   {"libgobject-2.0.0.dylib", "libgobject-2.0.dylib"}, "GObject");
-#else
-    core = load_runtime_library("RECO_GSTREAMER_DYLIB_PATH",
-                                {"libgstreamer-1.0.so.0", "libgstreamer-1.0.so"}, "GStreamer");
-    glib = load_runtime_library("RECO_GLIB_DYLIB_PATH", {"libglib-2.0.so.0", "libglib-2.0.so"},
-                                "GLib");
-    pbutils = load_runtime_library("RECO_GSTPBUTILS_DYLIB_PATH",
-                                   {"libgstpbutils-1.0.so.0", "libgstpbutils-1.0.so"},
-                                   "GStreamer PbUtils");
-    gobject = load_runtime_library("RECO_GOBJECT_DYLIB_PATH",
-                                   {"libgobject-2.0.so.0", "libgobject-2.0.so"}, "GObject");
-#endif
-    init_check = core->symbol<InitCheck>("gst_init_check");
-    filename_to_uri = core->symbol<FilenameToUri>("gst_filename_to_uri");
-    discoverer_new = pbutils->symbol<DiscovererNew>("gst_discoverer_new");
-    discoverer_discover_uri = pbutils->symbol<DiscovererDiscoverUri>("gst_discoverer_discover_uri");
-    discoverer_info_get_result =
-        pbutils->symbol<DiscovererInfoGetResult>("gst_discoverer_info_get_result");
-    discoverer_info_get_duration =
-        pbutils->symbol<DiscovererInfoGetDuration>("gst_discoverer_info_get_duration");
-    discoverer_info_get_video_streams =
-        pbutils->symbol<DiscovererInfoGetVideoStreams>("gst_discoverer_info_get_video_streams");
-    discoverer_video_info_get_width =
-        pbutils->symbol<DiscovererVideoInfoGetWidth>("gst_discoverer_video_info_get_width");
-    discoverer_video_info_get_height =
-        pbutils->symbol<DiscovererVideoInfoGetHeight>("gst_discoverer_video_info_get_height");
-    discoverer_stream_info_list_free =
-        pbutils->symbol<DiscovererStreamInfoListFree>("gst_discoverer_stream_info_list_free");
-    error_free = glib->symbol<ErrorFree>("g_error_free");
-    free = glib->symbol<Free>("g_free");
-    g_object_unref = gobject->symbol<GObjectUnref>("g_object_unref");
-  }
-
-  std::shared_ptr<DynamicLibrary> core;
-  std::shared_ptr<DynamicLibrary> glib;
-  std::shared_ptr<DynamicLibrary> pbutils;
-  std::shared_ptr<DynamicLibrary> gobject;
-  InitCheck init_check = nullptr;
-  FilenameToUri filename_to_uri = nullptr;
-  DiscovererNew discoverer_new = nullptr;
-  DiscovererDiscoverUri discoverer_discover_uri = nullptr;
-  DiscovererInfoGetResult discoverer_info_get_result = nullptr;
-  DiscovererInfoGetDuration discoverer_info_get_duration = nullptr;
-  DiscovererInfoGetVideoStreams discoverer_info_get_video_streams = nullptr;
-  DiscovererVideoInfoGetWidth discoverer_video_info_get_width = nullptr;
-  DiscovererVideoInfoGetHeight discoverer_video_info_get_height = nullptr;
-  DiscovererStreamInfoListFree discoverer_stream_info_list_free = nullptr;
-  ErrorFree error_free = nullptr;
-  Free free = nullptr;
-  GObjectUnref g_object_unref = nullptr;
 };
 
 template <typename Api>
@@ -998,66 +905,6 @@ std::string_view GpuVideoEncodeSession::pipeline() const {
     return {};
   }
   return impl_->pipeline_text;
-}
-
-void verify_muxed_gpu_video_output(std::string_view path, std::chrono::milliseconds timeout) {
-  if (path.empty() || path.find('\0') != std::string_view::npos) {
-    throw std::invalid_argument("GPU output verification requires a non-empty path without NUL");
-  }
-  if (timeout < std::chrono::milliseconds(1) || timeout > std::chrono::hours(1)) {
-    throw std::invalid_argument("GPU output verification timeout is outside the supported bound");
-  }
-
-  auto api = std::make_shared<GstreamerDiscoverApi>();
-  GErrorAbi* error = nullptr;
-  if (api->init_check(nullptr, nullptr, &error) == 0) {
-    throw GpuEncodeError(take_error(api, error, "GStreamer initialization failed"));
-  }
-  const std::string owned_path(path);
-  char* uri = api->filename_to_uri(owned_path.c_str(), &error);
-  if (uri == nullptr) {
-    throw GpuEncodeError(take_error(api, error, "failed to create encoded output URI"));
-  }
-  const std::unique_ptr<void, GstreamerDiscoverApi::Free> uri_owner(uri, api->free);
-  const auto timeout_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(timeout).count();
-  void* discoverer = api->discoverer_new(static_cast<std::uint64_t>(timeout_ns), &error);
-  if (discoverer == nullptr) {
-    throw GpuEncodeError(take_error(api, error, "failed to create encoded output discoverer"));
-  }
-  const std::unique_ptr<void, GstreamerDiscoverApi::GObjectUnref> discoverer_owner(
-      discoverer, api->g_object_unref);
-  void* info = api->discoverer_discover_uri(discoverer, static_cast<const char*>(uri), &error);
-  if (info == nullptr) {
-    throw GpuEncodeError(take_error(api, error, "failed to inspect encoded output streams"));
-  }
-  const std::unique_ptr<void, GstreamerDiscoverApi::GObjectUnref> info_owner(info,
-                                                                             api->g_object_unref);
-  constexpr int kDiscovererOk = 0;
-  constexpr int kDiscovererMissingPlugins = 5;
-  const int result = api->discoverer_info_get_result(info);
-  if (result != kDiscovererOk && result != kDiscovererMissingPlugins) {
-    throw GpuEncodeError(take_error(api, error, "encoded output stream discovery failed"));
-  }
-  if (error != nullptr) {
-    api->error_free(error);
-    error = nullptr;
-  }
-  void* streams = api->discoverer_info_get_video_streams(info);
-  if (streams == nullptr) {
-    throw GpuEncodeError("completed GPU output contains no video stream");
-  }
-  const auto* video_streams = static_cast<const GListAbi*>(streams);
-  const std::uint32_t width = video_streams->data == nullptr
-                                  ? 0U
-                                  : api->discoverer_video_info_get_width(video_streams->data);
-  const std::uint32_t height = video_streams->data == nullptr
-                                   ? 0U
-                                   : api->discoverer_video_info_get_height(video_streams->data);
-  api->discoverer_stream_info_list_free(streams);
-  const std::uint64_t duration = api->discoverer_info_get_duration(info);
-  if (duration == 0 || duration == kGstClockTimeNone || width == 0 || height == 0) {
-    throw GpuEncodeError("completed GPU output contains no decodable video samples");
-  }
 }
 
 } // namespace reco::io

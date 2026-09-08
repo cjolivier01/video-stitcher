@@ -1,5 +1,8 @@
 #include "reco/io/gpu_encode.hpp"
 
+#include "reco/core/path.hpp"
+#include "reco/io/gpu_video_probe.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -77,6 +80,32 @@ std::uint32_t target_bitrate(const GpuEncodeConfig& config) {
 
 bool valid_timeout(std::chrono::milliseconds timeout) {
   return timeout >= std::chrono::milliseconds(1) && timeout <= std::chrono::hours(1);
+}
+
+GpuDecodeCodec probe_codec(Codec codec) {
+  switch (codec) {
+  case Codec::H264:
+    return GpuDecodeCodec::H264;
+  case Codec::HEVC:
+    return GpuDecodeCodec::Hevc;
+  case Codec::AV1:
+    return GpuDecodeCodec::Av1;
+  }
+  throw GpuEncodeError("parser-only output verification received an invalid codec");
+}
+
+GpuDecodeContainer probe_container(Format format) {
+  switch (format) {
+  case Format::Mp4:
+  case Format::Mp4Fragmented:
+  case Format::Mov:
+    return GpuDecodeContainer::QuickTime;
+  case Format::Mkv:
+    return GpuDecodeContainer::Matroska;
+  case Format::Flv:
+    return GpuDecodeContainer::Flv;
+  }
+  throw GpuEncodeError("parser-only output verification received an invalid container");
 }
 
 } // namespace
@@ -177,6 +206,39 @@ std::string build_gstreamer_gpu_encode_pipeline(const GpuEncodeConfig& config) {
              << " sync=false async=false";
   }
   return pipeline.str();
+}
+
+void verify_muxed_gpu_video_output(const std::filesystem::path& path, Codec codec, Format format,
+                                   const std::filesystem::path& probe_worker,
+                                   std::chrono::milliseconds timeout) {
+  if (path.empty()) {
+    throw std::invalid_argument("GPU output verification requires a non-empty path");
+  }
+  if (timeout < std::chrono::seconds(1) || timeout > std::chrono::hours(1)) {
+    throw std::invalid_argument(
+        "GPU output verification timeout must be between one second and one hour");
+  }
+
+  const auto timeout_ns = static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(timeout).count());
+  try {
+    const auto result = probe_gpu_video({.path = core::path_to_utf8(path),
+                                         .codec = probe_codec(codec),
+                                         .elementary_stream = false,
+                                         .container = probe_container(format),
+                                         .require_selected_codec = true,
+                                         .max_buffers = 1,
+                                         .drop = false},
+                                        probe_worker, timeout_ns);
+    if (result.total_frames == 0U || result.width == 0U || result.height == 0U) {
+      throw GpuEncodeError(
+          "completed GPU output contains no parser-verified compressed video sample");
+    }
+  } catch (const GpuVideoProbeError& error) {
+    throw GpuEncodeError(
+        "completed GPU output failed parser-only compressed-sample verification: " +
+        std::string(error.what()));
+  }
 }
 
 } // namespace reco::io

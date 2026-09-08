@@ -22,21 +22,26 @@ inline constexpr std::uint32_t kMaximumGpuStereoQueueCapacity = 16;
 enum class GpuDecodeCodec {
   H264,
   Hevc,
+  Av1,
 };
 
 enum class GpuDecodeContainer {
   QuickTime,
   Matroska,
   MpegTs,
+  Flv,
 };
 
 struct GpuFileDecodeConfig {
   std::string path;
   // Elementary streams require an explicit parser. Supported containers
-  // select H264 or HEVC from their video pad at runtime.
+  // select H.264, HEVC, or AV1 from their video pad at runtime.
   GpuDecodeCodec codec = GpuDecodeCodec::H264;
   bool elementary_stream = false;
   std::optional<GpuDecodeContainer> container;
+  // Containerized inputs normally select H.264/HEVC/AV1 dynamically. Set this only when the
+  // container is required to expose exactly `codec`, avoiding parser autoplugging.
+  bool require_selected_codec = false;
   std::uint32_t max_buffers = 4;
   bool drop = false;
   // Bounds one appsink read, including repeated poll wakeups.

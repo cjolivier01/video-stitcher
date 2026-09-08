@@ -14,9 +14,11 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -28,6 +30,30 @@ using namespace reco::io;
 bool require_cuda() {
   const char* value = std::getenv("RECO_REQUIRE_CUDA_TEST");
   return value != nullptr && std::string_view(value) == "1";
+}
+
+std::filesystem::path probe_worker_runfile() {
+  const char* workspace = std::getenv("TEST_WORKSPACE");
+  if (workspace == nullptr || workspace[0] == '\0') {
+    throw std::runtime_error("TEST_WORKSPACE is not set");
+  }
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(&error));
+  if (!runfiles) {
+    throw std::runtime_error("failed to initialize Bazel runfiles: " + error);
+  }
+#if defined(_WIN32)
+  constexpr std::string_view executable = "cpp/reco_io/reco_video_probe_worker.exe";
+#else
+  constexpr std::string_view executable = "cpp/reco_io/reco_video_probe_worker";
+#endif
+  const auto logical_path = std::string(workspace) + "/" + std::string(executable);
+  const auto resolved = std::filesystem::path(runfiles->Rlocation(logical_path));
+  if (resolved.empty() || !std::filesystem::is_regular_file(resolved)) {
+    throw std::runtime_error("video probe worker runfile not found");
+  }
+  return std::filesystem::absolute(resolved);
 }
 
 class TemporaryDirectory {
@@ -89,7 +115,29 @@ std::string availability_error() {
   return {};
 }
 
-void run_round_trip() {
+void verify_empty_video_track_is_rejected(const std::filesystem::path& worker) {
+  TemporaryDirectory temporary;
+  const auto fixture = temporary.path() / "empty-video-track-with-audio.mp4";
+  reco::tests::materialize_base64_fixture(
+      reco::tests::find_runfile("empty_video_track_with_audio_mp4.b64"), fixture);
+  try {
+    verify_muxed_gpu_video_output(fixture, Codec::H264, Format::Mp4, worker,
+                                  std::chrono::seconds(10));
+  } catch (const GpuEncodeError& error) {
+    const std::string_view message(error.what());
+    if (message.find("found no H.264, HEVC, or AV1 moving-video stream") !=
+            std::string_view::npos ||
+        message.find("reason not-linked") != std::string_view::npos) {
+      return;
+    }
+    throw std::runtime_error("zero-sample video track returned the wrong verification error: " +
+                             std::string(error.what()));
+  }
+  throw std::runtime_error(
+      "video track with zero samples and nonzero audio duration passed output verification");
+}
+
+void run_round_trip(const std::filesystem::path& worker) {
   // NVENC rejects sub-minimum macroblock geometries on current discrete GPUs.
   constexpr std::uint32_t width = 320;
   constexpr std::uint32_t height = 180;
@@ -167,7 +215,7 @@ void run_round_trip() {
     encoder.submit_frame(std::move(output_frame), frame_index * duration_ns, duration_ns);
   }
   encoder.finish();
-  verify_muxed_gpu_video_output(output.string(), std::chrono::seconds(5));
+  verify_muxed_gpu_video_output(output, Codec::H264, Format::Mp4, worker, std::chrono::seconds(10));
 
   if (!std::filesystem::is_regular_file(output) || std::filesystem::file_size(output) < 1024U) {
     throw std::runtime_error("GPU encoder did not produce a usable output file");
@@ -210,6 +258,13 @@ void run_round_trip() {
 } // namespace
 
 int main() {
+  std::filesystem::path worker;
+  try {
+    worker = probe_worker_runfile();
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: video probe worker resolution: " << error.what() << '\n';
+    return EXIT_FAILURE;
+  }
   const auto unavailable = availability_error();
   if (!unavailable.empty()) {
     if (require_cuda()) {
@@ -220,7 +275,8 @@ int main() {
     return EXIT_SUCCESS;
   }
   try {
-    run_round_trip();
+    run_round_trip(worker);
+    verify_empty_video_track_is_rejected(worker);
     std::cout << "GPU encode/NVDEC round trip passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception& error) {

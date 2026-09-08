@@ -59,7 +59,7 @@ constexpr std::uint64_t kGstClockTimeNone = std::numeric_limits<std::uint64_t>::
 constexpr std::uint64_t kSamplePollTimeoutNs = 100'000'000ULL;
 constexpr std::size_t kTimingAnalysisSamples = 64;
 // The lookahead keeps the analysis prefix presentation-contiguous when the
-// parser scan stops inside an H.264/HEVC picture-reorder group.
+// parser scan stops inside a compressed picture-reorder group.
 constexpr std::size_t kTimingReorderLookahead = 32;
 // DTS can trail presentation time by the decoder picture-reorder depth.
 constexpr std::uint64_t kMaximumDecodeReorderFrames = 32;
@@ -429,8 +429,22 @@ std::string_view parser_for_codec(GpuDecodeCodec codec) {
     return "h264parse";
   case GpuDecodeCodec::Hevc:
     return "h265parse";
+  case GpuDecodeCodec::Av1:
+    return "av1parse";
   }
   return "h264parse";
+}
+
+std::string_view caps_for_codec(GpuDecodeCodec codec) {
+  switch (codec) {
+  case GpuDecodeCodec::H264:
+    return "video/x-h264";
+  case GpuDecodeCodec::Hevc:
+    return "video/x-h265";
+  case GpuDecodeCodec::Av1:
+    return "video/x-av1";
+  }
+  return "video/x-h264";
 }
 
 std::string path_for_gstreamer(const std::filesystem::path& path) {
@@ -459,13 +473,16 @@ std::string build_probe_pipeline(const GpuFileDecodeConfig& config,
   if (config.elementary_stream) {
     pipeline << "identity name=input_budget silent=true ! " << parser_for_codec(config.codec);
   } else {
-    pipeline << gpu_decode_container_demuxer(*config.container)
-             << " ! capsfilter caps=\"video/x-h264;video/x-h265\""
-             << " ! identity name=container_info silent=true"
-             << " ! identity name=input_budget silent=true ! parsebin";
+    pipeline << gpu_decode_container_demuxer(*config.container) << " ! capsfilter caps=\""
+             << (config.require_selected_codec ? caps_for_codec(config.codec)
+                                               : "video/x-h264;video/x-h265;video/x-av1")
+             << "\" ! identity name=container_info silent=true"
+             << " ! identity name=input_budget silent=true ! ";
+    pipeline << (config.require_selected_codec ? parser_for_codec(config.codec) : "parsebin");
   }
   pipeline << " ! capsfilter caps=\"video/x-h264,stream-format=byte-stream,alignment=au;"
-              "video/x-h265,stream-format=byte-stream,alignment=au\""
+              "video/x-h265,stream-format=byte-stream,alignment=au;"
+              "video/x-av1,stream-format=obu-stream,alignment=frame\""
            << " ! identity name=probe_info silent=true"
            << " ! appsink name=probe_sink emit-signals=false sync=false max-buffers=1 drop=false";
   return pipeline.str();
@@ -1888,7 +1905,7 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
   initial_sample_owner.reset(initial_sample);
   if (initial_sample == nullptr) {
     throw GpuVideoProbeError(
-        "video discovery found no H.264 or HEVC moving-video stream compatible with NVDEC");
+        "video discovery found no H.264, HEVC, or AV1 moving-video stream compatible with NVDEC");
   }
   if (api->sample_get_buffer(initial_sample) == nullptr) {
     throw GpuVideoProbeError("GStreamer parser-only probe returned a sample without a buffer");
@@ -1915,7 +1932,7 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
   void* caps = api->sample_get_caps(initial_sample);
   if (caps == nullptr) {
     throw GpuVideoProbeError(
-        "video discovery found no H.264 or HEVC moving-video stream compatible with NVDEC");
+        "video discovery found no H.264, HEVC, or AV1 moving-video stream compatible with NVDEC");
   }
   void* structure = api->caps_get_structure(caps, 0);
   if (structure == nullptr) {
@@ -1928,12 +1945,19 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
   int parsed = 0;
   const bool supported_codec =
       codec_caps != nullptr && (std::string_view(codec_caps) == "video/x-h264" ||
-                                std::string_view(codec_caps) == "video/x-h265");
+                                std::string_view(codec_caps) == "video/x-h265" ||
+                                std::string_view(codec_caps) == "video/x-av1");
+  const bool supported_framing =
+      codec_caps != nullptr && stream_format != nullptr && alignment != nullptr &&
+      ((std::string_view(codec_caps) == "video/x-av1" &&
+        std::string_view(stream_format) == "obu-stream" &&
+        std::string_view(alignment) == "frame") ||
+       (std::string_view(codec_caps) != "video/x-av1" &&
+        std::string_view(stream_format) == "byte-stream" && std::string_view(alignment) == "au"));
   if (!supported_codec || api->structure_get_boolean(structure, "parsed", &parsed) == 0 ||
-      parsed == 0 || stream_format == nullptr || std::string_view(stream_format) != "byte-stream" ||
-      alignment == nullptr || std::string_view(alignment) != "au") {
+      parsed == 0 || !supported_framing) {
     throw GpuVideoProbeError(
-        "video parser output is not decoder-compatible H.264/HEVC byte-stream AU data");
+        "video parser output is not decoder-compatible framed H.264/HEVC/AV1 data");
   }
 
   int width = 0;

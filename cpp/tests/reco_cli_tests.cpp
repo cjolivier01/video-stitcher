@@ -2950,7 +2950,8 @@ void command_execution_dispatches_available_stages() {
               "blocked stitch writes runtime plan");
   expect_true(out.str().find("nvv4l2decoder") != std::string::npos,
               "blocked stitch describes GPU decode contract");
-  expect_true(out.str().find("qtdemux ! capsfilter caps=\"video/x-h264;video/x-h265\" ! "
+  expect_true(out.str().find("qtdemux ! capsfilter "
+                             "caps=\"video/x-h264;video/x-h265;video/x-av1\" ! "
                              "parsebin ! identity name=display_info silent=true ! "
                              "nvv4l2decoder") != std::string::npos,
               "blocked stitch selects a supported video pad for containers");

@@ -223,7 +223,11 @@ cc_test(
         "base64_fixture.hpp",
         "reco_io_gpu_encode_runtime_tests.cpp",
     ],
-    data = ["fixtures/audio_only_mp4.b64"],
+    data = [
+        "fixtures/audio_only_mp4.b64",
+        "fixtures/empty_video_track_with_audio_mp4.b64",
+        "//cpp/reco_io:reco_video_probe_worker",
+    ],
     deps = [
         "//cpp/reco_core",
         "//cpp/reco_io",
@@ -239,6 +243,7 @@ cc_test(
         ":libfake_cuda_driver.so",
         ":libfake_gstreamer_runtime.so",
         ":libfake_nvbufsurface.so",
+        "//cpp/reco_io:reco_video_probe_worker",
     ],
     deps = ["//cpp/reco_io"],
 )
