@@ -327,6 +327,9 @@ void require_healthy_cuda_context(const std::shared_ptr<CudaFunctions>& function
     throw NvmmError(
         "CUDA caller context restoration previously failed during NvBufSurface cleanup");
   }
+  if (!functions->span_backend.context_healthy()) {
+    throw NvmmError(functions->span_backend.context_health_error());
+  }
 }
 
 class DeviceZeroContext {
@@ -340,11 +343,7 @@ public:
   DeviceZeroContext(const DeviceZeroContext&) = delete;
   DeviceZeroContext& operator=(const DeviceZeroContext&) = delete;
 
-  ~DeviceZeroContext() {
-    if (functions_) {
-      (void)functions_->context_set_current(previous_);
-    }
-  }
+  ~DeviceZeroContext() { restore_noexcept(); }
 
   void restore() {
     if (!functions_) {
@@ -352,6 +351,16 @@ public:
     }
     check_cuda("cuCtxSetCurrent (restore)", functions_->context_set_current(previous_));
     functions_.reset();
+  }
+
+  void restore_noexcept() noexcept {
+    if (!functions_) {
+      return;
+    }
+    auto functions = std::move(functions_);
+    if (functions->context_set_current(previous_) != kCudaSuccess) {
+      functions->context_restore_failed.store(true, std::memory_order_release);
+    }
   }
 
 private:
@@ -471,17 +480,20 @@ bool release_surface_mapping(CudaMappingState& mapping) noexcept {
         if (result != kCudaSuccess) {
           mapping.cleanup_failure = SurfaceCleanupFailure::CudaUnregister;
           mapping.cleanup_cuda_result = result;
+          context.restore_noexcept();
           return false;
         }
         mapping.graphics_resource = nullptr;
       }
       if (mapping.functions->unmap_egl(mapping.surface, 0) != 0) {
         mapping.cleanup_failure = SurfaceCleanupFailure::EglUnmap;
+        context.restore_noexcept();
         return false;
       }
     } else if (mapping.functions->unmap_cuda == nullptr ||
                mapping.functions->unmap_cuda(mapping.surface, 0) != 0) {
       mapping.cleanup_failure = SurfaceCleanupFailure::CudaUnmap;
+      context.restore_noexcept();
       return false;
     }
     resources_released = true;
@@ -928,21 +940,21 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info, std::shared_ptr<
         .uv_ptr = uv_ptr,
         .y_pitch = info.y_pitch,
         .uv_pitch = info.uv_pitch,
+        .width = info.width,
+        .height = info.height,
+        .gpu_id = info.gpu_id,
+        .color_matrix = info.color_matrix,
+        .color_range = info.color_range,
+        .owner = std::move(mapped_owner),
         .y_accessible_bytes = y_provenance.accessible_bytes,
         .uv_accessible_bytes = uv_provenance.accessible_bytes,
         .y_mapping_base = y_provenance.mapping_base,
         .uv_mapping_base = uv_provenance.mapping_base,
         .y_mapping_bytes = y_provenance.mapping_bytes,
         .uv_mapping_bytes = uv_provenance.mapping_bytes,
-        .width = info.width,
-        .height = info.height,
-        .gpu_id = info.gpu_id,
         .context_id = y_provenance.context_id,
         .device_ordinal = y_provenance.device_ordinal,
-        .color_matrix = info.color_matrix,
-        .color_range = info.color_range,
         .runtime = info.runtime,
-        .owner = std::move(mapped_owner),
         .y_validation = y_provenance.validation,
         .uv_validation = uv_provenance.validation,
     };

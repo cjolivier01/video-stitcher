@@ -10,6 +10,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -145,6 +146,7 @@ struct FakeSourceState {
 struct FakeSourcePlan {
   std::vector<std::uint64_t> frame_indices;
   std::optional<std::size_t> failure_at_read;
+  std::optional<std::size_t> bad_alloc_at_read;
   std::string failure_message = "fixture decode failure";
   bool block_at_end = false;
   bool gpu_resident = true;
@@ -177,6 +179,9 @@ public:
     }
     if (plan_.failure_at_read == read_number) {
       throw GpuDecodeError(plan_.failure_message);
+    }
+    if (plan_.bad_alloc_at_read == read_number) {
+      throw std::bad_alloc();
     }
     if (next_frame_ >= plan_.frame_indices.size()) {
       if (plan_.block_at_end) {
@@ -361,6 +366,25 @@ void side_specific_failures_stop_the_peer() {
   }
 }
 
+void allocation_failures_are_transferred_out_of_the_noexcept_worker() {
+  const auto left_state = std::make_shared<FakeSourceState>();
+  const auto right_state = std::make_shared<FakeSourceState>();
+  GpuStereoDecodeSession session(make_source("left", {.bad_alloc_at_read = 0}, left_state),
+                                 make_source("right", {.block_at_end = true}, right_state));
+
+  try {
+    (void)session.read();
+    expect_true(false, "allocation failure is propagated");
+  } catch (const GpuStereoDecodeError& error) {
+    expect_true(error.side() == GpuDecodeSide::Left,
+                "allocation failure preserves the failing side");
+  } catch (...) {
+    expect_true(false, "allocation failure uses GpuStereoDecodeError");
+  }
+  expect_true(wait_until([&] { return right_state->stops() == 1; }),
+              "allocation failure stops and wakes the peer");
+}
+
 void explicit_stop_wakes_blocked_reads_idempotently() {
   const auto left_state = std::make_shared<FakeSourceState>();
   const auto right_state = std::make_shared<FakeSourceState>();
@@ -440,6 +464,7 @@ int main() {
   negative_sync_aligns_indices();
   retained_owner_queues_are_bounded();
   side_specific_failures_stop_the_peer();
+  allocation_failures_are_transferred_out_of_the_noexcept_worker();
   explicit_stop_wakes_blocked_reads_idempotently();
   eos_stops_a_blocked_peer();
   invalid_configuration_and_cpu_sources_are_rejected();

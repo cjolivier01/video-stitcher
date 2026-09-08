@@ -565,6 +565,24 @@ private:
   bool mapped_ = false;
 };
 
+class GstSampleGuard {
+public:
+  GstSampleGuard(GstreamerApi& api, void* sample) noexcept : api_(&api), sample_(sample) {}
+  GstSampleGuard(const GstSampleGuard&) = delete;
+  GstSampleGuard& operator=(const GstSampleGuard&) = delete;
+  ~GstSampleGuard() {
+    if (sample_ != nullptr) {
+      api_->sample_unref(sample_);
+    }
+  }
+
+  void release() noexcept { sample_ = nullptr; }
+
+private:
+  GstreamerApi* api_ = nullptr;
+  void* sample_ = nullptr;
+};
+
 enum class GeometryProbeFailure {
   None,
   MissingBuffer,
@@ -1067,7 +1085,9 @@ public:
       }
     }
 
+    GstSampleGuard pulled_sample(*api_, sample);
     auto owner = std::make_shared<GstSampleOwner>(api_, pipeline_lifetime_, sample);
+    pulled_sample.release();
     drain_pipeline_messages();
     throw_if_geometry_probe_failed();
     void* buffer = api_->sample_get_buffer(sample);

@@ -41,6 +41,9 @@ std::atomic<bool> fail_module_load{false};
 std::atomic<int> sequence{0};
 std::atomic<int> last_launch_sequence{0};
 std::atomic<int> last_synchronize_sequence{0};
+std::atomic<int> last_restore_sequence{0};
+thread_local void* fail_set_current_target = nullptr;
+thread_local bool fail_set_current_once = false;
 std::array<std::uint64_t, 8> captured_u64{};
 std::array<std::uint32_t, 12> captured_u32{};
 std::array<float, 16> captured_float{};
@@ -87,6 +90,7 @@ RECO_FAKE_CUDA_EXPORT void recoFakeCudaStitchReset() {
   sequence = 0;
   last_launch_sequence = 0;
   last_synchronize_sequence = 0;
+  last_restore_sequence = 0;
   captured_u64.fill(0);
   captured_u32.fill(0);
   captured_float.fill(0.0F);
@@ -98,6 +102,9 @@ RECO_FAKE_CUDA_EXPORT int recoFakeCudaStitchLaunchSequence() { return last_launc
 RECO_FAKE_CUDA_EXPORT int recoFakeCudaStitchSynchronizeSequence() {
   return last_synchronize_sequence.load();
 }
+RECO_FAKE_CUDA_EXPORT int recoFakeCudaStitchRestoreSequence() {
+  return last_restore_sequence.load();
+}
 RECO_FAKE_CUDA_EXPORT int recoFakeCudaStitchPointerAttributeCount() {
   return pointer_attribute_count.load();
 }
@@ -108,6 +115,10 @@ RECO_FAKE_CUDA_EXPORT int recoFakeCudaStitchRetainCount() { return retain_count.
 RECO_FAKE_CUDA_EXPORT int recoFakeCudaStitchReleaseCount() { return release_count.load(); }
 RECO_FAKE_CUDA_EXPORT void recoFakeCudaStitchSetCurrentContext(std::uintptr_t context) {
   current_context = reinterpret_cast<void*>(context);
+}
+RECO_FAKE_CUDA_EXPORT void recoFakeCudaStitchFailNextSetCurrent(std::uintptr_t context) {
+  fail_set_current_target = reinterpret_cast<void*>(context);
+  fail_set_current_once = true;
 }
 RECO_FAKE_CUDA_EXPORT std::uintptr_t recoFakeCudaStitchCurrentContext() {
   return reinterpret_cast<std::uintptr_t>(current_context);
@@ -212,10 +223,17 @@ RECO_FAKE_CUDA_EXPORT int cuCtxGetDevice(int* device) {
   return 0;
 }
 RECO_FAKE_CUDA_EXPORT int cuCtxSetCurrent(void* context) {
+  if (fail_set_current_once && context == fail_set_current_target) {
+    fail_set_current_once = false;
+    return 901;
+  }
   if (context == reinterpret_cast<void*>(kContextIdentity) && retain_count.load() <= 0) {
     return 1;
   }
   current_context = context;
+  if (context == reinterpret_cast<void*>(kForeignContextIdentity)) {
+    last_restore_sequence = ++sequence;
+  }
   return 0;
 }
 RECO_FAKE_CUDA_EXPORT int cuCtxSynchronize() {

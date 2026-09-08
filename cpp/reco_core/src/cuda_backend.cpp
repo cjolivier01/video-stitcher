@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -334,7 +335,18 @@ struct CudaBackend::Impl {
     return device;
   }
 
+  void require_healthy_context() const {
+    if (context_restore_failed.load(std::memory_order_acquire)) {
+      throw std::runtime_error("CUDA caller context restoration previously failed");
+    }
+  }
+
+  void mark_context_restore_failed() noexcept {
+    context_restore_failed.store(true, std::memory_order_release);
+  }
+
   void ensure_primary_context(int ordinal) {
+    require_healthy_context();
     const CUdevice requested_device = device(ordinal);
     CUcontext context = nullptr;
     {
@@ -359,18 +371,35 @@ struct CudaBackend::Impl {
   void ensure_current_context_for_copy() { ensure_primary_context(0); }
 
   CUcontext current_context() {
+    require_healthy_context();
     CUcontext current = nullptr;
     check_cuda("cuCtxGetCurrent", cu_ctx_get_current(&current));
     return current;
   }
 
   void set_current_context(CUcontext context) {
+    require_healthy_context();
     check_cuda("cuCtxSetCurrent", cu_ctx_set_current(context));
+  }
+
+  void restore_context(CUcontext context) {
+    const auto result = cu_ctx_set_current(context);
+    if (result != kCudaSuccess) {
+      mark_context_restore_failed();
+      throw_cuda("cuCtxSetCurrent (restore)", result);
+    }
+  }
+
+  void restore_context_noexcept(CUcontext context) noexcept {
+    if (cu_ctx_set_current(context) != kCudaSuccess) {
+      mark_context_restore_failed();
+    }
   }
 
   DynamicLibrary driver;
   std::mutex context_mutex;
   std::unordered_map<int, CUcontext> retained_contexts;
+  std::atomic<bool> context_restore_failed{false};
   CUresult (*cu_init)(unsigned int) = nullptr;
   CUresult (*cu_device_get_count)(int*) = nullptr;
   CUresult (*cu_device_get)(CUdevice*, int) = nullptr;
@@ -434,7 +463,7 @@ public:
       backend_->ensure_primary_context(device_ordinal);
       current_ = backend_->current_context();
     } catch (...) {
-      (void)backend_->cu_ctx_set_current(previous_);
+      backend_->restore_context(previous_);
       throw;
     }
   }
@@ -444,7 +473,7 @@ public:
 
   ~PrimaryContextScope() {
     if (backend_ != nullptr) {
-      (void)backend_->cu_ctx_set_current(previous_);
+      backend_->restore_context_noexcept(previous_);
     }
   }
 
@@ -454,7 +483,7 @@ public:
     if (backend_ == nullptr) {
       return;
     }
-    check_cuda("cuCtxSetCurrent (restore)", backend_->cu_ctx_set_current(previous_));
+    backend_->restore_context(previous_);
     backend_ = nullptr;
   }
 
@@ -623,10 +652,10 @@ struct CudaModule::State {
       try {
         check_cuda("cuModuleUnload", backend->cu_module_unload(module));
       } catch (...) {
-        backend->set_current_context(previous_context);
+        backend->restore_context(previous_context);
         throw;
       }
-      backend->set_current_context(previous_context);
+      backend->restore_context(previous_context);
     } catch (...) {
     }
   }
@@ -724,7 +753,7 @@ void CudaSharedMemory::reset() {
     (void)unmap_result;
     const auto free_result = backend_->cu_mem_address_free(ptr_, size_);
     (void)free_result;
-    backend_->set_current_context(previous_context);
+    backend_->restore_context(previous_context);
   } catch (...) {
   }
   ptr_ = 0;
@@ -762,10 +791,10 @@ CudaKernel CudaModule::load_kernel(std::string_view function_name) const {
     check_cuda("cuModuleGetFunction", state->backend->cu_module_get_function(
                                           &function, state->module, terminated_name.data()));
   } catch (...) {
-    state->backend->set_current_context(previous_context);
+    state->backend->restore_context(previous_context);
     throw;
   }
-  state->backend->set_current_context(previous_context);
+  state->backend->restore_context(previous_context);
   return CudaKernel(state, function);
 }
 
@@ -789,6 +818,31 @@ CudaKernel& CudaKernel::operator=(CudaKernel&& other) noexcept {
 
 CudaKernel::~CudaKernel() { reset(); }
 
+void CudaKernel::launch_and_synchronize(const CudaLaunchConfig& config,
+                                        std::span<void*> args) const {
+  if (!*this) {
+    throw std::invalid_argument("CUDA kernel launch requires a live kernel");
+  }
+  validate_dim3(config.grid, "grid");
+  validate_dim3(config.block, "block");
+  const auto& backend = module_state_->backend;
+  const CUcontext previous_context = backend->current_context();
+  backend->set_current_context(module_state_->context);
+  void** kernel_args = args.empty() ? nullptr : args.data();
+  try {
+    check_cuda("cuLaunchKernel",
+               backend->cu_launch_kernel(static_cast<CUfunction>(function_), config.grid.x,
+                                         config.grid.y, config.grid.z, config.block.x,
+                                         config.block.y, config.block.z, config.shared_memory_bytes,
+                                         nullptr, kernel_args, nullptr));
+    check_cuda("cuCtxSynchronize", backend->cu_ctx_synchronize());
+  } catch (...) {
+    backend->restore_context(previous_context);
+    throw;
+  }
+  backend->restore_context(previous_context);
+}
+
 void CudaKernel::launch(const CudaLaunchConfig& config, std::span<void*> args) const {
   if (!*this) {
     throw std::invalid_argument("CUDA kernel launch requires a live kernel");
@@ -806,10 +860,10 @@ void CudaKernel::launch(const CudaLaunchConfig& config, std::span<void*> args) c
                                          config.block.y, config.block.z, config.shared_memory_bytes,
                                          nullptr, kernel_args, nullptr));
   } catch (...) {
-    backend->set_current_context(previous_context);
+    backend->restore_context(previous_context);
     throw;
   }
-  backend->set_current_context(previous_context);
+  backend->restore_context(previous_context);
 }
 
 void CudaKernel::synchronize() const {
@@ -822,10 +876,10 @@ void CudaKernel::synchronize() const {
   try {
     check_cuda("cuCtxSynchronize", backend->cu_ctx_synchronize());
   } catch (...) {
-    backend->set_current_context(previous_context);
+    backend->restore_context(previous_context);
     throw;
   }
-  backend->set_current_context(previous_context);
+  backend->restore_context(previous_context);
 }
 
 void CudaKernel::reset() {
@@ -894,6 +948,17 @@ CudaBackend CudaBackend::with_trace_sink(std::shared_ptr<CudaBackendTraceSink> t
     throw std::invalid_argument("CUDA trace sink must be non-null");
   }
   return CudaBackend(impl_, std::move(trace_sink));
+}
+
+bool CudaBackend::context_healthy() const noexcept {
+  return !impl_->context_restore_failed.load(std::memory_order_acquire);
+}
+
+std::string CudaBackend::context_health_error() const {
+  if (context_healthy()) {
+    return {};
+  }
+  return "CUDA caller context restoration previously failed";
 }
 
 int CudaBackend::device_count() const {

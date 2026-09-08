@@ -63,8 +63,13 @@ jobs:
         run: >-
           bazel test --jobs=2 --local_test_jobs=1 --config=asan
           //cpp/tests:reco_control_tests
+          //cpp/tests:reco_core_cuda_backend_tests
+          //cpp/tests:reco_core_cuda_frame_tests
+          //cpp/tests:reco_core_cuda_stitch_parity_tests
+          //cpp/tests:reco_core_cuda_stitch_renderer_tests
           //cpp/tests:reco_core_data_tests
           //cpp/tests:reco_core_math_events_tests
+          //cpp/tests:reco_core_nvrtc_tests
           //cpp/tests:reco_io_config_tests
           //cpp/tests:reco_autocam_policy_tests
           //cpp/tests:reco_calibrate_data_tests
@@ -113,8 +118,13 @@ jobs:
         run: >-
           bazel test --jobs=2 --local_test_jobs=1 --config=ubsan
           //cpp/tests:reco_control_tests
+          //cpp/tests:reco_core_cuda_backend_tests
+          //cpp/tests:reco_core_cuda_frame_tests
+          //cpp/tests:reco_core_cuda_stitch_parity_tests
+          //cpp/tests:reco_core_cuda_stitch_renderer_tests
           //cpp/tests:reco_core_data_tests
           //cpp/tests:reco_core_math_events_tests
+          //cpp/tests:reco_core_nvrtc_tests
           //cpp/tests:reco_io_config_tests
           //cpp/tests:reco_autocam_policy_tests
           //cpp/tests:reco_calibrate_data_tests
@@ -141,6 +151,7 @@ jobs:
           //cpp/tests:reco_io_gpu_video_probe_tests
           //cpp/tests:reco_io_gpu_video_probe_fallback_tests
           //cpp/tests:reco_io_nvmm_cuda_interop_tests
+          //cpp/tests:reco_core_nvrtc_tests
 
   # Same-repository PR branches are trusted on the delegated containment runner. Fork PRs remain
   # excluded because this job executes code outside GitHub-hosted isolation.

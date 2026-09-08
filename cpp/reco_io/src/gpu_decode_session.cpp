@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -101,7 +102,13 @@ public:
       if (failure_.has_value()) {
         const auto failure = *failure_;
         lock.unlock();
-        throw GpuStereoDecodeError(failure.side, failure.message);
+        try {
+          std::rethrow_exception(failure.exception);
+        } catch (const std::exception& error) {
+          throw GpuStereoDecodeError(failure.side, error.what());
+        } catch (...) {
+          throw GpuStereoDecodeError(failure.side, "unknown source failure");
+        }
       }
       if (terminal_eos_) {
         return {.status = GpuStereoDecodeStatus::EndOfStream, .frames = std::nullopt};
@@ -185,7 +192,7 @@ private:
 
   struct Failure {
     GpuDecodeSide side;
-    std::string message;
+    std::exception_ptr exception;
   };
 
   void start_threads() {
@@ -227,7 +234,7 @@ private:
     state_changed_.notify_all();
   }
 
-  void record_failure(GpuDecodeSide side, std::string message) noexcept {
+  void record_failure(GpuDecodeSide side, std::exception_ptr exception) noexcept {
     std::deque<GpuDecodedFrame> discarded_left;
     std::deque<GpuDecodedFrame> discarded_right;
     {
@@ -236,7 +243,7 @@ private:
         return;
       }
       if (!failure_.has_value()) {
-        failure_ = Failure{.side = side, .message = std::move(message)};
+        failure_ = Failure{.side = side, .exception = std::move(exception)};
       }
       const bool first_stop = !workers_stopped_.exchange(true, std::memory_order_acq_rel);
       discarded_left.swap(left_.frames);
@@ -306,10 +313,8 @@ private:
         state.frames.push_back(std::move(*result.frame));
         state_changed_.notify_all();
       }
-    } catch (const std::exception& error) {
-      record_failure(side, error.what());
     } catch (...) {
-      record_failure(side, "unknown source failure");
+      record_failure(side, std::current_exception());
     }
   }
 

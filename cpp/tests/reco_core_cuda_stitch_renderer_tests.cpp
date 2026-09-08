@@ -214,6 +214,7 @@ struct FakeCudaControl {
     synchronize_count_fn = library.symbol<int (*)()>("recoFakeCudaStitchSynchronizeCount");
     launch_sequence_fn = library.symbol<int (*)()>("recoFakeCudaStitchLaunchSequence");
     synchronize_sequence_fn = library.symbol<int (*)()>("recoFakeCudaStitchSynchronizeSequence");
+    restore_sequence_fn = library.symbol<int (*)()>("recoFakeCudaStitchRestoreSequence");
     pointer_attribute_count_fn =
         library.symbol<int (*)()>("recoFakeCudaStitchPointerAttributeCount");
     memory_access_count_fn = library.symbol<int (*)()>("recoFakeCudaStitchMemoryAccessCount");
@@ -221,6 +222,8 @@ struct FakeCudaControl {
     release_count_fn = library.symbol<int (*)()>("recoFakeCudaStitchReleaseCount");
     set_current_context_fn =
         library.symbol<void (*)(std::uintptr_t)>("recoFakeCudaStitchSetCurrentContext");
+    fail_next_set_current_fn =
+        library.symbol<void (*)(std::uintptr_t)>("recoFakeCudaStitchFailNextSetCurrent");
     current_context_fn = library.symbol<std::uintptr_t (*)()>("recoFakeCudaStitchCurrentContext");
     fail_module_load_fn = library.symbol<void (*)(int)>("recoFakeCudaStitchFailModuleLoad");
     captured_u64_fn = library.symbol<std::uint64_t (*)(int)>("recoFakeCudaStitchCapturedU64");
@@ -233,11 +236,13 @@ struct FakeCudaControl {
   int synchronize_count() const { return synchronize_count_fn(); }
   int launch_sequence() const { return launch_sequence_fn(); }
   int synchronize_sequence() const { return synchronize_sequence_fn(); }
+  int restore_sequence() const { return restore_sequence_fn(); }
   int pointer_attribute_count() const { return pointer_attribute_count_fn(); }
   int memory_access_count() const { return memory_access_count_fn(); }
   int retain_count() const { return retain_count_fn(); }
   int release_count() const { return release_count_fn(); }
   void set_current_context(std::uintptr_t context) const { set_current_context_fn(context); }
+  void fail_next_set_current(std::uintptr_t context) const { fail_next_set_current_fn(context); }
   std::uintptr_t current_context() const { return current_context_fn(); }
   void fail_module_load(bool fail) const { fail_module_load_fn(fail ? 1 : 0); }
   std::uint64_t captured_u64(int index) const { return captured_u64_fn(index); }
@@ -250,11 +255,13 @@ struct FakeCudaControl {
   int (*synchronize_count_fn)() = nullptr;
   int (*launch_sequence_fn)() = nullptr;
   int (*synchronize_sequence_fn)() = nullptr;
+  int (*restore_sequence_fn)() = nullptr;
   int (*pointer_attribute_count_fn)() = nullptr;
   int (*memory_access_count_fn)() = nullptr;
   int (*retain_count_fn)() = nullptr;
   int (*release_count_fn)() = nullptr;
   void (*set_current_context_fn)(std::uintptr_t) = nullptr;
+  void (*fail_next_set_current_fn)(std::uintptr_t) = nullptr;
   std::uintptr_t (*current_context_fn)() = nullptr;
   void (*fail_module_load_fn)(int) = nullptr;
   std::uint64_t (*captured_u64_fn)(int) = nullptr;
@@ -413,6 +420,55 @@ void compiles_once_and_synchronizes_each_render(const std::filesystem::path& cud
   expect_near(cuda_control.captured_float(1), 255.0F / 219.0F, 1.0e-6F, "limited-range luma scale");
   expect_near(cuda_control.captured_float(2), 128.0F, 1.0e-6F, "limited-range chroma center");
   expect_near(cuda_control.captured_float(13), 127.5F, 1.0e-6F, "full-range chroma center");
+}
+
+void render_synchronizes_before_restoring_the_caller_context(
+    const std::filesystem::path& cuda_runtime, const std::filesystem::path& nvrtc_runtime,
+    const FakeCudaControl& cuda_control) {
+  constexpr std::uintptr_t kCallerContext = 0xCAFE0002U;
+  auto backend = CudaBackend::load(cuda_runtime.string());
+  auto renderer = CudaStereoStitchRenderer::create(config(), backend,
+                                                   NvrtcCompiler::load(nvrtc_runtime.string()));
+  const CudaNv12FrameView left(
+      CudaPitchedPlaneView(backend.retain_device_span(0x10000U, 12U, CudaSpanAccess::Read), 8, 4,
+                           2),
+      CudaPitchedPlaneView(backend.retain_device_span(0x11000U, 4U, CudaSpanAccess::Read), 8, 4, 1),
+      4, 2, YuvColorMatrix::Bt709, YuvColorRange::Limited);
+  const CudaNv12FrameView right(
+      CudaPitchedPlaneView(backend.retain_device_span(0x30000U, 12U, CudaSpanAccess::Read), 8, 4,
+                           2),
+      CudaPitchedPlaneView(backend.retain_device_span(0x31000U, 4U, CudaSpanAccess::Read), 8, 4, 1),
+      4, 2, YuvColorMatrix::Bt709, YuvColorRange::Limited);
+  const CudaRgbaFrameView output(
+      CudaPitchedPlaneView(backend.retain_device_span(0x50000U, 48U, CudaSpanAccess::ReadWrite), 32,
+                           16, 2),
+      4, 2);
+
+  cuda_control.set_current_context(kCallerContext);
+  cuda_control.reset();
+  renderer.render(left, right, output);
+  expect_true(cuda_control.synchronize_sequence() < cuda_control.restore_sequence(),
+              "borrowed render memory is synchronized before caller-context restoration");
+  expect_eq(cuda_control.current_context(), kCallerContext,
+            "successful render restores the caller CUDA context");
+
+  cuda_control.reset();
+  cuda_control.set_current_context(kCallerContext);
+  cuda_control.fail_next_set_current(kCallerContext);
+  try {
+    renderer.render(left, right, output);
+    expect_true(false, "caller-context restoration failure is reported");
+  } catch (const std::runtime_error&) {
+  }
+  expect_eq(cuda_control.launch_count(), 1,
+            "restoration failure occurs after the borrowed-memory kernel launch");
+  expect_eq(cuda_control.synchronize_count(), 1,
+            "restoration failure occurs after borrowed-memory synchronization");
+  expect_true(!backend.context_healthy(), "restoration failure poisons backend context health");
+  expect_true(backend.context_health_error().find("restoration previously failed") !=
+                  std::string::npos,
+              "poisoned backend exposes a context-health diagnostic");
+  cuda_control.set_current_context(0U);
 }
 
 void enforces_device_access_permissions(const std::filesystem::path& cuda_runtime,
@@ -783,6 +839,10 @@ int main() {
   run_case("moved-from renderer",
            [&] { moved_from_renderer_is_diagnosed(cuda_runtime, nvrtc_runtime); });
   run_case("hardware kernel smoke", hardware_kernel_smoke_if_available);
+  run_case("render synchronization precedes context restoration", [&] {
+    render_synchronizes_before_restoring_the_caller_context(cuda_runtime, nvrtc_runtime,
+                                                            cuda_control);
+  });
 
   if (failures != 0) {
     std::cerr << failures << " test(s) failed\n";

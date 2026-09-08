@@ -150,6 +150,10 @@ public:
   [[nodiscard]] static CudaBackend load(std::string_view library_path);
   /// Returns a backend view that reports explicit operations to `trace_sink`.
   [[nodiscard]] CudaBackend with_trace_sink(std::shared_ptr<CudaBackendTraceSink> trace_sink) const;
+  /// Whether caller CUDA context restoration has remained reliable for this loaded driver.
+  [[nodiscard]] bool context_healthy() const noexcept;
+  /// Sticky diagnostic after any caller CUDA context restoration failure.
+  [[nodiscard]] std::string context_health_error() const;
 
   [[nodiscard]] int device_count() const;
   [[nodiscard]] CudaDeviceInfo device_info(int ordinal = 0) const;
@@ -312,6 +316,9 @@ public:
   [[nodiscard]] explicit operator bool() const {
     return module_state_ != nullptr && function_ != nullptr;
   }
+  /// Launches and synchronizes in one CUDA context scope before restoring the caller context.
+  /// Use this for kernels borrowing memory whose owners may be released when the call returns.
+  void launch_and_synchronize(const CudaLaunchConfig& config, std::span<void*> args) const;
   void launch(const CudaLaunchConfig& config, std::span<void*> args) const;
   void synchronize() const;
   void reset();

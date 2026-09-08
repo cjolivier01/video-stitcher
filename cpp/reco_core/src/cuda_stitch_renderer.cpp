@@ -613,11 +613,10 @@ void CudaStereoStitchRenderer::render(const CudaNv12FrameView& left, const CudaN
                                  &output_pitch, &output_width, &output_height};
   const auto grid_x = (output_width + kBlockWidth - 1U) / kBlockWidth;
   const auto grid_y = (output_height + kBlockHeight - 1U) / kBlockHeight;
-  state.kernel.launch({.grid = {grid_x, grid_y, 1},
-                       .block = {kBlockWidth, kBlockHeight, 1},
-                       .shared_memory_bytes = 0},
-                      std::span<void*>(arguments));
-  state.kernel.synchronize();
+  state.kernel.launch_and_synchronize({.grid = {grid_x, grid_y, 1},
+                                       .block = {kBlockWidth, kBlockHeight, 1},
+                                       .shared_memory_bytes = 0},
+                                      std::span<void*>(arguments));
 }
 
 CudaContextId CudaStereoStitchRenderer::context_id() const {
