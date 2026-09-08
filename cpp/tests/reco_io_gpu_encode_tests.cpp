@@ -99,6 +99,10 @@ void pipeline_is_nvmm_and_hardware_only() {
   expect_true(pipeline.find("video/x-raw(memory:NVMM)") != std::string::npos,
               "pipeline requires NVMM caps");
   expect_true(pipeline.find("format=(string)NV12") != std::string::npos, "pipeline requires NV12");
+  expect_true(pipeline.find("colorimetry=(string)bt709") != std::string::npos,
+              "pipeline signals BT.709 limited-range colorimetry");
+  expect_true(pipeline.find("chroma-site=(string)mpeg2") != std::string::npos,
+              "pipeline signals NV12 chroma siting");
   expect_true(pipeline.find("max-size-buffers=8") != std::string::npos,
               "pipeline queue matches bounded pool");
   expect_true(pipeline.find("nvv4l2h264enc") != std::string::npos,

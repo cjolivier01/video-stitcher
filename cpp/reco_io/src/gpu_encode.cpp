@@ -155,7 +155,8 @@ std::string build_gstreamer_gpu_encode_pipeline(const GpuEncodeConfig& config) {
            << config.pool_capacity
            << " caps=\"video/x-raw(memory:NVMM),format=(string)NV12,width=(int)" << config.width
            << ",height=(int)" << config.height << ",framerate=(fraction)" << config.fps_numerator
-           << '/' << config.fps_denominator << "\""
+           << '/' << config.fps_denominator
+           << ",colorimetry=(string)bt709,chroma-site=(string)mpeg2\""
            << " ! queue max-size-buffers=" << config.pool_capacity
            << " max-size-bytes=0 max-size-time=0"
            << " ! " << gstreamer_hardware_encoder_factory(config.codec)

@@ -193,6 +193,10 @@ void run_round_trip() {
   if (mapped.view().width() != width || mapped.view().height() != height) {
     throw std::runtime_error("round-trip decode did not remain CUDA/NVMM resident");
   }
+  if (mapped.view().color_matrix() != YuvColorMatrix::Bt709 ||
+      mapped.view().color_range() != YuvColorRange::Limited) {
+    throw std::runtime_error("round-trip decode did not preserve BT.709 limited-range metadata");
+  }
   decoder->request_stop();
 
   auto remuxed_audio = AudioPassthroughSource::open(
