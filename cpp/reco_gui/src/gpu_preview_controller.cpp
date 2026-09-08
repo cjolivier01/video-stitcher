@@ -205,11 +205,13 @@ public:
                                                              *cuda_, compiler));
     rgba_storage_ = cuda_->allocate_pitched(static_cast<std::size_t>(config.output_width) * 4U,
                                             config.output_height, 4U);
-    rgba_view_.emplace(core::CudaPitchedPlaneView(
-                           rgba_storage_.buffer.ptr(), rgba_storage_.buffer.size(),
-                           rgba_storage_.pitch, static_cast<std::size_t>(config.output_width) * 4U,
-                           config.output_height, cuda_->primary_context_id(device), device),
-                       config.output_width, config.output_height);
+    rgba_view_.emplace(
+        core::CudaPitchedPlaneView(
+            cuda_->retain_device_span(rgba_storage_.buffer.ptr(), rgba_storage_.buffer.size(),
+                                      core::CudaSpanAccess::ReadWrite, device),
+            rgba_storage_.pitch, static_cast<std::size_t>(config.output_width) * 4U,
+            config.output_height),
+        config.output_width, config.output_height);
     converter_.emplace(core::CudaRgbaToNv12Converter::create(
         {.width = config.output_width, .height = config.output_height, .device_ordinal = device},
         *cuda_, compiler));
