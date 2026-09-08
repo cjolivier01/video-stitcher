@@ -174,7 +174,7 @@ extern "C" int cuCtxSynchronize() {
   return current_context == reinterpret_cast<void*>(0xC0DA) ? 0 : 1;
 }
 
-extern "C" int cuPointerGetAttribute(void* data, int attribute, std::uint64_t pointer) {
+extern "C" int cuPointerGetAttribute(void* data, int attribute, unsigned long long pointer) {
   if (data == nullptr || current_context != reinterpret_cast<void*>(0xC0DA)) {
     return 1;
   }
@@ -212,6 +212,9 @@ extern "C" int cuPointerGetAttribute(void* data, int attribute, std::uint64_t po
   case 19:
     *static_cast<std::uint64_t*>(data) = base;
     return 0;
+  case 20:
+    *static_cast<unsigned long long*>(data) = base;
+    return 0;
   default:
     return 1;
   }
@@ -226,7 +229,7 @@ extern "C" int cuMemGetAllocationGranularity(std::size_t* granularity, const voi
   return 0;
 }
 
-extern "C" int cuMemGetAccess(std::uint64_t* flags, const void*, std::uint64_t pointer) {
+extern "C" int cuMemGetAccess(unsigned long long* flags, const void*, unsigned long long pointer) {
   if (flags == nullptr || current_context != reinterpret_cast<void*>(0xC0DA)) {
     return 1;
   }
@@ -235,7 +238,7 @@ extern "C" int cuMemGetAccess(std::uint64_t* flags, const void*, std::uint64_t p
   return base == kContextIndependentBase || base == kNoAccessBase || base == kReadOnlyBase ? 0 : 1;
 }
 
-extern "C" int cuMemRetainAllocationHandle(std::uint64_t* handle, void* address) {
+extern "C" int cuMemRetainAllocationHandle(unsigned long long* handle, void* address) {
   if (handle == nullptr || current_context != reinterpret_cast<void*>(0xC0DA)) {
     return 1;
   }
@@ -243,11 +246,11 @@ extern "C" int cuMemRetainAllocationHandle(std::uint64_t* handle, void* address)
   if (base != kContextIndependentBase && base != kNoAccessBase && base != kReadOnlyBase) {
     return 1;
   }
-  *handle = static_cast<std::uint64_t>(base);
+  *handle = static_cast<unsigned long long>(base);
   return 0;
 }
 
-extern "C" int cuMemRelease(std::uint64_t handle) {
+extern "C" int cuMemRelease(unsigned long long handle) {
   return handle == kContextIndependentBase || handle == kNoAccessBase || handle == kReadOnlyBase
              ? 0
              : 1;
@@ -263,20 +266,26 @@ extern "C" int cuMemsetD8_v2(std::uint64_t, unsigned char, std::size_t) { return
 extern "C" int cuMemcpy2D_v2(const void*) { return 1; }
 extern "C" int cuMemcpyDtoH_v2(void*, std::uint64_t, std::size_t) { return 1; }
 extern "C" int cuMemGetInfo_v2(std::size_t*, std::size_t*) { return 1; }
-extern "C" int cuMemAddressReserve(std::uint64_t*, std::size_t, std::size_t, std::uint64_t,
-                                   std::uint64_t) {
+extern "C" int cuMemAddressReserve(unsigned long long*, std::size_t, std::size_t,
+                                   unsigned long long, unsigned long long) {
   return 1;
 }
-extern "C" int cuMemCreate(std::uint64_t*, std::size_t, const void*, std::uint64_t) { return 1; }
-extern "C" int cuMemExportToShareableHandle(void*, std::uint64_t, unsigned int, std::uint64_t) {
+extern "C" int cuMemCreate(unsigned long long*, std::size_t, const void*, unsigned long long) {
   return 1;
 }
-extern "C" int cuMemMap(std::uint64_t, std::size_t, std::size_t, std::uint64_t, std::uint64_t) {
+extern "C" int cuMemExportToShareableHandle(void*, unsigned long long, unsigned int,
+                                            unsigned long long) {
   return 1;
 }
-extern "C" int cuMemSetAccess(std::uint64_t, std::size_t, const void*, std::size_t) { return 1; }
-extern "C" int cuMemUnmap(std::uint64_t, std::size_t) { return 1; }
-extern "C" int cuMemAddressFree(std::uint64_t, std::size_t) { return 1; }
+extern "C" int cuMemMap(unsigned long long, std::size_t, std::size_t, unsigned long long,
+                        unsigned long long) {
+  return 1;
+}
+extern "C" int cuMemSetAccess(unsigned long long, std::size_t, const void*, std::size_t) {
+  return 1;
+}
+extern "C" int cuMemUnmap(unsigned long long, std::size_t) { return 1; }
+extern "C" int cuMemAddressFree(unsigned long long, std::size_t) { return 1; }
 extern "C" int cuModuleLoadData(void**, const void*) { return 1; }
 extern "C" int cuModuleUnload(void*) { return 1; }
 extern "C" int cuModuleGetFunction(void**, void*, const char*) { return 1; }

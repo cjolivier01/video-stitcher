@@ -172,9 +172,10 @@ public:
   ///
   /// Context-owned allocations are checked against their complete allocation range. CUDA VMM
   /// mappings are checked at every minimum-granularity region and retain each physical allocation
-  /// handle, allowing consumers to detect aliases at distinct virtual addresses. The caller must
-  /// keep the virtual mapping live and its access permissions unchanged while the returned lease
-  /// is in use.
+  /// handle. Physical memory-block identities detect aliases at distinct virtual addresses; when
+  /// an older driver cannot provide those identities, two distinct VMM spans compare as aliases so
+  /// consumers fail closed. The caller must keep the virtual mapping live and its access
+  /// permissions unchanged while the returned lease is in use.
   [[nodiscard]] CudaValidatedSpan retain_device_span(CudaDevicePtr ptr,
                                                      std::size_t accessible_bytes,
                                                      CudaSpanAccess required_access,
@@ -207,8 +208,8 @@ private:
 
 /// Retained proof that a complete CUDA device span was validated by the driver.
 ///
-/// Copies share retained VMM allocation handles. `aliases` conservatively treats any spans backed
-/// by the same VMM physical allocation as aliases, even when their virtual addresses differ.
+/// Copies share retained VMM allocation handles and physical memory-block identities. `aliases`
+/// conservatively treats VMM spans with unknown physical identities as aliases.
 class CudaValidatedSpan {
 public:
   CudaValidatedSpan() = default;

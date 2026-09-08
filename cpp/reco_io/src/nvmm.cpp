@@ -308,6 +308,7 @@ struct CudaFunctions {
   UnregisterResource unregister_resource = nullptr;
   CudaDevice device = 0;
   CudaContext primary_context = nullptr;
+  std::atomic<bool> context_restore_failed = false;
 };
 
 std::shared_ptr<CudaFunctions> cuda_functions() {
@@ -319,6 +320,13 @@ std::shared_ptr<CudaFunctions> cuda_functions() {
     return std::make_shared<CudaFunctions>(path);
   }();
   return functions;
+}
+
+void require_healthy_cuda_context(const std::shared_ptr<CudaFunctions>& functions) {
+  if (functions->context_restore_failed.load(std::memory_order_acquire)) {
+    throw NvmmError(
+        "CUDA caller context restoration previously failed during NvBufSurface cleanup");
+  }
 }
 
 class DeviceZeroContext {
@@ -454,6 +462,7 @@ std::string cleanup_failure_message(const CudaMappingState& mapping) {
 }
 
 bool release_surface_mapping(CudaMappingState& mapping) noexcept {
+  bool resources_released = false;
   try {
     DeviceZeroContext context(mapping.cuda);
     if (mapping.kind == SurfaceMappingKind::EglImage) {
@@ -475,12 +484,20 @@ bool release_surface_mapping(CudaMappingState& mapping) noexcept {
       mapping.cleanup_failure = SurfaceCleanupFailure::CudaUnmap;
       return false;
     }
+    resources_released = true;
     context.restore();
     mapping.surface = nullptr;
     mapping.cleanup_failure = SurfaceCleanupFailure::None;
     mapping.cleanup_cuda_result = kCudaSuccess;
     return true;
   } catch (const std::exception&) {
+    if (resources_released) {
+      mapping.cuda->context_restore_failed.store(true, std::memory_order_release);
+      mapping.surface = nullptr;
+      mapping.cleanup_failure = SurfaceCleanupFailure::None;
+      mapping.cleanup_cuda_result = kCudaSuccess;
+      return true;
+    }
     mapping.cleanup_failure = SurfaceCleanupFailure::Context;
     return false;
   } catch (...) {
@@ -855,7 +872,7 @@ bool is_nvmm_cuda_interop_available() {
 #if defined(__linux__)
   try {
     (void)nvbuf_functions();
-    (void)cuda_functions();
+    require_healthy_cuda_context(cuda_functions());
     return true;
   } catch (...) {
     return false;
@@ -869,7 +886,7 @@ std::string nvmm_cuda_interop_availability_error() {
 #if defined(__linux__)
   try {
     (void)nvbuf_functions();
-    (void)cuda_functions();
+    require_healthy_cuda_context(cuda_functions());
     return {};
   } catch (const std::exception& error) {
     return error.what();
@@ -941,6 +958,7 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info, std::shared_ptr<
     }
   }
   auto cuda = cuda_functions();
+  require_healthy_cuda_context(cuda);
   DeviceZeroContext context(cuda);
   if (info.memory_type == NvmmMemoryType::CudaDevice) {
     void* base = direct_cuda_data_ptr(info);

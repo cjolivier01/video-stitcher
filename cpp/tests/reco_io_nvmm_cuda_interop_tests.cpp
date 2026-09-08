@@ -766,7 +766,10 @@ void context_restoration_failures_are_fail_closed() {
 
   auto mapped_params = make_params();
   auto mapped_surface = make_surface(mapped_params);
-  auto mapped = map_nvmm_frame_to_cuda(extract_info(&mapped_surface), std::make_shared<int>(31));
+  auto mapped_owner = std::make_shared<int>(31);
+  std::weak_ptr<int> mapped_owner_lifetime = mapped_owner;
+  auto mapped = map_nvmm_frame_to_cuda(extract_info(&mapped_surface), mapped_owner);
+  mapped_owner.reset();
   expect_eq(set_current(reinterpret_cast<void*>(kCallerContext)), 0,
             "cleanup caller CUDA context is selected");
   fail_next_set(kCallerContext);
@@ -775,12 +778,19 @@ void context_restoration_failures_are_fail_closed() {
               "cleanup unmaps the CUDA buffer before restoration failure");
   expect_eq(current_context(), kCallerContext,
             "cleanup unwind retries caller CUDA context restoration");
+  expect_true(mapped_owner_lifetime.expired(),
+              "completed cleanup releases its decoder owner after restoration failure");
   expect_nvmm_error_contains(
       [&] {
         (void)map_nvmm_frame_to_cuda(extract_info(&mapped_surface), std::make_shared<int>(32));
       },
-      "failed to select CUDA device 0 context during cleanup",
-      "cleanup restoration failure poisons the stale mapping");
+      "context restoration previously failed",
+      "cleanup restoration failure poisons CUDA context health without retaining the mapping");
+  expect_true(!is_nvmm_cuda_interop_available(),
+              "CUDA interop availability reflects poisoned context health");
+  expect_true(nvmm_cuda_interop_availability_error().find(
+                  "context restoration previously failed") != std::string::npos,
+              "CUDA interop availability reports the context restoration failure");
   expect_eq(set_current(nullptr), 0, "fake CUDA caller context is cleared");
 #endif
 }

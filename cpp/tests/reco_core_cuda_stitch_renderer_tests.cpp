@@ -393,7 +393,7 @@ void compiles_once_and_synchronizes_each_render(const std::filesystem::path& cud
   expect_eq(nvrtc_control.create_count(), 1, "render never recompiles the kernel");
   expect_eq(cuda_control.launch_count(), 2, "one fused launch per render");
   expect_eq(cuda_control.synchronize_count(), 2, "each render synchronizes before return");
-  expect_eq(cuda_control.pointer_attribute_count(), 64,
+  expect_eq(cuda_control.pointer_attribute_count(), 66,
             "each render validates legacy pointers and the VMM output provenance");
   expect_eq(cuda_control.memory_access_count(), 2,
             "each render validates the complete VMM output access range");
@@ -458,6 +458,13 @@ void rejects_physical_vmm_aliases(const std::filesystem::path& cuda_runtime,
       },
       "overlap", "distinct virtual mappings of one physical allocation are rejected");
   expect_eq(cuda_control.launch_count(), 0, "physical alias rejection prevents kernel launch");
+
+  auto backend = CudaBackend::load(cuda_runtime.string());
+  const auto known = backend.retain_device_span(0x50000U, 48U, CudaSpanAccess::ReadWrite);
+  const auto distinct = backend.retain_device_span(0x100000U, 0x1000U, CudaSpanAccess::Read);
+  expect_true(!known.aliases(distinct), "distinct physical VMM block identities do not alias");
+  const auto unknown = backend.retain_device_span(0x110000U, 48U, CudaSpanAccess::Read);
+  expect_true(known.aliases(unknown), "unknown VMM physical identity fails closed as an alias");
 }
 
 void retained_span_validation_avoids_render_time_driver_queries(

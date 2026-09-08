@@ -29,6 +29,7 @@ constexpr std::uint64_t kReadOnlyAllocation = 0xF0000U;
 constexpr std::uint64_t kContextIndependentMapping = 0x50000U;
 constexpr std::uint64_t kPhysicalAliasMapping = 0x60000U;
 constexpr std::uint64_t kSplitAccessMapping = 0x100000U;
+constexpr std::uint64_t kUnknownBlockIdMapping = 0x110000U;
 thread_local void* current_context = nullptr;
 std::atomic<int> retain_count{0};
 std::atomic<int> release_count{0};
@@ -226,7 +227,8 @@ RECO_FAKE_CUDA_EXPORT int cuCtxSynchronize() {
   return 0;
 }
 
-RECO_FAKE_CUDA_EXPORT int cuPointerGetAttribute(void* data, int attribute, std::uint64_t pointer) {
+RECO_FAKE_CUDA_EXPORT int cuPointerGetAttribute(void* data, int attribute,
+                                                unsigned long long pointer) {
   ++pointer_attribute_count;
   const auto base = allocation_base(pointer);
   if (data == nullptr || retain_count.load() <= 0 ||
@@ -240,7 +242,8 @@ RECO_FAKE_CUDA_EXPORT int cuPointerGetAttribute(void* data, int attribute, std::
         base == kForeignContextAllocation
             ? reinterpret_cast<void*>(kForeignContextIdentity)
             : (base == kContextIndependentMapping || base == kPhysicalAliasMapping ||
-                       base == kSplitAccessMapping || base == kSplitAccessMapping + 0x1000U
+                       base == kSplitAccessMapping || base == kSplitAccessMapping + 0x1000U ||
+                       base == kUnknownBlockIdMapping
                    ? nullptr
                    : reinterpret_cast<void*>(kContextIdentity));
     return 0;
@@ -268,6 +271,13 @@ RECO_FAKE_CUDA_EXPORT int cuPointerGetAttribute(void* data, int attribute, std::
     return 0;
   case 19:
     *static_cast<std::uint64_t*>(data) = base;
+    return 0;
+  case 20:
+    if (base == kUnknownBlockIdMapping) {
+      return 1;
+    }
+    *static_cast<unsigned long long*>(data) =
+        base == kContextIndependentMapping || base == kPhysicalAliasMapping ? 0xB10CU : base;
     return 0;
   default:
     return 1;
@@ -347,7 +357,8 @@ RECO_FAKE_CUDA_EXPORT int cuMemGetAllocationGranularity(std::size_t* granularity
   *granularity = kAllocationAlignment;
   return 0;
 }
-RECO_FAKE_CUDA_EXPORT int cuMemGetAccess(std::uint64_t* flags, const void*, std::uint64_t pointer) {
+RECO_FAKE_CUDA_EXPORT int cuMemGetAccess(unsigned long long* flags, const void*,
+                                         unsigned long long pointer) {
   if (flags == nullptr || current_context != reinterpret_cast<void*>(kContextIdentity)) {
     return 1;
   }
@@ -355,14 +366,15 @@ RECO_FAKE_CUDA_EXPORT int cuMemGetAccess(std::uint64_t* flags, const void*, std:
   *flags = pointer == kSplitAccessMapping + kAllocationAlignment ? 0U : 3U;
   return 0;
 }
-RECO_FAKE_CUDA_EXPORT int cuMemRetainAllocationHandle(std::uint64_t* handle, void* address) {
+RECO_FAKE_CUDA_EXPORT int cuMemRetainAllocationHandle(unsigned long long* handle, void* address) {
   if (handle == nullptr || current_context != reinterpret_cast<void*>(kContextIdentity)) {
     return 1;
   }
   const auto pointer = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(address));
   const auto base = allocation_base(pointer);
-  if (base == kContextIndependentMapping || base == kPhysicalAliasMapping) {
-    *handle = 0x500U;
+  if (base == kContextIndependentMapping || base == kPhysicalAliasMapping ||
+      base == kUnknownBlockIdMapping) {
+    *handle = base;
     return 0;
   }
   if (base == kSplitAccessMapping || base == kSplitAccessMapping + kAllocationAlignment) {
@@ -371,26 +383,31 @@ RECO_FAKE_CUDA_EXPORT int cuMemRetainAllocationHandle(std::uint64_t* handle, voi
   }
   return 1;
 }
-RECO_FAKE_CUDA_EXPORT int cuMemAddressReserve(std::uint64_t*, std::size_t, std::size_t,
-                                              std::uint64_t, std::uint64_t) {
+RECO_FAKE_CUDA_EXPORT int cuMemAddressReserve(unsigned long long*, std::size_t, std::size_t,
+                                              unsigned long long, unsigned long long) {
   return 1;
 }
-RECO_FAKE_CUDA_EXPORT int cuMemCreate(std::uint64_t*, std::size_t, const void*, std::uint64_t) {
+RECO_FAKE_CUDA_EXPORT int cuMemCreate(unsigned long long*, std::size_t, const void*,
+                                      unsigned long long) {
   return 1;
 }
-RECO_FAKE_CUDA_EXPORT int cuMemExportToShareableHandle(void*, std::uint64_t, unsigned int,
-                                                       std::uint64_t) {
+RECO_FAKE_CUDA_EXPORT int cuMemExportToShareableHandle(void*, unsigned long long, unsigned int,
+                                                       unsigned long long) {
   return 1;
 }
-RECO_FAKE_CUDA_EXPORT int cuMemMap(std::uint64_t, std::size_t, std::size_t, std::uint64_t,
-                                   std::uint64_t) {
+RECO_FAKE_CUDA_EXPORT int cuMemMap(unsigned long long, std::size_t, std::size_t, unsigned long long,
+                                   unsigned long long) {
   return 1;
 }
-RECO_FAKE_CUDA_EXPORT int cuMemSetAccess(std::uint64_t, std::size_t, const void*, std::size_t) {
+RECO_FAKE_CUDA_EXPORT int cuMemSetAccess(unsigned long long, std::size_t, const void*,
+                                         std::size_t) {
   return 1;
 }
-RECO_FAKE_CUDA_EXPORT int cuMemRelease(std::uint64_t handle) {
-  return handle == 0x500U || handle == 0x1000U ? 0 : 1;
+RECO_FAKE_CUDA_EXPORT int cuMemRelease(unsigned long long handle) {
+  return handle == kContextIndependentMapping || handle == kPhysicalAliasMapping ||
+                 handle == kUnknownBlockIdMapping || handle == 0x1000U
+             ? 0
+             : 1;
 }
-RECO_FAKE_CUDA_EXPORT int cuMemUnmap(std::uint64_t, std::size_t) { return 1; }
-RECO_FAKE_CUDA_EXPORT int cuMemAddressFree(std::uint64_t, std::size_t) { return 1; }
+RECO_FAKE_CUDA_EXPORT int cuMemUnmap(unsigned long long, std::size_t) { return 1; }
+RECO_FAKE_CUDA_EXPORT int cuMemAddressFree(unsigned long long, std::size_t) { return 1; }

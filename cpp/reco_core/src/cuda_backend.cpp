@@ -28,8 +28,19 @@ using CUfunction = void*;
 using CUmodule = void*;
 using CUresult = int;
 using CUstream = void*;
-using CUdeviceptr = std::uint64_t;
-using CUmemGenericAllocationHandle = std::uint64_t;
+#if defined(_WIN32)
+#define RECO_CUDA_API __stdcall
+#else
+#define RECO_CUDA_API
+#endif
+
+using CUdeviceptr = unsigned long long;
+using CUmemGenericAllocationHandle = unsigned long long;
+using CudaMemAccessFlags = unsigned long long;
+
+static_assert(sizeof(void*) == 8, "the CUDA backend supports only 64-bit targets");
+static_assert(sizeof(CUdeviceptr) == sizeof(void*));
+static_assert(sizeof(CUmemGenericAllocationHandle) == 8);
 
 constexpr CUresult kCudaSuccess = 0;
 constexpr unsigned int kMemoryTypeHost = 1;
@@ -41,6 +52,7 @@ constexpr int kPointerAttributeRangeStartAddress = 11;
 constexpr int kPointerAttributeRangeSize = 12;
 constexpr int kPointerAttributeMapped = 13;
 constexpr int kPointerAttributeAccessFlags = 16;
+constexpr int kPointerAttributeMemoryBlockId = 20;
 constexpr unsigned int kMemAllocationTypePinned = 1;
 constexpr unsigned int kMemLocationTypeDevice = 1;
 #if defined(_WIN32)
@@ -379,24 +391,29 @@ struct CudaBackend::Impl {
   CUresult (*cu_memcpy_2d)(const CudaMemcpy2D*) = nullptr;
   CUresult (*cu_memcpy_dtoh)(void*, CUdeviceptr, std::size_t) = nullptr;
   CUresult (*cu_mem_get_info)(std::size_t*, std::size_t*) = nullptr;
-  CUresult (*cu_pointer_get_attribute)(void*, int, CUdeviceptr) = nullptr;
-  CUresult (*cu_mem_get_allocation_granularity)(std::size_t*, const CudaMemAllocationProp*,
-                                                unsigned int) = nullptr;
-  CUresult (*cu_mem_get_access)(std::uint64_t*, const CudaMemLocation*, CUdeviceptr) = nullptr;
-  CUresult (*cu_mem_retain_allocation_handle)(CUmemGenericAllocationHandle*, void*) = nullptr;
-  CUresult (*cu_mem_address_reserve)(CUdeviceptr*, std::size_t, std::size_t, CUdeviceptr,
-                                     std::uint64_t) = nullptr;
-  CUresult (*cu_mem_create)(CUmemGenericAllocationHandle*, std::size_t,
-                            const CudaMemAllocationProp*, std::uint64_t) = nullptr;
-  CUresult (*cu_mem_export_to_shareable_handle)(void*, CUmemGenericAllocationHandle, unsigned int,
-                                                std::uint64_t) = nullptr;
-  CUresult (*cu_mem_map)(CUdeviceptr, std::size_t, std::size_t, CUmemGenericAllocationHandle,
-                         std::uint64_t) = nullptr;
-  CUresult (*cu_mem_set_access)(CUdeviceptr, std::size_t, const CudaMemAccessDesc*,
-                                std::size_t) = nullptr;
-  CUresult (*cu_mem_release)(CUmemGenericAllocationHandle) = nullptr;
-  CUresult (*cu_mem_unmap)(CUdeviceptr, std::size_t) = nullptr;
-  CUresult (*cu_mem_address_free)(CUdeviceptr, std::size_t) = nullptr;
+  CUresult(RECO_CUDA_API* cu_pointer_get_attribute)(void*, int, CUdeviceptr) = nullptr;
+  CUresult(RECO_CUDA_API* cu_mem_get_allocation_granularity)(std::size_t*,
+                                                             const CudaMemAllocationProp*,
+                                                             unsigned int) = nullptr;
+  CUresult(RECO_CUDA_API* cu_mem_get_access)(CudaMemAccessFlags*, const CudaMemLocation*,
+                                             CUdeviceptr) = nullptr;
+  CUresult(RECO_CUDA_API* cu_mem_retain_allocation_handle)(CUmemGenericAllocationHandle*,
+                                                           void*) = nullptr;
+  CUresult(RECO_CUDA_API* cu_mem_address_reserve)(CUdeviceptr*, std::size_t, std::size_t,
+                                                  CUdeviceptr, unsigned long long) = nullptr;
+  CUresult(RECO_CUDA_API* cu_mem_create)(CUmemGenericAllocationHandle*, std::size_t,
+                                         const CudaMemAllocationProp*,
+                                         unsigned long long) = nullptr;
+  CUresult(RECO_CUDA_API* cu_mem_export_to_shareable_handle)(void*, CUmemGenericAllocationHandle,
+                                                             unsigned int,
+                                                             unsigned long long) = nullptr;
+  CUresult(RECO_CUDA_API* cu_mem_map)(CUdeviceptr, std::size_t, std::size_t,
+                                      CUmemGenericAllocationHandle, unsigned long long) = nullptr;
+  CUresult(RECO_CUDA_API* cu_mem_set_access)(CUdeviceptr, std::size_t, const CudaMemAccessDesc*,
+                                             std::size_t) = nullptr;
+  CUresult(RECO_CUDA_API* cu_mem_release)(CUmemGenericAllocationHandle) = nullptr;
+  CUresult(RECO_CUDA_API* cu_mem_unmap)(CUdeviceptr, std::size_t) = nullptr;
+  CUresult(RECO_CUDA_API* cu_mem_address_free)(CUdeviceptr, std::size_t) = nullptr;
   CUresult (*cu_module_load_data)(CUmodule*, const void*) = nullptr;
   CUresult (*cu_module_unload)(CUmodule) = nullptr;
   CUresult (*cu_module_get_function)(CUfunction*, CUmodule, const char*) = nullptr;
@@ -404,6 +421,8 @@ struct CudaBackend::Impl {
                                unsigned int, unsigned int, unsigned int, CUstream, void**,
                                void**) = nullptr;
 };
+
+#undef RECO_CUDA_API
 
 namespace {
 
@@ -461,12 +480,16 @@ struct CudaValidatedSpan::State {
   State(std::shared_ptr<CudaBackend::Impl> backend_in, CudaDevicePtr ptr_in, std::size_t size_in,
         std::uintptr_t context_id_in, int device_ordinal_in, CudaSpanAccess access_in,
         CudaDevicePtr validated_range_base_in, std::size_t validated_range_bytes_in,
-        std::vector<CUmemGenericAllocationHandle> allocation_handles_in)
+        std::vector<CUmemGenericAllocationHandle> allocation_handles_in,
+        std::vector<unsigned long long> memory_block_ids_in, bool is_vmm_in,
+        bool vmm_identity_complete_in)
       : backend(std::move(backend_in)), ptr(ptr_in), size(size_in), context_id(context_id_in),
         device_ordinal(device_ordinal_in), access(access_in),
         validated_range_base(validated_range_base_in),
         validated_range_bytes(validated_range_bytes_in),
-        allocation_handles(std::move(allocation_handles_in)) {}
+        allocation_handles(std::move(allocation_handles_in)),
+        memory_block_ids(std::move(memory_block_ids_in)), is_vmm(is_vmm_in),
+        vmm_identity_complete(vmm_identity_complete_in) {}
 
   State(const State&) = delete;
   State& operator=(const State&) = delete;
@@ -489,6 +512,9 @@ struct CudaValidatedSpan::State {
   CudaDevicePtr validated_range_base = 0;
   std::size_t validated_range_bytes = 0;
   std::vector<CUmemGenericAllocationHandle> allocation_handles;
+  std::vector<unsigned long long> memory_block_ids;
+  bool is_vmm = false;
+  bool vmm_identity_complete = false;
 };
 
 CudaValidatedSpan::CudaValidatedSpan(std::shared_ptr<State> state) : state_(std::move(state)) {}
@@ -562,9 +588,15 @@ bool CudaValidatedSpan::aliases(const CudaValidatedSpan& other) const {
   if (state_->ptr <= other_last && other.state_->ptr <= this_last) {
     return true;
   }
-  for (const auto handle : state_->allocation_handles) {
-    if (std::find(other.state_->allocation_handles.begin(), other.state_->allocation_handles.end(),
-                  handle) != other.state_->allocation_handles.end()) {
+  if (!state_->is_vmm || !other.state_->is_vmm) {
+    return false;
+  }
+  if (!state_->vmm_identity_complete || !other.state_->vmm_identity_complete) {
+    return true;
+  }
+  for (const auto block_id : state_->memory_block_ids) {
+    if (std::find(other.state_->memory_block_ids.begin(), other.state_->memory_block_ids.end(),
+                  block_id) != other.state_->memory_block_ids.end()) {
       return true;
     }
   }
@@ -1195,6 +1227,8 @@ CudaValidatedSpan CudaBackend::retain_device_span(CudaDevicePtr ptr, std::size_t
   CudaDevicePtr validated_range_base = ptr;
   std::size_t validated_range_bytes = accessible_bytes;
   std::vector<CUmemGenericAllocationHandle> allocation_handles;
+  std::vector<unsigned long long> memory_block_ids;
+  bool vmm_identity_complete = pointer_context == nullptr;
   if (pointer_context != nullptr) {
     unsigned int access_flags = 0;
     check_cuda_pointer(
@@ -1239,10 +1273,24 @@ CudaValidatedSpan CudaBackend::retain_device_span(CudaDevicePtr ptr, std::size_t
     const CudaMemLocation location = {.type = kMemLocationTypeDevice, .id = device_ordinal};
     try {
       for (;;) {
-        std::uint64_t access_flags = 0;
+        CudaMemAccessFlags access_flags = 0;
         check_cuda_pointer("cuMemGetAccess",
                            impl_->cu_mem_get_access(&access_flags, &location, region));
         validate_access_flags(access_flags, required_access);
+
+        if (vmm_identity_complete) {
+          unsigned long long block_id = 0;
+          if (impl_->cu_pointer_get_attribute(&block_id, kPointerAttributeMemoryBlockId, region) ==
+              kCudaSuccess) {
+            if (std::find(memory_block_ids.begin(), memory_block_ids.end(), block_id) ==
+                memory_block_ids.end()) {
+              memory_block_ids.push_back(block_id);
+            }
+          } else {
+            memory_block_ids.clear();
+            vmm_identity_complete = false;
+          }
+        }
 
         CUmemGenericAllocationHandle handle = 0;
         check_cuda_pointer(
@@ -1281,7 +1329,8 @@ CudaValidatedSpan CudaBackend::retain_device_span(CudaDevicePtr ptr, std::size_t
     state = std::make_shared<CudaValidatedSpan::State>(
         impl_, ptr, accessible_bytes, reinterpret_cast<std::uintptr_t>(retained_context),
         device_ordinal, required_access, validated_range_base, validated_range_bytes,
-        std::move(allocation_handles));
+        std::move(allocation_handles), std::move(memory_block_ids), pointer_context == nullptr,
+        vmm_identity_complete);
   } catch (...) {
     for (const auto handle : allocation_handles) {
       (void)impl_->cu_mem_release(handle);
