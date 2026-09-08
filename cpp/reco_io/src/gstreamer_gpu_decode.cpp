@@ -1,5 +1,6 @@
 #include "reco/io/gpu_decode.hpp"
 
+#include "gstreamer_gpu_decode_internal.hpp"
 #include "reco/core/path.hpp"
 #include "reco/core/windows_runtime_library.hpp"
 
@@ -388,14 +389,22 @@ public:
 
   [[nodiscard]] bool interrupt() noexcept {
     std::lock_guard lock(mutex_);
-    if (interrupted_ || closed_ || pipeline == nullptr) {
+    if (interrupted_ || closed_) {
       return true;
+    }
+    if (pipeline == nullptr) {
+      return false;
     }
     if (void* flush = api_->event_new_flush_start(); flush != nullptr) {
       // gst_element_send_event takes ownership of the event, including on failure.
       interrupted_ = api_->element_send_event(pipeline, flush) != 0;
     }
     return interrupted_;
+  }
+
+  void publish_pipeline(void* value) noexcept {
+    std::lock_guard lock(mutex_);
+    pipeline = value;
   }
 
   void close() noexcept {
@@ -896,6 +905,9 @@ public:
   ~GstreamerGpuFileDecodeSource() override { close(); }
 
   void start() {
+    if (stop_startup_if_requested()) {
+      return;
+    }
     std::uint32_t major = 0;
     std::uint32_t minor = 0;
     std::uint32_t micro = 0;
@@ -917,10 +929,13 @@ public:
     }
 
     pipeline_ = api_->parse_launch(pipeline_description_.c_str(), &error);
-    resources_->pipeline = pipeline_;
+    resources_->publish_pipeline(pipeline_);
     if (pipeline_ == nullptr || error != nullptr) {
       throw GpuDecodeError("GStreamer pipeline parse failed: " +
                            take_error(api_, error, "parse returned no pipeline"));
+    }
+    if (stop_startup_if_requested()) {
+      return;
     }
     if (runtime_) {
       if (const auto provenance_error = validate_nvbufsurface_runtime_provenance(runtime_);
@@ -981,13 +996,20 @@ public:
     if (bus_ == nullptr) {
       throw GpuDecodeError("GStreamer pipeline does not provide a message bus");
     }
+    if (stop_startup_if_requested()) {
+      return;
+    }
     if (config_.start_frame_index.has_value()) {
       seek_pipeline_to_frame(*config_.start_frame_index, true);
+      startup_complete_.store(true, std::memory_order_release);
+      (void)stop_startup_if_requested();
       return;
     }
     if (api_->element_set_state(pipeline_, kGstStatePlaying) == kGstStateChangeFailure) {
       throw GpuDecodeError("GStreamer pipeline rejected the PLAYING state");
     }
+    startup_complete_.store(true, std::memory_order_release);
+    (void)stop_startup_if_requested();
   }
 
   [[nodiscard]] const GpuFileDecodeConfig& config() const override { return config_; }
@@ -999,7 +1021,8 @@ public:
     // Every racing caller attempts the idempotent interrupt. This avoids a caller observing the
     // stop flag in the interval before the first caller has flushed the pipeline.
     const bool interrupted = resources_->interrupt();
-    if (!interrupted || stop_drain_started_.exchange(true, std::memory_order_acq_rel)) {
+    if (!interrupted || !startup_complete_.load(std::memory_order_acquire) ||
+        stop_drain_started_.exchange(true, std::memory_order_acq_rel)) {
       return;
     }
     // Flush first: NVIDIA GStreamer elements can otherwise retain a streaming-pad lock while a
@@ -1163,6 +1186,14 @@ public:
   }
 
 private:
+  [[nodiscard]] bool stop_startup_if_requested() noexcept {
+    if (!stop_requested_.load(std::memory_order_acquire)) {
+      return false;
+    }
+    (void)resources_->interrupt();
+    return true;
+  }
+
   void seek_pipeline_to_frame(std::uint64_t frame_index, bool initial) {
     if (!config_.indexed_fps_numerator.has_value() ||
         !config_.indexed_stream_time_origin_ns.has_value()) {
@@ -1445,34 +1476,70 @@ private:
   std::uint16_t rotation_degrees_ = 0;
   std::optional<std::string> terminal_error_;
   std::atomic<bool> stop_requested_{false};
+  std::atomic<bool> startup_complete_{false};
   std::atomic<bool> stop_drain_started_{false};
   bool ended_ = false;
 };
 
+std::unique_ptr<GpuFileDecodeSource>
+open_gpu_file_decode_source_impl(GpuFileDecodeConfig config,
+                                 std::shared_ptr<const NvbufSurfaceRuntime> runtime,
+                                 NvbufSurfaceAbi abi, std::shared_ptr<GstreamerApi> api,
+                                 const detail::GpuDecodeOpeningSourceObserver& observer) {
+  auto source = std::make_unique<GstreamerGpuFileDecodeSource>(
+      std::move(config), std::move(runtime), abi, std::move(api));
+  bool observed = false;
+  if (observer) {
+    observed = true;
+    if (!observer(source.get())) {
+      source->request_stop();
+      (void)observer(nullptr);
+      return source;
+    }
+  }
+  try {
+    source->start();
+  } catch (...) {
+    if (observed) {
+      try {
+        (void)observer(nullptr);
+      } catch (...) {
+      }
+    }
+    throw;
+  }
+  if (observed) {
+    (void)observer(nullptr);
+  }
+  return source;
+}
+
 } // namespace
 
-std::unique_ptr<GpuFileDecodeSource>
-open_gstreamer_gpu_file_decode_source(GpuFileDecodeConfig config, NvbufSurfaceAbi abi) {
+namespace detail {
+
+std::unique_ptr<GpuFileDecodeSource> open_gstreamer_gpu_file_decode_source_interruptibly(
+    GpuFileDecodeConfig config, NvbufSurfaceAbi abi,
+    const GpuDecodeOpeningSourceObserver& observer) {
 #if defined(__linux__)
   auto runtime = discover_nvbufsurface_runtime();
   if (runtime->abi() != abi) {
     throw GpuDecodeError("requested NvBufSurface ABI does not match the loaded runtime");
   }
-  return open_gstreamer_gpu_file_decode_source(std::move(config), std::move(runtime));
+  return open_gstreamer_gpu_file_decode_source_interruptibly(std::move(config), std::move(runtime),
+                                                             observer);
 #else
   if (const auto error = validate_gpu_file_decode_config(config); error.has_value()) {
     throw std::invalid_argument(*error);
   }
-  auto source = std::make_unique<GstreamerGpuFileDecodeSource>(std::move(config), nullptr, abi,
-                                                               std::make_shared<GstreamerApi>());
-  source->start();
-  return source;
+  return open_gpu_file_decode_source_impl(std::move(config), nullptr, abi,
+                                          std::make_shared<GstreamerApi>(), observer);
 #endif
 }
 
-std::unique_ptr<GpuFileDecodeSource>
-open_gstreamer_gpu_file_decode_source(GpuFileDecodeConfig config,
-                                      std::shared_ptr<const NvbufSurfaceRuntime> runtime) {
+std::unique_ptr<GpuFileDecodeSource> open_gstreamer_gpu_file_decode_source_interruptibly(
+    GpuFileDecodeConfig config, std::shared_ptr<const NvbufSurfaceRuntime> runtime,
+    const GpuDecodeOpeningSourceObserver& observer) {
   if (const auto error = validate_gpu_file_decode_config(config); error.has_value()) {
     throw std::invalid_argument(*error);
   }
@@ -1488,10 +1555,22 @@ open_gstreamer_gpu_file_decode_source(GpuFileDecodeConfig config,
   }
 
   const auto abi = runtime->abi();
-  auto source = std::make_unique<GstreamerGpuFileDecodeSource>(
-      std::move(config), std::move(runtime), abi, std::make_shared<GstreamerApi>());
-  source->start();
-  return source;
+  return open_gpu_file_decode_source_impl(std::move(config), std::move(runtime), abi,
+                                          std::make_shared<GstreamerApi>(), observer);
+}
+
+} // namespace detail
+
+std::unique_ptr<GpuFileDecodeSource>
+open_gstreamer_gpu_file_decode_source(GpuFileDecodeConfig config, NvbufSurfaceAbi abi) {
+  return detail::open_gstreamer_gpu_file_decode_source_interruptibly(std::move(config), abi, {});
+}
+
+std::unique_ptr<GpuFileDecodeSource>
+open_gstreamer_gpu_file_decode_source(GpuFileDecodeConfig config,
+                                      std::shared_ptr<const NvbufSurfaceRuntime> runtime) {
+  return detail::open_gstreamer_gpu_file_decode_source_interruptibly(std::move(config),
+                                                                     std::move(runtime), {});
 }
 
 } // namespace reco::io

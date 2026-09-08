@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace reco::io {
 
@@ -55,6 +56,21 @@ struct GpuFileDecodeConfig {
   // Optional first frame for an accurate, bounded GStreamer seek before
   // decoding starts. Requires indexed cadence so emitted indices retain their
   // absolute stream positions after the seek.
+  std::optional<std::uint64_t> start_frame_index;
+};
+
+/// One recording segment in a lazy GPU decode chain.
+struct GpuFileDecodeSegment {
+  GpuFileDecodeConfig config;
+  /// Exact parser-proven frame count, when available. Exact counts preserve
+  /// dropped-frame positions and permit global indexed seeking across segments.
+  std::optional<std::uint64_t> exact_frame_count;
+};
+
+/// Ordered recording segments exposed as one GPU-resident frame timeline.
+struct GpuChainedFileDecodeConfig {
+  std::vector<GpuFileDecodeSegment> segments;
+  /// Optional absolute frame in the joined timeline.
   std::optional<std::uint64_t> start_frame_index;
 };
 
@@ -199,6 +215,8 @@ gpu_decode_container_for_path(std::string_view path);
 [[nodiscard]] std::optional<std::string>
 validate_gpu_file_decode_config(const GpuFileDecodeConfig& config);
 [[nodiscard]] std::optional<std::string>
+validate_gpu_chained_file_decode_config(const GpuChainedFileDecodeConfig& config);
+[[nodiscard]] std::optional<std::string>
 validate_gpu_stereo_decode_config(const GpuStereoDecodeConfig& config);
 [[nodiscard]] std::optional<std::string> validate_gpu_decoded_frame(const GpuDecodedFrame& frame);
 [[nodiscard]] NvmmCudaFrame map_gpu_decoded_frame_to_cuda(const GpuDecodedFrame& frame);
@@ -215,5 +233,13 @@ open_gstreamer_gpu_file_decode_source(GpuFileDecodeConfig config, NvbufSurfaceAb
 [[nodiscard]] std::unique_ptr<GpuFileDecodeSource>
 open_gstreamer_gpu_file_decode_source(GpuFileDecodeConfig config,
                                       std::shared_ptr<const NvbufSurfaceRuntime> runtime);
+/// Lazily opens one NVDEC/NVMM segment at a time and rebases frames globally.
+[[nodiscard]] std::unique_ptr<GpuFileDecodeSource>
+open_gstreamer_gpu_chained_file_decode_source(GpuChainedFileDecodeConfig config,
+                                              NvbufSurfaceAbi abi);
+/// Lazily opens a chained source against a retained NvBufSurface runtime.
+[[nodiscard]] std::unique_ptr<GpuFileDecodeSource>
+open_gstreamer_gpu_chained_file_decode_source(GpuChainedFileDecodeConfig config,
+                                              std::shared_ptr<const NvbufSurfaceRuntime> runtime);
 
 } // namespace reco::io

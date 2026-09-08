@@ -468,10 +468,30 @@ void surface_array_mapping_retains_and_unmaps_owner() {
   read_only.owner.reset();
 
   params = make_params();
+  params.buffer_desc = 16;
+  surface = make_surface(params);
+  expect_nvmm_error_contains(
+      [&] {
+        (void)map_nvmm_frame_to_cuda(extract_info(&surface), std::make_shared<int>(30),
+                                     reco::core::CudaSpanAccess::ReadWrite);
+      },
+      "not writable", "read-only CUDA mapping is rejected for encoder output");
+  expect_true(params.mapped_addr.cuda_ptr == nullptr,
+              "non-writable CUDA mapping rolls back cleanly");
+
+  params = make_params();
   surface = make_surface(params);
   const auto valid = extract_info(&surface);
   expect_nvmm_error([&] { (void)map_nvmm_frame_to_cuda(valid, {}); },
                     "missing decoder owner rejected");
+  expect_nvmm_error_contains(
+      [&] {
+        (void)map_nvmm_frame_to_cuda(valid, std::make_shared<int>(31),
+                                     static_cast<reco::core::CudaSpanAccess>(99));
+      },
+      "access requirement", "invalid CUDA mapping access is rejected before mapping");
+  expect_true(params.mapped_addr.cuda_ptr == nullptr,
+              "invalid CUDA mapping access leaves the surface unmapped");
 #endif
 }
 

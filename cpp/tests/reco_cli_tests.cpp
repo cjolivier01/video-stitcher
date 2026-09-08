@@ -31,6 +31,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <io.h>
 #include <windows.h>
 #else
 #include <fcntl.h>
@@ -197,8 +198,37 @@ void write_text_file(const std::filesystem::path& path, std::string_view content
   }
 }
 
+void write_text_descriptor(int descriptor, std::string_view contents) {
+  std::size_t offset = 0;
+  while (offset < contents.size()) {
+#if defined(_WIN32)
+    const auto chunk_size = static_cast<unsigned int>(
+        std::min<std::size_t>(contents.size() - offset, std::numeric_limits<unsigned int>::max()));
+    const int written = _write(descriptor, contents.data() + offset, chunk_size);
+#else
+    const auto written = ::write(descriptor, contents.data() + offset, contents.size() - offset);
+#endif
+    if (written < 0 && errno == EINTR) {
+      continue;
+    }
+    if (written <= 0) {
+      throw std::system_error(errno == 0 ? EIO : errno, std::generic_category(),
+                              "cannot write test output descriptor");
+    }
+    offset += static_cast<std::size_t>(written);
+  }
+#if defined(_WIN32)
+  if (_commit(descriptor) != 0) {
+    throw std::system_error(errno, std::generic_category(), "cannot flush test output descriptor");
+  }
+#endif
+}
+
 std::string read_text_file(const std::filesystem::path& path) {
   std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    throw std::runtime_error("cannot open test file " + path.string());
+  }
   return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
 }
 
@@ -610,6 +640,18 @@ void expect_true(bool condition, std::string_view message) {
   }
 }
 
+void expect_no_stitch_output_artifacts(const std::filesystem::path& directory,
+                                       std::string_view context) {
+  for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+    const auto filename = entry.path().filename().string();
+    const bool is_staging = filename.starts_with(".reco-stitch-");
+    const bool is_legacy_temporary = filename.find(".tmp.") != std::string::npos;
+    const bool is_legacy_publication = filename.find(".publish.") != std::string::npos;
+    expect_true(!is_staging && !is_legacy_temporary && !is_legacy_publication,
+                std::string(context) + " leaves no stitch output staging artifact");
+  }
+}
+
 template <typename T, typename U> void expect_eq(T actual, U expected, std::string_view message) {
   if (actual != expected) {
     std::cerr << "FAIL: " << message << " expected=" << expected << " actual=" << actual << '\n';
@@ -752,6 +794,282 @@ void stitch_parse_matches_rust_defaults() {
   expect_true(stitch->no_zero_copy, "stitch no zero copy");
 }
 
+void stitch_frame_timing_preserves_source_gaps_and_rejects_overflow() {
+  const auto first = detail::derive_stitch_frame_timing(100, 100, 30, 1);
+  const auto after_gap = detail::derive_stitch_frame_timing(102, 100, 30, 1);
+  expect_eq(first.pts_ns, 0ULL, "first aligned source frame starts at output zero");
+  expect_eq(first.duration_ns, 33'333'333ULL, "frame duration uses exact rational cadence");
+  expect_eq(after_gap.pts_ns, 66'666'666ULL,
+            "missing aligned source frame remains a timestamp gap");
+  expect_true(after_gap.pts_ns > first.pts_ns + first.duration_ns,
+              "source gap is not compressed to emitted-frame count");
+
+  bool backwards_rejected = false;
+  try {
+    (void)detail::derive_stitch_frame_timing(99, 100, 30, 1);
+  } catch (const std::runtime_error&) {
+    backwards_rejected = true;
+  }
+  expect_true(backwards_rejected, "backwards source frame index is rejected");
+
+  bool overflow_rejected = false;
+  try {
+    (void)detail::derive_stitch_frame_timing(std::numeric_limits<std::uint64_t>::max(), 0, 30, 1);
+  } catch (const std::overflow_error&) {
+    overflow_rejected = true;
+  }
+  expect_true(overflow_rejected, "terminal source frame index overflow is rejected");
+}
+
+void stitch_second_conversion_supports_the_unsigned_gstreamer_range() {
+  expect_eq(detail::nanoseconds_from_seconds(0.000'000'000'5, "timestamp"), 1ULL,
+            "sub-nanosecond stitch time rounds to the nearest nanosecond");
+  expect_eq(detail::nanoseconds_from_seconds(10'000'000'000.0, "timestamp"),
+            10'000'000'000'000'000'000ULL,
+            "stitch time supports timestamps above the signed 64-bit range");
+
+  constexpr double kExclusiveUint64Seconds = 18'446'744'073.709'551'616;
+  const auto largest_representable_seconds = std::nextafter(kExclusiveUint64Seconds, 0.0);
+  expect_true(detail::nanoseconds_from_seconds(largest_representable_seconds, "timestamp") >
+                  static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()),
+              "largest representable stitch time remains in the unsigned range");
+  bool overflow_rejected = false;
+  try {
+    (void)detail::nanoseconds_from_seconds(kExclusiveUint64Seconds, "timestamp");
+  } catch (const std::runtime_error& error) {
+    overflow_rejected =
+        std::string_view(error.what()).find("GStreamer time range") != std::string_view::npos;
+  }
+  expect_true(overflow_rejected, "stitch time rejects the exclusive unsigned boundary");
+}
+
+void stitch_frame_window_uses_one_rounded_timeline() {
+  const auto window = detail::derive_stitch_frame_window(0.051, 0.151, std::nullopt, 30, 1);
+  expect_eq(window.start_frame, 2ULL, "stitch start time rounds to the nearest source frame");
+  expect_eq(window.start_time_ns, 66'666'666ULL,
+            "audio trim uses the same rounded frame boundary as video");
+  expect_eq(window.frame_limit.value_or(0), 3ULL,
+            "stitch end duration matches Rust nearest-frame rounding");
+
+  const auto bounded = detail::derive_stitch_frame_window(0.0, 1.0, 7U, 30, 1);
+  expect_eq(bounded.frame_limit.value_or(0), 7ULL, "max frames bounds the rounded time window");
+  bool empty_window_rejected = false;
+  try {
+    (void)detail::derive_stitch_frame_window(0.0, 0.01, std::nullopt, 30, 1);
+  } catch (const std::runtime_error&) {
+    empty_window_rejected = true;
+  }
+  expect_true(empty_window_rejected, "sub-frame end window is rejected explicitly");
+}
+
+void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
+  TemporaryDirectory root;
+  const auto destination = root.path() / "stitched.mp4";
+  {
+    detail::AtomicOutputFile output(destination);
+    write_text_descriptor(output.descriptor(), "first encoded output\n");
+    expect_true(output.descriptor() >= 0, "stitch output exposes a retained descriptor");
+    const auto verification = read_atomic_output(output.verification_path());
+    expect_true(verification.status == AtomicReadStatus::Success,
+                "stitch output exposes a readable verification stream");
+    expect_eq(verification.contents, std::string("first encoded output\n"),
+              "verification stream reads independently from the write descriptor");
+#if defined(_WIN32)
+    const HANDLE ordinary_reader = CreateFileW(output.verification_path().c_str(), GENERIC_READ,
+                                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    expect_true(ordinary_reader != INVALID_HANDLE_VALUE,
+                "Windows verification does not require readers to share delete access");
+    if (ordinary_reader != INVALID_HANDLE_VALUE) {
+      (void)CloseHandle(ordinary_reader);
+    }
+#endif
+    output.commit();
+    output.commit();
+  }
+  expect_eq(read_text_file(destination), std::string("first encoded output\n"),
+            "stitch output transaction publishes a new file and repeated commit is a no-op");
+  expect_no_stitch_output_artifacts(root.path(), "new stitch output publication");
+  expect_eq(std::filesystem::hard_link_count(destination), std::uintmax_t{1},
+            "new stitch output has exactly one directory entry");
+
+  {
+    detail::AtomicOutputFile output(destination);
+    write_text_descriptor(output.descriptor(), "replacement encoded output\n");
+    output.commit();
+  }
+  expect_eq(read_text_file(destination), std::string("replacement encoded output\n"),
+            "stitch output transaction atomically replaces an existing file");
+  expect_no_stitch_output_artifacts(root.path(), "replacement stitch output publication");
+  expect_eq(std::filesystem::hard_link_count(destination), std::uintmax_t{1},
+            "replacement stitch output does not retain a temporary hard link");
+
+  bool injected_failure_reported = false;
+  try {
+    detail::AtomicOutputFile output(
+        destination, {}, [] { throw std::runtime_error("injected stitch publication failure"); });
+    write_text_descriptor(output.descriptor(), "output that must roll back\n");
+    output.commit();
+  } catch (const std::runtime_error& error) {
+    injected_failure_reported =
+        std::string_view(error.what()).find("injected stitch publication failure") !=
+        std::string_view::npos;
+  }
+  expect_true(injected_failure_reported, "stitch publication reports an injected failure");
+  expect_eq(read_text_file(destination), std::string("replacement encoded output\n"),
+            "failed stitch replacement restores the previous output");
+  expect_no_stitch_output_artifacts(root.path(), "failed stitch output publication");
+  expect_eq(std::filesystem::hard_link_count(destination), std::uintmax_t{1},
+            "failed stitch replacement leaves one destination entry");
+
+  const auto protected_input = root.path() / "protected-input.mp4";
+  const auto aliased_output = root.path() / "aliased-output.mp4";
+  write_text_file(protected_input, "protected input\n");
+  std::filesystem::create_hard_link(protected_input, aliased_output);
+  bool protected_alias_rejected = false;
+  try {
+    const std::array protected_paths{
+        detail::AtomicOutputProtectedPath{protected_input, "the protected input"}};
+    detail::AtomicOutputFile output(aliased_output, {}, {}, protected_paths);
+  } catch (const std::runtime_error& error) {
+    protected_alias_rejected = std::string_view(error.what()).find("aliases the protected input") !=
+                               std::string_view::npos;
+  }
+  expect_true(protected_alias_rejected,
+              "stitch output rejects a retained protected-input hard link");
+  expect_eq(read_text_file(protected_input), std::string("protected input\n"),
+            "rejected stitch output alias preserves its protected input");
+  std::filesystem::remove(aliased_output);
+  expect_no_stitch_output_artifacts(root.path(), "rejected protected stitch output alias");
+
+#if !defined(_WIN32)
+  const auto moved_protected_input = root.path() / "moved-protected-input.mp4";
+  const auto raced_output = root.path() / "protected-race-output.mp4";
+  bool protected_mutation_rejected = false;
+  try {
+    const std::array protected_paths{
+        detail::AtomicOutputProtectedPath{protected_input, "the protected input"}};
+    detail::AtomicOutputFile output(
+        raced_output, {},
+        [&] {
+          std::filesystem::rename(protected_input, moved_protected_input);
+          write_text_file(protected_input, "replacement input\n");
+        },
+        protected_paths);
+    write_text_descriptor(output.descriptor(), "raced output\n");
+    output.commit();
+  } catch (const std::runtime_error& error) {
+    protected_mutation_rejected =
+        std::string_view(error.what()).find("changed before") != std::string_view::npos;
+  }
+  expect_true(protected_mutation_rejected,
+              "stitch publication rejects a protected path changed at commit");
+  expect_true(!std::filesystem::exists(raced_output),
+              "protected path mutation rolls back a newly published stitch output");
+  expect_no_stitch_output_artifacts(root.path(), "protected path mutation rollback");
+  std::filesystem::remove(protected_input);
+  std::filesystem::rename(moved_protected_input, protected_input);
+#endif
+
+  const auto retained_output_parent = root.path() / "retained-stitch-parent";
+  const auto redirected_output_parent = root.path() / "redirected-stitch-parent";
+  const auto active_output_parent = root.path() / "active-stitch-parent";
+  std::filesystem::create_directory(retained_output_parent);
+  std::filesystem::create_directory(redirected_output_parent);
+  const auto redirected_victim = redirected_output_parent / "parent-race.mp4";
+  write_text_file(redirected_victim, "redirected victim\n");
+  std::error_code output_parent_symlink_error;
+  std::filesystem::create_directory_symlink(retained_output_parent, active_output_parent,
+                                            output_parent_symlink_error);
+  expect_true(!output_parent_symlink_error,
+              "stitch output parent symlink race fixture is available");
+  if (!output_parent_symlink_error) {
+    const std::array protected_paths{
+        detail::AtomicOutputProtectedPath{redirected_victim, "the redirected victim"}};
+    detail::AtomicOutputFile output(active_output_parent / "parent-race.mp4", {}, {},
+                                    protected_paths);
+    write_text_descriptor(output.descriptor(), "retained parent output\n");
+    std::filesystem::remove(active_output_parent);
+    std::filesystem::create_directory_symlink(redirected_output_parent, active_output_parent);
+    output.commit();
+    expect_eq(read_text_file(retained_output_parent / "parent-race.mp4"),
+              std::string("retained parent output\n"),
+              "stitch publication stays in its descriptor-pinned parent");
+    expect_eq(read_text_file(redirected_victim), std::string("redirected victim\n"),
+              "redirected output parent cannot replace a protected file");
+  }
+
+#if defined(__linux__)
+  std::filesystem::path attacker_entry;
+  bool substitution_rejected = false;
+  {
+    detail::AtomicOutputFile output(destination, [&](const std::filesystem::path& publication) {
+      attacker_entry = publication;
+      std::filesystem::remove(publication);
+      write_text_file(publication, "attacker replacement\n");
+    });
+    write_text_file(output.temporary_path(), "descriptor-bound encoded output\n");
+    try {
+      output.commit();
+    } catch (const std::runtime_error& error) {
+      substitution_rejected =
+          std::string_view(error.what()).find("publication boundary") != std::string_view::npos;
+    }
+  }
+  expect_true(substitution_rejected,
+              "stitch publication rejects a substituted temporary directory entry");
+  expect_eq(read_text_file(destination), std::string("replacement encoded output\n"),
+            "rejected stitch publication preserves the existing destination");
+  expect_eq(read_text_file(attacker_entry), std::string("attacker replacement\n"),
+            "stitch cleanup does not unlink an attacker replacement");
+  std::filesystem::remove(attacker_entry);
+
+  const auto descriptor_count = [] {
+    return static_cast<std::size_t>(
+        std::distance(std::filesystem::directory_iterator("/proc/self/fd"),
+                      std::filesystem::directory_iterator{}));
+  };
+  const auto before = descriptor_count();
+  const std::string oversized_name(8'192, 'x');
+  for (int attempt = 0; attempt < 32; ++attempt) {
+    try {
+      detail::AtomicOutputFile output(root.path() / oversized_name);
+      expect_true(false, "oversized stitch temporary unexpectedly opened");
+    } catch (const std::system_error&) {
+    }
+  }
+  const auto after = descriptor_count();
+  expect_true(after <= before + 1U,
+              "failed stitch output construction does not leak its directory descriptor");
+#elif defined(_WIN32)
+  const auto retained_parent = root.path() / "retained-output-parent";
+  const auto redirected_parent = root.path() / "redirected-output-parent";
+  const auto active_parent = root.path() / "active-output-parent";
+  std::filesystem::create_directory(retained_parent);
+  std::filesystem::create_directory(redirected_parent);
+  std::error_code parent_symlink_error;
+  std::filesystem::create_directory_symlink(retained_parent, active_parent, parent_symlink_error);
+  expect_true(!parent_symlink_error, "Windows stitch output parent symlink fixture is available");
+  if (!parent_symlink_error) {
+    detail::AtomicOutputFile output(active_parent / "stitched.mp4");
+    write_text_descriptor(output.descriptor(), "retained parent encoded output\n");
+    std::filesystem::remove(active_parent);
+    std::filesystem::create_directory_symlink(redirected_parent, active_parent);
+    const auto verification = read_atomic_output(output.verification_path());
+    expect_true(verification.status == AtomicReadStatus::Success,
+                "Windows verification path remains readable while output is retained");
+    expect_eq(verification.contents, std::string("retained parent encoded output\n"),
+              "Windows verification follows the retained output directory");
+    output.commit();
+    expect_eq(read_text_file(retained_parent / "stitched.mp4"),
+              std::string("retained parent encoded output\n"),
+              "Windows stitch publication stays in the retained output directory");
+    expect_true(!std::filesystem::exists(redirected_parent / "stitched.mp4"),
+                "Windows redirected output parent receives no publication");
+  }
+#endif
+}
+
 void preview_and_calibrate_parse_matches_rust_defaults() {
   const auto preview_command =
       expect_command(parse_args({"preview", "l.mp4", "r.mp4", "--calibration", "match.json",
@@ -869,6 +1187,9 @@ void parse_errors_are_reported() {
   expect_error(
       parse_args({"stitch", "left.mp4", "right.mp4", "-c", "match.json", "--lookahead", "-1"}),
       "lookahead does not allow hyphen value");
+  expect_error(
+      parse_args({"stitch", "left.mp4", "right.mp4", "-c", "match.json", "--max-frames", "0"}),
+      "zero-frame stitch is rejected before GPU setup");
   expect_error(parse_args({"calibrate", "left.mp4", "right.mp4", "--skip-start", "-1"}),
                "skip start does not allow hyphen value");
   expect_error(parse_args({"calibrate", "left.mp4", "right.mp4", "--akaze-threshold", "NaN"}),
@@ -2684,6 +3005,14 @@ int main(int argc, char** argv) {
 #endif
   run_test_case("validators_match_rust", validators_match_rust);
   run_test_case("stitch_parse_matches_rust_defaults", stitch_parse_matches_rust_defaults);
+  run_test_case("stitch_frame_timing_preserves_source_gaps_and_rejects_overflow",
+                stitch_frame_timing_preserves_source_gaps_and_rejects_overflow);
+  run_test_case("stitch_second_conversion_supports_the_unsigned_gstreamer_range",
+                stitch_second_conversion_supports_the_unsigned_gstreamer_range);
+  run_test_case("stitch_frame_window_uses_one_rounded_timeline",
+                stitch_frame_window_uses_one_rounded_timeline);
+  run_test_case("stitch_output_transaction_is_descriptor_pinned_and_atomic",
+                stitch_output_transaction_is_descriptor_pinned_and_atomic);
   run_test_case("preview_and_calibrate_parse_matches_rust_defaults",
                 preview_and_calibrate_parse_matches_rust_defaults);
   run_test_case("live_command_parse_matches_rust_defaults",

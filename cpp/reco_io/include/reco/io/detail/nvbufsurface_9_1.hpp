@@ -13,12 +13,26 @@ constexpr std::size_t kMaxPlanes = 4;
 constexpr std::size_t kStructurePadding = 4;
 constexpr std::uint32_t kMemCudaDevice = 2;
 constexpr std::uint32_t kMemSurfaceArray = 4;
+constexpr std::uint32_t kMemDefault = 0;
 constexpr std::uint32_t kLayoutPitch = 0;
 constexpr std::uint32_t kColorNv12 = 6;
 constexpr std::uint32_t kColorNv12Er = 7;
 constexpr std::uint32_t kColorNv12_709 = 33;
 constexpr std::uint32_t kColorNv12_709Er = 34;
 constexpr std::uint32_t kColorNv12_2020 = 36;
+
+struct CreateParams {
+  std::uint32_t gpu_id = 0;
+  std::uint32_t width = 0;
+  std::uint32_t height = 0;
+  std::uint32_t size = 0;
+  bool is_contiguous = false;
+  std::array<std::uint8_t, 3> pad0{};
+  std::uint32_t color_format = 0;
+  std::uint32_t layout = 0;
+  std::uint32_t mem_type = 0;
+  std::array<void*, kStructurePadding> reserved{};
+};
 
 struct PlaneParams {
   std::uint32_t num_planes = 0;
@@ -80,6 +94,7 @@ struct Surface {
 };
 
 static_assert(sizeof(PlaneParams) == 232);
+static_assert(sizeof(CreateParams) == 64);
 static_assert(sizeof(MappedAddr) == 88);
 static_assert(sizeof(CudaBuffer) == 96);
 static_assert(sizeof(SurfaceParams) == 416);

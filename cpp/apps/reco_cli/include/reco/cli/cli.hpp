@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <functional>
 #include <iosfwd>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -169,6 +170,71 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err,
                 const std::filesystem::path& executable_path = {});
 
 namespace detail {
+
+/// Rounds non-negative seconds to the full unsigned GStreamer nanosecond range.
+[[nodiscard]] std::uint64_t nanoseconds_from_seconds(double seconds, std::string_view label);
+
+/// Existing file identity that an atomic output transaction must never replace.
+struct AtomicOutputProtectedPath {
+  std::filesystem::path path;
+  std::string label;
+};
+
+/// Descriptor-pinned temporary output with identity-checked atomic publication.
+class AtomicOutputFile final {
+public:
+  /// Creates a private temporary in the destination's retained parent directory.
+  /// Hooks are deterministic publication-race injection points used by tests.
+  explicit AtomicOutputFile(
+      std::filesystem::path destination,
+      std::function<void(const std::filesystem::path&)> after_temporary_validation = {},
+      std::function<void()> publication_fault_hook = {},
+      std::span<const AtomicOutputProtectedPath> protected_paths = {});
+  AtomicOutputFile(const AtomicOutputFile&) = delete;
+  AtomicOutputFile& operator=(const AtomicOutputFile&) = delete;
+  AtomicOutputFile(AtomicOutputFile&&) = delete;
+  AtomicOutputFile& operator=(AtomicOutputFile&&) = delete;
+  ~AtomicOutputFile();
+
+  /// Borrowed descriptor passed directly to GStreamer's `fdsink`.
+  [[nodiscard]] int descriptor() const;
+  /// Stable identity path used for post-mux stream discovery.
+  [[nodiscard]] std::filesystem::path verification_path() const;
+  /// Original temporary entry, exposed only for diagnostics and race tests.
+  [[nodiscard]] const std::filesystem::path& temporary_path() const;
+  /// Flushes, validates, and atomically publishes the retained file.
+  void commit();
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
+
+/// Encoder timing derived from an aligned source frame index.
+struct StitchFrameTiming {
+  std::uint64_t pts_ns = 0;
+  std::uint64_t duration_ns = 0;
+};
+
+/// Frame-aligned processing window shared by video seek, audio trim, and output limiting.
+struct StitchFrameWindow {
+  std::uint64_t start_frame = 0;
+  std::uint64_t start_time_ns = 0;
+  std::optional<std::uint64_t> frame_limit;
+};
+
+/// Rounds a requested time window to the source cadence using the Rust stitch semantics.
+[[nodiscard]] StitchFrameWindow derive_stitch_frame_window(std::optional<double> start_time,
+                                                           std::optional<double> end_time,
+                                                           std::optional<std::uint64_t> max_frames,
+                                                           std::uint32_t fps_numerator,
+                                                           std::uint32_t fps_denominator);
+
+/// Preserves gaps in an exact constant-cadence source timeline and rejects overflow.
+[[nodiscard]] StitchFrameTiming derive_stitch_frame_timing(std::uint64_t source_frame_index,
+                                                           std::uint64_t first_source_frame_index,
+                                                           std::uint32_t fps_numerator,
+                                                           std::uint32_t fps_denominator);
 
 /// Resolves the deployed video probe worker for CLI startup and hardening tests.
 [[nodiscard]] std::optional<std::filesystem::path>

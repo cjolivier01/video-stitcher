@@ -77,6 +77,7 @@ enum class NvbufSurfaceAbi : std::uint32_t {
 
 struct NvmmFrameInfo;
 struct NvmmCudaFrame;
+struct NvmmSurfaceAllocation;
 
 /// Retains the exact NvBufSurface and DeepStream-version libraries used to
 /// select an ABI and to map frames produced by a decoder.
@@ -105,7 +106,12 @@ private:
   friend std::optional<std::string> validate_nvbufsurface_runtime_provenance(
       const std::shared_ptr<const NvbufSurfaceRuntime>& runtime);
   friend NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info,
-                                              std::shared_ptr<void> owner);
+                                              std::shared_ptr<void> owner,
+                                              core::CudaSpanAccess required_access);
+  friend NvmmSurfaceAllocation
+  allocate_nvmm_nv12_surface(std::uint32_t width, std::uint32_t height, std::uint32_t gpu_id,
+                             core::YuvColorMatrix color_matrix, core::YuvColorRange color_range,
+                             std::shared_ptr<const NvbufSurfaceRuntime> runtime);
 };
 
 /// Discovers the installed DeepStream NvBufSurface ABI from the runtime
@@ -151,6 +157,26 @@ struct NvmmFrameInfo {
   std::uint32_t uv_size = 0;
 };
 
+/// One NvBufSurface allocation owned by its originating DeepStream runtime.
+struct NvmmSurfaceAllocation {
+  /// Descriptor used for CUDA mapping and for `memory:NVMM` GStreamer buffers.
+  NvmmFrameInfo frame;
+  /// Retains and destroys the descriptor and all of its pixel storage.
+  std::shared_ptr<void> owner;
+  /// Exact ABI size of the descriptor wrapped by GStreamer.
+  std::size_t descriptor_size = 0;
+};
+
+/// Allocates an even-sized NV12 surface on the selected GPU without host pixel storage.
+///
+/// The runtime selects CUDA device memory on discrete GPUs and surface-array memory on Jetson.
+/// The returned owner must outlive every CUDA mapping and GStreamer buffer that references the
+/// descriptor.
+[[nodiscard]] NvmmSurfaceAllocation
+allocate_nvmm_nv12_surface(std::uint32_t width, std::uint32_t height, std::uint32_t gpu_id,
+                           Nv12ColorMatrix color_matrix, Nv12ColorRange color_range,
+                           std::shared_ptr<const NvbufSurfaceRuntime> runtime);
+
 struct NvmmCudaFrame {
   core::CudaDevicePtr y_ptr = 0;
   core::CudaDevicePtr uv_ptr = 0;
@@ -194,7 +220,12 @@ struct NvmmCudaFrame {
 [[nodiscard]] std::optional<std::string> validate_nvmm_frame_info(const NvmmFrameInfo& info);
 [[nodiscard]] bool is_nvmm_cuda_interop_available();
 [[nodiscard]] std::string nvmm_cuda_interop_availability_error();
+/// Maps an NVMM frame for CUDA reads while retaining its provider and allocation validation.
 [[nodiscard]] NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info,
                                                    std::shared_ptr<void> owner);
+/// Maps an NVMM frame with the requested CUDA device access and retains that validation.
+[[nodiscard]] NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info,
+                                                   std::shared_ptr<void> owner,
+                                                   core::CudaSpanAccess required_access);
 
 } // namespace reco::io

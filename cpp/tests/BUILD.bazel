@@ -109,6 +109,28 @@ cc_test(
 )
 
 cc_binary(
+    name = "libreco_core_fake_cuda_rgba_to_nv12_driver.so",
+    testonly = True,
+    srcs = ["reco_core_cuda_rgba_to_nv12_tests.cpp"],
+    linkshared = True,
+    local_defines = ["RECO_CUDA_RGBA_TO_NV12_FAKE_DRIVER"],
+)
+
+cc_test(
+    name = "reco_core_cuda_rgba_to_nv12_tests",
+    size = "small",
+    srcs = ["reco_core_cuda_rgba_to_nv12_tests.cpp"],
+    data = [
+        ":libreco_core_fake_cuda_rgba_to_nv12_driver.so",
+        ":libreco_core_fake_nvrtc_runtime.so",
+    ],
+    deps = [
+        "//cpp/reco_core",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
+cc_binary(
     name = "libreco_core_fake_nvrtc_runtime.so",
     testonly = True,
     srcs = ["reco_core_fake_nvrtc_runtime.cpp"],
@@ -168,6 +190,57 @@ cc_test(
     deps = [
         "//cpp/reco_io",
     ],
+)
+
+cc_test(
+    name = "reco_io_gpu_encode_tests",
+    size = "small",
+    srcs = ["reco_io_gpu_encode_tests.cpp"],
+    deps = ["//cpp/reco_io"],
+)
+
+cc_test(
+    name = "reco_io_audio_passthrough_runtime_tests",
+    size = "small",
+    srcs = [
+        "base64_fixture.hpp",
+        "reco_io_audio_passthrough_runtime_tests.cpp",
+    ],
+    data = [
+        "fixtures/audio_only_mp4.b64",
+        "fixtures/video_only_mp4.b64",
+    ],
+    deps = [
+        "//cpp/reco_io",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
+cc_test(
+    name = "reco_io_gpu_encode_runtime_tests",
+    size = "large",
+    srcs = [
+        "base64_fixture.hpp",
+        "reco_io_gpu_encode_runtime_tests.cpp",
+    ],
+    data = ["fixtures/audio_only_mp4.b64"],
+    deps = [
+        "//cpp/reco_core",
+        "//cpp/reco_io",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
+cc_test(
+    name = "reco_io_gpu_encode_fake_runtime_tests",
+    size = "small",
+    srcs = ["reco_io_gpu_encode_fake_runtime_tests.cpp"],
+    data = [
+        ":libfake_cuda_driver.so",
+        ":libfake_gstreamer_runtime.so",
+        ":libfake_nvbufsurface.so",
+    ],
+    deps = ["//cpp/reco_io"],
 )
 
 cc_binary(

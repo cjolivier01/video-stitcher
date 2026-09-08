@@ -1,0 +1,557 @@
+#include "stitch.hpp"
+
+#include "reco/core/calibration.hpp"
+#include "reco/core/cuda_backend.hpp"
+#include "reco/core/cuda_frame.hpp"
+#include "reco/core/cuda_rgba_to_nv12.hpp"
+#include "reco/core/cuda_stitch_renderer.hpp"
+#include "reco/core/nvrtc_compiler.hpp"
+#include "reco/core/path.hpp"
+#include "reco/io/audio_passthrough.hpp"
+#include "reco/io/gpu_decode.hpp"
+#include "reco/io/gpu_encode.hpp"
+#include "reco/io/gpu_video_probe.hpp"
+#include "reco/io/output.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace reco::cli::detail {
+
+std::uint64_t nanoseconds_from_seconds(double seconds, std::string_view label) {
+  if (!std::isfinite(seconds) || seconds < 0.0) {
+    throw std::runtime_error(std::string(label) + " must be finite and non-negative");
+  }
+  const long double nanoseconds = static_cast<long double>(seconds) * 1'000'000'000.0L;
+  const long double rounded = std::round(nanoseconds);
+  constexpr long double kExclusiveUint64Limit = 18'446'744'073'709'551'616.0L;
+  if (!std::isfinite(rounded) || rounded >= kExclusiveUint64Limit) {
+    throw std::runtime_error(std::string(label) + " exceeds the GStreamer time range");
+  }
+  return static_cast<std::uint64_t>(rounded);
+}
+
+namespace {
+
+using namespace reco::io;
+
+constexpr std::uint64_t kProbeTimeoutNs = 120'000'000'000ULL;
+constexpr std::size_t kMaximumInputSegments = 4096;
+
+struct ProbedInput {
+  std::vector<std::string> paths;
+  std::vector<GpuVideoProbe> probes;
+};
+
+struct AudioSelection {
+  std::vector<AudioPassthroughSegment> segments;
+  std::uint64_t local_start_time_ns = 0;
+};
+
+std::vector<std::string> split_input_segments(std::string_view input, std::string_view label) {
+  if (input.empty()) {
+    throw std::runtime_error(std::string(label) + " input path is empty");
+  }
+  std::vector<std::string> paths;
+  std::size_t begin = 0;
+  while (begin <= input.size()) {
+    const auto end = input.find(';', begin);
+    const auto part =
+        input.substr(begin, end == std::string_view::npos ? input.size() - begin : end - begin);
+    if (part.empty()) {
+      throw std::runtime_error(std::string(label) + " input contains an empty recording segment");
+    }
+    paths.emplace_back(part);
+    if (paths.size() > kMaximumInputSegments) {
+      throw std::runtime_error(std::string(label) + " input exceeds the 4096-segment bound");
+    }
+    if (end == std::string_view::npos) {
+      break;
+    }
+    begin = end + 1U;
+  }
+  return paths;
+}
+
+GpuFileDecodeConfig decode_config(const std::string& path, const GpuVideoProbe& probe,
+                                  std::optional<std::uint64_t> start_frame) {
+  GpuFileDecodeConfig config{
+      .path = path,
+      .codec = gpu_decode_codec_for_path(path),
+      .elementary_stream = gpu_decode_path_is_elementary_stream(path),
+      .container = gpu_decode_container_for_path(path),
+      .max_buffers = 4,
+      .drop = false,
+      .read_timeout_ns = 30'000'000'000ULL,
+  };
+  if (probe.indexed_sampling_cadence_verified && probe.first_stream_time_ns.has_value()) {
+    config.indexed_fps_numerator = probe.fps_numerator;
+    config.indexed_fps_denominator = probe.fps_denominator;
+    config.indexed_timestamp_multiplicity = probe.timestamp_multiplicity;
+    config.indexed_stream_time_origin_ns = probe.first_stream_time_ns;
+    config.start_frame_index = start_frame;
+  } else if (start_frame.has_value()) {
+    throw std::runtime_error("--start-time requires an input with verified constant cadence");
+  }
+  return config;
+}
+
+ProbedInput probe_input(std::vector<std::string> paths, const std::filesystem::path& worker,
+                        std::string_view label) {
+  ProbedInput input{.paths = std::move(paths)};
+  input.probes.reserve(input.paths.size());
+  for (const auto& path : input.paths) {
+    input.probes.push_back(
+        probe_gpu_video({.path = path,
+                         .codec = gpu_decode_codec_for_path(path),
+                         .elementary_stream = gpu_decode_path_is_elementary_stream(path),
+                         .container = gpu_decode_container_for_path(path)},
+                        worker, kProbeTimeoutNs));
+  }
+  const auto& first = input.probes.front();
+  for (std::size_t index = 1; index < input.probes.size(); ++index) {
+    const auto& probe = input.probes[index];
+    if (probe.fps_numerator != first.fps_numerator ||
+        probe.fps_denominator != first.fps_denominator) {
+      throw std::runtime_error(std::string(label) +
+                               " recording segments must have one constant frame rate");
+    }
+    if (probe.width != first.width || probe.height != first.height) {
+      throw std::runtime_error(std::string(label) +
+                               " recording segments must have one frame geometry");
+    }
+  }
+  return input;
+}
+
+std::optional<std::uint64_t> exact_total_frames(const ProbedInput& input) {
+  std::uint64_t total = 0;
+  for (const auto& probe : input.probes) {
+    if (!probe.indexed_sampling_cadence_verified || probe.total_frames_is_estimated) {
+      return std::nullopt;
+    }
+    if (probe.total_frames > std::numeric_limits<std::uint64_t>::max() - total) {
+      throw std::overflow_error("joined input frame count overflows");
+    }
+    total += probe.total_frames;
+  }
+  return total;
+}
+
+void require_exact_indexed_timeline(const ProbedInput& input, std::string_view label) {
+  if (!exact_total_frames(input).has_value()) {
+    throw std::runtime_error(std::string(label) +
+                             " input requires exact verified constant-cadence metadata");
+  }
+  for (const auto& probe : input.probes) {
+    if (!probe.first_stream_time_ns.has_value()) {
+      throw std::runtime_error(std::string(label) +
+                               " input is missing an indexed stream-time origin");
+    }
+  }
+}
+
+std::unique_ptr<GpuFileDecodeSource>
+open_decode_source(const ProbedInput& input, std::optional<std::uint64_t> start_frame,
+                   const std::shared_ptr<const NvbufSurfaceRuntime>& runtime) {
+  if (input.paths.size() == 1U) {
+    return open_gstreamer_gpu_file_decode_source(
+        decode_config(input.paths.front(), input.probes.front(), start_frame), runtime);
+  }
+
+  GpuChainedFileDecodeConfig config{.start_frame_index = start_frame};
+  config.segments.reserve(input.paths.size());
+  for (std::size_t index = 0; index < input.paths.size(); ++index) {
+    const auto& probe = input.probes[index];
+    config.segments.push_back({.config = decode_config(input.paths[index], probe, std::nullopt),
+                               .exact_frame_count = probe.indexed_sampling_cadence_verified &&
+                                                            !probe.total_frames_is_estimated
+                                                        ? std::optional(probe.total_frames)
+                                                        : std::nullopt});
+  }
+  return open_gstreamer_gpu_chained_file_decode_source(std::move(config), runtime);
+}
+
+std::uint64_t timestamp_for_frame(std::uint64_t frame_index, std::uint32_t fps_numerator,
+                                  std::uint32_t fps_denominator) {
+  const auto whole_seconds = frame_index / fps_numerator;
+  const auto remainder = frame_index % fps_numerator;
+  constexpr std::uint64_t billion = 1'000'000'000ULL;
+  const auto scale = billion * static_cast<std::uint64_t>(fps_denominator);
+  if (whole_seconds > std::numeric_limits<std::uint64_t>::max() / scale) {
+    throw std::overflow_error("stitch output timestamp exceeds the GStreamer time range");
+  }
+  const auto whole = whole_seconds * scale;
+  const auto fractional_whole = remainder * (scale / fps_numerator);
+  const auto fractional_remainder = (remainder * (scale % fps_numerator)) / fps_numerator;
+  if (fractional_whole > std::numeric_limits<std::uint64_t>::max() - fractional_remainder) {
+    throw std::overflow_error("stitch output timestamp exceeds the GStreamer time range");
+  }
+  const auto fractional = fractional_whole + fractional_remainder;
+  if (whole > std::numeric_limits<std::uint64_t>::max() - fractional) {
+    throw std::overflow_error("stitch output timestamp exceeds the GStreamer time range");
+  }
+  return whole + fractional;
+}
+
+std::uint64_t rounded_frames_from_seconds(long double seconds, std::uint32_t fps_numerator,
+                                          std::uint32_t fps_denominator, std::string_view label) {
+  const long double frames = seconds * static_cast<long double>(fps_numerator) / fps_denominator;
+  const long double rounded = std::round(frames);
+  constexpr long double kExclusiveUint64Limit = 18'446'744'073'709'551'616.0L;
+  if (!std::isfinite(rounded) || rounded < 0.0L || rounded >= kExclusiveUint64Limit) {
+    throw std::runtime_error(std::string(label) + " is outside the input frame range");
+  }
+  return static_cast<std::uint64_t>(rounded);
+}
+
+AudioSelection select_audio_segments(const ProbedInput& input, std::uint64_t start_time_ns) {
+  std::size_t first_segment = 0;
+  std::uint64_t local_start = start_time_ns;
+  while (first_segment < input.paths.size() &&
+         local_start >= input.probes[first_segment].duration_ns) {
+    local_start -= input.probes[first_segment].duration_ns;
+    ++first_segment;
+  }
+  if (first_segment >= input.paths.size()) {
+    return {};
+  }
+
+  AudioSelection selection;
+  for (std::size_t index = first_segment; index < input.paths.size(); ++index) {
+    selection.segments.push_back(
+        {.path = input.paths[index], .video_duration_ns = input.probes[index].duration_ns});
+  }
+  selection.local_start_time_ns = local_start;
+  return selection;
+}
+
+std::uint64_t audio_start_time_ns(std::uint64_t frame_aligned_start_time_ns,
+                                  std::int64_t sync_offset, std::uint32_t fps_numerator,
+                                  std::uint32_t fps_denominator) {
+  if (sync_offset >= 0) {
+    return frame_aligned_start_time_ns;
+  }
+  const auto skipped_frames = static_cast<std::uint64_t>(-(sync_offset + 1)) + 1U;
+  const auto sync_time = timestamp_for_frame(skipped_frames, fps_numerator, fps_denominator);
+  if (sync_time > std::numeric_limits<std::uint64_t>::max() - frame_aligned_start_time_ns) {
+    throw std::runtime_error("audio synchronization offset exceeds the GStreamer time range");
+  }
+  return frame_aligned_start_time_ns + sync_time;
+}
+
+void reject_unported_stitch_options(const StitchCommand& command) {
+  if (command.no_zero_copy) {
+    throw std::runtime_error("C++ stitch refuses --no-zero-copy because it requires CPU frames");
+  }
+  if (command.model.has_value() || command.events.has_value() || command.trajectory.has_value() ||
+      command.panner_config.has_value() || command.panner_preset.has_value() ||
+      command.replay.has_value() || command.replay_scale.has_value()) {
+    throw std::runtime_error(
+        "AI tracking, event output, trajectories, and replay are ported in a later GPU stage");
+  }
+  if (command.preset.has_value()) {
+    throw std::runtime_error("explicit encoder presets are not yet portable across NVIDIA targets");
+  }
+}
+
+} // namespace
+
+StitchFrameWindow derive_stitch_frame_window(std::optional<double> start_time,
+                                             std::optional<double> end_time,
+                                             std::optional<std::uint64_t> max_frames,
+                                             std::uint32_t fps_numerator,
+                                             std::uint32_t fps_denominator) {
+  if (fps_numerator == 0 || fps_denominator == 0) {
+    throw std::invalid_argument("stitch source frame rate must be non-zero");
+  }
+  const double start = start_time.value_or(0.0);
+  if (!std::isfinite(start) || start < 0.0) {
+    throw std::runtime_error("--start-time must be finite and non-negative");
+  }
+  StitchFrameWindow window;
+  window.start_frame = rounded_frames_from_seconds(static_cast<long double>(start), fps_numerator,
+                                                   fps_denominator, "--start-time");
+  window.start_time_ns = timestamp_for_frame(window.start_frame, fps_numerator, fps_denominator);
+  window.frame_limit = max_frames;
+  if (end_time.has_value()) {
+    if (!std::isfinite(*end_time) || *end_time <= start) {
+      throw std::runtime_error("--end-time must be greater than --start-time");
+    }
+    const auto time_limit = rounded_frames_from_seconds(
+        static_cast<long double>(*end_time) - static_cast<long double>(start), fps_numerator,
+        fps_denominator, "--end-time");
+    if (time_limit == 0) {
+      throw std::runtime_error("--end-time must select at least one output frame");
+    }
+    window.frame_limit =
+        window.frame_limit.has_value() ? std::min(*window.frame_limit, time_limit) : time_limit;
+  }
+  return window;
+}
+
+StitchFrameTiming derive_stitch_frame_timing(std::uint64_t source_frame_index,
+                                             std::uint64_t first_source_frame_index,
+                                             std::uint32_t fps_numerator,
+                                             std::uint32_t fps_denominator) {
+  if (fps_numerator == 0 || fps_denominator == 0) {
+    throw std::invalid_argument("stitch output frame rate must be non-zero");
+  }
+  if (source_frame_index < first_source_frame_index) {
+    throw std::runtime_error("stitch source frame index moved backwards");
+  }
+  const auto relative_index = source_frame_index - first_source_frame_index;
+  if (relative_index == std::numeric_limits<std::uint64_t>::max()) {
+    throw std::overflow_error("stitch output frame index overflows");
+  }
+  const auto pts = timestamp_for_frame(relative_index, fps_numerator, fps_denominator);
+  const auto next_pts = timestamp_for_frame(relative_index + 1U, fps_numerator, fps_denominator);
+  return {.pts_ns = pts, .duration_ns = next_pts - pts};
+}
+
+int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& executable_path,
+                   std::ostream& out, std::ostream& err) {
+  try {
+    reject_unported_stitch_options(command);
+    auto left_paths = split_input_segments(command.left, "left");
+    auto right_paths = split_input_segments(command.right, "right");
+    const auto calibration_path = core::path_from_utf8(command.calibration);
+    const auto output_path = core::path_from_utf8(command.output);
+    std::vector<AtomicOutputProtectedPath> protected_paths;
+    protected_paths.reserve(left_paths.size() + right_paths.size() + 1U);
+    for (const auto& path : left_paths) {
+      protected_paths.push_back(
+          {.path = core::path_from_utf8(path), .label = "a left input segment"});
+    }
+    for (const auto& path : right_paths) {
+      protected_paths.push_back(
+          {.path = core::path_from_utf8(path), .label = "a right input segment"});
+    }
+    protected_paths.push_back({.path = calibration_path, .label = "the calibration file"});
+    AtomicOutputFile output(output_path, {}, {}, protected_paths);
+
+    std::string calibration_error;
+    auto calibration = core::load_match_calibration_file(command.calibration, &calibration_error);
+    if (!calibration.has_value()) {
+      throw std::runtime_error(calibration_error.empty() ? "invalid calibration JSON"
+                                                         : calibration_error);
+    }
+    calibration->blend_width = command.blend;
+
+    const auto worker = resolve_video_probe_worker(executable_path);
+    if (!worker.has_value()) {
+      throw std::runtime_error("cannot locate the deployed reco_video_probe_worker executable");
+    }
+    auto left_input = probe_input(std::move(left_paths), *worker, "left");
+    auto right_input = probe_input(std::move(right_paths), *worker, "right");
+    require_exact_indexed_timeline(left_input, "left");
+    require_exact_indexed_timeline(right_input, "right");
+    const auto& left_probe = left_input.probes.front();
+    const auto& right_probe = right_input.probes.front();
+    if (left_probe.fps_numerator != right_probe.fps_numerator ||
+        left_probe.fps_denominator != right_probe.fps_denominator) {
+      throw std::runtime_error("stereo inputs must have the same constant frame rate");
+    }
+    const auto window =
+        derive_stitch_frame_window(command.start_time, command.end_time, command.max_frames,
+                                   left_probe.fps_numerator, left_probe.fps_denominator);
+    const auto start_frame =
+        command.start_time.has_value() ? std::optional(window.start_frame) : std::nullopt;
+    if (start_frame.has_value()) {
+      const auto right_total = exact_total_frames(right_input);
+      if (!right_total.has_value()) {
+        throw std::runtime_error(
+            "--start-time requires exact constant-cadence metadata for every right input segment");
+      }
+      if (*start_frame >= *right_total) {
+        throw std::runtime_error("--start-time is outside the right input frame range");
+      }
+    }
+    const auto limit = window.frame_limit;
+    const std::int64_t sync_offset =
+        command.sync_offset != 0 ? command.sync_offset : calibration->sync_offset;
+    if (const auto sync_error =
+            validate_gpu_stereo_decode_config({.sync_offset = sync_offset, .queue_capacity = 4});
+        sync_error.has_value()) {
+      throw std::runtime_error(*sync_error);
+    }
+    auto runtime = discover_nvbufsurface_runtime();
+
+    auto backend = core::CudaBackend::create();
+    auto renderer = core::CudaStereoStitchRenderer::create({.calibration = *calibration,
+                                                            .output_width = command.width,
+                                                            .output_height = command.height,
+                                                            .device_ordinal = 0},
+                                                           backend, core::NvrtcCompiler::create());
+    auto rgba_storage =
+        backend.allocate_pitched(static_cast<std::size_t>(command.width) * 4U, command.height, 4);
+    const core::CudaRgbaFrameView rgba(
+        core::CudaPitchedPlaneView(
+            backend.retain_device_span(rgba_storage.buffer.ptr(), rgba_storage.buffer.size(),
+                                       core::CudaSpanAccess::ReadWrite),
+            rgba_storage.pitch, static_cast<std::size_t>(command.width) * 4U, command.height),
+        command.width, command.height);
+    auto converter = core::CudaRgbaToNv12Converter::create(
+        {.width = command.width, .height = command.height}, backend, core::NvrtcCompiler::create());
+
+    const auto codec = parse_codec(command.codec);
+    const auto quality = parse_quality(command.quality);
+    if (!codec.has_value() || !quality.has_value()) {
+      throw std::runtime_error("stitch codec or quality is invalid");
+    }
+    Format format = format_for_output(command.output);
+    if (command.container.has_value()) {
+      const auto parsed = parse_format(*command.container);
+      if (!parsed.has_value()) {
+        throw std::runtime_error("unsupported stitch output container");
+      }
+      format = *parsed;
+    }
+    std::optional<std::string> encoder_factory;
+    if (command.encoder.has_value()) {
+      const auto factory = std::string(gstreamer_hardware_encoder_factory(*codec));
+      const auto nvenc_alias = std::string(codec_name(*codec)) + "_nvenc";
+      if (*command.encoder != factory && *command.encoder != nvenc_alias) {
+        throw std::runtime_error("only the selected NVIDIA hardware encoder is supported");
+      }
+      encoder_factory = factory;
+    }
+
+    std::optional<AudioPassthroughSource> audio;
+    const auto audio_selection = select_audio_segments(
+        left_input, audio_start_time_ns(window.start_time_ns, sync_offset, left_probe.fps_numerator,
+                                        left_probe.fps_denominator));
+    if (!audio_selection.segments.empty()) {
+      audio.emplace(
+          AudioPassthroughSource::open({.segments = audio_selection.segments,
+                                        .start_time_ns = audio_selection.local_start_time_ns}));
+      if (!audio->caps().has_value()) {
+        audio.reset();
+      }
+    }
+
+    GpuEncodeConfig encode_config{
+        .output_path = {},
+        .output_descriptor = output.descriptor(),
+        .width = command.width,
+        .height = command.height,
+        .fps_numerator = left_probe.fps_numerator,
+        .fps_denominator = left_probe.fps_denominator,
+        .codec = *codec,
+        .quality = *quality,
+        .format = format,
+        .encoder = std::move(encoder_factory),
+        .audio_caps = audio.has_value() ? audio->caps() : std::nullopt,
+        .quality_value = command.quality_value,
+        .device_ordinal = 0,
+        .pool_capacity = 8,
+    };
+    auto encoder = GpuVideoEncodeSession::open(std::move(encode_config), runtime);
+    auto left = open_decode_source(left_input, start_frame, runtime);
+    auto right = open_decode_source(right_input, start_frame, runtime);
+    GpuStereoDecodeSession decoder(std::move(left), std::move(right),
+                                   {.sync_offset = sync_offset, .queue_capacity = 4});
+
+    std::optional<CompressedAudioPacket> pending_audio;
+    bool audio_eos = false;
+    const auto forward_audio_before = [&](std::uint64_t video_duration_ns) {
+      while (audio.has_value() && !audio_eos) {
+        if (!pending_audio.has_value()) {
+          auto read = audio->read();
+          if (read.status == AudioPassthroughStatus::EndOfStream) {
+            audio_eos = true;
+            break;
+          }
+          if (!read.packet.has_value()) {
+            throw std::runtime_error("compressed audio source returned an empty packet result");
+          }
+          pending_audio = std::move(*read.packet);
+        }
+        const auto timestamp = pending_audio->timestamp_ns();
+        if (!timestamp.has_value()) {
+          throw std::runtime_error("compressed audio packet has no finite timestamp");
+        }
+        if (*timestamp >= video_duration_ns) {
+          break;
+        }
+        encoder.submit_audio_packet(std::move(*pending_audio));
+        pending_audio.reset();
+      }
+    };
+
+    const auto started = std::chrono::steady_clock::now();
+    std::uint64_t frames = 0;
+    std::optional<std::uint64_t> first_source_frame_index;
+    std::optional<std::uint64_t> previous_source_frame_index;
+    while (!limit.has_value() || frames < *limit) {
+      auto decoded = decoder.read();
+      if (decoded.status == GpuStereoDecodeStatus::EndOfStream) {
+        break;
+      }
+      if (decoded.status == GpuStereoDecodeStatus::Stopped || !decoded.frames.has_value()) {
+        throw std::runtime_error("stereo decoder stopped before end-of-stream");
+      }
+      auto left_frame = map_gpu_decoded_frame_to_cuda_lease(decoded.frames->left);
+      auto right_frame = map_gpu_decoded_frame_to_cuda_lease(decoded.frames->right);
+      if ((decoded.frames->left.rotation_degrees != 0 &&
+           decoded.frames->left.rotation_degrees != 180) ||
+          (decoded.frames->right.rotation_degrees != 0 &&
+           decoded.frames->right.rotation_degrees != 180)) {
+        throw std::runtime_error("90/270-degree stereo input rotation is not supported");
+      }
+      renderer.render(left_frame.view(), right_frame.view(), rgba,
+                      {.flip_left_180 = decoded.frames->left.rotation_degrees == 180,
+                       .flip_right_180 = decoded.frames->right.rotation_degrees == 180});
+      auto encoded = encoder.acquire_frame();
+      converter.convert(rgba, encoded.view());
+      const auto source_frame_index = decoded.frames->left.frame_index;
+      if (previous_source_frame_index.has_value() &&
+          source_frame_index <= *previous_source_frame_index) {
+        throw std::runtime_error("stereo decoder returned a non-increasing source frame index");
+      }
+      if (!first_source_frame_index.has_value()) {
+        first_source_frame_index = source_frame_index;
+      }
+      const auto timing =
+          derive_stitch_frame_timing(source_frame_index, *first_source_frame_index,
+                                     left_probe.fps_numerator, left_probe.fps_denominator);
+      encoder.submit_frame(std::move(encoded), timing.pts_ns, timing.duration_ns);
+      forward_audio_before(timing.pts_ns + timing.duration_ns);
+      previous_source_frame_index = source_frame_index;
+      ++frames;
+    }
+    decoder.request_stop();
+    if (audio.has_value()) {
+      audio->request_stop();
+    }
+    if (frames == 0) {
+      encoder.abort();
+      throw std::runtime_error("stereo inputs produced no aligned video frames");
+    }
+    encoder.finish();
+    verify_muxed_gpu_video_output(core::path_to_utf8(output.verification_path()));
+    output.commit();
+    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started);
+    const auto rate = elapsed.count() > 0.0 ? static_cast<double>(frames) / elapsed.count() : 0.0;
+    out << "Stitched " << frames << " frames to " << command.output << " in " << elapsed.count()
+        << "s (" << rate << " fps, CUDA/NVMM/NVENC)\n";
+    return 0;
+  } catch (const std::exception& error) {
+    err << "error: " << error.what() << '\n';
+    return 2;
+  }
+}
+
+} // namespace reco::cli::detail

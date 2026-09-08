@@ -27,8 +27,8 @@ jobs:
             test_target: "//cpp/tests:all //cpp/reco_io:gpu_video_probe_protocol_tests"
           - os: windows-latest
             bazel_args: "--cxxopt=/std:c++20 --host_cxxopt=/std:c++20"
-            test_args: ""
-            test_target: "//cpp/reco_io:gpu_video_probe_protocol_tests //cpp/tests:reco_core_cuda_backend_tests //cpp/tests:reco_core_cuda_frame_tests //cpp/tests:reco_core_nvrtc_tests //cpp/tests:reco_core_cuda_stitch_renderer_tests //cpp/tests:reco_core_cuda_stitch_parity_tests //cpp/tests:reco_core_data_tests //cpp/tests:reco_io_config_tests //cpp/tests:reco_io_gpu_video_probe_tests //cpp/tests:reco_io_gpu_decode_runtime_tests //cpp/tests:reco_io_gpu_decode_session_tests //cpp/tests:reco_cli_tests //cpp/tests:reco_gui_state_tests //cpp/tests:reco_io_gstreamer_tests //cpp/tests:reco_detect_ncnn_session_fake_runtime_tests //cpp/tests:reco_detect_ort_session_fake_runtime_tests //cpp/tests:reco_detect_ort_session_null_get_api_tests //cpp/tests:reco_detect_ort_session_unsupported_api_tests //cpp/tests:reco_detect_trt_engine_fake_runtime_tests"
+            test_args: "--test_env=RECO_SKIP_CUDA_TEST=1"
+            test_target: "//cpp/reco_io:gpu_video_probe_protocol_tests //cpp/tests:reco_core_cuda_backend_tests //cpp/tests:reco_core_cuda_frame_tests //cpp/tests:reco_core_nvrtc_tests //cpp/tests:reco_core_cuda_stitch_renderer_tests //cpp/tests:reco_core_cuda_stitch_parity_tests //cpp/tests:reco_core_cuda_rgba_to_nv12_tests //cpp/tests:reco_core_data_tests //cpp/tests:reco_io_config_tests //cpp/tests:reco_io_gpu_video_probe_tests //cpp/tests:reco_io_gpu_decode_runtime_tests //cpp/tests:reco_io_gpu_decode_session_tests //cpp/tests:reco_io_audio_passthrough_runtime_tests //cpp/tests:reco_io_gpu_encode_tests //cpp/tests:reco_io_gpu_encode_fake_runtime_tests //cpp/tests:reco_io_gpu_encode_runtime_tests //cpp/tests:reco_cli_tests //cpp/tests:reco_gui_state_tests //cpp/tests:reco_io_gstreamer_tests //cpp/tests:reco_detect_ncnn_session_fake_runtime_tests //cpp/tests:reco_detect_ort_session_fake_runtime_tests //cpp/tests:reco_detect_ort_session_null_get_api_tests //cpp/tests:reco_detect_ort_session_unsupported_api_tests //cpp/tests:reco_detect_trt_engine_fake_runtime_tests"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -87,6 +87,19 @@ jobs:
           //cpp/tests:reco_io_gpu_decode_session_tests
           //cpp/tests:reco_io_gstreamer_tests
           //cpp/tests:reco_io_nvmm_cuda_interop_tests
+      - name: Test GPU output with ASan
+        run: >-
+          bazel test --jobs=2 --local_test_jobs=1 --config=asan
+          --test_env=RECO_SKIP_CUDA_TEST=1
+          //cpp/tests:reco_core_cuda_rgba_to_nv12_tests
+          //cpp/tests:reco_io_gpu_encode_tests
+          //cpp/tests:reco_io_gpu_encode_fake_runtime_tests
+      - name: Test external GStreamer output runtimes with ASan
+        run: >-
+          bazel test --jobs=2 --local_test_jobs=1 --config=asan
+          --test_env=ASAN_OPTIONS=detect_leaks=0
+          //cpp/tests:reco_io_audio_passthrough_runtime_tests
+          //cpp/tests:reco_io_gpu_encode_runtime_tests
       - name: Fuzz probe CBOR decoders with Clang and ASan
         run: |
           mkdir -p "$RUNNER_TEMP/reco-request-corpus" "$RUNNER_TEMP/reco-response-corpus"
@@ -125,6 +138,7 @@ jobs:
           //cpp/tests:reco_core_data_tests
           //cpp/tests:reco_core_math_events_tests
           //cpp/tests:reco_core_nvrtc_tests
+          //cpp/tests:reco_core_cuda_rgba_to_nv12_tests
           //cpp/tests:reco_io_config_tests
           //cpp/tests:reco_autocam_policy_tests
           //cpp/tests:reco_calibrate_data_tests
@@ -140,6 +154,10 @@ jobs:
           //cpp/tests:reco_io_gpu_video_probe_fallback_tests
           //cpp/tests:reco_io_gpu_decode_runtime_tests
           //cpp/tests:reco_io_gpu_decode_session_tests
+          //cpp/tests:reco_io_audio_passthrough_runtime_tests
+          //cpp/tests:reco_io_gpu_encode_tests
+          //cpp/tests:reco_io_gpu_encode_fake_runtime_tests
+          //cpp/tests:reco_io_gpu_encode_runtime_tests
           //cpp/tests:reco_io_gstreamer_tests
           //cpp/tests:reco_io_nvmm_cuda_interop_tests
       - name: Test process containment with TSan
@@ -149,6 +167,7 @@ jobs:
           //cpp/tests:reco_calibrate_supervisor_tests
           //cpp/tests:reco_io_gpu_decode_runtime_tests
           //cpp/tests:reco_io_gpu_decode_session_tests
+          //cpp/tests:reco_io_gpu_encode_fake_runtime_tests
           //cpp/tests:reco_io_gpu_video_probe_tests
           //cpp/tests:reco_io_gpu_video_probe_fallback_tests
           //cpp/tests:reco_io_nvmm_cuda_interop_tests
@@ -206,6 +225,8 @@ jobs:
           //cpp/tests:reco_core_nvrtc_tests
           //cpp/tests:reco_core_cuda_stitch_renderer_tests
           //cpp/tests:reco_core_cuda_stitch_parity_tests
+          //cpp/tests:reco_core_cuda_rgba_to_nv12_tests
+          //cpp/tests:reco_io_gpu_encode_runtime_tests
           //cpp/tests:reco_calibrate_gpu_undistort_tests
           //cpp/tests:reco_calibrate_gpu_sampling_tests
           //cpp/tests:reco_calibrate_gpu_features_tests
@@ -264,6 +285,16 @@ jobs:
             '.left_uniforms.width == 1280 and .right_uniforms.width == 1280 and (.params.cameraAxisOffset | type == "number")' \
             "$work_dir/match.json" >/dev/null
 
+          bazel --output_base="$RUNNER_TEMP/reco-bazel-output" run \
+            --jobs=2 --local_test_jobs=1 //cpp/apps/reco_cli:reco -- stitch \
+            "$work_dir/left.mp4" "$work_dir/right.mp4" \
+            --calibration "$work_dir/match.json" \
+            --max-frames 3 \
+            --output "$work_dir/stitched.mp4"
+          test "$(ffprobe -v error -select_streams v:0 \
+            -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1 \
+            "$work_dir/stitched.mp4")" = "video"
+
   jetson-nvmm-hardware-conditional:
     name: Bazel C++ Jetson NVMM stitch (hardware-conditional)
     if: >-
@@ -291,4 +322,6 @@ jobs:
           --test_env=RECO_EXPECT_NVMM_MEMORY_TYPE=surface-array
           --test_env=RECO_REQUIRE_JETSON_NVMM_TEST=1
           --test_output=errors
+          //cpp/tests:reco_core_cuda_rgba_to_nv12_tests
+          //cpp/tests:reco_io_gpu_encode_runtime_tests
           //cpp/tests:reco_calibrate_gpu_video_parity_tests

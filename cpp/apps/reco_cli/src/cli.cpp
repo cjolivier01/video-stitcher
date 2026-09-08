@@ -11,6 +11,7 @@
 #include "reco/io/gpu_decode.hpp"
 #include "reco/io/gstreamer.hpp"
 #include "rules_cc/cc/runfiles/runfiles.h"
+#include "stitch.hpp"
 
 #include <algorithm>
 #include <array>
@@ -41,6 +42,8 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <fcntl.h>
+#include <io.h>
 #include <windows.h>
 #include <winternl.h>
 #elif defined(__linux__)
@@ -235,6 +238,12 @@ struct PinnedWindowsPath {
   UniqueWindowsHandle directory_entry;
 
   void verify_unchanged(const std::filesystem::path& path, std::string_view label) const;
+};
+
+struct PinnedWindowsProtectedPath {
+  std::filesystem::path path;
+  std::string label;
+  PinnedWindowsPath identity;
 };
 
 struct PinnedWindowsDirectory {
@@ -528,6 +537,82 @@ void PinnedWindowsPath::verify_unchanged(const std::filesystem::path& path,
   return pinned;
 }
 
+[[nodiscard]] bool same_windows_file_identity(const BY_HANDLE_FILE_INFORMATION& left,
+                                              const BY_HANDLE_FILE_INFORMATION& right);
+
+[[nodiscard]] std::optional<std::string>
+windows_protected_alias_error(HANDLE candidate,
+                              const std::vector<PinnedWindowsProtectedPath>& protected_paths) {
+  BY_HANDLE_FILE_INFORMATION candidate_identity{};
+  if (GetFileInformationByHandle(candidate, &candidate_identity) == 0) {
+    throw std::system_error(static_cast<int>(GetLastError()), std::system_category(),
+                            "cannot inspect stitch output identity");
+  }
+  for (const auto& protected_path : protected_paths) {
+    BY_HANDLE_FILE_INFORMATION target_identity{};
+    BY_HANDLE_FILE_INFORMATION entry_identity{};
+    if (GetFileInformationByHandle(protected_path.identity.target.get(), &target_identity) == 0 ||
+        GetFileInformationByHandle(protected_path.identity.directory_entry.get(),
+                                   &entry_identity) == 0) {
+      throw std::system_error(static_cast<int>(GetLastError()), std::system_category(),
+                              "cannot inspect protected stitch input identity");
+    }
+    if (same_windows_file_identity(candidate_identity, target_identity) ||
+        same_windows_file_identity(candidate_identity, entry_identity)) {
+      return "stitch output aliases " + protected_path.label;
+    }
+  }
+  return std::nullopt;
+}
+
+[[nodiscard]] std::optional<std::string> validate_windows_stitch_output_identity(
+    HANDLE directory, std::wstring_view destination_name,
+    const std::vector<PinnedWindowsProtectedPath>& protected_paths) {
+  for (const auto& protected_path : protected_paths) {
+    protected_path.identity.verify_unchanged(protected_path.path, protected_path.label);
+  }
+  constexpr ACCESS_MASK access = FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+  constexpr ULONG sharing = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+  DWORD open_error = ERROR_SUCCESS;
+  const HANDLE entry = open_windows_file_relative(
+      directory, destination_name, access, sharing, FILE_OPEN,
+      FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT, open_error);
+  if (entry == INVALID_HANDLE_VALUE) {
+    if (open_error == ERROR_FILE_NOT_FOUND || open_error == ERROR_PATH_NOT_FOUND) {
+      return std::nullopt;
+    }
+    throw std::system_error(static_cast<int>(open_error), std::system_category(),
+                            "cannot inspect stitch output path identity");
+  }
+  UniqueWindowsHandle retained_entry(entry);
+  if (const auto error = windows_protected_alias_error(entry, protected_paths); error.has_value()) {
+    return error;
+  }
+  FILE_ATTRIBUTE_TAG_INFO attributes{};
+  if (GetFileInformationByHandleEx(entry, FileAttributeTagInfo, &attributes, sizeof(attributes)) ==
+      0) {
+    throw std::system_error(static_cast<int>(GetLastError()), std::system_category(),
+                            "cannot inspect stitch output reparse state");
+  }
+  if ((attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0) {
+    return std::nullopt;
+  }
+  open_error = ERROR_SUCCESS;
+  const HANDLE target =
+      open_windows_file_relative(directory, destination_name, access, sharing, FILE_OPEN,
+                                 FILE_SYNCHRONOUS_IO_NONALERT, open_error);
+  if (target == INVALID_HANDLE_VALUE) {
+    if (open_error == ERROR_FILE_NOT_FOUND || open_error == ERROR_PATH_NOT_FOUND ||
+        open_error == ERROR_CANT_ACCESS_FILE) {
+      return std::nullopt;
+    }
+    throw std::system_error(static_cast<int>(open_error), std::system_category(),
+                            "cannot inspect stitch output reparse target identity");
+  }
+  UniqueWindowsHandle retained_target(target);
+  return windows_protected_alias_error(target, protected_paths);
+}
+
 std::filesystem::path create_exclusive_temporary(const std::filesystem::path& destination,
                                                  HANDLE directory, HANDLE& handle) {
   std::random_device random;
@@ -582,6 +667,14 @@ public:
                                               const BY_HANDLE_FILE_INFORMATION& right) {
   return left.dwVolumeSerialNumber == right.dwVolumeSerialNumber &&
          left.nFileIndexHigh == right.nFileIndexHigh && left.nFileIndexLow == right.nFileIndexLow;
+}
+
+[[nodiscard]] bool same_windows_handle_identity(HANDLE left, HANDLE right) {
+  BY_HANDLE_FILE_INFORMATION left_identity{};
+  BY_HANDLE_FILE_INFORMATION right_identity{};
+  return GetFileInformationByHandle(left, &left_identity) != 0 &&
+         GetFileInformationByHandle(right, &right_identity) != 0 &&
+         same_windows_file_identity(left_identity, right_identity);
 }
 
 [[nodiscard]] bool relative_path_identifies_windows_handle(HANDLE directory, std::wstring_view name,
@@ -701,6 +794,24 @@ void rename_open_file(HANDLE handle, HANDLE directory, std::wstring_view destina
   FILE_DISPOSITION_INFO disposition{.DeleteFile = TRUE};
   return SetFileInformationByHandle(handle, FileDispositionInfo, &disposition,
                                     sizeof(disposition)) != 0;
+}
+
+[[nodiscard]] bool discard_windows_entry_safely(HANDLE directory, std::wstring_view name,
+                                                HANDLE identity_handle) noexcept {
+  DWORD open_error = ERROR_SUCCESS;
+  const HANDLE deletion_handle = open_windows_file_relative(
+      directory, name, DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN,
+      FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT, open_error);
+  if (deletion_handle == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+  UniqueWindowsHandle retained_deletion_handle(deletion_handle);
+  if (!same_windows_handle_identity(deletion_handle, identity_handle) ||
+      !relative_path_identifies_windows_handle(directory, name, deletion_handle, false)) {
+    return false;
+  }
+  return discard_open_file(deletion_handle);
 }
 
 void publish_windows_output(HANDLE directory, const std::filesystem::path& resolved_directory,
@@ -938,6 +1049,50 @@ struct PinnedFileIdentity {
 
 [[nodiscard]] bool same_file_identity(const struct stat& left, const struct stat& right) {
   return left.st_dev == right.st_dev && left.st_ino == right.st_ino;
+}
+
+[[nodiscard]] std::optional<std::string>
+protected_file_alias_error(const struct stat& identity,
+                           const std::vector<PinnedFileIdentity>& protected_paths) {
+  for (const auto& protected_path : protected_paths) {
+    if (same_file_identity(identity, protected_path.identity) ||
+        same_file_identity(identity, protected_path.path_identity)) {
+      return "stitch output aliases " + protected_path.label;
+    }
+  }
+  return std::nullopt;
+}
+
+[[nodiscard]] std::optional<std::string>
+validate_linux_stitch_output_identity(int directory_descriptor, std::string_view destination_name,
+                                      const std::vector<PinnedFileIdentity>& protected_paths) {
+  for (const auto& protected_path : protected_paths) {
+    protected_path.verify_unchanged();
+  }
+  const std::string name(destination_name);
+  struct stat identity{};
+  if (::fstatat(directory_descriptor, name.c_str(), &identity, AT_SYMLINK_NOFOLLOW) != 0) {
+    if (errno == ENOENT) {
+      return std::nullopt;
+    }
+    throw std::system_error(errno, std::system_category(),
+                            "cannot inspect stitch output path identity");
+  }
+  if (const auto error = protected_file_alias_error(identity, protected_paths); error.has_value()) {
+    return error;
+  }
+  if (!S_ISLNK(identity.st_mode)) {
+    return std::nullopt;
+  }
+  struct stat followed_identity{};
+  if (::fstatat(directory_descriptor, name.c_str(), &followed_identity, 0) != 0) {
+    if (errno == ENOENT || errno == ELOOP) {
+      return std::nullopt;
+    }
+    throw std::system_error(errno, std::system_category(),
+                            "cannot inspect stitch output symlink target identity");
+  }
+  return protected_file_alias_error(followed_identity, protected_paths);
 }
 
 [[nodiscard]] std::optional<std::string>
@@ -1253,6 +1408,17 @@ void exchange_directory_entries_at(int directory_descriptor, std::string_view le
   }
 }
 
+void exchange_directory_entries_between_at(int left_directory, std::string_view left,
+                                           int right_directory, std::string_view right,
+                                           const std::filesystem::path& destination) {
+  const std::string left_name(left);
+  const std::string right_name(right);
+  if (::syscall(SYS_renameat2, left_directory, left_name.c_str(), right_directory,
+                right_name.c_str(), RENAME_EXCHANGE) != 0) {
+    throw_file_error("failed to exchange stitch output", destination, errno);
+  }
+}
+
 [[nodiscard]] bool rename_directory_entry_noreplace_at(int directory_descriptor,
                                                        std::string_view source,
                                                        std::string_view destination_name,
@@ -1267,6 +1433,21 @@ void exchange_directory_entries_at(int directory_descriptor, std::string_view le
     return false;
   }
   throw_file_error("failed to publish calibration output", destination, errno);
+}
+
+[[nodiscard]] bool rename_directory_entry_noreplace_between_at(
+    int source_directory, std::string_view source, int destination_directory,
+    std::string_view destination_name, const std::filesystem::path& destination) {
+  const std::string source_name(source);
+  const std::string target_name(destination_name);
+  if (::syscall(SYS_renameat2, source_directory, source_name.c_str(), destination_directory,
+                target_name.c_str(), RENAME_NOREPLACE) == 0) {
+    return true;
+  }
+  if (errno == EEXIST) {
+    return false;
+  }
+  throw_file_error("failed to publish stitch output", destination, errno);
 }
 
 [[nodiscard]] bool
@@ -1378,6 +1559,30 @@ rollback_new_directory_entry_safely(int directory_descriptor, std::string_view p
   }
 }
 
+[[nodiscard]] bool rollback_new_directory_entry_between_safely(
+    int published_directory, std::string_view published_name, int retained_directory,
+    std::string_view retained_name, int published_descriptor,
+    const std::filesystem::path& destination) noexcept {
+  try {
+    ProtectedPosixQuarantine quarantine(retained_directory, destination);
+    constexpr std::string_view quarantined_name = "published";
+    if (!move_directory_entry_noreplace_noexcept(published_directory, published_name,
+                                                 quarantine.get(), quarantined_name)) {
+      return false;
+    }
+    if (!temporary_name_identifies_descriptor(quarantine.get(), quarantined_name,
+                                              published_descriptor)) {
+      (void)move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_name,
+                                                    published_directory, published_name);
+      return false;
+    }
+    return move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_name,
+                                                   retained_directory, retained_name);
+  } catch (...) {
+    return false;
+  }
+}
+
 [[nodiscard]] bool rollback_exchanged_directory_entries_safely(
     int directory_descriptor, std::string_view published_name, int published_descriptor,
     std::string_view displaced_name, const DirectoryEntrySnapshot& displaced_snapshot,
@@ -1417,6 +1622,48 @@ rollback_new_directory_entry_safely(int directory_descriptor, std::string_view p
       return false;
     }
     return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+[[nodiscard]] bool rollback_exchanged_directory_entries_between_safely(
+    int published_directory, std::string_view published_name, int published_descriptor,
+    int displaced_directory, std::string_view displaced_name,
+    const DirectoryEntrySnapshot& displaced_snapshot,
+    const std::filesystem::path& destination) noexcept {
+  try {
+    ProtectedPosixQuarantine quarantine(displaced_directory, destination);
+    constexpr std::string_view quarantined_published = "published";
+    constexpr std::string_view quarantined_displaced = "displaced";
+    if (!move_directory_entry_noreplace_noexcept(published_directory, published_name,
+                                                 quarantine.get(), quarantined_published)) {
+      return false;
+    }
+    if (!move_directory_entry_noreplace_noexcept(displaced_directory, displaced_name,
+                                                 quarantine.get(), quarantined_displaced)) {
+      (void)move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_published,
+                                                    published_directory, published_name);
+      return false;
+    }
+    const bool identities_match =
+        temporary_name_identifies_descriptor(quarantine.get(), quarantined_published,
+                                             published_descriptor) &&
+        directory_entry_matches_snapshot(quarantine.get(), quarantined_displaced,
+                                         displaced_snapshot);
+    if (!identities_match) {
+      (void)move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_displaced,
+                                                    displaced_directory, displaced_name);
+      (void)move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_published,
+                                                    published_directory, published_name);
+      return false;
+    }
+    if (!move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_displaced,
+                                                 published_directory, published_name)) {
+      return false;
+    }
+    return move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_published,
+                                                   displaced_directory, displaced_name);
   } catch (...) {
     return false;
   }
@@ -1662,6 +1909,51 @@ pinned_posix_alias_error(const struct stat& identity, const PinnedPosixPath& lef
   return std::nullopt;
 }
 
+[[nodiscard]] std::optional<std::string>
+protected_posix_alias_error(const struct stat& identity,
+                            const std::vector<PinnedPosixPath>& protected_paths) {
+  for (const auto& protected_path : protected_paths) {
+    if (same_file_identity(identity, protected_path.identity) ||
+        same_file_identity(identity, protected_path.path_identity)) {
+      return "stitch output aliases " + protected_path.label;
+    }
+  }
+  return std::nullopt;
+}
+
+[[nodiscard]] std::optional<std::string>
+validate_posix_stitch_output_identity(int directory_descriptor, std::string_view destination_name,
+                                      const std::vector<PinnedPosixPath>& protected_paths) {
+  for (const auto& protected_path : protected_paths) {
+    protected_path.verify_unchanged();
+  }
+  const std::string name(destination_name);
+  struct stat identity{};
+  if (::fstatat(directory_descriptor, name.c_str(), &identity, AT_SYMLINK_NOFOLLOW) != 0) {
+    if (errno == ENOENT) {
+      return std::nullopt;
+    }
+    throw std::system_error(errno, std::system_category(),
+                            "cannot inspect stitch output path identity");
+  }
+  if (const auto error = protected_posix_alias_error(identity, protected_paths);
+      error.has_value()) {
+    return error;
+  }
+  if (!S_ISLNK(identity.st_mode)) {
+    return std::nullopt;
+  }
+  struct stat followed_identity{};
+  if (::fstatat(directory_descriptor, name.c_str(), &followed_identity, 0) != 0) {
+    if (errno == ENOENT || errno == ELOOP) {
+      return std::nullopt;
+    }
+    throw std::system_error(errno, std::system_category(),
+                            "cannot inspect stitch output symlink target identity");
+  }
+  return protected_posix_alias_error(followed_identity, protected_paths);
+}
+
 #if defined(__APPLE__)
 [[nodiscard]] std::optional<std::string> validate_pinned_posix_output_identity_at(
     int directory_descriptor, std::string_view destination_name, const PinnedPosixPath& left_input,
@@ -1809,6 +2101,32 @@ move_posix_directory_entry_noreplace_noexcept(int source_directory, std::string_
                         target_name.c_str(), RENAME_EXCL) == 0;
 }
 
+[[nodiscard]] bool rename_posix_directory_entry_noreplace_between_at(
+    int source_directory, std::string_view source, int destination_directory,
+    std::string_view destination_name, const std::filesystem::path& destination) {
+  const std::string source_name(source);
+  const std::string target_name(destination_name);
+  if (::renameatx_np(source_directory, source_name.c_str(), destination_directory,
+                     target_name.c_str(), RENAME_EXCL) == 0) {
+    return true;
+  }
+  if (errno == EEXIST) {
+    return false;
+  }
+  throw_file_error("cannot publish stitch output", destination, errno);
+}
+
+void exchange_posix_directory_entries_between_at(int left_directory, std::string_view left,
+                                                 int right_directory, std::string_view right,
+                                                 const std::filesystem::path& destination) {
+  const std::string left_name(left);
+  const std::string right_name(right);
+  if (::renameatx_np(left_directory, left_name.c_str(), right_directory, right_name.c_str(),
+                     RENAME_SWAP) != 0) {
+    throw_file_error("cannot exchange stitch output", destination, errno);
+  }
+}
+
 class ProtectedDarwinQuarantine {
 public:
   ProtectedDarwinQuarantine(int parent, const std::filesystem::path& destination)
@@ -1910,6 +2228,29 @@ rollback_new_posix_directory_entry_safely(int directory_descriptor, std::string_
   }
 }
 
+[[nodiscard]] bool rollback_new_posix_directory_entry_between_safely(
+    int published_directory, std::string_view published_name, int retained_directory,
+    std::string_view retained_name, int published_descriptor,
+    const std::filesystem::path& destination) noexcept {
+  try {
+    ProtectedDarwinQuarantine quarantine(retained_directory, destination);
+    constexpr std::string_view quarantined_name = "published";
+    if (!move_posix_directory_entry_noreplace_noexcept(published_directory, published_name,
+                                                       quarantine.get(), quarantined_name)) {
+      return false;
+    }
+    if (!path_identifies_descriptor_at(quarantine.get(), quarantined_name, published_descriptor)) {
+      (void)move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_name,
+                                                          published_directory, published_name);
+      return false;
+    }
+    return move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_name,
+                                                         retained_directory, retained_name);
+  } catch (...) {
+    return false;
+  }
+}
+
 [[nodiscard]] bool rollback_exchanged_posix_directory_entries_safely(
     int directory_descriptor, std::string_view published_name, int published_descriptor,
     std::string_view displaced_name, const PosixDirectoryEntrySnapshot& displaced_snapshot,
@@ -1946,6 +2287,48 @@ rollback_new_posix_directory_entry_safely(int directory_descriptor, std::string_
     }
     return move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_published,
                                                          directory_descriptor, displaced_name);
+  } catch (...) {
+    return false;
+  }
+}
+
+[[nodiscard]] bool rollback_exchanged_posix_directory_entries_between_safely(
+    int published_directory, std::string_view published_name, int published_descriptor,
+    int displaced_directory, std::string_view displaced_name,
+    const PosixDirectoryEntrySnapshot& displaced_snapshot,
+    const std::filesystem::path& destination) noexcept {
+  try {
+    ProtectedDarwinQuarantine quarantine(displaced_directory, destination);
+    constexpr std::string_view quarantined_published = "published";
+    constexpr std::string_view quarantined_displaced = "displaced";
+    if (!move_posix_directory_entry_noreplace_noexcept(published_directory, published_name,
+                                                       quarantine.get(), quarantined_published)) {
+      return false;
+    }
+    if (!move_posix_directory_entry_noreplace_noexcept(displaced_directory, displaced_name,
+                                                       quarantine.get(), quarantined_displaced)) {
+      (void)move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_published,
+                                                          published_directory, published_name);
+      return false;
+    }
+    const bool identities_match =
+        path_identifies_descriptor_at(quarantine.get(), quarantined_published,
+                                      published_descriptor) &&
+        posix_directory_entry_matches_snapshot(quarantine.get(), quarantined_displaced,
+                                               displaced_snapshot);
+    if (!identities_match) {
+      (void)move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_displaced,
+                                                          displaced_directory, displaced_name);
+      (void)move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_published,
+                                                          published_directory, published_name);
+      return false;
+    }
+    if (!move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_displaced,
+                                                       published_directory, published_name)) {
+      return false;
+    }
+    return move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_published,
+                                                         displaced_directory, displaced_name);
   } catch (...) {
     return false;
   }
@@ -2925,6 +3308,21 @@ require_gpu_video_backend(const reco::calibrate::CalibrationBackendStatus& backe
 }
 
 std::optional<std::string>
+require_gpu_stitch_backend(const reco::calibrate::CalibrationBackendStatus& backends) {
+  if (!backends.cuda.available) {
+    return "CUDA is required for the C++ GPU stitch path: " + backends.cuda.detail;
+  }
+  if (!backends.gstreamer.available) {
+    return "GStreamer is required for the C++ GPU stitch path: " + backends.gstreamer.detail;
+  }
+  if (!backends.nvbufsurface.available) {
+    return "NvBufSurface is required for GPU-resident decode and encode: " +
+           backends.nvbufsurface.detail;
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string>
 require_cuda_npp_backend(const reco::calibrate::CalibrationBackendStatus& backends) {
   if (!backends.cuda.available) {
     return "CUDA is required for the C++ GPU video path: " + backends.cuda.detail;
@@ -2996,11 +3394,8 @@ RuntimePlan build_stitch_plan(const StitchCommand& command,
   if (command.no_zero_copy) {
     plan.blocked_reason =
         "C++ stitch does not support --no-zero-copy because it would force a CPU path";
-  } else if (auto error = require_gpu_video_backend(backends, false); error.has_value()) {
+  } else if (auto error = require_gpu_stitch_backend(backends); error.has_value()) {
     plan.blocked_reason = *error;
-  } else {
-    plan.blocked_reason =
-        "C++ GPU stitch renderer and encode execution are not ported yet; refusing CPU fallback";
   }
   return plan;
 }
@@ -3285,6 +3680,9 @@ std::variant<StitchCommand, ParseError> parse_stitch(Cursor& cursor) {
   }
   if (command.calibration.empty()) {
     return ParseError{"stitch requires -c/--calibration"};
+  }
+  if (command.max_frames == 0U) {
+    return ParseError{"--max-frames must be greater than zero"};
   }
   command.left = positionals[0];
   command.right = positionals[1];
@@ -3752,6 +4150,719 @@ std::variant<CalibrateCommand, ParseError> parse_calibrate(Cursor& cursor) {
 
 namespace detail {
 
+struct AtomicOutputFile::Impl {
+  std::filesystem::path destination;
+  std::filesystem::path parent;
+  std::filesystem::path temporary;
+  std::string temporary_name;
+  std::function<void(const std::filesystem::path&)> after_temporary_validation;
+  std::function<void()> publication_fault_hook;
+#if defined(_WIN32)
+  PinnedWindowsDirectory output_directory;
+  std::vector<PinnedWindowsProtectedPath> protected_paths;
+#elif defined(__linux__)
+  std::vector<PinnedFileIdentity> protected_paths;
+#else
+  std::vector<PinnedPosixPath> protected_paths;
+#endif
+#if !defined(_WIN32)
+  int directory_descriptor = -1;
+  int staging_directory_descriptor = -1;
+  std::string staging_directory_name;
+  mutable int verification_descriptor = -1;
+#endif
+  int descriptor = -1;
+  bool committed = false;
+
+  ~Impl();
+};
+
+AtomicOutputFile::Impl::~Impl() {
+#if defined(_WIN32)
+  if (descriptor >= 0) {
+    const auto handle = reinterpret_cast<HANDLE>(_get_osfhandle(descriptor));
+    if (!committed && handle != INVALID_HANDLE_VALUE) {
+      (void)discard_windows_entry_safely(output_directory.handle.get(),
+                                         temporary.filename().wstring(), handle);
+    }
+    (void)_close(descriptor);
+  }
+#else
+  if (verification_descriptor >= 0) {
+    (void)::close(verification_descriptor);
+  }
+  if (!committed && descriptor >= 0 && staging_directory_descriptor >= 0 &&
+      !temporary_name.empty()) {
+#if defined(__linux__)
+    (void)unlink_descriptor_entry_safely(staging_directory_descriptor, temporary_name, descriptor,
+                                         destination);
+#elif defined(__APPLE__)
+    (void)unlink_posix_descriptor_entry_safely(staging_directory_descriptor, temporary_name,
+                                               descriptor, destination);
+#else
+    struct stat descriptor_identity{};
+    struct stat path_identity{};
+    if (::fstat(descriptor, &descriptor_identity) == 0 &&
+        ::fstatat(staging_directory_descriptor, temporary_name.c_str(), &path_identity,
+                  AT_SYMLINK_NOFOLLOW) == 0 &&
+        same_file_identity(descriptor_identity, path_identity)) {
+      (void)::unlinkat(staging_directory_descriptor, temporary_name.c_str(), 0);
+    }
+#endif
+  }
+  if (descriptor >= 0) {
+    (void)::close(descriptor);
+  }
+  if (staging_directory_descriptor >= 0) {
+    struct stat retained_identity{};
+    struct stat named_identity{};
+    const bool retained_name_is_unchanged =
+        directory_descriptor >= 0 && !staging_directory_name.empty() &&
+        ::fstat(staging_directory_descriptor, &retained_identity) == 0 &&
+        ::fstatat(directory_descriptor, staging_directory_name.c_str(), &named_identity,
+                  AT_SYMLINK_NOFOLLOW) == 0 &&
+        S_ISDIR(retained_identity.st_mode) && S_ISDIR(named_identity.st_mode) &&
+        same_file_identity(retained_identity, named_identity);
+    if (retained_name_is_unchanged) {
+      (void)::unlinkat(directory_descriptor, staging_directory_name.c_str(), AT_REMOVEDIR);
+    }
+    (void)::close(staging_directory_descriptor);
+  }
+  if (directory_descriptor >= 0) {
+    (void)::close(directory_descriptor);
+  }
+#endif
+}
+
+AtomicOutputFile::AtomicOutputFile(
+    std::filesystem::path destination,
+    std::function<void(const std::filesystem::path&)> after_temporary_validation,
+    std::function<void()> publication_fault_hook,
+    std::span<const AtomicOutputProtectedPath> protected_paths)
+    : impl_(std::make_unique<Impl>()) {
+  if (destination.filename().empty() || destination.filename() == "." ||
+      destination.filename() == "..") {
+    throw std::runtime_error("stitch output path must name a file");
+  }
+  impl_->destination = std::move(destination);
+  impl_->parent = impl_->destination.has_parent_path() ? impl_->destination.parent_path()
+                                                       : std::filesystem::path(".");
+  impl_->after_temporary_validation = std::move(after_temporary_validation);
+  impl_->publication_fault_hook = std::move(publication_fault_hook);
+
+#if defined(_WIN32)
+  impl_->output_directory = pin_windows_output_directory(impl_->destination);
+  impl_->protected_paths.reserve(protected_paths.size());
+  for (const auto& protected_path : protected_paths) {
+    impl_->protected_paths.push_back(
+        {.path = protected_path.path,
+         .label = protected_path.label,
+         .identity = pin_windows_path_for_publication(protected_path.path, protected_path.label)});
+  }
+  if (const auto error = validate_windows_stitch_output_identity(
+          impl_->output_directory.handle.get(), impl_->destination.filename().wstring(),
+          impl_->protected_paths);
+      error.has_value()) {
+    throw std::runtime_error(*error);
+  }
+  std::random_device random;
+  constexpr char hex[] = "0123456789abcdef";
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  for (int attempt = 0; attempt < 128; ++attempt) {
+    std::array<char, 32> token{};
+    for (auto& digit : token) {
+      digit = hex[random() & 0x0fU];
+    }
+    auto filename = impl_->destination.filename();
+    filename += ".tmp." + std::string(token.begin(), token.end());
+    DWORD open_error = ERROR_SUCCESS;
+    handle = open_windows_file_relative(
+        impl_->output_directory.handle.get(), filename.wstring(),
+        GENERIC_WRITE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+        open_error);
+    if (handle != INVALID_HANDLE_VALUE) {
+      impl_->descriptor =
+          _open_osfhandle(reinterpret_cast<std::intptr_t>(handle), _O_BINARY | _O_WRONLY);
+      if (impl_->descriptor < 0) {
+        const int descriptor_error = errno;
+        (void)discard_open_file(handle);
+        (void)CloseHandle(handle);
+        throw_file_error("cannot create stitch output descriptor", impl_->destination,
+                         descriptor_error);
+      }
+      impl_->temporary_name = core::path_to_utf8(filename);
+      impl_->temporary = impl_->parent / filename;
+      break;
+    }
+    if (open_error != ERROR_FILE_EXISTS && open_error != ERROR_ALREADY_EXISTS) {
+      throw_file_error("cannot create temporary stitch output", impl_->destination,
+                       static_cast<int>(open_error));
+    }
+  }
+  if (handle == INVALID_HANDLE_VALUE) {
+    throw std::runtime_error("cannot create unique temporary stitch output");
+  }
+#else
+  const int directory = ::open(impl_->parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (directory < 0) {
+    throw_file_error("cannot retain stitch output directory", impl_->parent, errno);
+  }
+  impl_->directory_descriptor = directory;
+  struct stat directory_identity{};
+  if (::fstat(directory, &directory_identity) != 0 || !S_ISDIR(directory_identity.st_mode)) {
+    const int inspect_error = errno == 0 ? ENOTDIR : errno;
+    throw_file_error("cannot inspect stitch output directory", impl_->parent, inspect_error);
+  }
+#if defined(__linux__)
+  impl_->protected_paths.reserve(protected_paths.size());
+  for (const auto& protected_path : protected_paths) {
+    impl_->protected_paths.push_back(pin_input_identity(protected_path.path, protected_path.label));
+  }
+  if (const auto error = validate_linux_stitch_output_identity(
+          directory, impl_->destination.filename().string(), impl_->protected_paths);
+      error.has_value()) {
+    throw std::runtime_error(*error);
+  }
+#else
+  impl_->protected_paths.reserve(protected_paths.size());
+  for (const auto& protected_path : protected_paths) {
+    impl_->protected_paths.push_back(
+        pin_posix_path_for_publication(protected_path.path, protected_path.label));
+  }
+  if (const auto error = validate_posix_stitch_output_identity(
+          directory, impl_->destination.filename().string(), impl_->protected_paths);
+      error.has_value()) {
+    throw std::runtime_error(*error);
+  }
+#endif
+  errno = 0;
+  const long name_limit = ::fpathconf(directory, _PC_NAME_MAX);
+  if (name_limit >= 0 &&
+      impl_->destination.filename().native().size() > static_cast<std::size_t>(name_limit)) {
+    throw_file_error("stitch output filename exceeds the filesystem limit", impl_->destination,
+                     ENAMETOOLONG);
+  }
+  if (name_limit < 0 && errno != 0) {
+    throw_file_error("cannot inspect stitch output filename limit", impl_->parent, errno);
+  }
+
+  std::random_device random;
+  constexpr char hex[] = "0123456789abcdef";
+  for (int attempt = 0; attempt < 128; ++attempt) {
+    std::array<char, 32> token{};
+    for (auto& digit : token) {
+      digit = hex[random() & 0x0fU];
+    }
+    const auto staging_name = ".reco-stitch-" + std::string(token.begin(), token.end());
+    if (::mkdirat(directory, staging_name.c_str(), 0700) == 0) {
+      const int staging = ::openat(directory, staging_name.c_str(),
+                                   O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+      if (staging < 0) {
+        const int open_error = errno;
+        (void)::unlinkat(directory, staging_name.c_str(), AT_REMOVEDIR);
+        throw_file_error("cannot retain private stitch output staging directory",
+                         impl_->destination, open_error);
+      }
+      struct stat staging_identity{};
+      struct stat named_identity{};
+      if (::fstat(staging, &staging_identity) != 0 ||
+          ::fstatat(directory, staging_name.c_str(), &named_identity, AT_SYMLINK_NOFOLLOW) != 0 ||
+          !S_ISDIR(staging_identity.st_mode) ||
+          !same_file_identity(staging_identity, named_identity) ||
+          staging_identity.st_uid != ::geteuid() || (staging_identity.st_mode & 0077) != 0) {
+        const int inspect_error = errno == 0 ? EACCES : errno;
+        (void)::close(staging);
+        (void)::unlinkat(directory, staging_name.c_str(), AT_REMOVEDIR);
+        throw_file_error("stitch output staging directory is not private", impl_->destination,
+                         inspect_error);
+      }
+      impl_->staging_directory_descriptor = staging;
+      impl_->staging_directory_name = staging_name;
+      break;
+    }
+    if (errno != EEXIST) {
+      throw_file_error("cannot create private stitch output staging directory", impl_->destination,
+                       errno);
+    }
+  }
+  if (impl_->staging_directory_descriptor < 0) {
+    throw std::runtime_error("cannot create unique private stitch output staging directory");
+  }
+  impl_->temporary_name = "output";
+  impl_->temporary = impl_->parent / impl_->staging_directory_name / impl_->temporary_name;
+  impl_->descriptor = ::openat(impl_->staging_directory_descriptor, impl_->temporary_name.c_str(),
+                               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+  if (impl_->descriptor < 0) {
+    throw_file_error("cannot create private temporary stitch output", impl_->destination, errno);
+  }
+#endif
+}
+
+AtomicOutputFile::~AtomicOutputFile() = default;
+
+int AtomicOutputFile::descriptor() const {
+  if (!impl_ || impl_->descriptor < 0) {
+    throw std::runtime_error("stitch output descriptor is closed");
+  }
+  return impl_->descriptor;
+}
+
+std::filesystem::path AtomicOutputFile::verification_path() const {
+  const int retained_descriptor = descriptor();
+#if defined(__linux__)
+  if (impl_->verification_descriptor < 0) {
+    impl_->verification_descriptor =
+        ::openat(impl_->staging_directory_descriptor, impl_->temporary_name.c_str(),
+                 O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (impl_->verification_descriptor < 0 ||
+        !temporary_name_identifies_descriptor(impl_->staging_directory_descriptor,
+                                              impl_->temporary_name,
+                                              impl_->verification_descriptor) ||
+        !temporary_name_identifies_descriptor(impl_->staging_directory_descriptor,
+                                              impl_->temporary_name, retained_descriptor)) {
+      if (impl_->verification_descriptor >= 0) {
+        (void)::close(impl_->verification_descriptor);
+        impl_->verification_descriptor = -1;
+      }
+      throw std::runtime_error("cannot retain a readable stitch output verification handle");
+    }
+  }
+  return std::filesystem::path("/proc") / std::to_string(::getpid()) / "fd" /
+         std::to_string(impl_->verification_descriptor);
+#elif defined(__APPLE__)
+  if (impl_->verification_descriptor < 0) {
+    impl_->verification_descriptor =
+        ::openat(impl_->staging_directory_descriptor, impl_->temporary_name.c_str(),
+                 O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (impl_->verification_descriptor < 0 ||
+        !path_identifies_descriptor_at(impl_->staging_directory_descriptor, impl_->temporary_name,
+                                       impl_->verification_descriptor) ||
+        !path_identifies_descriptor_at(impl_->staging_directory_descriptor, impl_->temporary_name,
+                                       retained_descriptor)) {
+      if (impl_->verification_descriptor >= 0) {
+        (void)::close(impl_->verification_descriptor);
+        impl_->verification_descriptor = -1;
+      }
+      throw std::runtime_error("cannot retain a readable stitch output verification handle");
+    }
+  }
+  return std::filesystem::path("/dev/fd") / std::to_string(impl_->verification_descriptor);
+#elif defined(_WIN32)
+  return impl_->output_directory.resolved_path / impl_->temporary.filename();
+#else
+  return impl_->temporary;
+#endif
+}
+
+const std::filesystem::path& AtomicOutputFile::temporary_path() const {
+  if (!impl_) {
+    throw std::runtime_error("stitch output transaction is empty");
+  }
+  return impl_->temporary;
+}
+
+void AtomicOutputFile::commit() {
+  if (!impl_) {
+    throw std::runtime_error("stitch output transaction is empty");
+  }
+  if (impl_->committed) {
+    return;
+  }
+  if (impl_->descriptor < 0) {
+    throw std::runtime_error("stitch output transaction is closed");
+  }
+
+#if defined(_WIN32)
+  const auto handle = reinterpret_cast<HANDLE>(_get_osfhandle(impl_->descriptor));
+  if (handle == INVALID_HANDLE_VALUE) {
+    throw_file_error("cannot access completed stitch output", impl_->temporary, EBADF);
+  }
+  if (_commit(impl_->descriptor) != 0) {
+    const int commit_error = errno;
+    throw_file_error("cannot commit completed stitch output", impl_->temporary, commit_error);
+  }
+  if (FlushFileBuffers(handle) == 0) {
+    const int flush_error = static_cast<int>(GetLastError());
+    throw_file_error("cannot flush completed stitch output", impl_->temporary, flush_error);
+  }
+  BY_HANDLE_FILE_INFORMATION identity{};
+  if (GetFileInformationByHandle(handle, &identity) == 0 ||
+      (identity.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ||
+      (identity.nFileSizeHigh == 0 && identity.nFileSizeLow == 0)) {
+    throw std::runtime_error("GPU encoder did not produce a regular non-empty output");
+  }
+  [[maybe_unused]] auto publication_lock =
+      lock_windows_output_directory(impl_->output_directory.handle.get(),
+                                    impl_->output_directory.path, {}, std::chrono::seconds(2));
+  if (const auto error = validate_windows_stitch_output_identity(
+          impl_->output_directory.handle.get(), impl_->destination.filename().wstring(),
+          impl_->protected_paths);
+      error.has_value()) {
+    throw std::runtime_error(*error);
+  }
+  HANDLE publication_handle = handle;
+  DWORD publication_open_error = ERROR_SUCCESS;
+  publication_handle = open_windows_file_relative(
+      impl_->output_directory.handle.get(), impl_->temporary.filename().wstring(),
+      DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN,
+      FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+      publication_open_error);
+  if (publication_handle == INVALID_HANDLE_VALUE ||
+      !same_windows_handle_identity(publication_handle, handle) ||
+      !relative_path_identifies_windows_handle(impl_->output_directory.handle.get(),
+                                               impl_->temporary.filename().wstring(),
+                                               publication_handle, false)) {
+    if (publication_handle != INVALID_HANDLE_VALUE) {
+      (void)CloseHandle(publication_handle);
+    }
+    throw_file_error("cannot acquire stitch output publication handle", impl_->temporary,
+                     static_cast<int>(publication_open_error == ERROR_SUCCESS
+                                          ? ERROR_FILE_INVALID
+                                          : publication_open_error));
+  }
+  UniqueWindowsHandle retained_publication_handle(publication_handle);
+  bool destination_published = false;
+  const auto final_commit_gate = [&] {
+    if (impl_->publication_fault_hook) {
+      impl_->publication_fault_hook();
+    }
+    if (const auto error = validate_windows_stitch_output_identity(
+            impl_->output_directory.handle.get(), impl_->destination.filename().wstring(),
+            impl_->protected_paths);
+        error.has_value()) {
+      throw std::runtime_error(*error);
+    }
+  };
+  publish_windows_output(
+      impl_->output_directory.handle.get(), impl_->output_directory.resolved_path,
+      impl_->destination.filename().wstring(), impl_->temporary.filename().wstring(),
+      publication_handle, impl_->destination, destination_published,
+      impl_->after_temporary_validation, final_commit_gate, false);
+  impl_->committed = destination_published;
+  if (_close(impl_->descriptor) != 0) {
+    impl_->descriptor = -1;
+    throw_file_error("cannot close completed stitch output", impl_->destination, errno);
+  }
+  impl_->descriptor = -1;
+#elif defined(__linux__)
+  struct stat descriptor_identity{};
+  if (::fstat(impl_->descriptor, &descriptor_identity) != 0 ||
+      !S_ISREG(descriptor_identity.st_mode) || descriptor_identity.st_size <= 0 ||
+      ::fsync(impl_->descriptor) != 0) {
+    throw_file_error("cannot validate completed stitch output", impl_->temporary,
+                     errno == 0 ? EIO : errno);
+  }
+  auto publication_lock = lock_output_directory(impl_->directory_descriptor, impl_->parent, {},
+                                                std::chrono::seconds(2));
+  bool temporary_exists = true;
+  bool exchanged = false;
+  std::optional<DirectoryEntrySnapshot> displaced;
+  try {
+    if (const auto error = validate_linux_stitch_output_identity(
+            impl_->directory_descriptor, impl_->destination.filename().string(),
+            impl_->protected_paths);
+        error.has_value()) {
+      throw std::runtime_error(*error);
+    }
+    if (!temporary_name_identifies_descriptor(impl_->staging_directory_descriptor,
+                                              impl_->temporary_name, impl_->descriptor)) {
+      throw std::runtime_error("temporary stitch output identity changed before publication");
+    }
+    if (impl_->after_temporary_validation) {
+      impl_->after_temporary_validation(impl_->temporary);
+    }
+    if (!temporary_name_identifies_descriptor(impl_->staging_directory_descriptor,
+                                              impl_->temporary_name, impl_->descriptor)) {
+      throw std::runtime_error("temporary stitch output changed at the publication boundary");
+    }
+
+    const auto destination_name = impl_->destination.filename().string();
+    const bool published_new = rename_directory_entry_noreplace_between_at(
+        impl_->staging_directory_descriptor, impl_->temporary_name, impl_->directory_descriptor,
+        destination_name, impl_->destination);
+    if (published_new) {
+      temporary_exists = false;
+      try {
+        if (impl_->publication_fault_hook) {
+          impl_->publication_fault_hook();
+        }
+        if (!temporary_name_identifies_descriptor(impl_->directory_descriptor, destination_name,
+                                                  impl_->descriptor)) {
+          throw std::runtime_error("published stitch output identity changed");
+        }
+        if (const auto error = validate_linux_stitch_output_identity(
+                impl_->directory_descriptor, destination_name, impl_->protected_paths);
+            error.has_value()) {
+          throw std::runtime_error(*error);
+        }
+      } catch (...) {
+        const bool rolled_back = rollback_new_directory_entry_between_safely(
+            impl_->directory_descriptor, destination_name, impl_->staging_directory_descriptor,
+            impl_->temporary_name, impl_->descriptor, impl_->destination);
+        temporary_exists = rolled_back;
+        if (!rolled_back) {
+          throw std::runtime_error("stitch output publication failed and rollback was refused");
+        }
+        throw;
+      }
+    } else {
+      displaced.emplace(
+          capture_directory_entry_snapshot(impl_->directory_descriptor, destination_name));
+      if (S_ISDIR(displaced->identity.st_mode)) {
+        throw std::runtime_error("stitch output destination identifies a directory");
+      }
+      if (const auto error =
+              protected_file_alias_error(displaced->identity, impl_->protected_paths);
+          error.has_value()) {
+        throw std::runtime_error(*error);
+      }
+      if (!temporary_name_identifies_descriptor(impl_->staging_directory_descriptor,
+                                                impl_->temporary_name, impl_->descriptor)) {
+        throw std::runtime_error("temporary stitch output changed before atomic exchange");
+      }
+      exchange_directory_entries_between_at(impl_->staging_directory_descriptor,
+                                            impl_->temporary_name, impl_->directory_descriptor,
+                                            destination_name, impl_->destination);
+      const auto rollback_exchange = [&] {
+        const bool rolled_back = rollback_exchanged_directory_entries_between_safely(
+            impl_->directory_descriptor, destination_name, impl_->descriptor,
+            impl_->staging_directory_descriptor, impl_->temporary_name, *displaced,
+            impl_->destination);
+        temporary_exists = rolled_back;
+        exchanged = !rolled_back;
+        return rolled_back;
+      };
+      exchanged = true;
+      try {
+        if (impl_->publication_fault_hook) {
+          impl_->publication_fault_hook();
+        }
+        if (!temporary_name_identifies_descriptor(impl_->directory_descriptor, destination_name,
+                                                  impl_->descriptor) ||
+            !directory_entry_matches_snapshot(impl_->staging_directory_descriptor,
+                                              impl_->temporary_name, *displaced)) {
+          throw std::runtime_error("exchanged stitch output identity changed");
+        }
+        if (const auto error = validate_linux_stitch_output_identity(
+                impl_->directory_descriptor, destination_name, impl_->protected_paths);
+            error.has_value()) {
+          throw std::runtime_error(*error);
+        }
+      } catch (...) {
+        if (!rollback_exchange()) {
+          throw std::runtime_error("stitch output exchange failed and rollback was refused");
+        }
+        throw;
+      }
+      if (!unlink_directory_entry_if_unchanged(impl_->staging_directory_descriptor,
+                                               impl_->temporary_name, *displaced,
+                                               impl_->destination)) {
+        if (!rollback_exchange()) {
+          throw std::runtime_error("displaced stitch output changed and rollback was refused");
+        }
+        throw std::runtime_error("cannot remove displaced stitch output");
+      }
+      temporary_exists = false;
+      exchanged = false;
+    }
+    impl_->committed = true;
+    if (::fsync(impl_->staging_directory_descriptor) != 0) {
+      throw_file_error("cannot flush stitch output staging directory", impl_->temporary, errno);
+    }
+    if (::fsync(impl_->directory_descriptor) != 0) {
+      throw_file_error("cannot flush stitch output directory", impl_->parent, errno);
+    }
+    if (::close(impl_->descriptor) != 0) {
+      impl_->descriptor = -1;
+      throw_file_error("cannot close completed stitch output", impl_->destination, errno);
+    }
+    impl_->descriptor = -1;
+  } catch (...) {
+    if (exchanged && displaced.has_value()) {
+      (void)rollback_exchanged_directory_entries_between_safely(
+          impl_->directory_descriptor, impl_->destination.filename().string(), impl_->descriptor,
+          impl_->staging_directory_descriptor, impl_->temporary_name, *displaced,
+          impl_->destination);
+    }
+    if (temporary_exists) {
+      (void)unlink_descriptor_entry_safely(impl_->staging_directory_descriptor,
+                                           impl_->temporary_name, impl_->descriptor,
+                                           impl_->destination);
+    }
+    throw;
+  }
+#elif defined(__APPLE__)
+  struct stat descriptor_identity{};
+  if (::fstat(impl_->descriptor, &descriptor_identity) != 0 ||
+      !S_ISREG(descriptor_identity.st_mode) || descriptor_identity.st_size <= 0 ||
+      ::fsync(impl_->descriptor) != 0) {
+    throw_file_error("cannot validate completed stitch output", impl_->temporary,
+                     errno == 0 ? EIO : errno);
+  }
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (::flock(impl_->directory_descriptor, LOCK_EX | LOCK_NB) != 0) {
+    if (errno != EINTR && errno != EWOULDBLOCK && errno != EAGAIN) {
+      throw_file_error("cannot lock stitch output directory", impl_->parent, errno);
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      throw_file_error("timed out locking stitch output directory", impl_->parent, ETIMEDOUT);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  bool temporary_exists = true;
+  bool exchanged = false;
+  std::optional<PosixDirectoryEntrySnapshot> displaced;
+  try {
+    if (const auto error = validate_posix_stitch_output_identity(
+            impl_->directory_descriptor, impl_->destination.filename().string(),
+            impl_->protected_paths);
+        error.has_value()) {
+      throw std::runtime_error(*error);
+    }
+    if (!path_identifies_descriptor_at(impl_->staging_directory_descriptor, impl_->temporary_name,
+                                       impl_->descriptor)) {
+      throw std::runtime_error("temporary stitch output identity changed before publication");
+    }
+    if (impl_->after_temporary_validation) {
+      impl_->after_temporary_validation(impl_->temporary);
+    }
+    if (!path_identifies_descriptor_at(impl_->staging_directory_descriptor, impl_->temporary_name,
+                                       impl_->descriptor)) {
+      throw std::runtime_error("temporary stitch output changed at the publication boundary");
+    }
+    const auto destination_name = impl_->destination.filename().string();
+    if (rename_posix_directory_entry_noreplace_between_at(
+            impl_->staging_directory_descriptor, impl_->temporary_name, impl_->directory_descriptor,
+            destination_name, impl_->destination)) {
+      temporary_exists = false;
+      try {
+        if (impl_->publication_fault_hook) {
+          impl_->publication_fault_hook();
+        }
+        if (!path_identifies_descriptor_at(impl_->directory_descriptor, destination_name,
+                                           impl_->descriptor)) {
+          throw std::runtime_error("published stitch output identity changed");
+        }
+        if (const auto error = validate_posix_stitch_output_identity(
+                impl_->directory_descriptor, destination_name, impl_->protected_paths);
+            error.has_value()) {
+          throw std::runtime_error(*error);
+        }
+      } catch (...) {
+        if (!rollback_new_posix_directory_entry_between_safely(
+                impl_->directory_descriptor, destination_name, impl_->staging_directory_descriptor,
+                impl_->temporary_name, impl_->descriptor, impl_->destination)) {
+          throw std::runtime_error("stitch output publication failed and rollback was refused");
+        }
+        temporary_exists = true;
+        throw;
+      }
+    } else {
+      displaced =
+          capture_posix_directory_entry_snapshot(impl_->directory_descriptor, destination_name);
+      if (S_ISDIR(displaced->identity.st_mode)) {
+        throw std::runtime_error("stitch output destination identifies a directory");
+      }
+      if (const auto error =
+              protected_posix_alias_error(displaced->identity, impl_->protected_paths);
+          error.has_value()) {
+        throw std::runtime_error(*error);
+      }
+      if (!path_identifies_descriptor_at(impl_->staging_directory_descriptor, impl_->temporary_name,
+                                         impl_->descriptor)) {
+        throw std::runtime_error("temporary stitch output changed before atomic exchange");
+      }
+      exchange_posix_directory_entries_between_at(
+          impl_->staging_directory_descriptor, impl_->temporary_name, impl_->directory_descriptor,
+          destination_name, impl_->destination);
+      exchanged = true;
+      const auto rollback_exchange = [&] {
+        const bool rolled_back = rollback_exchanged_posix_directory_entries_between_safely(
+            impl_->directory_descriptor, destination_name, impl_->descriptor,
+            impl_->staging_directory_descriptor, impl_->temporary_name, *displaced,
+            impl_->destination);
+        temporary_exists = rolled_back;
+        exchanged = !rolled_back;
+        return rolled_back;
+      };
+      try {
+        if (impl_->publication_fault_hook) {
+          impl_->publication_fault_hook();
+        }
+        if (!path_identifies_descriptor_at(impl_->directory_descriptor, destination_name,
+                                           impl_->descriptor) ||
+            !posix_directory_entry_matches_snapshot(impl_->staging_directory_descriptor,
+                                                    impl_->temporary_name, *displaced)) {
+          throw std::runtime_error("exchanged stitch output identity changed");
+        }
+        if (const auto error = validate_posix_stitch_output_identity(
+                impl_->directory_descriptor, destination_name, impl_->protected_paths);
+            error.has_value()) {
+          throw std::runtime_error(*error);
+        }
+      } catch (...) {
+        if (!rollback_exchange()) {
+          throw std::runtime_error("stitch output exchange failed and rollback was refused");
+        }
+        throw;
+      }
+      if (!unlink_posix_directory_entry_if_unchanged(impl_->staging_directory_descriptor,
+                                                     impl_->temporary_name, *displaced,
+                                                     impl_->destination)) {
+        if (!rollback_exchange()) {
+          throw std::runtime_error("displaced stitch output changed and rollback was refused");
+        }
+        throw std::runtime_error("cannot remove displaced stitch output");
+      }
+      temporary_exists = false;
+      exchanged = false;
+    }
+    impl_->committed = true;
+    if (::fsync(impl_->staging_directory_descriptor) != 0) {
+      throw_file_error("cannot flush stitch output staging directory", impl_->temporary, errno);
+    }
+    if (::fsync(impl_->directory_descriptor) != 0) {
+      throw_file_error("cannot flush stitch output directory", impl_->parent, errno);
+    }
+    (void)::flock(impl_->directory_descriptor, LOCK_UN);
+    if (::close(impl_->descriptor) != 0) {
+      impl_->descriptor = -1;
+      throw_file_error("cannot close completed stitch output", impl_->destination, errno);
+    }
+    impl_->descriptor = -1;
+  } catch (...) {
+    if (exchanged && displaced.has_value()) {
+      (void)rollback_exchanged_posix_directory_entries_between_safely(
+          impl_->directory_descriptor, impl_->destination.filename().string(), impl_->descriptor,
+          impl_->staging_directory_descriptor, impl_->temporary_name, *displaced,
+          impl_->destination);
+    }
+    if (temporary_exists) {
+      (void)unlink_posix_descriptor_entry_safely(impl_->staging_directory_descriptor,
+                                                 impl_->temporary_name, impl_->descriptor,
+                                                 impl_->destination);
+    }
+    (void)::flock(impl_->directory_descriptor, LOCK_UN);
+    throw;
+  }
+#else
+  if (::fsync(impl_->descriptor) != 0) {
+    throw_file_error("cannot flush completed stitch output", impl_->temporary, errno);
+  }
+  if (::linkat(impl_->staging_directory_descriptor, impl_->temporary_name.c_str(),
+               impl_->directory_descriptor, impl_->destination.filename().c_str(), 0) != 0) {
+    throw_file_error("cannot publish completed stitch output", impl_->destination, errno);
+  }
+  if (::unlinkat(impl_->staging_directory_descriptor, impl_->temporary_name.c_str(), 0) != 0) {
+    throw_file_error("cannot remove temporary stitch output", impl_->temporary, errno);
+  }
+  impl_->committed = true;
+#endif
+}
+
 std::optional<std::filesystem::path>
 resolve_video_probe_worker(const std::filesystem::path& executable_path) {
   return resolve_video_probe_worker_impl(executable_path);
@@ -4089,11 +5200,19 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err,
     return 0;
   }
 
-  RuntimePlan runtime_plan;
   if (const auto* stitch = std::get_if<StitchCommand>(&command)) {
     const auto backends = reco::calibrate::probe_calibration_backends();
-    runtime_plan = build_stitch_plan(*stitch, backends);
-  } else if (const auto* preview = std::get_if<PreviewCommand>(&command)) {
+    const auto plan = build_stitch_plan(*stitch, backends);
+    write_runtime_plan(out, plan);
+    if (plan.blocked_reason.has_value()) {
+      err << "error: " << *plan.blocked_reason << '\n';
+      return 2;
+    }
+    return detail::run_gpu_stitch(*stitch, executable_path, out, err);
+  }
+
+  RuntimePlan runtime_plan;
+  if (const auto* preview = std::get_if<PreviewCommand>(&command)) {
     const auto backends = reco::calibrate::probe_calibration_backends();
     runtime_plan = build_preview_plan(*preview, backends);
   } else if (const auto* camera = std::get_if<CameraCommand>(&command)) {
