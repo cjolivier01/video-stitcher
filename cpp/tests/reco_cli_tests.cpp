@@ -860,6 +860,11 @@ void stitch_frame_window_uses_one_rounded_timeline() {
     empty_window_rejected = true;
   }
   expect_true(empty_window_rejected, "sub-frame end window is rejected explicitly");
+
+  expect_eq(detail::stitch_timeline_duration_ns(3, 30'000, 1'001), 100'100'000ULL,
+            "audio segment duration follows the exact rational frame boundary");
+  expect_eq(detail::stitch_timeline_duration_ns(1'001, 30'000, 1'001), 33'400'033'333ULL,
+            "chained segment duration does not inherit container duration drift");
 }
 
 void stitch_output_transaction_is_descriptor_pinned_and_atomic() {

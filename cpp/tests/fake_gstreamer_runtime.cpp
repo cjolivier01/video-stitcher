@@ -1365,8 +1365,8 @@ RECO_FAKE_EXPORT int gst_element_seek_simple(void* pipeline_pointer, int format,
     ++static_cast<FakePipeline*>(pipeline_pointer)->seek_generation;
     return 1;
   }
-  if (format != 3 || target < 0 || scenario() == "probe-seek-unsupported" ||
-      scenario() == "probe-durationless-unseekable-15") {
+  if (format != 3 || target < 0 || scenario() == "audio-seek-error" ||
+      scenario() == "probe-seek-unsupported" || scenario() == "probe-durationless-unseekable-15") {
     return 0;
   }
   static_cast<FakePipeline*>(pipeline_pointer)->seek_target_ns = target;

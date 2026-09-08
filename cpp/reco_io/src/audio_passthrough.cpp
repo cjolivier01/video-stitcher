@@ -727,11 +727,14 @@ struct AudioPassthroughSource::Impl {
       throw AudioPassthroughError(detail);
     }
     if (trim_before_ns > 0) {
-      (void)api->element_seek_simple(
-          pipeline, kGstFormatTime, kGstSeekFlush | kGstSeekKeyUnit,
-          static_cast<std::int64_t>(std::min<std::uint64_t>(
-              trim_before_ns,
-              static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))));
+      if (api->element_seek_simple(
+              pipeline, kGstFormatTime, kGstSeekFlush | kGstSeekKeyUnit,
+              static_cast<std::int64_t>(std::min<std::uint64_t>(
+                  trim_before_ns,
+                  static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())))) == 0) {
+        close_segment();
+        throw AudioPassthroughError("failed to seek compressed audio to the requested trim point");
+      }
     }
     return true;
   }

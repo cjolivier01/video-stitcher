@@ -702,13 +702,15 @@ void compressed_audio_prime_failures_release_resources(const std::filesystem::pa
   for (const auto& [scenario, error] : std::vector<std::pair<std::string_view, std::string_view>>{
            {"audio-prime-timeout", "timed out waiting"},
            {"audio-invalid-segment-time", "cannot be converted to stream time"},
+           {"audio-seek-error", "failed to seek compressed audio"},
        }) {
     std::filesystem::remove(event_path);
     set_scenario(scenario);
     expect_audio_error(
         [&] {
           (void)AudioPassthroughSource::open(
-              {.segments = {{.path = "first.mp4", .video_duration_ns = 80'000'000ULL}}});
+              {.segments = {{.path = "first.mp4", .video_duration_ns = 80'000'000ULL}},
+               .start_time_ns = scenario == "audio-seek-error" ? 20'000'000ULL : 0ULL});
         },
         error, "audio prime failure is reported");
     const auto events = read_events(event_path);

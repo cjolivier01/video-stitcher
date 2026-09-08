@@ -223,6 +223,11 @@ struct StitchFrameWindow {
   std::optional<std::uint64_t> frame_limit;
 };
 
+/// Returns the exact nanosecond boundary after `frame_count` constant-cadence frames.
+[[nodiscard]] std::uint64_t stitch_timeline_duration_ns(std::uint64_t frame_count,
+                                                        std::uint32_t fps_numerator,
+                                                        std::uint32_t fps_denominator);
+
 /// Rounds a requested time window to the source cadence using the Rust stitch semantics.
 [[nodiscard]] StitchFrameWindow derive_stitch_frame_window(std::optional<double> start_time,
                                                            std::optional<double> end_time,

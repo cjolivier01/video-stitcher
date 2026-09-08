@@ -218,11 +218,18 @@ std::uint64_t rounded_frames_from_seconds(long double seconds, std::uint32_t fps
 }
 
 AudioSelection select_audio_segments(const ProbedInput& input, std::uint64_t start_time_ns) {
+  const auto segment_duration = [&](std::size_t index) {
+    const auto& probe = input.probes[index];
+    if (!probe.indexed_sampling_cadence_verified || probe.total_frames_is_estimated) {
+      throw std::runtime_error("audio selection requires an exact indexed video timeline");
+    }
+    return stitch_timeline_duration_ns(probe.total_frames, probe.fps_numerator,
+                                       probe.fps_denominator);
+  };
   std::size_t first_segment = 0;
   std::uint64_t local_start = start_time_ns;
-  while (first_segment < input.paths.size() &&
-         local_start >= input.probes[first_segment].duration_ns) {
-    local_start -= input.probes[first_segment].duration_ns;
+  while (first_segment < input.paths.size() && local_start >= segment_duration(first_segment)) {
+    local_start -= segment_duration(first_segment);
     ++first_segment;
   }
   if (first_segment >= input.paths.size()) {
@@ -232,7 +239,7 @@ AudioSelection select_audio_segments(const ProbedInput& input, std::uint64_t sta
   AudioSelection selection;
   for (std::size_t index = first_segment; index < input.paths.size(); ++index) {
     selection.segments.push_back(
-        {.path = input.paths[index], .video_duration_ns = input.probes[index].duration_ns});
+        {.path = input.paths[index], .video_duration_ns = segment_duration(index)});
   }
   selection.local_start_time_ns = local_start;
   return selection;
@@ -268,6 +275,14 @@ void reject_unported_stitch_options(const StitchCommand& command) {
 }
 
 } // namespace
+
+std::uint64_t stitch_timeline_duration_ns(std::uint64_t frame_count, std::uint32_t fps_numerator,
+                                          std::uint32_t fps_denominator) {
+  if (fps_numerator == 0 || fps_denominator == 0) {
+    throw std::invalid_argument("stitch source frame rate must be non-zero");
+  }
+  return timestamp_for_frame(frame_count, fps_numerator, fps_denominator);
+}
 
 StitchFrameWindow derive_stitch_frame_window(std::optional<double> start_time,
                                              std::optional<double> end_time,
