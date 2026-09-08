@@ -2451,6 +2451,33 @@ void write_all(int descriptor, std::string_view contents, const std::filesystem:
 }
 #endif
 
+#if defined(_WIN32)
+[[nodiscard]] bool discard_atomic_output_entry_nofollow(HANDLE directory,
+                                                        std::wstring_view name) noexcept {
+  DWORD open_error = ERROR_SUCCESS;
+  const HANDLE deletion_handle = open_windows_file_relative(
+      directory, name, DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN,
+      FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT, open_error);
+  if (deletion_handle == INVALID_HANDLE_VALUE) {
+    return open_error == ERROR_FILE_NOT_FOUND || open_error == ERROR_PATH_NOT_FOUND;
+  }
+  UniqueWindowsHandle retained_deletion_handle(deletion_handle);
+  return discard_open_file(deletion_handle);
+}
+#else
+[[nodiscard]] bool discard_atomic_output_entry_nofollow(int directory_descriptor,
+                                                        std::string_view name) noexcept {
+  const std::string filename(name);
+  struct stat identity{};
+  if (::fstatat(directory_descriptor, filename.c_str(), &identity, AT_SYMLINK_NOFOLLOW) != 0) {
+    return errno == ENOENT;
+  }
+  const int flags = S_ISDIR(identity.st_mode) ? AT_REMOVEDIR : 0;
+  return ::unlinkat(directory_descriptor, filename.c_str(), flags) == 0 || errno == ENOENT;
+}
+#endif
+
 void write_calibration_json_atomically_impl(
     std::string_view json, const std::filesystem::path& destination,
     const std::filesystem::path& left_input, const std::filesystem::path& right_input,
@@ -4182,8 +4209,11 @@ AtomicOutputFile::Impl::~Impl() {
   if (descriptor >= 0) {
     const auto handle = reinterpret_cast<HANDLE>(_get_osfhandle(descriptor));
     if (!committed && handle != INVALID_HANDLE_VALUE) {
-      (void)discard_windows_entry_safely(output_directory.handle.get(),
-                                         temporary.filename().wstring(), handle);
+      if (!discard_windows_entry_safely(output_directory.handle.get(),
+                                        temporary.filename().wstring(), handle)) {
+        (void)discard_atomic_output_entry_nofollow(output_directory.handle.get(),
+                                                   temporary.filename().wstring());
+      }
     }
     (void)_close(descriptor);
   }
@@ -4194,21 +4224,23 @@ AtomicOutputFile::Impl::~Impl() {
   if (!committed && descriptor >= 0 && staging_directory_descriptor >= 0 &&
       !temporary_name.empty()) {
 #if defined(__linux__)
-    (void)unlink_descriptor_entry_safely(staging_directory_descriptor, temporary_name, descriptor,
-                                         destination);
+    const bool removed = unlink_descriptor_entry_safely(staging_directory_descriptor,
+                                                        temporary_name, descriptor, destination);
 #elif defined(__APPLE__)
-    (void)unlink_posix_descriptor_entry_safely(staging_directory_descriptor, temporary_name,
-                                               descriptor, destination);
+    const bool removed = unlink_posix_descriptor_entry_safely(
+        staging_directory_descriptor, temporary_name, descriptor, destination);
 #else
     struct stat descriptor_identity{};
     struct stat path_identity{};
-    if (::fstat(descriptor, &descriptor_identity) == 0 &&
-        ::fstatat(staging_directory_descriptor, temporary_name.c_str(), &path_identity,
-                  AT_SYMLINK_NOFOLLOW) == 0 &&
-        same_file_identity(descriptor_identity, path_identity)) {
-      (void)::unlinkat(staging_directory_descriptor, temporary_name.c_str(), 0);
-    }
+    const bool removed = ::fstat(descriptor, &descriptor_identity) == 0 &&
+                         ::fstatat(staging_directory_descriptor, temporary_name.c_str(),
+                                   &path_identity, AT_SYMLINK_NOFOLLOW) == 0 &&
+                         same_file_identity(descriptor_identity, path_identity) &&
+                         ::unlinkat(staging_directory_descriptor, temporary_name.c_str(), 0) == 0;
 #endif
+    if (!removed) {
+      (void)discard_atomic_output_entry_nofollow(staging_directory_descriptor, temporary_name);
+    }
   }
   if (descriptor >= 0) {
     (void)::close(descriptor);
@@ -4536,11 +4568,16 @@ void AtomicOutputFile::commit() {
       throw std::runtime_error(*error);
     }
   };
-  publish_windows_output(
-      impl_->output_directory.handle.get(), impl_->output_directory.resolved_path,
-      impl_->destination.filename().wstring(), impl_->temporary.filename().wstring(),
-      publication_handle, impl_->destination, destination_published,
-      impl_->after_temporary_validation, final_commit_gate, false);
+  try {
+    publish_windows_output(
+        impl_->output_directory.handle.get(), impl_->output_directory.resolved_path,
+        impl_->destination.filename().wstring(), impl_->temporary.filename().wstring(),
+        publication_handle, impl_->destination, destination_published,
+        impl_->after_temporary_validation, final_commit_gate, false);
+  } catch (...) {
+    (void)discard_open_file(publication_handle);
+    throw;
+  }
   impl_->committed = destination_published;
   if (_close(impl_->descriptor) != 0) {
     impl_->descriptor = -1;

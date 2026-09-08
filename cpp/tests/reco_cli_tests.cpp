@@ -999,13 +999,31 @@ void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
               "redirected output parent cannot replace a protected file");
   }
 
-#if defined(__linux__)
+  std::vector<std::filesystem::path> retained_windows_temporaries;
+  const auto remove_transaction_temporary = [&](const std::filesystem::path& publication) {
+#if defined(_WIN32)
+    auto retained = publication;
+    retained += ".retained";
+    std::filesystem::rename(publication, retained);
+    retained_windows_temporaries.push_back(std::move(retained));
+#else
+    std::filesystem::remove(publication);
+#endif
+  };
+  const auto expect_no_retained_windows_temporary = [&] {
+#if defined(_WIN32)
+    expect_true(!retained_windows_temporaries.empty() &&
+                    !std::filesystem::exists(retained_windows_temporaries.back()),
+                "Windows stitch cleanup removes the renamed descriptor-bound temporary");
+#endif
+  };
+
   std::filesystem::path attacker_entry;
   bool substitution_rejected = false;
   {
     detail::AtomicOutputFile output(destination, [&](const std::filesystem::path& publication) {
       attacker_entry = publication;
-      std::filesystem::remove(publication);
+      remove_transaction_temporary(publication);
       write_text_file(publication, "attacker replacement\n");
     });
     write_text_file(output.temporary_path(), "descriptor-bound encoded output\n");
@@ -1020,10 +1038,77 @@ void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
               "stitch publication rejects a substituted temporary directory entry");
   expect_eq(read_text_file(destination), std::string("replacement encoded output\n"),
             "rejected stitch publication preserves the existing destination");
-  expect_eq(read_text_file(attacker_entry), std::string("attacker replacement\n"),
-            "stitch cleanup does not unlink an attacker replacement");
-  std::filesystem::remove(attacker_entry);
+  expect_true(!std::filesystem::exists(attacker_entry),
+              "stitch cleanup removes a substituted temporary file");
+  expect_no_retained_windows_temporary();
+  expect_no_stitch_output_artifacts(root.path(), "substituted stitch temporary file cleanup");
 
+  std::filesystem::path attacker_directory;
+  bool directory_substitution_rejected = false;
+  {
+    detail::AtomicOutputFile output(destination, [&](const std::filesystem::path& publication) {
+      attacker_directory = publication;
+      remove_transaction_temporary(publication);
+      std::filesystem::create_directory(publication);
+    });
+    write_text_descriptor(output.descriptor(), "descriptor-bound directory output\n");
+    try {
+      output.commit();
+    } catch (const std::runtime_error& error) {
+      directory_substitution_rejected =
+          std::string_view(error.what()).find("temporary") != std::string_view::npos;
+    }
+  }
+  expect_true(directory_substitution_rejected,
+              "stitch publication rejects a substituted temporary directory");
+  expect_true(!std::filesystem::exists(attacker_directory),
+              "stitch cleanup removes a substituted empty directory");
+  expect_no_retained_windows_temporary();
+  expect_eq(read_text_file(destination), std::string("replacement encoded output\n"),
+            "directory substitution preserves the existing destination");
+  expect_no_stitch_output_artifacts(root.path(), "substituted stitch directory cleanup");
+
+  const auto symlink_victim = root.path() / "stitch-cleanup-victim.mp4";
+  const auto symlink_probe = root.path() / "stitch-cleanup-symlink-probe";
+  write_text_file(symlink_victim, "protected victim content\n");
+  std::error_code symlink_error;
+  std::filesystem::create_symlink(symlink_victim, symlink_probe, symlink_error);
+  if (!symlink_error) {
+    std::filesystem::remove(symlink_probe);
+    std::filesystem::path attacker_symlink;
+    bool symlink_substitution_rejected = false;
+    {
+      const std::array protected_paths{
+          detail::AtomicOutputProtectedPath{symlink_victim, "the cleanup victim"}};
+      detail::AtomicOutputFile output(
+          destination,
+          [&](const std::filesystem::path& publication) {
+            attacker_symlink = publication;
+            remove_transaction_temporary(publication);
+            std::filesystem::create_symlink(symlink_victim, publication);
+          },
+          {}, protected_paths);
+      write_text_descriptor(output.descriptor(), "descriptor-bound symlink output\n");
+      try {
+        output.commit();
+      } catch (const std::runtime_error& error) {
+        symlink_substitution_rejected =
+            std::string_view(error.what()).find("temporary") != std::string_view::npos;
+      }
+    }
+    expect_true(symlink_substitution_rejected,
+                "stitch publication rejects a substituted temporary symlink");
+    expect_true(!std::filesystem::exists(attacker_symlink),
+                "stitch cleanup removes a substituted symlink without following it");
+    expect_no_retained_windows_temporary();
+    expect_eq(read_text_file(symlink_victim), std::string("protected victim content\n"),
+              "stitch cleanup preserves a substituted symlink victim");
+    expect_eq(read_text_file(destination), std::string("replacement encoded output\n"),
+              "symlink substitution preserves the existing destination");
+    expect_no_stitch_output_artifacts(root.path(), "substituted stitch symlink cleanup");
+  }
+
+#if defined(__linux__)
   const auto descriptor_count = [] {
     return static_cast<std::size_t>(
         std::distance(std::filesystem::directory_iterator("/proc/self/fd"),
