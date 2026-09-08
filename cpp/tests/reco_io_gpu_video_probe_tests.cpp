@@ -192,6 +192,30 @@ wait_for_process_marker(const std::filesystem::path& path,
   return std::nullopt;
 }
 
+bool process_exists(std::uint64_t process_id) {
+#if defined(_WIN32)
+  if (process_id == 0 || process_id > std::numeric_limits<DWORD>::max()) {
+    return false;
+  }
+  const HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                                     static_cast<DWORD>(process_id));
+  if (process == nullptr) {
+    return false;
+  }
+  DWORD status = 0;
+  const bool active = GetExitCodeProcess(process, &status) != 0 && status == STILL_ACTIVE;
+  (void)CloseHandle(process);
+  return active;
+#else
+  if (process_id == 0 ||
+      process_id > static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max())) {
+    return false;
+  }
+  errno = 0;
+  return ::kill(static_cast<pid_t>(process_id), 0) == 0 || errno != ESRCH;
+#endif
+}
+
 #if defined(__APPLE__)
 std::optional<std::uint64_t>
 wait_for_process_marker_at_offset(const std::filesystem::path& path, std::uint64_t offset,
@@ -1757,6 +1781,55 @@ void worker_ipc_failures_are_bounded(const std::filesystem::path& video_path) {
     expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
               std::string("invalid worker cleanup is certified: ") + std::string(scenario));
   }
+}
+
+void cancellation_terminates_an_active_probe_worker(const std::filesystem::path& video_path) {
+  const auto marker =
+      video_path.parent_path() / (video_path.filename().string() + ".cancelled-worker");
+  std::filesystem::remove(marker);
+  set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", marker.string());
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "block-input");
+
+  std::atomic<bool> cancel{false};
+  std::optional<std::uint64_t> worker;
+  std::thread requester([&] {
+    worker =
+        wait_for_process_marker(marker, std::chrono::steady_clock::now() + std::chrono::seconds(2));
+    cancel.store(true, std::memory_order_release);
+  });
+
+  const auto started = std::chrono::steady_clock::now();
+  bool cancelled = false;
+  try {
+    (void)reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
+                                    30'000'000'000ULL,
+                                    [&] { return cancel.load(std::memory_order_acquire); });
+  } catch (const GpuVideoProbeCancelled&) {
+    cancelled = true;
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: active probe cancellation returned the wrong error: " << error.what()
+              << '\n';
+    ++failures;
+  }
+  requester.join();
+
+  expect_true(worker.has_value(), "active probe worker reports its process ID before cancellation");
+  expect_true(cancelled, "active probe reports explicit cancellation");
+  expect_true(std::chrono::steady_clock::now() - started < std::chrono::seconds(3),
+              "active probe cancellation returns within the cleanup bound");
+  if (worker.has_value()) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (process_exists(*worker) && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    expect_true(!process_exists(*worker), "active probe cancellation removes the worker process");
+  }
+  expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
+            "active probe cancellation releases its aggregate memory reservation");
+
+  set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", "");
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+  std::filesystem::remove(marker);
 }
 
 void rapid_posix_probe_launches_establish_process_groups(const std::filesystem::path& video_path) {
@@ -4793,6 +4866,7 @@ int main(int argc, char** argv) {
   expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
             "path tests leave no aggregate admission behind");
   worker_ipc_failures_are_bounded(video_path);
+  cancellation_terminates_an_active_probe_worker(video_path);
   rapid_posix_probe_launches_establish_process_groups(video_path);
   aggregate_worker_memory_budget_is_enforced();
   maximum_linux_snapshots_are_aggregate_bounded();

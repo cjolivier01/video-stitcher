@@ -598,6 +598,44 @@ void timeout_is_end_to_end_and_reaps_the_worker() {
   expect_true(elapsed < std::chrono::seconds(2), "timeout includes bounded teardown");
 }
 
+void cancellation_terminates_the_active_worker() {
+  const auto marker = temporary_path("cancelled-worker.pid");
+  std::filesystem::remove(marker);
+  EnvironmentValue worker_marker("RECO_FAKE_CALIBRATION_WORKER_PID_PATH", marker.string());
+  Scenario scenario("timeout");
+  auto request = lifecycle_request_fixture();
+  request.calibration_timeout_ns = 30'000'000'000ULL;
+  std::atomic<bool> cancel{false};
+  std::optional<pid_t> worker;
+  std::thread requester([&] {
+    worker = wait_for_pid_marker(marker, std::chrono::seconds(2));
+    cancel.store(true, std::memory_order_release);
+  });
+
+  const auto started = std::chrono::steady_clock::now();
+  bool cancelled = false;
+  try {
+    (void)run_gpu_calibration(request, ready_backends(),
+                              [&] { return cancel.load(std::memory_order_acquire); });
+  } catch (const CalibrationCancelled&) {
+    cancelled = true;
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: active calibration cancellation returned the wrong error: " << error.what()
+              << '\n';
+    ++failures;
+  }
+  requester.join();
+
+  expect_true(worker.has_value(), "active calibration worker reports its PID before cancellation");
+  expect_true(cancelled, "active calibration reports explicit cancellation");
+  expect_true(std::chrono::steady_clock::now() - started < std::chrono::seconds(3),
+              "active calibration cancellation returns within the cleanup bound");
+  if (worker.has_value()) {
+    wait_for_process_removal(*worker, "active calibration cancellation removes the worker");
+  }
+  std::filesystem::remove(marker);
+}
+
 #if !defined(RECO_CALIBRATION_WIDE_ADDRESS_SANITIZER)
 void aggregate_host_memory_is_monitored() {
   Scenario scenario("memory");
@@ -1548,6 +1586,7 @@ int main() {
   run_case("delayed worker request", delayed_worker_request_io_obeys_the_deadline);
   run_case("worker failure containment", worker_failures_crashes_and_bad_frames_are_contained);
   run_case("end-to-end timeout", timeout_is_end_to_end_and_reaps_the_worker);
+  run_case("active cancellation", cancellation_terminates_the_active_worker);
 #if !defined(RECO_CALIBRATION_WIDE_ADDRESS_SANITIZER)
   run_case("aggregate memory monitoring", aggregate_host_memory_is_monitored);
   run_case("shared memory monitoring", shared_mapping_memory_is_monitored);

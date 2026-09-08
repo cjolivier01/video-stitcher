@@ -77,9 +77,34 @@ extern "C" void __sanitizer_syscall_post_impl_fork(long result) noexcept;
 
 namespace reco::calibrate::detail {
 
+namespace {
+
+[[nodiscard]] bool
+cancellation_is_requested(const CalibrationCancellationRequested& requested) noexcept {
+  if (!requested) {
+    return false;
+  }
+  try {
+    return requested();
+  } catch (...) {
+    return true;
+  }
+}
+
+void throw_if_cancelled(const CalibrationCancellationRequested& requested) {
+  if (cancellation_is_requested(requested)) {
+    throw CalibrationCancelled();
+  }
+}
+
+} // namespace
+
 #if !defined(__linux__)
 
-CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest&) {
+CalibrationResult
+run_gpu_calibration_supervised(const GpuCalibrationRequest&,
+                               const CalibrationCancellationRequested& cancellation_requested) {
+  throw_if_cancelled(cancellation_requested);
 #if defined(_WIN32)
   throw CalibrationExecutionError(
       "isolated GPU calibration is not implemented on Windows and fails closed");
@@ -635,8 +660,10 @@ public:
     return result > 0 && (item.revents & (POLLIN | POLLHUP | POLLERR)) != 0;
   }
 
-  void wait_until(Clock::time_point deadline) const {
+  void wait_until(Clock::time_point deadline,
+                  const CalibrationCancellationRequested& cancellation_requested = {}) const {
     while (!exited()) {
+      throw_if_cancelled(cancellation_requested);
       if (Clock::now() >= deadline) {
         throw CalibrationExecutionError("calibration worker exceeded its end-to-end deadline");
       }
@@ -1890,11 +1917,13 @@ private:
   return {.descriptor = std::move(descriptor), .address = std::move(name)};
 }
 
-[[nodiscard]] UniqueFd accept_authenticated(const UnixListener& listener, OwnedProcess& process,
-                                            Clock::time_point deadline,
-                                            std::uint64_t resident_limit = 0,
-                                            ScratchQuotaMonitor* scratch_monitor = nullptr) {
+[[nodiscard]] UniqueFd
+accept_authenticated(const UnixListener& listener, OwnedProcess& process,
+                     Clock::time_point deadline, std::uint64_t resident_limit = 0,
+                     ScratchQuotaMonitor* scratch_monitor = nullptr,
+                     const CalibrationCancellationRequested& cancellation_requested = {}) {
   while (Clock::now() < deadline) {
+    throw_if_cancelled(cancellation_requested);
     if (scratch_monitor != nullptr) {
       scratch_monitor->enforce(process);
     }
@@ -2018,8 +2047,10 @@ void enforce_resident_limit(const OwnedProcess& process, std::uint64_t limit) {
 void wait_for_socket(int socket, const OwnedProcess& process, short events,
                      Clock::time_point deadline, int abort_socket = -1,
                      std::uint64_t resident_limit = 0,
-                     ScratchQuotaMonitor* scratch_monitor = nullptr) {
+                     ScratchQuotaMonitor* scratch_monitor = nullptr,
+                     const CalibrationCancellationRequested& cancellation_requested = {}) {
   while (Clock::now() < deadline) {
+    throw_if_cancelled(cancellation_requested);
     if (scratch_monitor != nullptr) {
       scratch_monitor->enforce(process);
     }
@@ -2057,11 +2088,12 @@ void wait_for_socket(int socket, const OwnedProcess& process, short events,
 
 void write_all(int socket, const OwnedProcess& process, std::string_view bytes,
                Clock::time_point deadline, int abort_socket = -1, std::uint64_t resident_limit = 0,
-               ScratchQuotaMonitor* scratch_monitor = nullptr) {
+               ScratchQuotaMonitor* scratch_monitor = nullptr,
+               const CalibrationCancellationRequested& cancellation_requested = {}) {
   std::size_t offset = 0;
   while (offset < bytes.size()) {
     wait_for_socket(socket, process, POLLOUT, deadline, abort_socket, resident_limit,
-                    scratch_monitor);
+                    scratch_monitor, cancellation_requested);
     const auto written = ::send(socket, bytes.data() + offset, bytes.size() - offset, MSG_NOSIGNAL);
     if (written < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
       continue;
@@ -2075,11 +2107,12 @@ void write_all(int socket, const OwnedProcess& process, std::string_view bytes,
 
 void read_exact(int socket, const OwnedProcess& process, char* destination, std::size_t size,
                 Clock::time_point deadline, int abort_socket = -1, std::uint64_t resident_limit = 0,
-                ScratchQuotaMonitor* scratch_monitor = nullptr) {
+                ScratchQuotaMonitor* scratch_monitor = nullptr,
+                const CalibrationCancellationRequested& cancellation_requested = {}) {
   std::size_t offset = 0;
   while (offset < size) {
     wait_for_socket(socket, process, POLLIN, deadline, abort_socket, resident_limit,
-                    scratch_monitor);
+                    scratch_monitor, cancellation_requested);
     const auto received = ::recv(socket, destination + offset, size - offset, 0);
     if (received < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
       continue;
@@ -2091,14 +2124,14 @@ void read_exact(int socket, const OwnedProcess& process, char* destination, std:
   }
 }
 
-[[nodiscard]] std::string read_frame(int socket, const OwnedProcess& process,
-                                     Clock::time_point deadline,
-                                     std::size_t maximum_success_frame_bytes, int abort_socket = -1,
-                                     std::uint64_t resident_limit = 0,
-                                     ScratchQuotaMonitor* scratch_monitor = nullptr) {
+[[nodiscard]] std::string
+read_frame(int socket, const OwnedProcess& process, Clock::time_point deadline,
+           std::size_t maximum_success_frame_bytes, int abort_socket = -1,
+           std::uint64_t resident_limit = 0, ScratchQuotaMonitor* scratch_monitor = nullptr,
+           const CalibrationCancellationRequested& cancellation_requested = {}) {
   CalibrationWorkerFrameHeader header{};
   read_exact(socket, process, header.data(), header.size(), deadline, abort_socket, resident_limit,
-             scratch_monitor);
+             scratch_monitor, cancellation_requested);
   const auto decoded = decode_calibration_worker_header(header);
   if (decoded.message == CalibrationWorkerMessage::Success &&
       (maximum_success_frame_bytes < header.size() ||
@@ -2110,14 +2143,14 @@ void read_exact(int socket, const OwnedProcess& process, char* destination, std:
   const auto payload_offset = response.size();
   response.resize(payload_offset + decoded.payload_size);
   read_exact(socket, process, response.data() + payload_offset, decoded.payload_size, deadline,
-             abort_socket, resident_limit, scratch_monitor);
+             abort_socket, resident_limit, scratch_monitor, cancellation_requested);
   return response;
 }
 
 void send_file_fd(int socket, const OwnedProcess& process, char marker, int file_descriptor,
                   Clock::time_point deadline, int abort_socket = -1,
-                  std::uint64_t resident_limit = 0,
-                  ScratchQuotaMonitor* scratch_monitor = nullptr) {
+                  std::uint64_t resident_limit = 0, ScratchQuotaMonitor* scratch_monitor = nullptr,
+                  const CalibrationCancellationRequested& cancellation_requested = {}) {
   std::array<char, CMSG_SPACE(sizeof(int))> control{};
   iovec bytes{.iov_base = &marker, .iov_len = 1};
   msghdr message{};
@@ -2133,7 +2166,7 @@ void send_file_fd(int socket, const OwnedProcess& process, char marker, int file
 
   while (true) {
     wait_for_socket(socket, process, POLLOUT, deadline, abort_socket, resident_limit,
-                    scratch_monitor);
+                    scratch_monitor, cancellation_requested);
     const auto sent = ::sendmsg(socket, &message, MSG_NOSIGNAL);
     if (sent < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
       continue;
@@ -2146,8 +2179,9 @@ void send_file_fd(int socket, const OwnedProcess& process, char marker, int file
 }
 
 [[nodiscard]] ExternalProcessAuthority
-receive_worker_authority(int socket, const OwnedProcess& guardian, Clock::time_point deadline) {
-  wait_for_socket(socket, guardian, POLLIN, deadline);
+receive_worker_authority(int socket, const OwnedProcess& guardian, Clock::time_point deadline,
+                         const CalibrationCancellationRequested& cancellation_requested = {}) {
+  wait_for_socket(socket, guardian, POLLIN, deadline, -1, 0, nullptr, cancellation_requested);
   char marker = '\0';
   std::array<char, CMSG_SPACE(sizeof(int) * 2U)> control{};
   iovec bytes{.iov_base = &marker, .iov_len = 1};
@@ -4073,16 +4107,21 @@ int run_calibration_guardian_fd(int descriptor, const char* executable,
   }
 }
 
-CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest& request) {
+CalibrationResult
+run_gpu_calibration_supervised(const GpuCalibrationRequest& request,
+                               const CalibrationCancellationRequested& cancellation_requested) {
+  throw_if_cancelled(cancellation_requested);
   const auto timeout = std::chrono::nanoseconds(request.calibration_timeout_ns);
   if (timeout <= kCleanupReserve || Clock::time_point::max() - Clock::now() < timeout) {
     throw CalibrationExecutionError("calibration timeout is outside the supervisor clock range");
   }
   const auto deadline = Clock::now() + timeout;
   require_observable_child_status();
+  throw_if_cancelled(cancellation_requested);
   AdmissionLock admission;
   check_admission_headroom(request.calibration_host_memory_limit_bytes);
   PinnedExecutable executable(std::filesystem::path(request.calibration_worker_path), deadline);
+  throw_if_cancelled(cancellation_requested);
   auto worker_request = request;
   const auto open_retained_input = [](const std::string& path, std::string_view label,
                                       std::optional<CalibrationFileIdentity>& expected_identity) {
@@ -4112,6 +4151,7 @@ CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest& re
                                         worker_request.left.expected_identity);
   auto right_input = open_retained_input(right_open_path, "right calibration video",
                                          worker_request.right.expected_identity);
+  throw_if_cancelled(cancellation_requested);
   worker_request.left.retained_path = retained_descriptor_path(left_input.get());
   worker_request.right.retained_path = retained_descriptor_path(right_input.get());
   UniqueFd left_profile;
@@ -4138,35 +4178,47 @@ CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest& re
   };
   const auto encoded_request = encode_calibration_worker_request(worker_request);
   CgroupMemoryBoundary memory_boundary(request.calibration_host_memory_limit_bytes, deadline);
+  throw_if_cancelled(cancellation_requested);
   try {
     auto listener = create_listener();
     auto guardian = spawn_guardian(executable, listener.address, deadline);
-    auto channel = accept_authenticated(listener, guardian, deadline);
-    send_file_fd(channel.get(), guardian, 'L', admission.fd(), deadline);
-    send_file_fd(channel.get(), guardian, 'X', executable.fd(), deadline);
-    send_file_fd(channel.get(), guardian, 'C', memory_boundary.fd(), deadline);
-    write_all(channel.get(), guardian, encoded_request, deadline);
+    auto channel =
+        accept_authenticated(listener, guardian, deadline, 0, nullptr, cancellation_requested);
+    send_file_fd(channel.get(), guardian, 'L', admission.fd(), deadline, -1, 0, nullptr,
+                 cancellation_requested);
+    send_file_fd(channel.get(), guardian, 'X', executable.fd(), deadline, -1, 0, nullptr,
+                 cancellation_requested);
+    send_file_fd(channel.get(), guardian, 'C', memory_boundary.fd(), deadline, -1, 0, nullptr,
+                 cancellation_requested);
+    write_all(channel.get(), guardian, encoded_request, deadline, -1, 0, nullptr,
+              cancellation_requested);
     if (left_input) {
-      send_file_fd(channel.get(), guardian, 'I', left_input.get(), deadline);
+      send_file_fd(channel.get(), guardian, 'I', left_input.get(), deadline, -1, 0, nullptr,
+                   cancellation_requested);
     }
     if (right_input) {
-      send_file_fd(channel.get(), guardian, 'J', right_input.get(), deadline);
+      send_file_fd(channel.get(), guardian, 'J', right_input.get(), deadline, -1, 0, nullptr,
+                   cancellation_requested);
     }
     if (left_profile) {
-      send_file_fd(channel.get(), guardian, 'K', left_profile.get(), deadline);
+      send_file_fd(channel.get(), guardian, 'K', left_profile.get(), deadline, -1, 0, nullptr,
+                   cancellation_requested);
     }
     if (right_profile) {
-      send_file_fd(channel.get(), guardian, 'M', right_profile.get(), deadline);
+      send_file_fd(channel.get(), guardian, 'M', right_profile.get(), deadline, -1, 0, nullptr,
+                   cancellation_requested);
     }
     if (::shutdown(channel.get(), SHUT_WR) != 0) {
       throw CalibrationExecutionError("cannot finish the calibration guardian request");
     }
-    auto worker_authority = receive_worker_authority(channel.get(), guardian, deadline);
+    auto worker_authority =
+        receive_worker_authority(channel.get(), guardian, deadline, cancellation_requested);
     (void)worker_authority;
     auto response = read_frame(channel.get(), guardian, deadline,
                                maximum_calibration_worker_success_frame_bytes(
-                                   request.config.num_frames, request.config.akaze.max_keypoints));
-    guardian.wait_until(deadline);
+                                   request.config.num_frames, request.config.akaze.max_keypoints),
+                               -1, 0, nullptr, cancellation_requested);
+    guardian.wait_until(deadline, cancellation_requested);
     const auto status = guardian.reap();
     certify_channel_eof(channel.get());
     if (memory_boundary.oom_killed()) {
@@ -4185,6 +4237,7 @@ CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest& re
       throw CalibrationExecutionError("calibration guardian terminated abnormally");
     }
     auto result = decode_calibration_worker_response(response);
+    throw_if_cancelled(cancellation_requested);
     if (result.frames_used > request.config.num_frames ||
         result.per_frame.size() > request.config.num_frames) {
       throw CalibrationExecutionError(
@@ -4226,6 +4279,7 @@ CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest& re
                             worker_request.right.lens_profile_expected_identity);
     }
     memory_boundary.finish();
+    throw_if_cancelled(cancellation_requested);
     return result;
   } catch (...) {
     if (memory_boundary.oom_killed()) {

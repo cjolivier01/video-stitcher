@@ -872,23 +872,26 @@ CalibrationResult detail::run_gpu_calibration_in_process(const GpuCalibrationReq
   }
 }
 
-CalibrationResult run_gpu_calibration(const GpuCalibrationRequest& request,
-                                      const CalibrationBackendStatus& backends) {
+CalibrationResult
+run_gpu_calibration(const GpuCalibrationRequest& request, const CalibrationBackendStatus& backends,
+                    const CalibrationCancellationRequested& cancellation_requested) {
   const auto plan = build_gpu_calibration_plan(request, backends);
   if (!plan.ready) {
     throw CalibrationExecutionError(plan.blocked_reason.value_or("GPU calibration is unavailable"));
   }
-  return detail::run_gpu_calibration_supervised(request);
+  return detail::run_gpu_calibration_supervised(request, cancellation_requested);
 }
 
-CalibrationResult run_gpu_calibration(const GpuCalibrationRequest& request) {
+CalibrationResult
+run_gpu_calibration(const GpuCalibrationRequest& request,
+                    const CalibrationCancellationRequested& cancellation_requested) {
   if (const auto error = validate_gpu_calibration_request(request); error.has_value()) {
     throw CalibrationExecutionError(*error);
   }
   if (request.calibration_worker_path.empty()) {
     throw CalibrationExecutionError("GPU calibration worker path is required for file execution");
   }
-  return detail::run_gpu_calibration_supervised(request);
+  return detail::run_gpu_calibration_supervised(request, cancellation_requested);
 }
 
 } // namespace reco::calibrate

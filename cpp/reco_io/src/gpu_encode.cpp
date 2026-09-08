@@ -210,10 +210,10 @@ std::string build_gstreamer_gpu_encode_pipeline(const GpuEncodeConfig& config) {
 
 namespace {
 
-void verify_muxed_gpu_video_output_impl(const std::filesystem::path& path,
-                                        std::shared_ptr<const StableMediaFile> source, Codec codec,
-                                        Format format, const std::filesystem::path& probe_worker,
-                                        std::chrono::milliseconds timeout) {
+void verify_muxed_gpu_video_output_impl(
+    const std::filesystem::path& path, std::shared_ptr<const StableMediaFile> source, Codec codec,
+    Format format, const std::filesystem::path& probe_worker, std::chrono::milliseconds timeout,
+    const GpuVideoProbeCancellationRequested& cancellation_requested) {
   if (path.empty() || (source && source->display_path().empty())) {
     throw std::invalid_argument("GPU output verification requires a non-empty path");
   }
@@ -233,7 +233,7 @@ void verify_muxed_gpu_video_output_impl(const std::filesystem::path& path,
                                          .require_selected_codec = true,
                                          .max_buffers = 1,
                                          .drop = false},
-                                        probe_worker, timeout_ns);
+                                        probe_worker, timeout_ns, cancellation_requested);
     if (result.total_frames == 0U || result.width == 0U || result.height == 0U) {
       throw GpuEncodeError(
           "completed GPU output contains no parser-verified compressed video sample");
@@ -247,20 +247,24 @@ void verify_muxed_gpu_video_output_impl(const std::filesystem::path& path,
 
 } // namespace
 
-void verify_muxed_gpu_video_output(const std::filesystem::path& path, Codec codec, Format format,
-                                   const std::filesystem::path& probe_worker,
-                                   std::chrono::milliseconds timeout) {
-  verify_muxed_gpu_video_output_impl(path, {}, codec, format, probe_worker, timeout);
+void verify_muxed_gpu_video_output(
+    const std::filesystem::path& path, Codec codec, Format format,
+    const std::filesystem::path& probe_worker, std::chrono::milliseconds timeout,
+    const GpuVideoProbeCancellationRequested& cancellation_requested) {
+  verify_muxed_gpu_video_output_impl(path, {}, codec, format, probe_worker, timeout,
+                                     cancellation_requested);
 }
 
-void verify_muxed_gpu_video_output(std::shared_ptr<const StableMediaFile> source, Codec codec,
-                                   Format format, const std::filesystem::path& probe_worker,
-                                   std::chrono::milliseconds timeout) {
+void verify_muxed_gpu_video_output(
+    std::shared_ptr<const StableMediaFile> source, Codec codec, Format format,
+    const std::filesystem::path& probe_worker, std::chrono::milliseconds timeout,
+    const GpuVideoProbeCancellationRequested& cancellation_requested) {
   if (!source) {
     throw std::invalid_argument("GPU output verification requires a retained source");
   }
   const auto path = source->display_path();
-  verify_muxed_gpu_video_output_impl(path, std::move(source), codec, format, probe_worker, timeout);
+  verify_muxed_gpu_video_output_impl(path, std::move(source), codec, format, probe_worker, timeout,
+                                     cancellation_requested);
 }
 
 } // namespace reco::io

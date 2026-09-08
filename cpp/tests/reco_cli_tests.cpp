@@ -367,6 +367,34 @@ int run_windows_publication_writer_child(int argc, wchar_t** argv) {
   return 0;
 }
 
+int run_windows_interrupt_child(int argc, wchar_t** argv) {
+  if (argc != 4) {
+    return 95;
+  }
+  const HANDLE ready = OpenEventW(EVENT_MODIFY_STATE, FALSE, argv[3]);
+  if (ready == nullptr) {
+    return 96;
+  }
+  try {
+    detail::InterruptMonitor interrupts;
+    {
+      detail::AtomicOutputFile output(std::filesystem::path(argv[2]));
+      write_text_descriptor(output.descriptor(), "partial output\n");
+      if (SetEvent(ready) == 0) {
+        throw std::runtime_error("cannot signal Windows interrupt-child readiness");
+      }
+      while (!interrupts.requested()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
+  } catch (...) {
+    (void)CloseHandle(ready);
+    return 97;
+  }
+  (void)CloseHandle(ready);
+  return kCancelledExitCode;
+}
+
 bool wait_windows_process_success(HANDLE process, DWORD timeout_ms) {
   if (process == nullptr) {
     return false;
@@ -680,15 +708,59 @@ void interrupt_request_unwinds_stitch_output_staging() {
   write_text_file(destination, "existing destination\n");
 
 #if defined(_WIN32)
-  {
-    detail::InterruptMonitor interrupts;
-    {
-      detail::AtomicOutputFile output(destination);
-      write_text_descriptor(output.descriptor(), "partial output\n");
-      expect_true(std::raise(SIGINT) == 0, "Windows CRT interrupt is delivered");
-      expect_true(interrupts.requested(), "Windows interrupt monitor records cancellation");
-    }
+  if (GetConsoleCP() == 0) {
+    expect_true(AllocConsole() != 0, "Windows cancellation test allocates a console");
   }
+  const auto event_name = L"Local\\RecoInterruptReady-" + std::to_wstring(GetCurrentProcessId()) +
+                          L"-" + std::to_wstring(GetTickCount64());
+  const HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, event_name.c_str());
+  expect_true(ready != nullptr, "Windows cancellation test creates its readiness event");
+
+  std::wstring executable(32768, L'\0');
+  const DWORD executable_size =
+      GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+  expect_true(executable_size != 0 && executable_size < executable.size(),
+              "Windows cancellation test resolves its child executable");
+  executable.resize(executable_size < executable.size() ? executable_size : 0);
+  std::wstring command = quote_windows_argument(executable);
+  for (const auto argument :
+       {std::wstring_view(L"--reco-interrupt-child"), std::wstring_view(destination.native()),
+        std::wstring_view(event_name)}) {
+    command.push_back(L' ');
+    command += quote_windows_argument(argument);
+  }
+  command.push_back(L'\0');
+  STARTUPINFOW startup{.cb = sizeof(startup)};
+  PROCESS_INFORMATION process{};
+  const bool started =
+      ready != nullptr && !executable.empty() &&
+      CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE,
+                     CREATE_NEW_PROCESS_GROUP, nullptr, nullptr, &startup, &process) != 0;
+  expect_true(started, "Windows cancellation child starts in a new process group");
+  if (started) {
+    (void)CloseHandle(process.hThread);
+  }
+  const bool active = started && WaitForSingleObject(ready, 10000) == WAIT_OBJECT_0;
+  expect_true(active, "Windows cancellation child enters active staged work");
+  const bool delivered =
+      active && GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, process.dwProcessId) != 0;
+  expect_true(delivered, "CTRL_BREAK_EVENT is delivered to the child process group");
+  const bool exited = delivered && WaitForSingleObject(process.hProcess, 5000) == WAIT_OBJECT_0;
+  expect_true(exited, "Windows cancellation child exits within the cancellation bound");
+  DWORD exit_code = 0;
+  if (started) {
+    if (!exited) {
+      (void)TerminateProcess(process.hProcess, 98);
+      (void)WaitForSingleObject(process.hProcess, 5000);
+    }
+    (void)GetExitCodeProcess(process.hProcess, &exit_code);
+    (void)CloseHandle(process.hProcess);
+  }
+  if (ready != nullptr) {
+    (void)CloseHandle(ready);
+  }
+  expect_true(exited && exit_code == static_cast<DWORD>(kCancelledExitCode),
+              "Windows console cancellation exits with status 130");
 #else
   int ready[2]{};
   if (::pipe(ready) != 0) {
@@ -3219,6 +3291,17 @@ void command_execution_dispatches_available_stages() {
   err.str("");
   err.clear();
   CalibrateCommand calibrate{.left = "left.mp4", .right = "right.mp4"};
+  const auto cancelled_calibration_status =
+      run_command(Command{calibrate}, out, err, {}, [] { return true; });
+  expect_eq(cancelled_calibration_status, kCancelledExitCode,
+            "pre-cancelled calibration uses the cancellation exit status");
+  expect_true(out.str().empty(), "pre-cancelled calibration starts no runtime plan");
+  expect_eq(err.str(), std::string("cancelled\n"),
+            "pre-cancelled calibration reports cancellation");
+  out.str("");
+  out.clear();
+  err.str("");
+  err.clear();
 #if defined(__linux__)
   const auto fake_nvbufsurface = find_shared_library_runfile("fake_nvbufsurface");
   ScopedEnvironment nvbufsurface_runtime("RECO_NVBUFSURFACE_DYLIB_PATH",
@@ -3386,6 +3469,9 @@ void command_execution_dispatches_available_stages() {
 int wmain(int argc, wchar_t** argv) {
   if (argc >= 2 && std::wstring_view(argv[1]) == L"--reco-publication-writer-child") {
     return run_windows_publication_writer_child(argc, argv);
+  }
+  if (argc >= 2 && std::wstring_view(argv[1]) == L"--reco-interrupt-child") {
+    return run_windows_interrupt_child(argc, argv);
   }
 #else
 int main(int argc, char** argv) {

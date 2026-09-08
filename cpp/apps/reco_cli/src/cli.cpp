@@ -5271,6 +5271,16 @@ std::string help_text() {
 int run_command(const Command& command, std::ostream& out, std::ostream& err,
                 const std::filesystem::path& executable_path,
                 const CancellationRequested& cancellation_requested) {
+  const auto cancellation_requested_now = [&] {
+    if (!cancellation_requested) {
+      return false;
+    }
+    try {
+      return cancellation_requested();
+    } catch (...) {
+      return true;
+    }
+  };
   if (std::holds_alternative<HelpCommand>(command)) {
     out << help_text() << '\n';
     return 0;
@@ -5327,6 +5337,10 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err,
   }
 
   if (const auto* calibrate = std::get_if<CalibrateCommand>(&command)) {
+    if (cancellation_requested_now()) {
+      err << "cancelled\n";
+      return kCancelledExitCode;
+    }
     reco::calibrate::GpuCalibrationRequest request;
     request.left.path = calibrate->left;
     request.left.lens_profile = calibrate->left_profile;
@@ -5367,6 +5381,10 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err,
 
     const auto backends = reco::calibrate::probe_calibration_backends();
     const auto plan = reco::calibrate::build_gpu_calibration_plan(request, backends);
+    if (cancellation_requested_now()) {
+      err << "cancelled\n";
+      return kCancelledExitCode;
+    }
     out << reco::calibrate::describe_calibration_plan(plan);
     if (!plan.ready) {
       err << "error: " << plan.blocked_reason.value_or("C++ GPU calibration is unavailable")
@@ -5403,7 +5421,8 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err,
         pinned_request.right.lens_profile_expected_identity =
             right_profile_identity->portable_identity();
       }
-      auto result = reco::calibrate::run_gpu_calibration(pinned_request, backends);
+      auto result =
+          reco::calibrate::run_gpu_calibration(pinned_request, backends, cancellation_requested);
       if (result.left_lens_profile.has_value()) {
         result.left_lens_profile->path = request.left.lens_profile;
       }
@@ -5413,6 +5432,9 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err,
                                               : request.left.lens_profile;
       }
       const auto verify_pinned_inputs = [&] {
+        if (cancellation_requested_now()) {
+          throw reco::calibrate::CalibrationCancelled();
+        }
         left_identity.verify_unchanged();
         right_identity.verify_unchanged();
         if (left_profile_identity.has_value()) {
@@ -5422,16 +5444,33 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err,
           right_profile_identity->verify_unchanged();
         }
       };
+      if (cancellation_requested_now()) {
+        throw reco::calibrate::CalibrationCancelled();
+      }
       verify_pinned_inputs();
+      if (cancellation_requested_now()) {
+        throw reco::calibrate::CalibrationCancelled();
+      }
       // Publish against the original user-visible entries while the descriptors used by the
       // worker remain pinned. This preserves both symlink and target identities through commit.
       write_calibration_result(result, request, verify_pinned_inputs);
 #else
-      const auto result = reco::calibrate::run_gpu_calibration(request, backends);
+      const auto result =
+          reco::calibrate::run_gpu_calibration(request, backends, cancellation_requested);
+      if (cancellation_requested_now()) {
+        throw reco::calibrate::CalibrationCancelled();
+      }
       write_calibration_result(result, request);
 #endif
       write_calibration_result_summary(result, request.output, out);
+    } catch (const reco::calibrate::CalibrationCancelled&) {
+      err << "cancelled\n";
+      return kCancelledExitCode;
     } catch (const std::exception& error) {
+      if (cancellation_requested_now()) {
+        err << "cancelled\n";
+        return kCancelledExitCode;
+      }
       err << "error: " << error.what() << '\n';
       return 2;
     }
@@ -5439,12 +5478,16 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err,
   }
 
   if (const auto* stitch = std::get_if<StitchCommand>(&command)) {
-    if (cancellation_requested && cancellation_requested()) {
+    if (cancellation_requested_now()) {
       err << "cancelled\n";
       return kCancelledExitCode;
     }
     const auto backends = reco::calibrate::probe_calibration_backends();
     const auto plan = build_stitch_plan(*stitch, backends);
+    if (cancellation_requested_now()) {
+      err << "cancelled\n";
+      return kCancelledExitCode;
+    }
     write_runtime_plan(out, plan);
     if (plan.blocked_reason.has_value()) {
       err << "error: " << *plan.blocked_reason << '\n';

@@ -2,6 +2,7 @@
 
 #include "reco/core/cuda_frame.hpp"
 #include "reco/io/audio_passthrough.hpp"
+#include "reco/io/gpu_video_probe.hpp"
 #include "reco/io/nvmm.hpp"
 #include "reco/io/output.hpp"
 
@@ -132,12 +133,16 @@ private:
 /// The worker uses only a demuxer, parser, compressed caps filters, and an appsink. It never
 /// instantiates a video decoder or materializes pixels. H.264, HEVC, and AV1 in MP4, fragmented
 /// MP4, Matroska, QuickTime, and FLV containers are supported.
-void verify_muxed_gpu_video_output(const std::filesystem::path& path, Codec codec, Format format,
-                                   const std::filesystem::path& probe_worker,
-                                   std::chrono::milliseconds timeout = std::chrono::seconds(10));
+void verify_muxed_gpu_video_output(
+    const std::filesystem::path& path, Codec codec, Format format,
+    const std::filesystem::path& probe_worker,
+    std::chrono::milliseconds timeout = std::chrono::seconds(10),
+    const GpuVideoProbeCancellationRequested& cancellation_requested = {});
 /// Verifies the exact retained file authority without reopening its diagnostic pathname.
-void verify_muxed_gpu_video_output(std::shared_ptr<const StableMediaFile> source, Codec codec,
-                                   Format format, const std::filesystem::path& probe_worker,
-                                   std::chrono::milliseconds timeout = std::chrono::seconds(10));
+void verify_muxed_gpu_video_output(
+    std::shared_ptr<const StableMediaFile> source, Codec codec, Format format,
+    const std::filesystem::path& probe_worker,
+    std::chrono::milliseconds timeout = std::chrono::seconds(10),
+    const GpuVideoProbeCancellationRequested& cancellation_requested = {});
 
 } // namespace reco::io

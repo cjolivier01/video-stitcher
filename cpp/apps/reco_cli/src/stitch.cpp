@@ -195,7 +195,8 @@ GpuFileDecodeConfig decode_config(const std::string& path,
 }
 
 ProbedInput probe_input(std::vector<std::string> paths, RetainedInputSources sources,
-                        const std::filesystem::path& worker, std::string_view label) {
+                        const std::filesystem::path& worker, std::string_view label,
+                        const CancellationRequested& cancellation_requested) {
   if (paths.size() != sources.decode.size()) {
     throw std::logic_error("stable stitch input count does not match its paths");
   }
@@ -210,7 +211,7 @@ ProbedInput probe_input(std::vector<std::string> paths, RetainedInputSources sou
                          .codec = gpu_decode_codec_for_path(path),
                          .elementary_stream = gpu_decode_path_is_elementary_stream(path),
                          .container = gpu_decode_container_for_path(path)},
-                        worker, kProbeTimeoutNs));
+                        worker, kProbeTimeoutNs, cancellation_requested));
   }
   const auto& first = input.probes.front();
   for (std::size_t index = 1; index < input.probes.size(); ++index) {
@@ -410,21 +411,23 @@ public:
 
 class StitchCancellationRelay final {
 public:
-  StitchCancellationRelay(const CancellationRequested& requested, GpuStereoDecodeSession& decoder,
-                          AudioPassthroughSource* audio, GpuVideoEncodeSession& encoder)
-      : requested_(requested) {
+  explicit StitchCancellationRelay(const CancellationRequested& requested) : requested_(requested) {
     if (!requested_) {
       return;
     }
-    worker_ = std::jthread([this, &decoder, audio, &encoder](std::stop_token stop) {
+    worker_ = std::jthread([this](std::stop_token stop) {
       while (!stop.stop_requested()) {
         if (cancellation_is_requested(requested_)) {
           observed_.store(true, std::memory_order_release);
-          decoder.request_stop();
-          if (audio != nullptr) {
+          if (auto* decoder = decoder_.load(std::memory_order_acquire); decoder != nullptr) {
+            decoder->request_stop();
+          }
+          if (auto* audio = audio_.load(std::memory_order_acquire); audio != nullptr) {
             audio->request_stop();
           }
-          encoder.abort();
+          if (auto* encoder = encoder_.load(std::memory_order_acquire); encoder != nullptr) {
+            encoder->abort();
+          }
           return;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -452,9 +455,33 @@ public:
     }
   }
 
+  void attach(GpuStereoDecodeSession& decoder) noexcept {
+    decoder_.store(&decoder, std::memory_order_release);
+    if (requested()) {
+      decoder.request_stop();
+    }
+  }
+
+  void attach(AudioPassthroughSource& audio) noexcept {
+    audio_.store(&audio, std::memory_order_release);
+    if (requested()) {
+      audio.request_stop();
+    }
+  }
+
+  void attach(GpuVideoEncodeSession& encoder) noexcept {
+    encoder_.store(&encoder, std::memory_order_release);
+    if (requested()) {
+      encoder.abort();
+    }
+  }
+
 private:
   const CancellationRequested& requested_;
   std::atomic<bool> observed_{false};
+  std::atomic<GpuStereoDecodeSession*> decoder_{nullptr};
+  std::atomic<AudioPassthroughSource*> audio_{nullptr};
+  std::atomic<GpuVideoEncodeSession*> encoder_{nullptr};
   std::jthread worker_;
 };
 
@@ -616,9 +643,11 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
                                .label = "the calibration file",
                                .stable_source = calibration_source});
     AtomicOutputFile output(output_path, {}, {}, protected_paths);
-    if (cancellation_is_requested(cancellation_requested)) {
-      throw StitchCancelled();
-    }
+    std::optional<AudioPassthroughSource> audio;
+    std::optional<GpuVideoEncodeSession> encoder;
+    std::optional<GpuStereoDecodeSession> decoder;
+    StitchCancellationRelay cancellation(cancellation_requested);
+    cancellation.throw_if_requested();
 
     auto calibration = core::parse_match_calibration_json(
         calibration_source->read_all(core::kMaxCalibrationFileSize));
@@ -631,12 +660,11 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
     if (!worker.has_value()) {
       throw std::runtime_error("cannot locate the deployed reco_video_probe_worker executable");
     }
-    auto left_input = probe_input(std::move(left_paths), std::move(left_sources), *worker, "left");
-    auto right_input =
-        probe_input(std::move(right_paths), std::move(right_sources), *worker, "right");
-    if (cancellation_is_requested(cancellation_requested)) {
-      throw StitchCancelled();
-    }
+    auto left_input = probe_input(std::move(left_paths), std::move(left_sources), *worker, "left",
+                                  cancellation_requested);
+    auto right_input = probe_input(std::move(right_paths), std::move(right_sources), *worker,
+                                   "right", cancellation_requested);
+    cancellation.throw_if_requested();
     require_exact_indexed_timeline(left_input, "left");
     require_exact_indexed_timeline(right_input, "right");
     const auto& left_probe = left_input.probes.front();
@@ -669,8 +697,10 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
       throw std::runtime_error(*sync_error);
     }
     auto runtime = discover_nvbufsurface_runtime();
+    cancellation.throw_if_requested();
 
     auto backend = core::CudaBackend::create();
+    cancellation.throw_if_requested();
     const auto memory_estimate = estimate_gpu_stitch_memory({
         .output_width = command.width,
         .output_height = command.height,
@@ -690,6 +720,7 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
                                                             .output_height = command.height,
                                                             .device_ordinal = 0},
                                                            backend, core::NvrtcCompiler::create());
+    cancellation.throw_if_requested();
     auto rgba_storage =
         backend.allocate_pitched(static_cast<std::size_t>(command.width) * 4U, command.height, 4);
     const core::CudaRgbaFrameView rgba(
@@ -700,6 +731,7 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
         command.width, command.height);
     auto converter = core::CudaRgbaToNv12Converter::create(
         {.width = command.width, .height = command.height}, backend, core::NvrtcCompiler::create());
+    cancellation.throw_if_requested();
 
     const auto codec = parse_codec(command.codec);
     const auto quality = parse_quality(command.quality);
@@ -724,7 +756,6 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
       encoder_factory = factory;
     }
 
-    std::optional<AudioPassthroughSource> audio;
     const auto audio_selection = select_audio_segments(
         left_input, audio_start_time_ns(window.start_time_ns, sync_offset, left_probe.fps_numerator,
                                         left_probe.fps_denominator));
@@ -734,8 +765,11 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
                                         .start_time_ns = audio_selection.local_start_time_ns}));
       if (!audio->caps().has_value()) {
         audio.reset();
+      } else {
+        cancellation.attach(*audio);
       }
     }
+    cancellation.throw_if_requested();
 
     GpuEncodeConfig encode_config{
         .output_path = {},
@@ -753,14 +787,18 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
         .device_ordinal = 0,
         .pool_capacity = kStitchEncodePoolCapacity,
     };
-    auto encoder = GpuVideoEncodeSession::open(std::move(encode_config), runtime);
+    encoder.emplace(GpuVideoEncodeSession::open(std::move(encode_config), runtime));
+    cancellation.attach(*encoder);
+    cancellation.throw_if_requested();
     auto left = open_decode_source(left_input, start_frame, runtime);
+    cancellation.throw_if_requested();
     auto right = open_decode_source(right_input, start_frame, runtime);
-    GpuStereoDecodeSession decoder(
-        std::move(left), std::move(right),
-        {.sync_offset = sync_offset, .queue_capacity = kStitchStereoQueueCapacity});
-    StitchCancellationRelay cancellation(cancellation_requested, decoder,
-                                         audio.has_value() ? &*audio : nullptr, encoder);
+    cancellation.throw_if_requested();
+    decoder.emplace(std::move(left), std::move(right),
+                    GpuStereoDecodeConfig{.sync_offset = sync_offset,
+                                          .queue_capacity = kStitchStereoQueueCapacity});
+    cancellation.attach(*decoder);
+    cancellation.throw_if_requested();
 
     std::optional<CompressedAudioPacket> pending_audio;
     bool audio_eos = false;
@@ -791,7 +829,7 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
           break;
         }
         pending_audio->duration_ns = *clipped_duration;
-        encoder.submit_audio_packet(std::move(*pending_audio));
+        encoder->submit_audio_packet(std::move(*pending_audio));
         pending_audio.reset();
       }
     };
@@ -803,7 +841,7 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
     std::optional<std::uint64_t> previous_source_frame_index;
     while (!limit.has_value() || frames < *limit) {
       cancellation.throw_if_requested();
-      auto decoded = decoder.read();
+      auto decoded = decoder->read();
       if (decoded.status == GpuStereoDecodeStatus::EndOfStream) {
         break;
       }
@@ -819,7 +857,7 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
            decoded.frames->right.rotation_degrees != 180)) {
         throw std::runtime_error("90/270-degree stereo input rotation is not supported");
       }
-      auto encoded = encoder.acquire_frame();
+      auto encoded = encoder->acquire_frame();
       auto batch = renderer.begin_batch();
       renderer.enqueue(batch, left_frame.view(), right_frame.view(), rgba,
                        {.flip_left_180 = decoded.frames->left.rotation_degrees == 180,
@@ -837,15 +875,15 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
       const auto timing =
           derive_stitch_frame_timing(source_frame_index, *first_source_frame_index,
                                      left_probe.fps_numerator, left_probe.fps_denominator);
-      encoder.submit_frame(std::move(encoded), timing.pts_ns, timing.duration_ns);
+      encoder->submit_frame(std::move(encoded), timing.pts_ns, timing.duration_ns);
       video_duration_ns = timing.pts_ns + timing.duration_ns;
       forward_audio_before(video_duration_ns, false);
       previous_source_frame_index = source_frame_index;
       ++frames;
     }
-    decoder.request_stop();
+    decoder->request_stop();
     if (frames == 0) {
-      encoder.abort();
+      encoder->abort();
       if (audio.has_value()) {
         audio->request_stop();
       }
@@ -856,10 +894,10 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
       audio->request_stop();
     }
     cancellation.throw_if_requested();
-    encoder.finish();
+    encoder->finish();
     cancellation.throw_if_requested();
     verify_muxed_gpu_video_output(output.verification_source(), *codec, format, *worker,
-                                  kProbeTimeout);
+                                  kProbeTimeout, cancellation_requested);
     cancellation.throw_if_requested();
     verify_retained_inputs(left_input, right_input, *calibration_source);
     cancellation.throw_if_requested();

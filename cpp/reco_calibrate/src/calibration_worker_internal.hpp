@@ -20,7 +20,8 @@ run_gpu_calibration_in_process(const GpuCalibrationRequest& request,
 
 /// Executes a file-backed calibration in a bounded subprocess.
 [[nodiscard]] CalibrationResult
-run_gpu_calibration_supervised(const GpuCalibrationRequest& request);
+run_gpu_calibration_supervised(const GpuCalibrationRequest& request,
+                               const CalibrationCancellationRequested& cancellation_requested);
 
 /// Connects to an abstract Unix socket after the executable and its loader have initialized.
 [[nodiscard]] int connect_calibration_ipc(std::string_view address,

@@ -610,6 +610,25 @@ void finalized_output_requires_a_compressed_video_sample(const std::filesystem::
             "zero-sample verification does not enable autoplugging");
   expect_eq(count_event(events, "decoder-element"), 0U,
             "zero-sample verification does not fall back to a decoder");
+
+  std::filesystem::remove(event_path);
+  set_scenario("probe-timeout");
+  std::atomic<bool> cancel{false};
+  std::thread requester([&] {
+    (void)wait_for_event(event_path, "pull-probe");
+    cancel.store(true, std::memory_order_release);
+  });
+  const auto started = std::chrono::steady_clock::now();
+  expect_encode_error(
+      [&] {
+        verify_muxed_gpu_video_output(output_path, Codec::H264, Format::Mp4, worker,
+                                      std::chrono::seconds(30),
+                                      [&] { return cancel.load(std::memory_order_acquire); });
+      },
+      "video probe cancelled", "output verification forwards cancellation to its probe worker");
+  requester.join();
+  expect_true(std::chrono::steady_clock::now() - started < std::chrono::seconds(3),
+              "output-verification cancellation does not wait for the parser timeout");
   std::filesystem::remove(output_path);
 }
 
