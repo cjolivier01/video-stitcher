@@ -501,6 +501,13 @@ bool release_surface_mapping(CudaMappingState& mapping) noexcept {
     mapping.cleanup_failure = SurfaceCleanupFailure::Context;
     return false;
   } catch (...) {
+    if (resources_released) {
+      mapping.cuda->context_restore_failed.store(true, std::memory_order_release);
+      mapping.surface = nullptr;
+      mapping.cleanup_failure = SurfaceCleanupFailure::None;
+      mapping.cleanup_cuda_result = kCudaSuccess;
+      return true;
+    }
     mapping.cleanup_failure = SurfaceCleanupFailure::Unknown;
     return false;
   }
