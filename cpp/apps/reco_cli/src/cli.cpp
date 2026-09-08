@@ -759,14 +759,20 @@ void publish_windows_output(HANDLE directory, const std::filesystem::path& resol
     if (before_replace) {
       before_replace(resolved_directory / temporary_name);
     }
-    if (!path_identifies_windows_handle(resolved_directory, directory, true) ||
-        !relative_path_identifies_windows_handle(directory, temporary_name, temporary_handle,
-                                                 false) ||
-        (current != INVALID_HANDLE_VALUE &&
-         !relative_path_identifies_windows_handle(directory, destination_name, current,
-                                                  current_is_reparse_point))) {
+    if (!path_identifies_windows_handle(resolved_directory, directory, true)) {
       throw WindowsPublicationIdentityError(
-          "calibration output identity changed before Windows publication handoff");
+          "calibration output directory changed before Windows publication handoff");
+    }
+    if (!relative_path_identifies_windows_handle(directory, temporary_name, temporary_handle,
+                                                 false)) {
+      throw WindowsPublicationIdentityError(
+          "temporary output changed before Windows publication handoff");
+    }
+    if (current != INVALID_HANDLE_VALUE &&
+        !relative_path_identifies_windows_handle(directory, destination_name, current,
+                                                 current_is_reparse_point)) {
+      throw WindowsPublicationIdentityError(
+          "destination output changed before Windows publication handoff");
     }
 
     if (current == INVALID_HANDLE_VALUE) {
@@ -790,13 +796,19 @@ void publish_windows_output(HANDLE directory, const std::filesystem::path& resol
     if (final_commit_gate) {
       final_commit_gate();
     }
-    if (!path_identifies_windows_handle(resolved_directory, directory, true) ||
-        !relative_path_identifies_windows_handle(directory, temporary_name, temporary_handle,
-                                                 false) ||
-        !relative_path_identifies_windows_handle(directory, destination_name, current,
+    if (!path_identifies_windows_handle(resolved_directory, directory, true)) {
+      throw WindowsPublicationIdentityError(
+          "calibration output directory changed at the Windows commit boundary");
+    }
+    if (!relative_path_identifies_windows_handle(directory, temporary_name, temporary_handle,
+                                                 false)) {
+      throw WindowsPublicationIdentityError(
+          "temporary output changed at the Windows commit boundary");
+    }
+    if (!relative_path_identifies_windows_handle(directory, destination_name, current,
                                                  current_is_reparse_point)) {
       throw WindowsPublicationIdentityError(
-          "calibration output identity changed at the Windows commit boundary");
+          "destination output changed at the Windows commit boundary");
     }
     rename_open_file(temporary_handle, directory, destination_name, destination, true);
     destination_published = true;
