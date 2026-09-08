@@ -347,13 +347,10 @@ void release_wrapped_audio_packet(void* raw_owner) {
 }
 
 core::CudaNv12FrameView make_nv12_view(const NvmmCudaFrame& mapping) {
-  core::CudaPitchedPlaneView y_plane(
-      mapping.y_ptr, mapping.y_accessible_bytes, mapping.y_pitch, mapping.width, mapping.height,
-      static_cast<core::CudaContextId>(mapping.context_id), mapping.device_ordinal);
-  core::CudaPitchedPlaneView uv_plane(mapping.uv_ptr, mapping.uv_accessible_bytes, mapping.uv_pitch,
-                                      mapping.width, mapping.height / 2U,
-                                      static_cast<core::CudaContextId>(mapping.context_id),
-                                      mapping.device_ordinal);
+  core::CudaPitchedPlaneView y_plane(mapping.y_validation, mapping.y_pitch, mapping.width,
+                                     mapping.height);
+  core::CudaPitchedPlaneView uv_plane(mapping.uv_validation, mapping.uv_pitch, mapping.width,
+                                      mapping.height / 2U);
   return core::CudaNv12FrameView(std::move(y_plane), std::move(uv_plane), mapping.width,
                                  mapping.height, mapping.color_matrix, mapping.color_range);
 }
@@ -403,7 +400,8 @@ struct GpuVideoEncodeSession::Impl {
       auto allocation = allocate_nvmm_nv12_surface(
           config.width, config.height, config.device_ordinal, core::YuvColorMatrix::Bt709,
           core::YuvColorRange::Limited, runtime);
-      auto mapping = map_nvmm_frame_to_cuda(allocation.frame, allocation.owner);
+      auto mapping = map_nvmm_frame_to_cuda(allocation.frame, allocation.owner,
+                                            core::CudaSpanAccess::ReadWrite);
       auto view = make_nv12_view(mapping);
       pool->slots.push_back(
           std::make_unique<EncodeSlot>(std::move(allocation), std::move(mapping), std::move(view)));

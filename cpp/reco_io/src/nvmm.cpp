@@ -401,7 +401,8 @@ CudaPointerProvenance validate_cuda_plane_pointer(const std::shared_ptr<CudaFunc
                                                   core::CudaDevicePtr pointer, std::size_t pitch,
                                                   std::size_t row_bytes, std::uint32_t rows,
                                                   std::size_t plane_bytes, int expected_device,
-                                                  const char* plane_name) {
+                                                  const char* plane_name,
+                                                  core::CudaSpanAccess required_access) {
   if (rows == 0 || row_bytes == 0 || pitch < row_bytes ||
       static_cast<std::uint64_t>(rows - 1U) * pitch >
           std::numeric_limits<std::size_t>::max() - row_bytes) {
@@ -415,13 +416,18 @@ CudaPointerProvenance validate_cuda_plane_pointer(const std::shared_ptr<CudaFunc
   }
   core::CudaValidatedSpan validation;
   try {
-    validation = cuda->span_backend.retain_device_span(pointer, plane_bytes,
-                                                       core::CudaSpanAccess::Read, expected_device);
+    validation = cuda->span_backend.retain_device_span(pointer, plane_bytes, required_access,
+                                                       expected_device);
   } catch (const std::exception& error) {
     if (std::string_view(error.what()).find("does not permit device reads") !=
         std::string_view::npos) {
       throw NvmmError(std::string("NvBufSurface ") + plane_name +
                       " plane is not readable from the expected CUDA device");
+    }
+    if (std::string_view(error.what()).find("does not permit device writes") !=
+        std::string_view::npos) {
+      throw NvmmError(std::string("NvBufSurface ") + plane_name +
+                      " plane is not writable from the expected CUDA device");
     }
     throw NvmmError(std::string("NvBufSurface ") + plane_name +
                     " plane failed CUDA driver validation: " + error.what());
@@ -980,9 +986,7 @@ allocate_nvmm_nv12_surface(std::uint32_t width, std::uint32_t height, std::uint3
   const auto descriptor_size = runtime->abi() == NvbufSurfaceAbi::DeepStream7_1
                                    ? sizeof(abi7::Surface)
                                    : sizeof(abi9::Surface);
-  return {.frame = std::move(frame),
-          .owner = std::move(owner),
-          .descriptor_size = descriptor_size};
+  return {.frame = std::move(frame), .owner = std::move(owner), .descriptor_size = descriptor_size};
 #else
   (void)gpu_id;
   (void)color_matrix;
@@ -1022,8 +1026,18 @@ std::string nvmm_cuda_interop_availability_error() {
 
 NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& provided_info,
                                      std::shared_ptr<void> owner) {
+  return map_nvmm_frame_to_cuda(provided_info, std::move(owner), core::CudaSpanAccess::Read);
+}
+
+NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& provided_info,
+                                     std::shared_ptr<void> owner,
+                                     core::CudaSpanAccess required_access) {
   if (!owner) {
     throw NvmmError("NvBufSurface CUDA mapping requires a retained decoder owner");
+  }
+  if (required_access != core::CudaSpanAccess::Read &&
+      required_access != core::CudaSpanAccess::ReadWrite) {
+    throw NvmmError("NvBufSurface CUDA mapping access requirement is invalid");
   }
   if (const auto error = validate_nvmm_frame_info(provided_info); error.has_value()) {
     throw NvmmError(*error);
@@ -1096,10 +1110,10 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& provided_info,
     const auto uv_ptr = checked_device_pointer(base, info.uv_offset);
     const auto y_provenance =
         validate_cuda_plane_pointer(cuda, y_ptr, info.y_pitch, info.width, info.height, info.y_size,
-                                    static_cast<int>(info.gpu_id), "Y");
-    const auto uv_provenance =
-        validate_cuda_plane_pointer(cuda, uv_ptr, info.uv_pitch, info.width, info.height / 2U,
-                                    info.uv_size, static_cast<int>(info.gpu_id), "UV");
+                                    static_cast<int>(info.gpu_id), "Y", required_access);
+    const auto uv_provenance = validate_cuda_plane_pointer(
+        cuda, uv_ptr, info.uv_pitch, info.width, info.height / 2U, info.uv_size,
+        static_cast<int>(info.gpu_id), "UV", required_access);
     auto direct_owner = std::make_shared<DirectCudaOwner>();
     direct_owner->decoder_owner = std::move(owner);
     direct_owner->runtime = info.runtime;
@@ -1124,6 +1138,10 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& provided_info,
     }
     if (!same_frame_info(existing->frame_info, info)) {
       throw NvmmError("NvBufSurface metadata changed while its CUDA mapping remained active");
+    }
+    if (!existing->y_provenance.validation.permits(required_access) ||
+        !existing->uv_provenance.validation.permits(required_access)) {
+      throw NvmmError("NvBufSurface existing CUDA mapping does not satisfy the requested access");
     }
     context.restore();
     return make_frame(existing->y_ptr, existing->uv_ptr, existing->y_provenance,
@@ -1154,12 +1172,12 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& provided_info,
       void* base = mapped_cuda_buffer_ptr(info);
       const auto y_ptr = checked_device_pointer(base, info.y_offset);
       const auto uv_ptr = checked_device_pointer(base, info.uv_offset);
-      const auto y_provenance =
-          validate_cuda_plane_pointer(cuda, y_ptr, info.y_pitch, info.width, info.height,
-                                      info.y_size, static_cast<int>(info.gpu_id), "Y");
-      const auto uv_provenance =
-          validate_cuda_plane_pointer(cuda, uv_ptr, info.uv_pitch, info.width, info.height / 2U,
-                                      info.uv_size, static_cast<int>(info.gpu_id), "UV");
+      const auto y_provenance = validate_cuda_plane_pointer(
+          cuda, y_ptr, info.y_pitch, info.width, info.height, info.y_size,
+          static_cast<int>(info.gpu_id), "Y", required_access);
+      const auto uv_provenance = validate_cuda_plane_pointer(
+          cuda, uv_ptr, info.uv_pitch, info.width, info.height / 2U, info.uv_size,
+          static_cast<int>(info.gpu_id), "UV", required_access);
       mapping->y_ptr = y_ptr;
       mapping->uv_ptr = uv_ptr;
       mapping->y_provenance = y_provenance;
@@ -1215,10 +1233,10 @@ NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& provided_info,
     const auto uv_ptr = checked_device_pointer(egl_frame.frame.pitches[1], 0);
     const auto y_provenance =
         validate_cuda_plane_pointer(cuda, y_ptr, info.y_pitch, info.width, info.height, info.y_size,
-                                    static_cast<int>(info.gpu_id), "Y");
-    const auto uv_provenance =
-        validate_cuda_plane_pointer(cuda, uv_ptr, info.uv_pitch, info.width, info.height / 2U,
-                                    info.uv_size, static_cast<int>(info.gpu_id), "UV");
+                                    static_cast<int>(info.gpu_id), "Y", required_access);
+    const auto uv_provenance = validate_cuda_plane_pointer(
+        cuda, uv_ptr, info.uv_pitch, info.width, info.height / 2U, info.uv_size,
+        static_cast<int>(info.gpu_id), "UV", required_access);
     mapping->y_ptr = y_ptr;
     mapping->uv_ptr = uv_ptr;
     mapping->y_provenance = y_provenance;

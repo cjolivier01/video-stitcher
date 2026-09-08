@@ -28,6 +28,8 @@ constexpr std::uint64_t kForeignDeviceAllocation = 0xC0000U;
 constexpr std::uint64_t kUnmappedAllocation = 0xD0000U;
 constexpr std::uint64_t kNoAccessAllocation = 0xE0000U;
 constexpr std::uint64_t kReadOnlyAllocation = 0xF0000U;
+constexpr std::uint64_t kContextIndependentMapping = 0x100000U;
+constexpr std::uint64_t kPhysicalAliasMapping = 0x110000U;
 thread_local void* current_context = nullptr;
 std::atomic<int> retain_count{0};
 std::atomic<int> launch_count{0};
@@ -188,9 +190,11 @@ RECO_FAKE_CUDA_EXPORT int cuPointerGetAttribute(void* data, int attribute, std::
   }
   switch (attribute) {
   case 1:
-    *static_cast<void**>(data) = base == kForeignContextAllocation
-                                     ? reinterpret_cast<void*>(kForeignContextIdentity)
-                                     : reinterpret_cast<void*>(kContextIdentity);
+    *static_cast<void**>(data) =
+        base == kForeignContextAllocation ? reinterpret_cast<void*>(kForeignContextIdentity)
+        : base == kContextIndependentMapping || base == kPhysicalAliasMapping
+            ? nullptr
+            : reinterpret_cast<void*>(kContextIdentity);
     return 0;
   case 2:
     *static_cast<unsigned int*>(data) = base == kHostAllocation ? 1U : 2U;
@@ -279,8 +283,31 @@ RECO_FAKE_CUDA_EXPORT int cuMemsetD8_v2(std::uint64_t, unsigned char, std::size_
 RECO_FAKE_CUDA_EXPORT int cuMemcpy2D_v2(const void*) { return 1; }
 RECO_FAKE_CUDA_EXPORT int cuMemcpyDtoH_v2(void*, std::uint64_t, std::size_t) { return 1; }
 RECO_FAKE_CUDA_EXPORT int cuMemGetInfo_v2(std::size_t*, std::size_t*) { return 1; }
-RECO_FAKE_CUDA_EXPORT int cuMemGetAllocationGranularity(std::size_t*, const void*, unsigned int) {
-  return 1;
+RECO_FAKE_CUDA_EXPORT int cuMemGetAllocationGranularity(std::size_t* granularity, const void*,
+                                                        unsigned int option) {
+  if (granularity == nullptr || option != 0U) {
+    return 1;
+  }
+  *granularity = kAllocationAlignment;
+  return 0;
+}
+RECO_FAKE_CUDA_EXPORT int cuMemGetAccess(std::uint64_t* flags, const void*, std::uint64_t pointer) {
+  const auto base = allocation_base(pointer);
+  if (flags == nullptr || current_context != reinterpret_cast<void*>(kContextIdentity) ||
+      (base != kContextIndependentMapping && base != kPhysicalAliasMapping)) {
+    return 1;
+  }
+  *flags = 3U;
+  return 0;
+}
+RECO_FAKE_CUDA_EXPORT int cuMemRetainAllocationHandle(std::uint64_t* handle, void* address) {
+  const auto base = allocation_base(reinterpret_cast<std::uintptr_t>(address));
+  if (handle == nullptr || current_context != reinterpret_cast<void*>(kContextIdentity) ||
+      (base != kContextIndependentMapping && base != kPhysicalAliasMapping)) {
+    return 1;
+  }
+  *handle = 0x2904U;
+  return 0;
 }
 RECO_FAKE_CUDA_EXPORT int cuMemAddressReserve(std::uint64_t*, std::size_t, std::size_t,
                                               std::uint64_t, std::uint64_t) {
@@ -300,7 +327,7 @@ RECO_FAKE_CUDA_EXPORT int cuMemMap(std::uint64_t, std::size_t, std::size_t, std:
 RECO_FAKE_CUDA_EXPORT int cuMemSetAccess(std::uint64_t, std::size_t, const void*, std::size_t) {
   return 1;
 }
-RECO_FAKE_CUDA_EXPORT int cuMemRelease(std::uint64_t) { return 1; }
+RECO_FAKE_CUDA_EXPORT int cuMemRelease(std::uint64_t handle) { return handle == 0x2904U ? 0 : 1; }
 RECO_FAKE_CUDA_EXPORT int cuMemUnmap(std::uint64_t, std::size_t) { return 1; }
 RECO_FAKE_CUDA_EXPORT int cuMemAddressFree(std::uint64_t, std::size_t) { return 1; }
 
@@ -334,6 +361,9 @@ RECO_FAKE_CUDA_EXPORT int cuMemAddressFree(std::uint64_t, std::size_t) { return 
 namespace {
 
 using namespace reco::core;
+
+constexpr CudaDevicePtr kContextIndependentMapping = 0x100000U;
+constexpr CudaDevicePtr kPhysicalAliasMapping = 0x110000U;
 
 static_assert(!std::is_copy_constructible_v<CudaRgbaToNv12Converter>);
 static_assert(!std::is_copy_assignable_v<CudaRgbaToNv12Converter>);
@@ -606,6 +636,51 @@ void enforces_device_access_permissions(const std::filesystem::path& cuda_runtim
       },
       "writes", "read-only UV output is rejected");
   expect_eq(cuda_control.launch_count(), 1, "denied converter access never launches");
+}
+
+void retained_validation_avoids_conversion_time_queries(const std::filesystem::path& cuda_runtime,
+                                                        const std::filesystem::path& nvrtc_runtime,
+                                                        const FakeCudaControl& cuda_control) {
+  auto backend = CudaBackend::load(cuda_runtime.string());
+  auto converter = CudaRgbaToNv12Converter::create({.width = 34, .height = 18}, backend,
+                                                   NvrtcCompiler::load(nvrtc_runtime.string()));
+  const auto input_pitch = 34U * 4U + 20U;
+  const auto y_pitch = 34U + 14U;
+  const auto uv_pitch = 34U + 30U;
+  const CudaRgbaFrameView input(
+      CudaPitchedPlaneView(
+          backend.retain_device_span(0x10000U, input_pitch * 18U, CudaSpanAccess::Read),
+          input_pitch, 34U * 4U, 18U),
+      34U, 18U);
+  const CudaNv12FrameView output(
+      CudaPitchedPlaneView(
+          backend.retain_device_span(0x40000U, y_pitch * 18U, CudaSpanAccess::ReadWrite), y_pitch,
+          34U, 18U),
+      CudaPitchedPlaneView(
+          backend.retain_device_span(0x50000U, uv_pitch * 9U, CudaSpanAccess::ReadWrite), uv_pitch,
+          34U, 9U),
+      34U, 18U, YuvColorMatrix::Bt709, YuvColorRange::Limited);
+
+  cuda_control.reset();
+  converter.convert(input, output);
+  expect_eq(cuda_control.pointer_attribute_count(), 0,
+            "retained converter views avoid per-frame CUDA pointer queries");
+  expect_eq(cuda_control.launch_count(), 1, "retained converter views launch normally");
+}
+
+void rejects_physical_vmm_aliases(const std::filesystem::path& cuda_runtime,
+                                  const std::filesystem::path& nvrtc_runtime,
+                                  const FakeCudaControl& cuda_control) {
+  auto converter = create_converter({.width = 34, .height = 18}, cuda_runtime, nvrtc_runtime);
+  const auto context = converter.context_id();
+  cuda_control.reset();
+  expect_throws<std::invalid_argument>(
+      [&] {
+        converter.convert(rgba_frame(kContextIndependentMapping, context),
+                          nv12_frame(kPhysicalAliasMapping, 0x70000U, context));
+      },
+      "overlap", "distinct VMM mappings of one physical allocation are rejected");
+  expect_eq(cuda_control.launch_count(), 0, "physical alias rejection prevents conversion");
 }
 
 void rejects_invalid_configuration(const std::filesystem::path& cuda_runtime,
@@ -887,6 +962,11 @@ int main() {
            [&] { rejects_unsafe_frames(cuda_runtime, nvrtc_runtime, cuda_control); });
   run_case("device access validation",
            [&] { enforces_device_access_permissions(cuda_runtime, nvrtc_runtime, cuda_control); });
+  run_case("retained validation conversion path", [&] {
+    retained_validation_avoids_conversion_time_queries(cuda_runtime, nvrtc_runtime, cuda_control);
+  });
+  run_case("physical VMM alias validation",
+           [&] { rejects_physical_vmm_aliases(cuda_runtime, nvrtc_runtime, cuda_control); });
   run_case("moved-from converter",
            [&] { moved_from_converter_is_diagnosed(cuda_runtime, nvrtc_runtime); });
   run_case("hardware parity", hardware_parity_if_available);

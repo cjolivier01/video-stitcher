@@ -517,9 +517,10 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
     auto rgba_storage =
         backend.allocate_pitched(static_cast<std::size_t>(command.width) * 4U, command.height, 4);
     const core::CudaRgbaFrameView rgba(
-        core::CudaPitchedPlaneView(rgba_storage.buffer.ptr(), rgba_storage.buffer.size(),
-                                   rgba_storage.pitch, static_cast<std::size_t>(command.width) * 4U,
-                                   command.height, backend.primary_context_id(), 0),
+        core::CudaPitchedPlaneView(
+            backend.retain_device_span(rgba_storage.buffer.ptr(), rgba_storage.buffer.size(),
+                                       core::CudaSpanAccess::ReadWrite),
+            rgba_storage.pitch, static_cast<std::size_t>(command.width) * 4U, command.height),
         command.width, command.height);
     auto converter = core::CudaRgbaToNv12Converter::create(
         {.width = command.width, .height = command.height}, backend, core::NvrtcCompiler::create());

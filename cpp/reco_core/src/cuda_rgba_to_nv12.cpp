@@ -205,18 +205,21 @@ KernelColorParams color_params(YuvColorMatrix matrix, YuvColorRange range) {
   return params;
 }
 
-bool spans_overlap(const CudaPitchedPlaneView& lhs, const CudaPitchedPlaneView& rhs) {
-  const auto lhs_last = lhs.ptr() + lhs.address_span_bytes() - 1U;
-  const auto rhs_last = rhs.ptr() + rhs.address_span_bytes() - 1U;
-  return lhs.ptr() <= rhs_last && rhs.ptr() <= lhs_last;
-}
-
-void validate_plane_allocation(const CudaBackend& backend, const CudaPitchedPlaneView& plane,
-                               std::string_view label, CudaSpanAccess required_access,
-                               int device_ordinal) {
+CudaValidatedSpan validate_plane_allocation(const CudaBackend& backend,
+                                            const CudaPitchedPlaneView& plane,
+                                            std::string_view label, CudaSpanAccess required_access,
+                                            int device_ordinal) {
   try {
-    backend.validate_device_span(plane.ptr(), plane.accessible_bytes(), required_access,
-                                 device_ordinal);
+    if (const auto* validation = plane.driver_validation(); validation != nullptr) {
+      if (!validation->permits(required_access)) {
+        throw std::invalid_argument(required_access == CudaSpanAccess::ReadWrite
+                                        ? "CUDA device span does not permit device writes"
+                                        : "CUDA device span does not permit device reads");
+      }
+      return *validation;
+    }
+    return backend.retain_device_span(plane.ptr(), plane.address_span_bytes(), required_access,
+                                      device_ordinal);
   } catch (const std::invalid_argument& error) {
     throw std::invalid_argument("CUDA RGBA-to-NV12 " + std::string(label) +
                                 " plane is invalid: " + error.what());
@@ -235,10 +238,6 @@ void validate_frame(const CudaRgbaToNv12Config& config, CudaContextId context_id
   if (input.device_ordinal() != config.device_ordinal ||
       output.device_ordinal() != config.device_ordinal) {
     throw std::invalid_argument("CUDA RGBA-to-NV12 frame belongs to a different CUDA device");
-  }
-  if (spans_overlap(input.plane(), output.y_plane()) ||
-      spans_overlap(input.plane(), output.uv_plane())) {
-    throw std::invalid_argument("CUDA RGBA-to-NV12 input and output memory must not overlap");
   }
 }
 
@@ -304,12 +303,18 @@ void CudaRgbaToNv12Converter::convert(const CudaRgbaFrameView& input,
   const auto& state = *impl_;
   std::lock_guard<std::mutex> lock(state.convert_mutex);
   validate_frame(state.config, state.context_id, input, output);
-  validate_plane_allocation(state.backend, input.plane(), "RGBA input", CudaSpanAccess::Read,
-                            state.config.device_ordinal);
-  validate_plane_allocation(state.backend, output.y_plane(), "Y output", CudaSpanAccess::ReadWrite,
-                            state.config.device_ordinal);
-  validate_plane_allocation(state.backend, output.uv_plane(), "UV output",
-                            CudaSpanAccess::ReadWrite, state.config.device_ordinal);
+  const auto input_span =
+      validate_plane_allocation(state.backend, input.plane(), "RGBA input", CudaSpanAccess::Read,
+                                state.config.device_ordinal);
+  const auto output_y_span =
+      validate_plane_allocation(state.backend, output.y_plane(), "Y output",
+                                CudaSpanAccess::ReadWrite, state.config.device_ordinal);
+  const auto output_uv_span =
+      validate_plane_allocation(state.backend, output.uv_plane(), "UV output",
+                                CudaSpanAccess::ReadWrite, state.config.device_ordinal);
+  if (input_span.aliases(output_y_span) || input_span.aliases(output_uv_span)) {
+    throw std::invalid_argument("CUDA RGBA-to-NV12 input and output memory must not overlap");
+  }
 
   auto input_ptr = input.plane().ptr();
   auto input_pitch = checked_pitch(input.plane().pitch_bytes());

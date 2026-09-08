@@ -216,6 +216,14 @@ void wrapped_callbacks_and_move_assignment_release_exactly_once(
   auto session = open_session(runtime, trace);
   auto first = session.acquire_frame();
   auto second = session.acquire_frame();
+  expect_true(first.view().y_plane().driver_validation() != nullptr &&
+                  first.view().uv_plane().driver_validation() != nullptr,
+              "encoder surface view retains CUDA driver validation");
+  expect_true(
+      first.view().y_plane().driver_validation()->permits(reco::core::CudaSpanAccess::ReadWrite) &&
+          first.view().uv_plane().driver_validation()->permits(
+              reco::core::CudaSpanAccess::ReadWrite),
+      "encoder surface validation permits CUDA writes");
   first = std::move(second);
   expect_eq(trace->released.load(), 1U, "move assignment releases the displaced lease");
   session.submit_frame(std::move(first), 0, 33'333'333);

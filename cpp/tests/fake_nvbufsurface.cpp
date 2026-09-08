@@ -33,7 +33,7 @@ void* mapped_device_pointer(std::uint64_t descriptor) {
 #if !defined(RECO_FAKE_NVBUFSURFACE_7_1)
 std::mutex cuda_buffers_mutex;
 std::unordered_map<void*, std::unique_ptr<abi::CudaBuffer>> cuda_buffers;
-std::atomic<std::uintptr_t> next_fake_device_pointer{0x50000000U};
+std::atomic<std::uintptr_t> next_fake_device_pointer{0x60000000U};
 
 struct FakeSurfaceAllocation {
   abi::Surface surface;

@@ -106,7 +106,8 @@ private:
   friend std::optional<std::string> validate_nvbufsurface_runtime_provenance(
       const std::shared_ptr<const NvbufSurfaceRuntime>& runtime);
   friend NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info,
-                                              std::shared_ptr<void> owner);
+                                              std::shared_ptr<void> owner,
+                                              core::CudaSpanAccess required_access);
   friend NvmmSurfaceAllocation
   allocate_nvmm_nv12_surface(std::uint32_t width, std::uint32_t height, std::uint32_t gpu_id,
                              core::YuvColorMatrix color_matrix, core::YuvColorRange color_range,
@@ -219,7 +220,12 @@ struct NvmmCudaFrame {
 [[nodiscard]] std::optional<std::string> validate_nvmm_frame_info(const NvmmFrameInfo& info);
 [[nodiscard]] bool is_nvmm_cuda_interop_available();
 [[nodiscard]] std::string nvmm_cuda_interop_availability_error();
+/// Maps an NVMM frame for CUDA reads while retaining its provider and allocation validation.
 [[nodiscard]] NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info,
                                                    std::shared_ptr<void> owner);
+/// Maps an NVMM frame with the requested CUDA device access and retains that validation.
+[[nodiscard]] NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info,
+                                                   std::shared_ptr<void> owner,
+                                                   core::CudaSpanAccess required_access);
 
 } // namespace reco::io
