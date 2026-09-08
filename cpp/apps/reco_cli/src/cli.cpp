@@ -2231,6 +2231,7 @@ void write_calibration_json_atomically_impl(
                            destination_published, displaced_output, before_windows_publish_replace);
     temporary_exists = false;
     destination_published = true;
+    std::string rollback_failure_detail;
     const auto rollback_publication = [&]() noexcept {
       if (!destination_published) {
         return false;
@@ -2277,7 +2278,11 @@ void write_calibration_json_atomically_impl(
           }
         }
         return true;
+      } catch (const std::exception& error) {
+        rollback_failure_detail = error.what();
+        return false;
       } catch (...) {
+        rollback_failure_detail = "unknown rollback error";
         return false;
       }
     };
@@ -2288,7 +2293,8 @@ void write_calibration_json_atomically_impl(
     } catch (...) {
       if (!rollback_publication()) {
         throw std::runtime_error(
-            "post-publication hook failed and calibration output rollback failed");
+            "post-publication hook failed and calibration output rollback failed: " +
+            rollback_failure_detail);
       }
       throw;
     }

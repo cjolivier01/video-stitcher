@@ -1062,6 +1062,9 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
     } catch (const std::exception& error) {
       rollback_hook_failed = std::string_view(error.what()).find("synthetic symlink rollback") !=
                              std::string_view::npos;
+      if (!rollback_hook_failed) {
+        std::cerr << "symlink rollback failure: " << error.what() << '\n';
+      }
     }
     expect_true(rollback_hook_failed, "symlink post-publication failure is reported");
     expect_true(std::filesystem::is_symlink(rollback_destination),
