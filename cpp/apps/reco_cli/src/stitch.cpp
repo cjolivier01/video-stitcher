@@ -85,19 +85,6 @@ std::vector<std::string> split_input_segments(std::string_view input, std::strin
   return paths;
 }
 
-void reject_output_alias(const std::filesystem::path& output, const std::filesystem::path& input,
-                         std::string_view label) {
-  std::error_code output_error;
-  std::error_code input_error;
-  if (std::filesystem::exists(output, output_error) && !output_error &&
-      std::filesystem::exists(input, input_error) && !input_error) {
-    std::error_code equivalent_error;
-    if (std::filesystem::equivalent(output, input, equivalent_error) && !equivalent_error) {
-      throw std::runtime_error("stitch output aliases " + std::string(label));
-    }
-  }
-}
-
 GpuFileDecodeConfig decode_config(const std::string& path, const GpuVideoProbe& probe,
                                   std::optional<std::uint64_t> start_frame) {
   GpuFileDecodeConfig config{
@@ -219,6 +206,17 @@ std::uint64_t timestamp_for_frame(std::uint64_t frame_index, std::uint32_t fps_n
   return whole + fractional;
 }
 
+std::uint64_t rounded_frames_from_seconds(long double seconds, std::uint32_t fps_numerator,
+                                          std::uint32_t fps_denominator, std::string_view label) {
+  const long double frames = seconds * static_cast<long double>(fps_numerator) / fps_denominator;
+  const long double rounded = std::round(frames);
+  constexpr long double kExclusiveUint64Limit = 18'446'744'073'709'551'616.0L;
+  if (!std::isfinite(rounded) || rounded < 0.0L || rounded >= kExclusiveUint64Limit) {
+    throw std::runtime_error(std::string(label) + " is outside the input frame range");
+  }
+  return static_cast<std::uint64_t>(rounded);
+}
+
 AudioSelection select_audio_segments(const ProbedInput& input, std::uint64_t start_time_ns) {
   std::size_t first_segment = 0;
   std::uint64_t local_start = start_time_ns;
@@ -240,63 +238,18 @@ AudioSelection select_audio_segments(const ProbedInput& input, std::uint64_t sta
   return selection;
 }
 
-std::uint64_t audio_start_time_ns(const StitchCommand& command, std::int64_t sync_offset,
-                                  std::uint32_t fps_numerator, std::uint32_t fps_denominator) {
-  auto start = nanoseconds_from_seconds(command.start_time.value_or(0.0), "--start-time");
+std::uint64_t audio_start_time_ns(std::uint64_t frame_aligned_start_time_ns,
+                                  std::int64_t sync_offset, std::uint32_t fps_numerator,
+                                  std::uint32_t fps_denominator) {
   if (sync_offset >= 0) {
-    return start;
+    return frame_aligned_start_time_ns;
   }
   const auto skipped_frames = static_cast<std::uint64_t>(-(sync_offset + 1)) + 1U;
   const auto sync_time = timestamp_for_frame(skipped_frames, fps_numerator, fps_denominator);
-  if (sync_time > std::numeric_limits<std::uint64_t>::max() - start) {
+  if (sync_time > std::numeric_limits<std::uint64_t>::max() - frame_aligned_start_time_ns) {
     throw std::runtime_error("audio synchronization offset exceeds the GStreamer time range");
   }
-  return start + sync_time;
-}
-
-std::optional<std::uint64_t> start_frame_index(const StitchCommand& command,
-                                               const ProbedInput& input) {
-  if (!command.start_time.has_value()) {
-    return std::nullopt;
-  }
-  const auto& probe = input.probes.front();
-  const long double frame =
-      static_cast<long double>(*command.start_time) * probe.fps_numerator / probe.fps_denominator;
-  if (!std::isfinite(*command.start_time) || frame < 0.0L ||
-      frame > static_cast<long double>(std::numeric_limits<std::uint64_t>::max())) {
-    throw std::runtime_error("--start-time is outside the input frame range");
-  }
-  const auto start = static_cast<std::uint64_t>(std::floor(frame));
-  const auto total = exact_total_frames(input);
-  if (!total.has_value()) {
-    throw std::runtime_error(
-        "--start-time requires exact constant-cadence metadata for every input segment");
-  }
-  if (start >= *total) {
-    throw std::runtime_error("--start-time is outside the input frame range");
-  }
-  return start;
-}
-
-std::optional<std::uint64_t> output_frame_limit(const StitchCommand& command,
-                                                const GpuVideoProbe& probe) {
-  std::optional<std::uint64_t> limit = command.max_frames;
-  if (command.end_time.has_value()) {
-    const double start = command.start_time.value_or(0.0);
-    if (!std::isfinite(*command.end_time) || !std::isfinite(start) || start < 0.0 ||
-        *command.end_time <= start) {
-      throw std::runtime_error("--end-time must be greater than --start-time");
-    }
-    const long double frames = static_cast<long double>(*command.end_time - start) *
-                               probe.fps_numerator / probe.fps_denominator;
-    if (!std::isfinite(frames) ||
-        std::ceil(frames) > static_cast<long double>(std::numeric_limits<std::uint64_t>::max())) {
-      throw std::runtime_error("--end-time exceeds the supported output frame range");
-    }
-    const auto time_limit = static_cast<std::uint64_t>(std::ceil(frames));
-    limit = limit.has_value() ? std::min(*limit, time_limit) : time_limit;
-  }
-  return limit;
+  return frame_aligned_start_time_ns + sync_time;
 }
 
 void reject_unported_stitch_options(const StitchCommand& command) {
@@ -315,6 +268,39 @@ void reject_unported_stitch_options(const StitchCommand& command) {
 }
 
 } // namespace
+
+StitchFrameWindow derive_stitch_frame_window(std::optional<double> start_time,
+                                             std::optional<double> end_time,
+                                             std::optional<std::uint64_t> max_frames,
+                                             std::uint32_t fps_numerator,
+                                             std::uint32_t fps_denominator) {
+  if (fps_numerator == 0 || fps_denominator == 0) {
+    throw std::invalid_argument("stitch source frame rate must be non-zero");
+  }
+  const double start = start_time.value_or(0.0);
+  if (!std::isfinite(start) || start < 0.0) {
+    throw std::runtime_error("--start-time must be finite and non-negative");
+  }
+  StitchFrameWindow window;
+  window.start_frame = rounded_frames_from_seconds(static_cast<long double>(start), fps_numerator,
+                                                   fps_denominator, "--start-time");
+  window.start_time_ns = timestamp_for_frame(window.start_frame, fps_numerator, fps_denominator);
+  window.frame_limit = max_frames;
+  if (end_time.has_value()) {
+    if (!std::isfinite(*end_time) || *end_time <= start) {
+      throw std::runtime_error("--end-time must be greater than --start-time");
+    }
+    const auto time_limit = rounded_frames_from_seconds(
+        static_cast<long double>(*end_time) - static_cast<long double>(start), fps_numerator,
+        fps_denominator, "--end-time");
+    if (time_limit == 0) {
+      throw std::runtime_error("--end-time must select at least one output frame");
+    }
+    window.frame_limit =
+        window.frame_limit.has_value() ? std::min(*window.frame_limit, time_limit) : time_limit;
+  }
+  return window;
+}
 
 StitchFrameTiming derive_stitch_frame_timing(std::uint64_t source_frame_index,
                                              std::uint64_t first_source_frame_index,
@@ -343,13 +329,18 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
     auto right_paths = split_input_segments(command.right, "right");
     const auto calibration_path = core::path_from_utf8(command.calibration);
     const auto output_path = core::path_from_utf8(command.output);
+    std::vector<AtomicOutputProtectedPath> protected_paths;
+    protected_paths.reserve(left_paths.size() + right_paths.size() + 1U);
     for (const auto& path : left_paths) {
-      reject_output_alias(output_path, core::path_from_utf8(path), "a left input segment");
+      protected_paths.push_back(
+          {.path = core::path_from_utf8(path), .label = "a left input segment"});
     }
     for (const auto& path : right_paths) {
-      reject_output_alias(output_path, core::path_from_utf8(path), "a right input segment");
+      protected_paths.push_back(
+          {.path = core::path_from_utf8(path), .label = "a right input segment"});
     }
-    reject_output_alias(output_path, calibration_path, "the calibration file");
+    protected_paths.push_back({.path = calibration_path, .label = "the calibration file"});
+    AtomicOutputFile output(output_path, {}, {}, protected_paths);
 
     std::string calibration_error;
     auto calibration = core::load_match_calibration_file(command.calibration, &calibration_error);
@@ -373,7 +364,11 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
         left_probe.fps_denominator != right_probe.fps_denominator) {
       throw std::runtime_error("stereo inputs must have the same constant frame rate");
     }
-    const auto start_frame = start_frame_index(command, left_input);
+    const auto window =
+        derive_stitch_frame_window(command.start_time, command.end_time, command.max_frames,
+                                   left_probe.fps_numerator, left_probe.fps_denominator);
+    const auto start_frame =
+        command.start_time.has_value() ? std::optional(window.start_frame) : std::nullopt;
     if (start_frame.has_value()) {
       const auto right_total = exact_total_frames(right_input);
       if (!right_total.has_value()) {
@@ -384,7 +379,7 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
         throw std::runtime_error("--start-time is outside the right input frame range");
       }
     }
-    const auto limit = output_frame_limit(command, left_probe);
+    const auto limit = window.frame_limit;
     const std::int64_t sync_offset =
         command.sync_offset != 0 ? command.sync_offset : calibration->sync_offset;
     if (const auto sync_error =
@@ -436,7 +431,7 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
 
     std::optional<AudioPassthroughSource> audio;
     const auto audio_selection = select_audio_segments(
-        left_input, audio_start_time_ns(command, sync_offset, left_probe.fps_numerator,
+        left_input, audio_start_time_ns(window.start_time_ns, sync_offset, left_probe.fps_numerator,
                                         left_probe.fps_denominator));
     if (!audio_selection.segments.empty()) {
       audio.emplace(
@@ -447,7 +442,6 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
       }
     }
 
-    AtomicOutputFile output(output_path);
     GpuEncodeConfig encode_config{
         .output_path = {},
         .output_descriptor = output.descriptor(),

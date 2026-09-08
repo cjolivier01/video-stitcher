@@ -174,6 +174,12 @@ namespace detail {
 /// Rounds non-negative seconds to the full unsigned GStreamer nanosecond range.
 [[nodiscard]] std::uint64_t nanoseconds_from_seconds(double seconds, std::string_view label);
 
+/// Existing file identity that an atomic output transaction must never replace.
+struct AtomicOutputProtectedPath {
+  std::filesystem::path path;
+  std::string label;
+};
+
 /// Descriptor-pinned temporary output with identity-checked atomic publication.
 class AtomicOutputFile final {
 public:
@@ -182,7 +188,8 @@ public:
   explicit AtomicOutputFile(
       std::filesystem::path destination,
       std::function<void(const std::filesystem::path&)> after_temporary_validation = {},
-      std::function<void()> publication_fault_hook = {});
+      std::function<void()> publication_fault_hook = {},
+      std::span<const AtomicOutputProtectedPath> protected_paths = {});
   AtomicOutputFile(const AtomicOutputFile&) = delete;
   AtomicOutputFile& operator=(const AtomicOutputFile&) = delete;
   AtomicOutputFile(AtomicOutputFile&&) = delete;
@@ -208,6 +215,20 @@ struct StitchFrameTiming {
   std::uint64_t pts_ns = 0;
   std::uint64_t duration_ns = 0;
 };
+
+/// Frame-aligned processing window shared by video seek, audio trim, and output limiting.
+struct StitchFrameWindow {
+  std::uint64_t start_frame = 0;
+  std::uint64_t start_time_ns = 0;
+  std::optional<std::uint64_t> frame_limit;
+};
+
+/// Rounds a requested time window to the source cadence using the Rust stitch semantics.
+[[nodiscard]] StitchFrameWindow derive_stitch_frame_window(std::optional<double> start_time,
+                                                           std::optional<double> end_time,
+                                                           std::optional<std::uint64_t> max_frames,
+                                                           std::uint32_t fps_numerator,
+                                                           std::uint32_t fps_denominator);
 
 /// Preserves gaps in an exact constant-cadence source timeline and rejects overflow.
 [[nodiscard]] StitchFrameTiming derive_stitch_frame_timing(std::uint64_t source_frame_index,

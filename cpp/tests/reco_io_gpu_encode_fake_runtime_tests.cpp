@@ -430,6 +430,14 @@ void finalized_output_requires_a_discoverable_video_stream() {
   expect_encode_error(
       [&] { verify_muxed_gpu_video_output("fake-output.mp4", std::chrono::milliseconds(5)); },
       "contains no video stream", "audio-only muxed output is rejected before publication");
+  for (const std::string_view scenario :
+       {"encoded-output-zero-duration", "encoded-output-zero-geometry"}) {
+    set_scenario(scenario);
+    expect_encode_error(
+        [&] { verify_muxed_gpu_video_output("fake-output.mp4", std::chrono::milliseconds(5)); },
+        "contains no decodable video samples",
+        "empty or malformed muxed video track is rejected before publication");
+  }
 }
 
 void compressed_audio_backpressure_bounds_packets_and_bytes(

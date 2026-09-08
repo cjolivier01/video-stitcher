@@ -843,6 +843,25 @@ void stitch_second_conversion_supports_the_unsigned_gstreamer_range() {
   expect_true(overflow_rejected, "stitch time rejects the exclusive unsigned boundary");
 }
 
+void stitch_frame_window_uses_one_rounded_timeline() {
+  const auto window = detail::derive_stitch_frame_window(0.051, 0.151, std::nullopt, 30, 1);
+  expect_eq(window.start_frame, 2ULL, "stitch start time rounds to the nearest source frame");
+  expect_eq(window.start_time_ns, 66'666'666ULL,
+            "audio trim uses the same rounded frame boundary as video");
+  expect_eq(window.frame_limit.value_or(0), 3ULL,
+            "stitch end duration matches Rust nearest-frame rounding");
+
+  const auto bounded = detail::derive_stitch_frame_window(0.0, 1.0, 7U, 30, 1);
+  expect_eq(bounded.frame_limit.value_or(0), 7ULL, "max frames bounds the rounded time window");
+  bool empty_window_rejected = false;
+  try {
+    (void)detail::derive_stitch_frame_window(0.0, 0.01, std::nullopt, 30, 1);
+  } catch (const std::runtime_error&) {
+    empty_window_rejected = true;
+  }
+  expect_true(empty_window_rejected, "sub-frame end window is rejected explicitly");
+}
+
 void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
   TemporaryDirectory root;
   const auto destination = root.path() / "stitched.mp4";
@@ -850,6 +869,21 @@ void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
     detail::AtomicOutputFile output(destination);
     write_text_descriptor(output.descriptor(), "first encoded output\n");
     expect_true(output.descriptor() >= 0, "stitch output exposes a retained descriptor");
+    const auto verification = read_atomic_output(output.verification_path());
+    expect_true(verification.status == AtomicReadStatus::Success,
+                "stitch output exposes a readable verification stream");
+    expect_eq(verification.contents, std::string("first encoded output\n"),
+              "verification stream reads independently from the write descriptor");
+#if defined(_WIN32)
+    const HANDLE ordinary_reader = CreateFileW(output.verification_path().c_str(), GENERIC_READ,
+                                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    expect_true(ordinary_reader != INVALID_HANDLE_VALUE,
+                "Windows verification does not require readers to share delete access");
+    if (ordinary_reader != INVALID_HANDLE_VALUE) {
+      (void)CloseHandle(ordinary_reader);
+    }
+#endif
     output.commit();
     output.commit();
   }
@@ -887,6 +921,83 @@ void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
   expect_no_stitch_output_artifacts(root.path(), "failed stitch output publication");
   expect_eq(std::filesystem::hard_link_count(destination), std::uintmax_t{1},
             "failed stitch replacement leaves one destination entry");
+
+  const auto protected_input = root.path() / "protected-input.mp4";
+  const auto aliased_output = root.path() / "aliased-output.mp4";
+  write_text_file(protected_input, "protected input\n");
+  std::filesystem::create_hard_link(protected_input, aliased_output);
+  bool protected_alias_rejected = false;
+  try {
+    const std::array protected_paths{
+        detail::AtomicOutputProtectedPath{protected_input, "the protected input"}};
+    detail::AtomicOutputFile output(aliased_output, {}, {}, protected_paths);
+  } catch (const std::runtime_error& error) {
+    protected_alias_rejected = std::string_view(error.what()).find("aliases the protected input") !=
+                               std::string_view::npos;
+  }
+  expect_true(protected_alias_rejected,
+              "stitch output rejects a retained protected-input hard link");
+  expect_eq(read_text_file(protected_input), std::string("protected input\n"),
+            "rejected stitch output alias preserves its protected input");
+  std::filesystem::remove(aliased_output);
+  expect_no_stitch_output_artifacts(root.path(), "rejected protected stitch output alias");
+
+#if !defined(_WIN32)
+  const auto moved_protected_input = root.path() / "moved-protected-input.mp4";
+  const auto raced_output = root.path() / "protected-race-output.mp4";
+  bool protected_mutation_rejected = false;
+  try {
+    const std::array protected_paths{
+        detail::AtomicOutputProtectedPath{protected_input, "the protected input"}};
+    detail::AtomicOutputFile output(
+        raced_output, {},
+        [&] {
+          std::filesystem::rename(protected_input, moved_protected_input);
+          write_text_file(protected_input, "replacement input\n");
+        },
+        protected_paths);
+    write_text_descriptor(output.descriptor(), "raced output\n");
+    output.commit();
+  } catch (const std::runtime_error& error) {
+    protected_mutation_rejected =
+        std::string_view(error.what()).find("changed before") != std::string_view::npos;
+  }
+  expect_true(protected_mutation_rejected,
+              "stitch publication rejects a protected path changed at commit");
+  expect_true(!std::filesystem::exists(raced_output),
+              "protected path mutation rolls back a newly published stitch output");
+  expect_no_stitch_output_artifacts(root.path(), "protected path mutation rollback");
+  std::filesystem::remove(protected_input);
+  std::filesystem::rename(moved_protected_input, protected_input);
+#endif
+
+  const auto retained_output_parent = root.path() / "retained-stitch-parent";
+  const auto redirected_output_parent = root.path() / "redirected-stitch-parent";
+  const auto active_output_parent = root.path() / "active-stitch-parent";
+  std::filesystem::create_directory(retained_output_parent);
+  std::filesystem::create_directory(redirected_output_parent);
+  const auto redirected_victim = redirected_output_parent / "parent-race.mp4";
+  write_text_file(redirected_victim, "redirected victim\n");
+  std::error_code output_parent_symlink_error;
+  std::filesystem::create_directory_symlink(retained_output_parent, active_output_parent,
+                                            output_parent_symlink_error);
+  expect_true(!output_parent_symlink_error,
+              "stitch output parent symlink race fixture is available");
+  if (!output_parent_symlink_error) {
+    const std::array protected_paths{
+        detail::AtomicOutputProtectedPath{redirected_victim, "the redirected victim"}};
+    detail::AtomicOutputFile output(active_output_parent / "parent-race.mp4", {}, {},
+                                    protected_paths);
+    write_text_descriptor(output.descriptor(), "retained parent output\n");
+    std::filesystem::remove(active_output_parent);
+    std::filesystem::create_directory_symlink(redirected_output_parent, active_output_parent);
+    output.commit();
+    expect_eq(read_text_file(retained_output_parent / "parent-race.mp4"),
+              std::string("retained parent output\n"),
+              "stitch publication stays in its descriptor-pinned parent");
+    expect_eq(read_text_file(redirected_victim), std::string("redirected victim\n"),
+              "redirected output parent cannot replace a protected file");
+  }
 
 #if defined(__linux__)
   std::filesystem::path attacker_entry;
@@ -1076,6 +1187,9 @@ void parse_errors_are_reported() {
   expect_error(
       parse_args({"stitch", "left.mp4", "right.mp4", "-c", "match.json", "--lookahead", "-1"}),
       "lookahead does not allow hyphen value");
+  expect_error(
+      parse_args({"stitch", "left.mp4", "right.mp4", "-c", "match.json", "--max-frames", "0"}),
+      "zero-frame stitch is rejected before GPU setup");
   expect_error(parse_args({"calibrate", "left.mp4", "right.mp4", "--skip-start", "-1"}),
                "skip start does not allow hyphen value");
   expect_error(parse_args({"calibrate", "left.mp4", "right.mp4", "--akaze-threshold", "NaN"}),
@@ -2895,6 +3009,8 @@ int main(int argc, char** argv) {
                 stitch_frame_timing_preserves_source_gaps_and_rejects_overflow);
   run_test_case("stitch_second_conversion_supports_the_unsigned_gstreamer_range",
                 stitch_second_conversion_supports_the_unsigned_gstreamer_range);
+  run_test_case("stitch_frame_window_uses_one_rounded_timeline",
+                stitch_frame_window_uses_one_rounded_timeline);
   run_test_case("stitch_output_transaction_is_descriptor_pinned_and_atomic",
                 stitch_output_transaction_is_descriptor_pinned_and_atomic);
   run_test_case("preview_and_calibrate_parse_matches_rust_defaults",

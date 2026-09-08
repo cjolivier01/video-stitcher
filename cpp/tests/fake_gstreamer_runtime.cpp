@@ -191,6 +191,17 @@ struct FakeDiscovererInfo : FakeObject {
   bool has_video = true;
 };
 
+struct FakeDiscovererStreamInfo {
+  std::uint32_t width = 1280;
+  std::uint32_t height = 720;
+};
+
+struct GListAbi {
+  void* data = nullptr;
+  GListAbi* next = nullptr;
+  GListAbi* previous = nullptr;
+};
+
 struct FakePipeline : FakeObject {
   FakePipeline() : FakeObject(ObjectKind::Pipeline) {}
   ~FakePipeline();
@@ -1444,18 +1455,40 @@ RECO_FAKE_EXPORT void* gst_discoverer_discover_uri(void*, const char* uri, GErro
 
 RECO_FAKE_EXPORT int gst_discoverer_info_get_result(const void*) { return 0; }
 
+RECO_FAKE_EXPORT std::uint64_t gst_discoverer_info_get_duration(const void*) {
+  return scenario() == "encoded-output-zero-duration" ? 0 : 1'000'000'000ULL;
+}
+
 RECO_FAKE_EXPORT void* gst_discoverer_info_get_audio_streams(void* info_pointer) {
   const auto* info = static_cast<FakeDiscovererInfo*>(info_pointer);
-  return info != nullptr && info->has_audio ? static_cast<void*>(new int(1)) : nullptr;
+  return info != nullptr && info->has_audio
+             ? static_cast<void*>(new GListAbi{.data = new FakeDiscovererStreamInfo})
+             : nullptr;
 }
 
 RECO_FAKE_EXPORT void* gst_discoverer_info_get_video_streams(void* info_pointer) {
   const auto* info = static_cast<FakeDiscovererInfo*>(info_pointer);
-  return info != nullptr && info->has_video ? static_cast<void*>(new int(1)) : nullptr;
+  return info != nullptr && info->has_video
+             ? static_cast<void*>(new GListAbi{
+                   .data =
+                       new FakeDiscovererStreamInfo{
+                           .width = scenario() == "encoded-output-zero-geometry" ? 0U : 1280U,
+                           .height = scenario() == "encoded-output-zero-geometry" ? 0U : 720U}})
+             : nullptr;
 }
 
 RECO_FAKE_EXPORT void gst_discoverer_stream_info_list_free(void* streams) {
-  delete static_cast<int*>(streams);
+  auto* list = static_cast<GListAbi*>(streams);
+  delete static_cast<FakeDiscovererStreamInfo*>(list->data);
+  delete list;
+}
+
+RECO_FAKE_EXPORT std::uint32_t gst_discoverer_video_info_get_width(const void* stream) {
+  return static_cast<const FakeDiscovererStreamInfo*>(stream)->width;
+}
+
+RECO_FAKE_EXPORT std::uint32_t gst_discoverer_video_info_get_height(const void* stream) {
+  return static_cast<const FakeDiscovererStreamInfo*>(stream)->height;
 }
 
 RECO_FAKE_EXPORT void* gst_pad_get_current_caps(void* pad_pointer) {

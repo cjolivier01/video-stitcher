@@ -50,6 +50,12 @@ struct GErrorAbi {
   char* message = nullptr;
 };
 
+struct GListAbi {
+  void* data = nullptr;
+  GListAbi* next = nullptr;
+  GListAbi* previous = nullptr;
+};
+
 struct GstMiniObjectAbi {
   std::uintptr_t type = 0;
   std::int32_t ref_count = 0;
@@ -249,7 +255,10 @@ public:
   using DiscovererNew = void* (*)(std::uint64_t, GErrorAbi**);
   using DiscovererDiscoverUri = void* (*)(void*, const char*, GErrorAbi**);
   using DiscovererInfoGetResult = int (*)(const void*);
+  using DiscovererInfoGetDuration = std::uint64_t (*)(const void*);
   using DiscovererInfoGetVideoStreams = void* (*)(void*);
+  using DiscovererVideoInfoGetWidth = std::uint32_t (*)(const void*);
+  using DiscovererVideoInfoGetHeight = std::uint32_t (*)(const void*);
   using DiscovererStreamInfoListFree = void (*)(void*);
   using ErrorFree = void (*)(GErrorAbi*);
   using Free = void (*)(void*);
@@ -292,8 +301,14 @@ public:
     discoverer_discover_uri = pbutils->symbol<DiscovererDiscoverUri>("gst_discoverer_discover_uri");
     discoverer_info_get_result =
         pbutils->symbol<DiscovererInfoGetResult>("gst_discoverer_info_get_result");
+    discoverer_info_get_duration =
+        pbutils->symbol<DiscovererInfoGetDuration>("gst_discoverer_info_get_duration");
     discoverer_info_get_video_streams =
         pbutils->symbol<DiscovererInfoGetVideoStreams>("gst_discoverer_info_get_video_streams");
+    discoverer_video_info_get_width =
+        pbutils->symbol<DiscovererVideoInfoGetWidth>("gst_discoverer_video_info_get_width");
+    discoverer_video_info_get_height =
+        pbutils->symbol<DiscovererVideoInfoGetHeight>("gst_discoverer_video_info_get_height");
     discoverer_stream_info_list_free =
         pbutils->symbol<DiscovererStreamInfoListFree>("gst_discoverer_stream_info_list_free");
     error_free = glib->symbol<ErrorFree>("g_error_free");
@@ -310,7 +325,10 @@ public:
   DiscovererNew discoverer_new = nullptr;
   DiscovererDiscoverUri discoverer_discover_uri = nullptr;
   DiscovererInfoGetResult discoverer_info_get_result = nullptr;
+  DiscovererInfoGetDuration discoverer_info_get_duration = nullptr;
   DiscovererInfoGetVideoStreams discoverer_info_get_video_streams = nullptr;
+  DiscovererVideoInfoGetWidth discoverer_video_info_get_width = nullptr;
+  DiscovererVideoInfoGetHeight discoverer_video_info_get_height = nullptr;
   DiscovererStreamInfoListFree discoverer_stream_info_list_free = nullptr;
   ErrorFree error_free = nullptr;
   Free free = nullptr;
@@ -498,6 +516,12 @@ struct GpuVideoEncodeSession::Impl {
       const auto detail = take_error(api, error, "failed to construct GPU encode pipeline");
       close_resources();
       throw GpuEncodeError(detail);
+    }
+    if (const auto provenance_error = validate_nvbufsurface_runtime_provenance(runtime);
+        provenance_error.has_value()) {
+      close_resources();
+      throw GpuEncodeError("GPU encode pipeline loaded an incompatible NvBufSurface provider: " +
+                           *provenance_error);
     }
     source = api->bin_get_by_name(pipeline, "source");
     if (config.audio_caps.has_value()) {
@@ -1022,7 +1046,18 @@ void verify_muxed_gpu_video_output(std::string_view path, std::chrono::milliseco
   if (streams == nullptr) {
     throw GpuEncodeError("completed GPU output contains no video stream");
   }
+  const auto* video_streams = static_cast<const GListAbi*>(streams);
+  const std::uint32_t width = video_streams->data == nullptr
+                                  ? 0U
+                                  : api->discoverer_video_info_get_width(video_streams->data);
+  const std::uint32_t height = video_streams->data == nullptr
+                                   ? 0U
+                                   : api->discoverer_video_info_get_height(video_streams->data);
   api->discoverer_stream_info_list_free(streams);
+  const std::uint64_t duration = api->discoverer_info_get_duration(info);
+  if (duration == 0 || duration == kGstClockTimeNone || width == 0 || height == 0) {
+    throw GpuEncodeError("completed GPU output contains no decodable video samples");
+  }
 }
 
 } // namespace reco::io
