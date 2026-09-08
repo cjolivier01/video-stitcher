@@ -785,6 +785,11 @@ bool require_cuda() {
   return value != nullptr && std::string_view(value) != "0";
 }
 
+bool skip_cuda() {
+  const char* value = std::getenv("RECO_SKIP_CUDA_TEST");
+  return value != nullptr && std::string_view(value) != "0";
+}
+
 struct CpuColor {
   float kr = 0.0F;
   float kb = 0.0F;
@@ -825,6 +830,10 @@ std::uint8_t quantize(float value) {
 }
 
 void hardware_parity_if_available() {
+  if (skip_cuda()) {
+    std::cout << "SKIP: hardware CUDA RGBA-to-NV12 test disabled\n";
+    return;
+  }
   const auto cuda_error = CudaBackend::availability_error();
   const auto nvrtc_error = NvrtcCompiler::availability_error();
   if (!cuda_error.empty() || !nvrtc_error.empty()) {
