@@ -375,6 +375,7 @@ std::size_t decode_probe_ipc_frame_header(const ProbeIpcFrameHeader& header) {
 std::string encode_probe_request(const GpuFileDecodeConfig& config, std::uint64_t timeout_ns) {
   const nlohmann::json request{{"protocol_version", kProbeProtocolVersion},
                                {"path", nlohmann::json::binary(bytes(config.path))},
+                               {"stable_source", config.stable_source != nullptr},
                                {"codec", static_cast<int>(config.codec)},
                                {"elementary_stream", config.elementary_stream},
                                {"container", encode_container(config.container)},
@@ -400,6 +401,8 @@ ProbeWorkerRequest decode_probe_request(std::string_view payload) {
   }
   ProbeWorkerRequest decoded;
   decoded.config.path = required_bytes(request, "path", "video probe worker request");
+  decoded.expects_stable_source =
+      required_value<bool>(request, "stable_source", "video probe worker request");
   decoded.config.codec =
       decode_codec(required_value<int>(request, "codec", "video probe worker request"));
   decoded.config.elementary_stream =

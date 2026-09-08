@@ -2,6 +2,7 @@
 
 #include "reco/core/cuda_frame.hpp"
 #include "reco/io/nvmm.hpp"
+#include "reco/io/stable_media_file.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -33,7 +34,10 @@ enum class GpuDecodeContainer {
 };
 
 struct GpuFileDecodeConfig {
+  // User-facing path used only for diagnostics and explicit format selection.
   std::string path;
+  // When present, media bytes are read only from this retained descriptor.
+  std::shared_ptr<const StableMediaFile> stable_source;
   // Elementary streams require an explicit parser. Supported containers
   // select H.264, HEVC, or AV1 from their video pad at runtime.
   GpuDecodeCodec codec = GpuDecodeCodec::H264;

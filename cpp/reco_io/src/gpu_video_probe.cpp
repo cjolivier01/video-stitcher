@@ -468,8 +468,12 @@ std::filesystem::path path_from_utf8(std::string_view value) {
 std::string build_probe_pipeline(const GpuFileDecodeConfig& config,
                                  const std::filesystem::path& absolute_path) {
   std::ostringstream pipeline;
-  pipeline << "filesrc location=" << quote_gstreamer_property(path_for_gstreamer(absolute_path))
-           << " ! ";
+  if (config.stable_source) {
+    pipeline << "fdsrc fd=" << config.stable_source->descriptor() << " ! ";
+  } else {
+    pipeline << "filesrc location=" << quote_gstreamer_property(path_for_gstreamer(absolute_path))
+             << " ! ";
+  }
   if (config.elementary_stream) {
     pipeline << "identity name=input_budget silent=true ! " << parser_for_codec(config.codec);
   } else {
@@ -1779,14 +1783,17 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
   const bool exhaustive = policy == GpuVideoProbePolicy::ExhaustiveIndexedCadence;
   CompressedSampleBudget sample_budget(exhaustive);
 
-  std::error_code path_error;
-  const auto absolute_path = std::filesystem::absolute(path_from_utf8(config.path), path_error);
-  if (path_error) {
-    throw GpuVideoProbeError("failed to resolve video path: " + path_error.message());
-  }
-  if (!std::filesystem::is_regular_file(absolute_path, path_error) || path_error) {
-    throw GpuVideoProbeError("video probe path is not a readable regular file: " +
-                             path_for_gstreamer(absolute_path));
+  auto absolute_path = path_from_utf8(config.path);
+  if (!config.stable_source) {
+    std::error_code path_error;
+    absolute_path = std::filesystem::absolute(absolute_path, path_error);
+    if (path_error) {
+      throw GpuVideoProbeError("failed to resolve video path: " + path_error.message());
+    }
+    if (!std::filesystem::is_regular_file(absolute_path, path_error) || path_error) {
+      throw GpuVideoProbeError("video probe path is not a readable regular file: " +
+                               path_for_gstreamer(absolute_path));
+    }
   }
 
   auto api = std::make_shared<ProbeApi>();

@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <string_view>
 #include <system_error>
 #include <vector>
@@ -26,9 +27,9 @@
 #endif
 
 namespace reco::io::detail {
-int run_gpu_video_probe_worker();
+int run_gpu_video_probe_worker(std::intptr_t inherited_handle = -1);
 #if defined(_WIN32)
-int run_gpu_video_probe_guardian();
+int run_gpu_video_probe_guardian(std::intptr_t inherited_handle = -1);
 #else
 int run_gpu_video_probe_owner(const char* executable, std::uint64_t pre_worker_report_delay_ns,
                               std::uint64_t pre_guardian_exec_delay_ns, bool has_marker,
@@ -149,8 +150,22 @@ bool close_unrelated_descriptors() {
 
 int main(int argc, char** argv) {
 #if defined(_WIN32)
-  if (argc == 2 && std::strcmp(argv[1], "--reco-video-probe-guardian") == 0) {
-    return reco::io::detail::run_gpu_video_probe_guardian();
+  const auto inherited_handle = [&](int index) -> std::optional<std::intptr_t> {
+    if (index >= argc) {
+      return std::intptr_t{-1};
+    }
+    std::uint64_t value = 0;
+    const std::string_view text(argv[index]);
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (error != std::errc{} || end != text.data() + text.size() || value == 0 ||
+        value > static_cast<std::uint64_t>(std::numeric_limits<std::intptr_t>::max())) {
+      return std::nullopt;
+    }
+    return static_cast<std::intptr_t>(value);
+  };
+  if ((argc == 2 || argc == 3) && std::strcmp(argv[1], "--reco-video-probe-guardian") == 0) {
+    const auto handle = inherited_handle(2);
+    return handle.has_value() ? reco::io::detail::run_gpu_video_probe_guardian(*handle) : 2;
   }
 #else
   if (argc == 7 && std::strcmp(argv[1], "--reco-video-probe-owner") == 0) {
@@ -206,13 +221,14 @@ int main(int argc, char** argv) {
     return 2;
   }
 #if defined(_WIN32)
-  if (argc != 2) {
+  if (argc != 2 && argc != 3) {
     return 2;
   }
   if (_setmode(_fileno(stdin), _O_BINARY) == -1 || _setmode(_fileno(stdout), _O_BINARY) == -1) {
     return 2;
   }
-  return reco::io::detail::run_gpu_video_probe_worker();
+  const auto handle = inherited_handle(2);
+  return handle.has_value() ? reco::io::detail::run_gpu_video_probe_worker(*handle) : 2;
 #else
   if (argc != 3) {
     return 2;

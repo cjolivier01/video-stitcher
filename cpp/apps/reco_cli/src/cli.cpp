@@ -10,6 +10,7 @@
 #include "reco/detect/probe.hpp"
 #include "reco/io/gpu_decode.hpp"
 #include "reco/io/gstreamer.hpp"
+#include "reco/io/stable_media_file.hpp"
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "stitch.hpp"
 
@@ -516,9 +517,13 @@ void PinnedWindowsPath::verify_unchanged(const std::filesystem::path& path,
   }
 }
 
-[[nodiscard]] PinnedWindowsPath pin_windows_path_for_publication(const std::filesystem::path& path,
-                                                                 std::string_view label) {
+[[nodiscard]] PinnedWindowsPath pin_windows_path_for_publication(
+    const std::filesystem::path& path, std::string_view label,
+    const std::shared_ptr<const io::StableMediaFile>& stable_source = {}) {
   constexpr DWORD kReadOnlySharing = FILE_SHARE_READ;
+  if (stable_source) {
+    stable_source->verify_unchanged();
+  }
   const HANDLE directory_entry =
       CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, kReadOnlySharing, nullptr, OPEN_EXISTING,
                   FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
@@ -527,13 +532,25 @@ void PinnedWindowsPath::verify_unchanged(const std::filesystem::path& path,
                      static_cast<int>(GetLastError()));
   }
   PinnedWindowsPath pinned{.directory_entry = UniqueWindowsHandle(directory_entry)};
-  const HANDLE target =
-      CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, kReadOnlySharing, nullptr, OPEN_EXISTING,
-                  FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  HANDLE target = INVALID_HANDLE_VALUE;
+  if (stable_source) {
+    const auto retained = reinterpret_cast<HANDLE>(_get_osfhandle(stable_source->descriptor()));
+    if (retained != INVALID_HANDLE_VALUE) {
+      target =
+          ReOpenFile(retained, FILE_READ_ATTRIBUTES, kReadOnlySharing, FILE_FLAG_BACKUP_SEMANTICS);
+    }
+  } else {
+    target =
+        CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, kReadOnlySharing, nullptr, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  }
   if (target == INVALID_HANDLE_VALUE) {
     throw_file_error("cannot retain " + std::string(label), path, static_cast<int>(GetLastError()));
   }
   pinned.target = UniqueWindowsHandle(target);
+  if (stable_source) {
+    stable_source->verify_unchanged();
+  }
   return pinned;
 }
 
@@ -1027,9 +1044,14 @@ struct PinnedFileIdentity {
   }
 };
 
-[[nodiscard]] PinnedFileIdentity pin_input_identity(const std::filesystem::path& path,
-                                                    std::string_view label) {
-  const int descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+[[nodiscard]] PinnedFileIdentity
+pin_input_identity(const std::filesystem::path& path, std::string_view label,
+                   const std::shared_ptr<const io::StableMediaFile>& stable_source = {}) {
+  if (stable_source) {
+    stable_source->verify_unchanged();
+  }
+  const int descriptor = stable_source ? ::fcntl(stable_source->descriptor(), F_DUPFD_CLOEXEC, 0)
+                                       : ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (descriptor < 0) {
     throw_file_error("cannot open " + std::string(label), path, errno);
   }
@@ -1043,6 +1065,9 @@ struct PinnedFileIdentity {
   }
   if (!S_ISREG(pinned.identity.st_mode) || pinned.identity.st_size <= 0) {
     throw std::runtime_error(std::string(label) + " must be a regular file: " + path.string());
+  }
+  if (stable_source) {
+    stable_source->verify_unchanged();
   }
   return pinned;
 }
@@ -1866,12 +1891,31 @@ lock_posix_output_directory(const std::filesystem::path& destination,
 }
 #endif
 
-[[nodiscard]] PinnedPosixPath pin_posix_path_for_publication(const std::filesystem::path& path,
-                                                             std::string_view label) {
+[[nodiscard]] PinnedPosixPath pin_posix_path_for_publication(
+    const std::filesystem::path& path, std::string_view label,
+    const std::shared_ptr<const io::StableMediaFile>& stable_source = {}) {
   PinnedPosixPath pinned;
   pinned.label = std::string(label);
   pinned.path = path;
-  pinned.descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (stable_source) {
+    stable_source->verify_unchanged();
+  }
+#if defined(F_DUPFD_CLOEXEC)
+  pinned.descriptor = stable_source ? ::fcntl(stable_source->descriptor(), F_DUPFD_CLOEXEC, 0)
+                                    : ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+#else
+  pinned.descriptor = stable_source ? ::dup(stable_source->descriptor())
+                                    : ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (stable_source && pinned.descriptor >= 0) {
+    const int flags = ::fcntl(pinned.descriptor, F_GETFD);
+    if (flags < 0 || ::fcntl(pinned.descriptor, F_SETFD, flags | FD_CLOEXEC) != 0) {
+      const int saved_error = errno;
+      (void)::close(pinned.descriptor);
+      pinned.descriptor = -1;
+      errno = saved_error;
+    }
+  }
+#endif
   if (pinned.descriptor < 0) {
     throw_file_error("cannot open " + pinned.label, path, errno);
   }
@@ -1883,6 +1927,9 @@ lock_posix_output_directory(const std::filesystem::path& destination,
   }
   if (!S_ISREG(pinned.identity.st_mode) || pinned.identity.st_size <= 0) {
     throw std::runtime_error(pinned.label + " must be a regular file: " + path.string());
+  }
+  if (stable_source) {
+    stable_source->verify_unchanged();
   }
   return pinned;
 }
@@ -4289,7 +4336,8 @@ AtomicOutputFile::AtomicOutputFile(
     impl_->protected_paths.push_back(
         {.path = protected_path.path,
          .label = protected_path.label,
-         .identity = pin_windows_path_for_publication(protected_path.path, protected_path.label)});
+         .identity = pin_windows_path_for_publication(protected_path.path, protected_path.label,
+                                                      protected_path.stable_source)});
   }
   if (const auto error = validate_windows_stitch_output_identity(
           impl_->output_directory.handle.get(), impl_->destination.filename().wstring(),
@@ -4352,7 +4400,8 @@ AtomicOutputFile::AtomicOutputFile(
 #if defined(__linux__)
   impl_->protected_paths.reserve(protected_paths.size());
   for (const auto& protected_path : protected_paths) {
-    impl_->protected_paths.push_back(pin_input_identity(protected_path.path, protected_path.label));
+    impl_->protected_paths.push_back(pin_input_identity(protected_path.path, protected_path.label,
+                                                        protected_path.stable_source));
   }
   if (const auto error = validate_linux_stitch_output_identity(
           directory, impl_->destination.filename().string(), impl_->protected_paths);
@@ -4362,8 +4411,8 @@ AtomicOutputFile::AtomicOutputFile(
 #else
   impl_->protected_paths.reserve(protected_paths.size());
   for (const auto& protected_path : protected_paths) {
-    impl_->protected_paths.push_back(
-        pin_posix_path_for_publication(protected_path.path, protected_path.label));
+    impl_->protected_paths.push_back(pin_posix_path_for_publication(
+        protected_path.path, protected_path.label, protected_path.stable_source));
   }
   if (const auto error = validate_posix_stitch_output_identity(
           directory, impl_->destination.filename().string(), impl_->protected_paths);

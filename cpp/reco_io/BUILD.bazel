@@ -22,6 +22,8 @@ _RECO_IO_SRCS = [
     "src/output.cpp",
     "src/settings.cpp",
     "src/stacked_video.cpp",
+    "src/stable_media_file.cpp",
+    "src/stable_media_file_internal.hpp",
 ]
 
 _RECO_IO_HDRS = [
@@ -38,6 +40,7 @@ _RECO_IO_HDRS = [
     "include/reco/io/output.hpp",
     "include/reco/io/settings.hpp",
     "include/reco/io/stacked_video.hpp",
+    "include/reco/io/stable_media_file.hpp",
 ]
 
 _RECO_IO_DEPS = [

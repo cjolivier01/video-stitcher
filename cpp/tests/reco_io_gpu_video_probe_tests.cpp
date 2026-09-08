@@ -2,6 +2,7 @@
 
 #include "gpu_video_probe_process_test.hpp"
 #include "reco/core/path.hpp"
+#include "reco/io/stable_media_file.hpp"
 
 #include "rules_cc/cc/runfiles/runfiles.h"
 
@@ -94,6 +95,17 @@ template <typename T, typename U> void expect_eq(T actual, U expected, std::stri
   if (actual != expected) {
     std::cerr << "FAIL: " << message << " expected=" << expected << " actual=" << actual << '\n';
     ++failures;
+  }
+}
+
+void expect_verified_or_fail_closed(const std::shared_ptr<const StableMediaFile>& source,
+                                    std::string_view message) {
+  try {
+    source->verify_unchanged();
+  } catch (const std::exception& error) {
+    expect_true(std::string_view(error.what()).find("changed while it was retained") !=
+                    std::string_view::npos,
+                message);
   }
 }
 
@@ -1513,6 +1525,40 @@ void probe_contracts(const std::filesystem::path& video_path,
             3840U, "HEVC elementary stream uses explicit parser");
   expect_true(has_event(read_events(event_path), "probe-h265-parser"),
               "HEVC elementary probe constructs only the requested parser");
+}
+
+void stable_probe_uses_transferred_descriptor(const std::filesystem::path& video_path) {
+  const auto moved = video_path.parent_path() / (video_path.filename().string() + ".retained");
+  const auto substitute =
+      video_path.parent_path() / (video_path.filename().string() + ".substitute");
+  try {
+    {
+      std::ofstream output(substitute, std::ios::binary);
+      output << "pathname substitute that must not be opened";
+    }
+    const auto retained = StableMediaFile::open(video_path);
+    auto config = container_config(video_path);
+    config.stable_source = retained->open_cursor();
+    std::filesystem::rename(video_path, moved);
+    std::filesystem::rename(substitute, video_path);
+    const auto result = reco::io::probe_gpu_video(config, probe_worker_path, 5'000'000'000ULL);
+    expect_eq(result.width, 3840U,
+              "probe worker consumes transferred stable descriptor during pathname substitution");
+    std::filesystem::rename(video_path, substitute);
+    std::filesystem::rename(moved, video_path);
+    expect_verified_or_fail_closed(retained,
+                                   "restored probe input reports only a retained-file change");
+    std::filesystem::remove(substitute);
+  } catch (const std::exception& error) {
+    std::error_code ignored;
+    if (std::filesystem::exists(moved, ignored)) {
+      std::filesystem::remove(video_path, ignored);
+      std::filesystem::rename(moved, video_path, ignored);
+    }
+    std::filesystem::remove(substitute, ignored);
+    std::cerr << "FAIL: stable probe descriptor race: " << error.what() << '\n';
+    ++failures;
+  }
 }
 
 void invalid_inputs_fail(const std::filesystem::path& video_path,
@@ -4732,6 +4778,7 @@ int main(int argc, char** argv) {
   set_environment("RECO_FAKE_GST_EVENT_PATH", event_path.string());
 
   probe_contracts(video_path, event_path);
+  stable_probe_uses_transferred_descriptor(video_path);
 #if !defined(RECO_PROBE_TEST_FORCE_GUARDIAN_FALLBACKS)
   exhaustive_calibration_probe_scans_to_eos(video_path);
 #endif

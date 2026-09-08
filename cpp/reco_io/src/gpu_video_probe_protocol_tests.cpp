@@ -21,6 +21,7 @@ std::string encode(const nlohmann::json& value) {
 nlohmann::json valid_request() {
   return {{"protocol_version", 6U},
           {"path", nlohmann::json::binary({0x76, 0x69, 0x64, 0x65, 0x6f})},
+          {"stable_source", false},
           {"codec", 0},
           {"elementary_stream", false},
           {"container", 0},
@@ -109,6 +110,20 @@ void request_numeric_domains_are_enforced() {
     std::cerr << "FAIL: strict codec selection round trips in worker requests\n";
     ++failures;
   }
+}
+
+void stable_source_authority_is_explicit() {
+  auto request = valid_request();
+  request["stable_source"] = true;
+  const auto decoded = reco::io::detail::decode_probe_request(encode(request));
+  if (!decoded.expects_stable_source || decoded.config.stable_source) {
+    std::cerr << "FAIL: protocol separates stable-source authority from serialized metadata\n";
+    ++failures;
+  }
+
+  request.erase("stable_source");
+  expect_probe_error([&] { (void)reco::io::detail::decode_probe_request(encode(request)); },
+                     "stable_source", "stable-source authority is mandatory in protocol version 6");
 }
 
 void response_numeric_domains_are_enforced() {
@@ -358,6 +373,7 @@ void cbor_nesting_is_bounded_before_parsing() {
 
 int main() {
   request_numeric_domains_are_enforced();
+  stable_source_authority_is_explicit();
   response_numeric_domains_are_enforced();
   stream_time_origin_round_trips();
   timestamp_multiplicity_round_trips();

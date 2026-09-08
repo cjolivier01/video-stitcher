@@ -45,6 +45,17 @@ template <typename T, typename U> void expect_eq(T actual, U expected, std::stri
   }
 }
 
+void expect_verified_or_fail_closed(const std::shared_ptr<const StableMediaFile>& source,
+                                    std::string_view message) {
+  try {
+    source->verify_unchanged();
+  } catch (const std::exception& error) {
+    expect_true(std::string_view(error.what()).find("changed while it was retained") !=
+                    std::string_view::npos,
+                message);
+  }
+}
+
 template <typename Function>
 void expect_gpu_decode_error(Function&& function, std::string_view fragment,
                              std::string_view message) {
@@ -227,6 +238,55 @@ void production_source_retains_mapped_sample() {
   events = read_events(event_path);
   expect_eq(count_event(events, "pull"), 3U,
             "idempotent EOS does not perform a third pull on either source");
+}
+
+void nvdec_pipeline_uses_only_retained_descriptor() {
+  set_scenario("frame-eos");
+  const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto path = std::filesystem::temp_directory_path() /
+                    ("reco-pinned-decode-" + std::to_string(unique) + ".mp4");
+  const auto moved = path.string() + ".retained";
+  const auto substitute = path.string() + ".substitute";
+  {
+    std::ofstream output(path, std::ios::binary);
+    output << "pinned compressed media";
+  }
+  {
+    std::ofstream output(substitute, std::ios::binary);
+    output << "pathname substitute";
+  }
+
+  try {
+    const auto retained = StableMediaFile::open(path);
+    auto config = valid_config();
+    config.path = path.string();
+    config.stable_source = retained;
+    std::filesystem::rename(path, moved);
+    std::filesystem::rename(substitute, path);
+    auto source = open_gstreamer_gpu_file_decode_source(config, NvbufSurfaceAbi::DeepStream9_1);
+    expect_true(source->pipeline().find("fdsrc fd=") != std::string_view::npos,
+                "NVDEC pipeline reads the retained descriptor");
+    expect_true(source->pipeline().find("filesrc location=") == std::string_view::npos,
+                "NVDEC pipeline never reopens the mutable pathname");
+    expect_true(source->read().status == GpuDecodeFrameStatus::Frame,
+                "descriptor-backed NVDEC pipeline returns a GPU frame");
+    source.reset();
+    std::filesystem::rename(path, substitute);
+    std::filesystem::rename(moved, path);
+    expect_verified_or_fail_closed(retained,
+                                   "restored NVDEC input reports only a retained-file change");
+  } catch (...) {
+    std::error_code ignored;
+    if (std::filesystem::exists(moved, ignored)) {
+      std::filesystem::remove(path, ignored);
+      std::filesystem::rename(moved, path, ignored);
+    }
+    std::filesystem::remove(path, ignored);
+    std::filesystem::remove(substitute, ignored);
+    throw;
+  }
+  std::filesystem::remove(path);
+  std::filesystem::remove(substitute);
 }
 
 void source_destruction_stops_decode_with_a_retained_frame() {
@@ -1140,6 +1200,7 @@ int run_tests() {
   set_environment("RECO_FAKE_GST_EVENT_PATH", event_path.string());
 
   production_source_retains_mapped_sample();
+  nvdec_pipeline_uses_only_retained_descriptor();
   source_destruction_stops_decode_with_a_retained_frame();
   chained_sources_open_lazily_and_preserve_global_indices();
   chained_source_stop_interrupts_the_active_segment();

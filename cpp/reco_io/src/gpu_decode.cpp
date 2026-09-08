@@ -236,7 +236,11 @@ std::string build_gstreamer_gpu_file_decode_pipeline(const GpuFileDecodeConfig& 
     throw std::invalid_argument(*error);
   }
   std::ostringstream pipeline;
-  pipeline << "filesrc location=" << quote_gstreamer_property(config.path) << " ! ";
+  if (config.stable_source) {
+    pipeline << "fdsrc fd=" << config.stable_source->descriptor() << " ! ";
+  } else {
+    pipeline << "filesrc location=" << quote_gstreamer_property(config.path) << " ! ";
+  }
   if (config.elementary_stream) {
     pipeline << parser_for_codec(config.codec);
   } else if (config.require_selected_codec) {

@@ -2,6 +2,7 @@
 
 #include "gpu_video_probe_process_test.hpp"
 #include "gpu_video_probe_protocol.hpp"
+#include "stable_media_file_internal.hpp"
 
 #include <algorithm>
 #include <array>
@@ -448,7 +449,8 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
                              std::chrono::steady_clock::time_point deadline,
                              std::chrono::steady_clock::time_point cleanup_deadline,
                              const ProbeLaunchOptions& options,
-                             std::shared_ptr<SupervisorSlot> reservation) {
+                             std::shared_ptr<SupervisorSlot> reservation,
+                             const std::shared_ptr<const StableMediaFile>& stable_source) {
   (void)options.pre_worker_report_delay;
   (void)options.pre_guardian_exec_delay;
   (void)options.pre_guardian_exec_marker;
@@ -495,6 +497,19 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   }
   UniqueHandle child_stderr(child_stderr_raw);
 
+  UniqueHandle child_media;
+  if (stable_source) {
+    HANDLE inherited = INVALID_HANDLE_VALUE;
+    const auto source =
+        reinterpret_cast<HANDLE>(detail::stable_media_native_handle(*stable_source));
+    if (source == INVALID_HANDLE_VALUE ||
+        DuplicateHandle(GetCurrentProcess(), source, GetCurrentProcess(), &inherited, 0, TRUE,
+                        DUPLICATE_SAME_ACCESS) == 0) {
+      throw GpuVideoProbeError("failed to duplicate the stable media handle for the probe worker");
+    }
+    child_media = UniqueHandle(inherited);
+  }
+
   UniqueHandle job(CreateJobObjectW(nullptr, nullptr));
   JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
   limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE |
@@ -508,11 +523,13 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   }
 
   StartupAttributeList attributes(2);
-  std::array<HANDLE, 3> inherited_handles{child_stdin.get(), child_stdout.get(),
-                                          child_stderr.get()};
-  if (UpdateProcThreadAttribute(attributes.get(), 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-                                inherited_handles.data(), sizeof(inherited_handles), nullptr,
-                                nullptr) == 0) {
+  std::vector<HANDLE> inherited_handles{child_stdin.get(), child_stdout.get(), child_stderr.get()};
+  if (child_media) {
+    inherited_handles.push_back(child_media.get());
+  }
+  if (UpdateProcThreadAttribute(
+          attributes.get(), 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited_handles.data(),
+          inherited_handles.size() * sizeof(inherited_handles.front()), nullptr, nullptr) == 0) {
     throw GpuVideoProbeError("failed to restrict video probe worker inherited handles");
   }
   std::array<HANDLE, 1> assigned_jobs{job.get()};
@@ -526,6 +543,10 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
                               encoded_path.size());
   const auto application = utf8_to_wide(utf8_path);
   auto command_line = L"\"" + application + L"\" --reco-video-probe-guardian";
+  if (child_media) {
+    command_line += L" " + std::to_wstring(static_cast<std::uint64_t>(
+                               reinterpret_cast<std::uintptr_t>(child_media.get())));
+  }
   STARTUPINFOEXW startup{};
   startup.lpAttributeList = attributes.get();
   startup.StartupInfo.cb = sizeof(startup);
@@ -590,6 +611,7 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   child_stdin.reset();
   child_stdout.reset();
   child_stderr.reset();
+  child_media.reset();
   if (std::chrono::steady_clock::now() >= deadline) {
     terminate_worker();
     throw_worker_timeout();
@@ -1060,9 +1082,49 @@ void write_all(int output, std::string_view payload,
 }
 
 void write_request(int output, std::string_view request,
-                   std::chrono::steady_clock::time_point deadline) {
+                   std::chrono::steady_clock::time_point deadline,
+                   const std::shared_ptr<const StableMediaFile>& stable_source) {
   const auto header = detail::encode_probe_ipc_frame_header(request.size());
-  write_all(output, std::string_view(header.data(), header.size()), deadline);
+  if (stable_source) {
+    const int descriptor = stable_source->descriptor();
+    std::array<char, CMSG_SPACE(sizeof(descriptor))> control{};
+    iovec vector{.iov_base = const_cast<char*>(header.data()), .iov_len = header.size()};
+    msghdr message{};
+    message.msg_iov = &vector;
+    message.msg_iovlen = 1;
+    message.msg_control = control.data();
+    message.msg_controllen = control.size();
+    auto* authority = CMSG_FIRSTHDR(&message);
+    authority->cmsg_level = SOL_SOCKET;
+    authority->cmsg_type = SCM_RIGHTS;
+    authority->cmsg_len = CMSG_LEN(sizeof(descriptor));
+    std::memcpy(CMSG_DATA(authority), &descriptor, sizeof(descriptor));
+
+    ssize_t written = -1;
+    do {
+      written = ::sendmsg(output, &message,
+#if defined(MSG_NOSIGNAL)
+                          MSG_NOSIGNAL
+#else
+                          0
+#endif
+      );
+    } while (written < 0 && errno == EINTR);
+    if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      wait_for_socket(output, POLLOUT, deadline);
+      return write_request(output, request, deadline, stable_source);
+    }
+    if (written <= 0 || static_cast<std::size_t>(written) > header.size()) {
+      throw GpuVideoProbeError("failed to transfer stable media descriptor to probe worker: " +
+                               std::string(std::strerror(errno)));
+    }
+    write_all(output,
+              std::string_view(header.data() + written,
+                               header.size() - static_cast<std::size_t>(written)),
+              deadline);
+  } else {
+    write_all(output, std::string_view(header.data(), header.size()), deadline);
+  }
   write_all(output, request, deadline);
 }
 
@@ -4239,7 +4301,8 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
                              std::chrono::steady_clock::time_point deadline,
                              std::chrono::steady_clock::time_point cleanup_deadline,
                              const ProbeLaunchOptions& options,
-                             std::shared_ptr<SupervisorSlot> reservation) {
+                             std::shared_ptr<SupervisorSlot> reservation,
+                             const std::shared_ptr<const StableMediaFile>& stable_source) {
   require_worker_launch_active(deadline);
   (void)deferred_process_reaper();
   auto source_executable = open_probe_executable(worker_path);
@@ -4358,7 +4421,7 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   }
   require_worker_launch_active(deadline);
   write_all(guardian.control(), std::string_view(&kGuardianRelease, 1), deadline);
-  write_request(parent_input.get(), request, deadline);
+  write_request(parent_input.get(), request, deadline, stable_source);
   parent_input.reset();
 
   read_exact(guardian.control(), &lifecycle, 1, deadline);
@@ -4385,7 +4448,8 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
 std::string run_probe_worker_bounded(std::filesystem::path worker_path, std::string request,
                                      std::chrono::steady_clock::time_point worker_deadline,
                                      std::chrono::steady_clock::time_point public_deadline,
-                                     const ProbeLaunchOptions& options) {
+                                     const ProbeLaunchOptions& options,
+                                     const std::shared_ptr<const StableMediaFile>& stable_source) {
   require_probe_process_generation();
 #if defined(_WIN32)
   (void)deferred_windows_job_reaper();
@@ -4396,10 +4460,10 @@ std::string run_probe_worker_bounded(std::filesystem::path worker_path, std::str
   wait_for_worker_launch_delay(options.supervisor_start_delay, public_deadline);
 #if defined(_WIN32)
   return run_probe_worker(worker_path, request, worker_deadline, public_deadline, options,
-                          std::move(reservation));
+                          std::move(reservation), stable_source);
 #else
   return run_probe_worker(worker_path, request, worker_deadline, public_deadline, options,
-                          std::move(reservation));
+                          std::move(reservation), stable_source);
 #endif
 }
 
@@ -4433,8 +4497,8 @@ GpuVideoProbe probe_gpu_video_with_delays(const GpuFileDecodeConfig& config,
     request.resize(detail::kMaximumProbeIpcBytes, '\0');
   }
 #endif
-  return detail::decode_probe_response(
-      run_probe_worker_bounded(worker_path, request, worker_deadline, public_deadline, options));
+  return detail::decode_probe_response(run_probe_worker_bounded(
+      worker_path, request, worker_deadline, public_deadline, options, config.stable_source));
 }
 
 } // namespace

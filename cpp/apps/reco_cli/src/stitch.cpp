@@ -13,6 +13,7 @@
 #include "reco/io/gpu_memory.hpp"
 #include "reco/io/gpu_video_probe.hpp"
 #include "reco/io/output.hpp"
+#include "reco/io/stable_media_file.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -58,7 +59,16 @@ constexpr std::size_t kStitchEncodePoolCapacity = 8;
 
 struct ProbedInput {
   std::vector<std::string> paths;
+  std::vector<std::shared_ptr<const StableMediaFile>> stable_sources;
+  std::vector<std::shared_ptr<const StableMediaFile>> probe_sources;
+  std::vector<std::shared_ptr<const StableMediaFile>> audio_sources;
   std::vector<GpuVideoProbe> probes;
+};
+
+struct RetainedInputSources {
+  std::vector<std::shared_ptr<const StableMediaFile>> decode;
+  std::vector<std::shared_ptr<const StableMediaFile>> probe;
+  std::vector<std::shared_ptr<const StableMediaFile>> audio;
 };
 
 struct AudioSelection {
@@ -91,10 +101,13 @@ std::vector<std::string> split_input_segments(std::string_view input, std::strin
   return paths;
 }
 
-GpuFileDecodeConfig decode_config(const std::string& path, const GpuVideoProbe& probe,
+GpuFileDecodeConfig decode_config(const std::string& path,
+                                  std::shared_ptr<const StableMediaFile> stable_source,
+                                  const GpuVideoProbe& probe,
                                   std::optional<std::uint64_t> start_frame) {
   GpuFileDecodeConfig config{
       .path = path,
+      .stable_source = std::move(stable_source),
       .codec = gpu_decode_codec_for_path(path),
       .elementary_stream = gpu_decode_path_is_elementary_stream(path),
       .container = gpu_decode_container_for_path(path),
@@ -114,13 +127,22 @@ GpuFileDecodeConfig decode_config(const std::string& path, const GpuVideoProbe& 
   return config;
 }
 
-ProbedInput probe_input(std::vector<std::string> paths, const std::filesystem::path& worker,
-                        std::string_view label) {
-  ProbedInput input{.paths = std::move(paths)};
+ProbedInput probe_input(std::vector<std::string> paths, RetainedInputSources sources,
+                        const std::filesystem::path& worker, std::string_view label) {
+  if (paths.size() != sources.decode.size() || paths.size() != sources.probe.size() ||
+      paths.size() != sources.audio.size()) {
+    throw std::logic_error("stable stitch input count does not match its paths");
+  }
+  ProbedInput input{.paths = std::move(paths),
+                    .stable_sources = std::move(sources.decode),
+                    .probe_sources = std::move(sources.probe),
+                    .audio_sources = std::move(sources.audio)};
   input.probes.reserve(input.paths.size());
-  for (const auto& path : input.paths) {
+  for (std::size_t index = 0; index < input.paths.size(); ++index) {
+    const auto& path = input.paths[index];
     input.probes.push_back(
         probe_gpu_video({.path = path,
+                         .stable_source = input.probe_sources[index],
                          .codec = gpu_decode_codec_for_path(path),
                          .elementary_stream = gpu_decode_path_is_elementary_stream(path),
                          .container = gpu_decode_container_for_path(path)},
@@ -173,19 +195,23 @@ std::unique_ptr<GpuFileDecodeSource>
 open_decode_source(const ProbedInput& input, std::optional<std::uint64_t> start_frame,
                    const std::shared_ptr<const NvbufSurfaceRuntime>& runtime) {
   if (input.paths.size() == 1U) {
-    return open_gstreamer_gpu_file_decode_source(
-        decode_config(input.paths.front(), input.probes.front(), start_frame), runtime);
+    return open_gstreamer_gpu_file_decode_source(decode_config(input.paths.front(),
+                                                               input.stable_sources.front(),
+                                                               input.probes.front(), start_frame),
+                                                 runtime);
   }
 
   GpuChainedFileDecodeConfig config{.start_frame_index = start_frame};
   config.segments.reserve(input.paths.size());
   for (std::size_t index = 0; index < input.paths.size(); ++index) {
     const auto& probe = input.probes[index];
-    config.segments.push_back({.config = decode_config(input.paths[index], probe, std::nullopt),
-                               .exact_frame_count = probe.indexed_sampling_cadence_verified &&
-                                                            !probe.total_frames_is_estimated
-                                                        ? std::optional(probe.total_frames)
-                                                        : std::nullopt});
+    config.segments.push_back(
+        {.config =
+             decode_config(input.paths[index], input.stable_sources[index], probe, std::nullopt),
+         .exact_frame_count =
+             probe.indexed_sampling_cadence_verified && !probe.total_frames_is_estimated
+                 ? std::optional(probe.total_frames)
+                 : std::nullopt});
   }
   return open_gstreamer_gpu_chained_file_decode_source(std::move(config), runtime);
 }
@@ -244,8 +270,9 @@ AudioSelection select_audio_segments(const ProbedInput& input, std::uint64_t sta
 
   AudioSelection selection;
   for (std::size_t index = first_segment; index < input.paths.size(); ++index) {
-    selection.segments.push_back(
-        {.path = input.paths[index], .video_duration_ns = segment_duration(index)});
+    selection.segments.push_back({.path = input.paths[index],
+                                  .stable_source = input.audio_sources[index],
+                                  .video_duration_ns = segment_duration(index)});
   }
   selection.local_start_time_ns = local_start;
   return selection;
@@ -278,6 +305,33 @@ void reject_unported_stitch_options(const StitchCommand& command) {
   if (command.preset.has_value()) {
     throw std::runtime_error("explicit encoder presets are not yet portable across NVIDIA targets");
   }
+}
+
+RetainedInputSources retain_media_inputs(const std::vector<std::string>& paths) {
+  RetainedInputSources retained;
+  retained.decode.reserve(paths.size());
+  retained.probe.reserve(paths.size());
+  retained.audio.reserve(paths.size());
+  for (const auto& path : paths) {
+    auto source = StableMediaFile::open(core::path_from_utf8(path));
+    auto probe = source->open_cursor();
+    auto audio = source->open_cursor();
+    retained.decode.push_back(std::move(source));
+    retained.probe.push_back(std::move(probe));
+    retained.audio.push_back(std::move(audio));
+  }
+  return retained;
+}
+
+void verify_retained_inputs(const ProbedInput& left, const ProbedInput& right,
+                            const StableMediaFile& calibration) {
+  for (const auto& input : left.stable_sources) {
+    input->verify_unchanged();
+  }
+  for (const auto& input : right.stable_sources) {
+    input->verify_unchanged();
+  }
+  calibration.verify_unchanged();
 }
 
 } // namespace
@@ -350,24 +404,33 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
     auto right_paths = split_input_segments(command.right, "right");
     const auto calibration_path = core::path_from_utf8(command.calibration);
     const auto output_path = core::path_from_utf8(command.output);
+    auto left_sources = retain_media_inputs(left_paths);
+    auto right_sources = retain_media_inputs(right_paths);
+    auto calibration_source = StableMediaFile::open(calibration_path);
     std::vector<AtomicOutputProtectedPath> protected_paths;
     protected_paths.reserve(left_paths.size() + right_paths.size() + 1U);
     for (const auto& path : left_paths) {
-      protected_paths.push_back(
-          {.path = core::path_from_utf8(path), .label = "a left input segment"});
+      const auto index = protected_paths.size();
+      protected_paths.push_back({.path = core::path_from_utf8(path),
+                                 .label = "a left input segment",
+                                 .stable_source = left_sources.decode[index]});
     }
+    const auto right_protected_offset = protected_paths.size();
     for (const auto& path : right_paths) {
-      protected_paths.push_back(
-          {.path = core::path_from_utf8(path), .label = "a right input segment"});
+      const auto index = protected_paths.size() - right_protected_offset;
+      protected_paths.push_back({.path = core::path_from_utf8(path),
+                                 .label = "a right input segment",
+                                 .stable_source = right_sources.decode[index]});
     }
-    protected_paths.push_back({.path = calibration_path, .label = "the calibration file"});
+    protected_paths.push_back({.path = calibration_path,
+                               .label = "the calibration file",
+                               .stable_source = calibration_source});
     AtomicOutputFile output(output_path, {}, {}, protected_paths);
 
-    std::string calibration_error;
-    auto calibration = core::load_match_calibration_file(command.calibration, &calibration_error);
+    auto calibration = core::parse_match_calibration_json(
+        calibration_source->read_all(core::kMaxCalibrationFileSize));
     if (!calibration.has_value()) {
-      throw std::runtime_error(calibration_error.empty() ? "invalid calibration JSON"
-                                                         : calibration_error);
+      throw std::runtime_error("invalid calibration JSON");
     }
     calibration->blend_width = command.blend;
 
@@ -375,8 +438,9 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
     if (!worker.has_value()) {
       throw std::runtime_error("cannot locate the deployed reco_video_probe_worker executable");
     }
-    auto left_input = probe_input(std::move(left_paths), *worker, "left");
-    auto right_input = probe_input(std::move(right_paths), *worker, "right");
+    auto left_input = probe_input(std::move(left_paths), std::move(left_sources), *worker, "left");
+    auto right_input =
+        probe_input(std::move(right_paths), std::move(right_sources), *worker, "right");
     require_exact_indexed_timeline(left_input, "left");
     require_exact_indexed_timeline(right_input, "right");
     const auto& left_probe = left_input.probes.front();
@@ -578,6 +642,7 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
     }
     encoder.finish();
     verify_muxed_gpu_video_output(output.temporary_path(), *codec, format, *worker, kProbeTimeout);
+    verify_retained_inputs(left_input, right_input, *calibration_source);
     output.commit();
     const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started);
     const auto rate = elapsed.count() > 0.0 ? static_cast<double>(frames) / elapsed.count() : 0.0;

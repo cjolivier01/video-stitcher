@@ -1,5 +1,7 @@
 #pragma once
 
+#include "reco/io/stable_media_file.hpp"
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -14,8 +16,10 @@ namespace reco::io {
 
 /// One video segment whose compressed audio may be passed through.
 struct AudioPassthroughSegment {
-  /// Input video path. Elementary video streams are retained as silent timeline gaps.
+  /// User-facing input path used for explicit container selection and diagnostics.
   std::string path;
+  /// Optional retained descriptor. When present, the pathname is never reopened.
+  std::shared_ptr<const StableMediaFile> stable_source;
   /// Probed video duration used to preserve the joined video timeline when audio is absent.
   std::uint64_t video_duration_ns = 0;
 };

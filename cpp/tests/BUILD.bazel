@@ -180,6 +180,16 @@ cc_test(
 )
 
 cc_test(
+    name = "reco_io_stable_media_file_tests",
+    size = "small",
+    srcs = ["reco_io_stable_media_file_tests.cpp"],
+    deps = [
+        "//cpp/reco_core",
+        "//cpp/reco_io",
+    ],
+)
+
+cc_test(
     name = "reco_io_gstreamer_tests",
     size = "small",
     srcs = [

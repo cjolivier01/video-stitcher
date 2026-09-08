@@ -13,6 +13,10 @@
 #include <variant>
 #include <vector>
 
+namespace reco::io {
+class StableMediaFile;
+}
+
 namespace reco::cli {
 
 struct WxH {
@@ -178,6 +182,8 @@ namespace detail {
 struct AtomicOutputProtectedPath {
   std::filesystem::path path;
   std::string label;
+  /// Retained media authority that publication must protect. Empty preserves the generic API.
+  std::shared_ptr<const io::StableMediaFile> stable_source;
 };
 
 /// Descriptor-pinned temporary output with identity-checked atomic publication.
