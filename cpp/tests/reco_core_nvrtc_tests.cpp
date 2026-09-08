@@ -4,6 +4,7 @@
 #include "rules_cc/cc/runfiles/runfiles.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -22,6 +23,17 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#if defined(__linux__)
+#include <sys/resource.h>
+#endif
+#endif
+
+#if defined(__SANITIZE_THREAD__)
+#define RECO_CORE_TEST_WITH_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define RECO_CORE_TEST_WITH_TSAN 1
+#endif
 #endif
 
 #if defined(__SANITIZE_ADDRESS__)
@@ -220,6 +232,16 @@ private:
 
 const std::string kSource = "extern \"C\" __global__ void fake_kernel() {}";
 
+#if defined(__linux__) && !defined(RECO_CORE_TEST_WITH_ASAN) && !defined(RECO_CORE_TEST_WITH_TSAN)
+std::size_t peak_resident_kibibytes() {
+  rusage usage{};
+  if (getrusage(RUSAGE_SELF, &usage) != 0 || usage.ru_maxrss < 0) {
+    throw std::runtime_error("failed to read peak resident memory");
+  }
+  return static_cast<std::size_t>(usage.ru_maxrss);
+}
+#endif
+
 void exact_library_probe(const std::filesystem::path& fake_runtime,
                          const std::filesystem::path& incomplete_runtime,
                          const std::filesystem::path& incomplete_architecture_runtime) {
@@ -380,6 +402,119 @@ void shared_compiler_supports_concurrent_compiles(const std::filesystem::path& f
   set_scenario("success");
 }
 
+void near_limit_concurrent_requests_share_transient_result(
+    const std::filesystem::path& fake_runtime, const FakeRuntimeControl& control) {
+  constexpr std::size_t kThreadCount = 8;
+  const std::string source(kNvrtcMaximumSourceBytes, 'x');
+#if defined(__linux__) && !defined(RECO_CORE_TEST_WITH_ASAN) && !defined(RECO_CORE_TEST_WITH_TSAN)
+  const auto resident_before_kib = peak_resident_kibibytes();
+#endif
+  set_scenario("slow-near-limit-success");
+  control.reset();
+  auto compiler = NvrtcCompiler::load(fake_runtime.string());
+  std::atomic<std::size_t> ready{0};
+  std::atomic<bool> start{false};
+  std::array<std::exception_ptr, kThreadCount> errors{};
+  std::vector<std::thread> threads;
+  threads.reserve(kThreadCount);
+  for (std::size_t index = 0; index < kThreadCount; ++index) {
+    threads.emplace_back([&, index] {
+      ++ready;
+      while (!start.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      try {
+        if (compiler.compile(source, "near-limit-single-flight.cu").ptx.empty()) {
+          throw std::runtime_error("near-limit compilation returned empty PTX");
+        }
+      } catch (...) {
+        errors[index] = std::current_exception();
+      }
+    });
+  }
+  while (ready.load(std::memory_order_acquire) != kThreadCount) {
+    std::this_thread::yield();
+  }
+  start.store(true, std::memory_order_release);
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  for (const auto& error : errors) {
+    expect_true(error == nullptr, "near-limit concurrent compile succeeds");
+  }
+  expect_eq(control.compile_count(), 1,
+            "near-limit waiters share one admitted compilation and transient result");
+#if defined(__linux__) && !defined(RECO_CORE_TEST_WITH_ASAN) && !defined(RECO_CORE_TEST_WITH_TSAN)
+  constexpr std::size_t kMaximumAdmissionGrowthKib = 80U * 1024U;
+  const auto resident_after_kib = peak_resident_kibibytes();
+  expect_true(resident_after_kib <= resident_before_kib + kMaximumAdmissionGrowthKib,
+              "near-limit waiters do not retain one source copy per request");
+#endif
+
+  set_scenario("success");
+  (void)compiler.compile(source, "near-limit-single-flight.cu");
+  expect_eq(control.compile_count(), 2,
+            "near-limit request is not retained beyond its concurrent flight");
+}
+
+void concurrent_failures_remain_independently_retryable(const std::filesystem::path& fake_runtime,
+                                                        const FakeRuntimeControl& control) {
+  constexpr std::size_t kThreadCount = 8;
+  set_scenario("slow-compile-error");
+  control.reset();
+  auto compiler = NvrtcCompiler::load(fake_runtime.string());
+  std::atomic<std::size_t> ready{0};
+  std::atomic<bool> start{false};
+  std::array<bool, kThreadCount> expected_errors{};
+  std::array<std::exception_ptr, kThreadCount> unexpected_errors{};
+  std::vector<std::thread> threads;
+  threads.reserve(kThreadCount);
+  for (std::size_t index = 0; index < kThreadCount; ++index) {
+    threads.emplace_back([&, index] {
+      ++ready;
+      while (!start.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      try {
+        (void)compiler.compile(kSource, "concurrent-failure.cu");
+        unexpected_errors[index] = std::make_exception_ptr(
+            std::runtime_error("failed compilation unexpectedly succeeded"));
+      } catch (const NvrtcError& error) {
+        if (std::string_view(error.what()).find("synthetic compile failure") !=
+            std::string_view::npos) {
+          expected_errors[index] = true;
+        } else {
+          unexpected_errors[index] = std::current_exception();
+        }
+      } catch (...) {
+        unexpected_errors[index] = std::current_exception();
+      }
+    });
+  }
+  while (ready.load(std::memory_order_acquire) != kThreadCount) {
+    std::this_thread::yield();
+  }
+  start.store(true, std::memory_order_release);
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  for (std::size_t index = 0; index < kThreadCount; ++index) {
+    expect_true(expected_errors[index], "concurrent failure preserves its NVRTC exception");
+    expect_true(unexpected_errors[index] == nullptr,
+                "concurrent failure does not report an unexpected exception");
+  }
+  expect_eq(control.compile_count(), static_cast<int>(kThreadCount),
+            "each failed concurrent request remains an independent retry");
+  expect_eq(control.maximum_active_compile_count(), 1,
+            "failed concurrent requests remain process-wide serialized");
+
+  set_scenario("success");
+  (void)compiler.compile(kSource, "concurrent-failure.cu");
+  (void)compiler.compile(kSource, "concurrent-failure.cu");
+  expect_eq(control.compile_count(), static_cast<int>(kThreadCount + 1U),
+            "successful retry after concurrent failures is cached");
+}
+
 void distinct_compiles_are_serialized(const std::filesystem::path& fake_runtime,
                                       const FakeRuntimeControl& control) {
   constexpr std::size_t kThreadCount = 8;
@@ -436,6 +571,14 @@ void successful_cache_is_bounded(const std::filesystem::path& fake_runtime,
   (void)compiler.compile(kSource, "byte-cap-0.cu");
   expect_eq(control.compile_count(), 4, "accounted byte cap evicts the oldest large result");
   expect_eq(control.maximum_active_compile_count(), 1, "cache misses remain serialized");
+
+  set_scenario("accounting-boundary-ptx");
+  control.reset();
+  (void)compiler.compile(kSource, "accounting-boundary-a.cu");
+  (void)compiler.compile(kSource, "accounting-boundary-b.cu");
+  (void)compiler.compile(kSource, "accounting-boundary-a.cu");
+  expect_eq(control.compile_count(), 3,
+            "cache byte cap includes key, result capacity, and conservative overhead");
   set_scenario("success");
 }
 
@@ -644,6 +787,10 @@ int main() {
            [&] { cache_key_covers_the_exact_request(fake_runtime, control); });
   run_case("shared compiler concurrent compiles",
            [&] { shared_compiler_supports_concurrent_compiles(fake_runtime, control); });
+  run_case("near-limit concurrent compile admission",
+           [&] { near_limit_concurrent_requests_share_transient_result(fake_runtime, control); });
+  run_case("concurrent compile failures",
+           [&] { concurrent_failures_remain_independently_retryable(fake_runtime, control); });
   run_case("distinct compiles are serialized",
            [&] { distinct_compiles_are_serialized(fake_runtime, control); });
   run_case("successful cache is bounded",

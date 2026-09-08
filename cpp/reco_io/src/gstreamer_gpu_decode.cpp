@@ -977,13 +977,15 @@ public:
   [[nodiscard]] bool gpu_resident() const override { return true; }
 
   void request_stop() noexcept override {
-    bool expected = false;
-    if (!stop_requested_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+    const bool already_requested = stop_requested_.exchange(true, std::memory_order_acq_rel);
+    // Every racing caller attempts the idempotent interrupt. This avoids a caller observing the
+    // stop flag in the interval before the first caller has flushed the pipeline.
+    resources_->interrupt();
+    if (already_requested) {
       return;
     }
     // Flush first: NVIDIA GStreamer elements can otherwise retain a streaming-pad lock while a
     // bounded appsink pull is active, making the subsequent NULL state transition deadlock.
-    resources_->interrupt();
     // Wait out the bounded appsink poll. Pipeline ownership stays with the source until normal
     // destruction so a stereo session can flush and join both decoders before either NVIDIA
     // pipeline begins its NULL state transition.
@@ -1385,7 +1387,13 @@ private:
     return index;
   }
 
-  void close() noexcept { pipeline_lifetime_->release_source(); }
+  void close() noexcept {
+    // Frame leases defer NULL and unref, but they must not leave a destroyed source decoding in
+    // PLAYING. Both operations are internally synchronized and idempotent for partial startup and
+    // repeated request_stop/destructor paths.
+    resources_->interrupt();
+    pipeline_lifetime_->release_source();
+  }
 
   GpuFileDecodeConfig config_;
   std::string pipeline_description_;

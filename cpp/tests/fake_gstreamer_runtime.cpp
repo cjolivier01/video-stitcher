@@ -160,6 +160,7 @@ struct FakePad : FakeObject {
 
 struct FakePipeline : FakeObject {
   FakePipeline() : FakeObject(ObjectKind::Pipeline) {}
+  ~FakePipeline();
   FakePad* display_pad = nullptr;
   FakePad* output_pad = nullptr;
   bool parser_probe = false;
@@ -176,6 +177,7 @@ struct FakePipeline : FakeObject {
   std::mutex flush_mutex;
   std::condition_variable flush_changed;
   bool flush_started = false;
+  std::thread decode_thread;
 };
 
 struct FakeEvent {
@@ -545,6 +547,17 @@ void record(std::string_view event) {
   output << event << '\n';
 }
 
+FakePipeline::~FakePipeline() {
+  {
+    std::lock_guard lock(flush_mutex);
+    flush_started = true;
+  }
+  flush_changed.notify_all();
+  if (decode_thread.joinable()) {
+    decode_thread.join();
+  }
+}
+
 char* duplicate(const char* value) {
   const auto size = std::strlen(value) + 1;
   auto* result = static_cast<char*>(std::malloc(size));
@@ -901,6 +914,20 @@ RECO_FAKE_EXPORT int gst_element_set_state(void* pipeline_pointer, int state) {
     return 0;
   }
   pipeline->state = state;
+  if (state == 4 && scenario() == "retained-frame-running" && !pipeline->decode_thread.joinable()) {
+    pipeline->decode_thread = std::thread([pipeline] {
+      std::unique_lock lock(pipeline->flush_mutex);
+      while (!pipeline->flush_started) {
+        lock.unlock();
+        record("decode-running");
+        lock.lock();
+        pipeline->flush_changed.wait_for(lock, std::chrono::milliseconds(5),
+                                         [&] { return pipeline->flush_started; });
+      }
+      lock.unlock();
+      record("decode-stopped");
+    });
+  }
   if (state == 2 && !pipeline->parser_probe) {
     pipeline->has_seek = false;
     ++pipeline->seek_generation;
@@ -1990,14 +2017,14 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     }
     return deliver_output(sink, sample);
   }
-  if ((current_scenario == "frame-eos" || current_scenario == "unknown-time" ||
-       current_scenario == "missing-buffer" || current_scenario == "map-error" ||
-       current_scenario == "invalid-surface" || current_scenario == "visible-crop" ||
-       current_scenario == "missing-caps" || current_scenario == "missing-caps-structure" ||
-       current_scenario == "invalid-caps" || current_scenario == "oversized-caps" ||
-       current_scenario == "drop-stale-caps-first" || current_scenario == "post-pull-runahead" ||
-       current_scenario == "orientation-180" || current_scenario == "orientation-90" ||
-       current_scenario == "orientation-flip") &&
+  if ((current_scenario == "frame-eos" || current_scenario == "retained-frame-running" ||
+       current_scenario == "unknown-time" || current_scenario == "missing-buffer" ||
+       current_scenario == "map-error" || current_scenario == "invalid-surface" ||
+       current_scenario == "visible-crop" || current_scenario == "missing-caps" ||
+       current_scenario == "missing-caps-structure" || current_scenario == "invalid-caps" ||
+       current_scenario == "oversized-caps" || current_scenario == "drop-stale-caps-first" ||
+       current_scenario == "post-pull-runahead" || current_scenario == "orientation-180" ||
+       current_scenario == "orientation-90" || current_scenario == "orientation-flip") &&
       current == 0) {
     auto* sample = make_sample(current);
     push_predecoder_buffer(sink->pipeline->display_pad, sample->buffer, predecoder_width(current),
@@ -2013,9 +2040,9 @@ RECO_FAKE_EXPORT int gst_app_sink_is_eos(void* sink_pointer) {
   if (sink->pipeline->parser_probe) {
     return sink->probe_eos ? 1 : 0;
   }
-  return (current_scenario == "frame-eos" || current_scenario == "unknown-time" ||
-          current_scenario == "visible-crop" || current_scenario == "caps-runahead" ||
-          current_scenario == "caps-runahead-unknown-time" ||
+  return (current_scenario == "frame-eos" || current_scenario == "retained-frame-running" ||
+          current_scenario == "unknown-time" || current_scenario == "visible-crop" ||
+          current_scenario == "caps-runahead" || current_scenario == "caps-runahead-unknown-time" ||
           current_scenario == "caps-runahead-stale-caps" ||
           current_scenario == "same-allocation-runahead" ||
           current_scenario == "drop-transition-first" || current_scenario == "orientation-180" ||

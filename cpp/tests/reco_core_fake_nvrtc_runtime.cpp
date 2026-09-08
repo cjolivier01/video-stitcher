@@ -26,6 +26,7 @@ constexpr NvrtcResult kInternalError = 11;
 constexpr std::size_t kOversizedLogBytes = 5U * 1024U * 1024U;
 constexpr std::size_t kOversizedPtxBytes = 65U * 1024U * 1024U;
 constexpr std::size_t kLargeCachePtxBytes = 6U * 1024U * 1024U;
+constexpr std::size_t kAccountingBoundaryPtxBytes = 8U * 1024U * 1024U - 8U * 1024U;
 
 struct Program {
   std::string source;
@@ -164,6 +165,8 @@ RECO_FAKE_NVRTC_EXPORT NvrtcResult nvrtcCreateProgram(NvrtcProgram* output, cons
       ".version 7.0\n.target sm_75\n.address_size 64\n.visible .entry fake_kernel() { ret; }\n";
   if (scenario() == "large-cache-ptx") {
     program->ptx.assign(kLargeCachePtxBytes, 'x');
+  } else if (scenario() == "accounting-boundary-ptx") {
+    program->ptx.assign(kAccountingBoundaryPtxBytes, 'x');
   }
   *output = program;
   if (scenario() == "create-error") {
@@ -202,8 +205,10 @@ RECO_FAKE_NVRTC_EXPORT NvrtcResult nvrtcCompileProgram(NvrtcProgram input, int o
     ~ActiveCompileGuard() { --active_compile_count; }
   } active_guard;
   record_architecture(option_count, options);
-  if (scenario() == "slow-success") {
+  if (scenario() == "slow-success" || scenario() == "slow-compile-error") {
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  } else if (scenario() == "slow-near-limit-success") {
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
   }
   if (scenario() == "verify-request") {
     constexpr std::string_view kExpectedSource = "extern \"C\" __global__ void fake_kernel() {}";
@@ -223,7 +228,8 @@ RECO_FAKE_NVRTC_EXPORT NvrtcResult nvrtcCompileProgram(NvrtcProgram input, int o
       return kCompilationError;
     }
   }
-  if (scenario() == "compile-error" || scenario() == "compile-error-oversized-log") {
+  if (scenario() == "compile-error" || scenario() == "slow-compile-error" ||
+      scenario() == "compile-error-oversized-log") {
     program->log = "synthetic compile failure";
     return kCompilationError;
   }

@@ -1,7 +1,11 @@
 #include "reco/core/nvrtc_compiler.hpp"
 
+#include "reco/core/path.hpp"
+#include "reco/core/windows_runtime_library.hpp"
+
 #include <algorithm>
 #include <condition_variable>
+#include <exception>
 #include <iterator>
 #include <limits>
 #include <list>
@@ -71,64 +75,14 @@ std::string sanitize_log(std::string log) {
 }
 
 #if defined(_WIN32)
-std::wstring utf8_to_wide(std::string_view value) {
-  const auto size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
-                                        static_cast<int>(value.size()), nullptr, 0);
-  if (size <= 0) {
+std::filesystem::path windows_library_path(std::string_view path) {
+  try {
+    return path_from_utf8(path);
+  } catch (const std::bad_alloc&) {
+    throw;
+  } catch (...) {
     throw NvrtcError("NVRTC library path is not valid UTF-8");
   }
-  std::wstring result(static_cast<std::size_t>(size), L'\0');
-  if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
-                          static_cast<int>(value.size()), result.data(), size) != size) {
-    throw NvrtcError("failed to convert NVRTC library path to UTF-16");
-  }
-  return result;
-}
-
-std::wstring resolve_windows_library_path(const std::wstring& requested) {
-  const std::filesystem::path requested_path(requested);
-  if (requested_path.is_absolute()) {
-    return requested_path.lexically_normal().native();
-  }
-  if (requested_path.has_parent_path()) {
-    std::error_code error;
-    const auto absolute = std::filesystem::absolute(requested_path, error);
-    return error ? requested : absolute.lexically_normal().native();
-  }
-
-  constexpr unsigned long kMaximumPathEnvironmentCharacters = 1024U * 1024U;
-  const auto required = GetEnvironmentVariableW(L"PATH", nullptr, 0);
-  if (required == 0 || required > kMaximumPathEnvironmentCharacters) {
-    return requested;
-  }
-  std::wstring path_value(static_cast<std::size_t>(required), L'\0');
-  const auto written = GetEnvironmentVariableW(L"PATH", path_value.data(), required);
-  if (written == 0 || written >= required) {
-    return requested;
-  }
-  path_value.resize(written);
-  std::size_t offset = 0;
-  while (offset <= path_value.size()) {
-    const auto separator = path_value.find(L';', offset);
-    auto directory = path_value.substr(
-        offset, separator == std::wstring::npos ? std::wstring::npos : separator - offset);
-    if (directory.size() >= 2 && directory.front() == L'"' && directory.back() == L'"') {
-      directory = directory.substr(1, directory.size() - 2);
-    }
-    const std::filesystem::path directory_path(directory);
-    if (!directory.empty() && directory_path.is_absolute()) {
-      const auto candidate = (directory_path / requested_path).lexically_normal();
-      std::error_code error;
-      if (std::filesystem::is_regular_file(candidate, error) && !error) {
-        return candidate.native();
-      }
-    }
-    if (separator == std::wstring::npos) {
-      break;
-    }
-    offset = separator + 1;
-  }
-  return requested;
 }
 #endif
 
@@ -136,12 +90,8 @@ class DynamicLibrary {
 public:
   explicit DynamicLibrary(std::string path) : path_(std::move(path)) {
 #if defined(_WIN32)
-    const auto wide_path = resolve_windows_library_path(utf8_to_wide(path_));
-    auto flags = LOAD_LIBRARY_SEARCH_DEFAULT_DIRS;
-    if (std::filesystem::path(wide_path).is_absolute()) {
-      flags |= LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR;
-    }
-    handle_ = LoadLibraryExW(wide_path.c_str(), nullptr, flags);
+    handle_ =
+        static_cast<HMODULE>(detail::load_windows_runtime_library(windows_library_path(path_)));
     if (handle_ == nullptr) {
       const auto error = GetLastError();
       throw NvrtcError("failed to load NVRTC library " + path_ + " (Windows error " +
@@ -228,118 +178,194 @@ struct CompileCacheKey {
   std::string source;
   std::string source_name;
   std::vector<std::string> options;
-
-  [[nodiscard]] bool operator==(const CompileCacheKey& other) const {
-    return library_path == other.library_path && version.major == other.version.major &&
-           version.minor == other.version.minor && source == other.source &&
-           source_name == other.source_name && options == other.options;
-  }
 };
 
-std::size_t checked_cache_bytes(const CompileCacheKey& key, const NvrtcCompileResult& result) {
-  std::size_t bytes = sizeof(CompileCacheKey) + sizeof(NvrtcCompileResult) +
-                      key.options.size() * sizeof(std::string);
+struct CompileRequestView {
+  std::string_view library_path;
+  NvrtcVersion version;
+  std::string_view source;
+  std::string_view source_name;
+  const std::vector<std::string>* options = nullptr;
+};
+
+[[nodiscard]] bool matches(const CompileCacheKey& key, const CompileRequestView& request) {
+  return key.library_path == request.library_path && key.version.major == request.version.major &&
+         key.version.minor == request.version.minor && key.source == request.source &&
+         key.source_name == request.source_name && key.options == *request.options;
+}
+
+[[nodiscard]] CompileCacheKey copy_key(const CompileRequestView& request) {
+  return {
+      .library_path = std::string(request.library_path),
+      .version = request.version,
+      .source = std::string(request.source),
+      .source_name = std::string(request.source_name),
+      .options = *request.options,
+  };
+}
+
+struct CompileFlight {
+  explicit CompileFlight(CompileCacheKey compile_key) : key(std::move(compile_key)) {}
+
+  CompileCacheKey key;
+  NvrtcCompileResult result;
+  std::size_t accounted_bytes = 0;
+  bool finished = false;
+  bool failed = false;
+};
+
+std::size_t checked_cache_bytes(const CompileFlight& flight) {
+  // This reserve covers allocator metadata and implementation-specific list/shared ownership
+  // bookkeeping in addition to the capacities and concrete objects counted below.
+  constexpr std::size_t kCacheEntryBookkeepingReserveBytes = 16U * 1024U;
+  constexpr std::size_t kAllocationOverheadBytes = 64U;
+  std::size_t bytes = sizeof(CompileFlight) + sizeof(std::shared_ptr<CompileFlight>) +
+                      2U * sizeof(void*) + kCacheEntryBookkeepingReserveBytes;
   const auto add = [&](std::size_t value) {
     if (value > std::numeric_limits<std::size_t>::max() - bytes) {
       throw NvrtcError("NVRTC compile cache accounting overflow");
     }
     bytes += value;
   };
-  add(key.library_path.size());
-  add(key.source.size());
-  add(key.source_name.size());
-  for (const auto& option : key.options) {
-    add(option.size());
+  const auto add_string = [&](const std::string& value) {
+    add(value.capacity());
+    add(1U);
+    add(kAllocationOverheadBytes);
+  };
+  add_string(flight.key.library_path);
+  add_string(flight.key.source);
+  add_string(flight.key.source_name);
+  add(flight.key.options.capacity() * sizeof(std::string));
+  add(kAllocationOverheadBytes);
+  for (const auto& option : flight.key.options) {
+    add_string(option);
   }
-  add(result.ptx.size());
-  add(result.log.size());
+  add_string(flight.result.ptx);
+  add_string(flight.result.log);
   return bytes;
 }
 
 class CompileCoordinator {
 public:
   template <typename Compile>
-  [[nodiscard]] NvrtcCompileResult compile(const CompileCacheKey& key, Compile&& compile_uncached) {
-    std::unique_lock lock(mutex_);
+  [[nodiscard]] NvrtcCompileResult compile(const CompileRequestView& request,
+                                           Compile&& compile_uncached) {
+    std::shared_ptr<CompileFlight> flight;
     for (;;) {
-      if (auto cached = find_locked(key); cached != cache_.end()) {
-        cache_.splice(cache_.begin(), cache_, cached);
-        return cached->result;
+      bool owns_compile = false;
+      {
+        std::unique_lock lock(mutex_);
+        for (;;) {
+          if (auto cached = find_locked(request); cached != cache_.end()) {
+            flight = *cached;
+            cache_.splice(cache_.begin(), cache_, cached);
+            break;
+          }
+          if (const auto recent = recent_uncached_.lock();
+              recent != nullptr && matches(recent->key, request)) {
+            flight = recent;
+            break;
+          }
+          if (active_ == nullptr) {
+            // Admission occurs before the bounded source and option copies. All other callers
+            // retain only their own input storage while they wait for this process-wide
+            // compilation.
+            flight = std::make_shared<CompileFlight>(copy_key(request));
+            active_ = flight;
+            owns_compile = true;
+            break;
+          }
+          if (matches(active_->key, request)) {
+            flight = active_;
+            break;
+          }
+          changed_.wait(lock);
+        }
       }
-      if (!compiling_) {
-        compiling_ = true;
+
+      if (owns_compile) {
         break;
       }
-      changed_.wait(lock);
+      std::unique_lock lock(mutex_);
+      changed_.wait(lock, [&] { return flight->finished; });
+      const bool failed = flight->failed;
+      lock.unlock();
+      if (!failed) {
+        return flight->result;
+      }
+      // Failures are not cached or shared. Preserve the caller's independent retry after the
+      // failed leader has released process-wide admission.
+      flight.reset();
     }
-    lock.unlock();
 
     NvrtcCompileResult result;
     try {
-      result = compile_uncached();
+      result = compile_uncached(flight->key);
     } catch (...) {
-      finish_compile();
-      throw;
-    }
-
-    lock.lock();
-    try {
-      retain_locked(key, result);
-    } catch (const std::bad_alloc&) {
-      // A cache allocation failure must not discard an otherwise valid compilation.
-    } catch (...) {
-      compiling_ = false;
-      lock.unlock();
+      {
+        std::lock_guard lock(mutex_);
+        flight->failed = true;
+        flight->finished = true;
+        active_.reset();
+      }
       changed_.notify_all();
       throw;
     }
-    compiling_ = false;
+
+    std::unique_lock lock(mutex_);
+    flight->result = std::move(result);
+    flight->finished = true;
+    try {
+      if (!retain_locked(flight)) {
+        recent_uncached_ = flight;
+      }
+    } catch (const std::bad_alloc&) {
+      // A cache allocation failure must not discard an otherwise valid compilation.
+      recent_uncached_ = flight;
+    } catch (...) {
+      const auto error = std::current_exception();
+      flight->failed = true;
+      active_.reset();
+      lock.unlock();
+      changed_.notify_all();
+      std::rethrow_exception(error);
+    }
+    active_.reset();
     lock.unlock();
     changed_.notify_all();
-    return result;
+    return flight->result;
   }
 
 private:
-  struct CachedCompile {
-    CompileCacheKey key;
-    NvrtcCompileResult result;
-    std::size_t accounted_bytes = 0;
-  };
+  using Cache = std::list<std::shared_ptr<CompileFlight>>;
 
-  using Cache = std::list<CachedCompile>;
-
-  [[nodiscard]] Cache::iterator find_locked(const CompileCacheKey& key) {
+  [[nodiscard]] Cache::iterator find_locked(const CompileRequestView& request) {
     return std::find_if(cache_.begin(), cache_.end(),
-                        [&](const CachedCompile& entry) { return entry.key == key; });
+                        [&](const auto& entry) { return matches(entry->key, request); });
   }
 
-  void retain_locked(const CompileCacheKey& key, const NvrtcCompileResult& result) {
-    const auto entry_bytes = checked_cache_bytes(key, result);
+  [[nodiscard]] bool retain_locked(const std::shared_ptr<CompileFlight>& flight) {
+    const auto entry_bytes = checked_cache_bytes(*flight);
     if (entry_bytes > kNvrtcCompileCacheMaximumBytes) {
-      return;
+      return false;
     }
     while (!cache_.empty() && (cache_.size() >= kNvrtcCompileCacheMaximumEntries ||
                                entry_bytes > kNvrtcCompileCacheMaximumBytes - cache_bytes_)) {
-      cache_bytes_ -= cache_.back().accounted_bytes;
+      cache_bytes_ -= cache_.back()->accounted_bytes;
       cache_.pop_back();
     }
-    cache_.push_front(CachedCompile{.key = key, .result = result, .accounted_bytes = entry_bytes});
+    flight->accounted_bytes = entry_bytes;
+    cache_.push_front(flight);
     cache_bytes_ += entry_bytes;
-  }
-
-  void finish_compile() noexcept {
-    {
-      std::lock_guard lock(mutex_);
-      compiling_ = false;
-    }
-    changed_.notify_all();
+    return true;
   }
 
   std::mutex mutex_;
   std::condition_variable changed_;
   Cache cache_;
+  std::shared_ptr<CompileFlight> active_;
+  std::weak_ptr<CompileFlight> recent_uncached_;
   std::size_t cache_bytes_ = 0;
-  bool compiling_ = false;
 };
 
 CompileCoordinator& compile_coordinator() {
@@ -381,15 +407,16 @@ struct NvrtcCompiler::Impl {
     validate_text(source_name, kNvrtcMaximumSourceNameBytes, "source name");
     validate_options(options);
 
-    CompileCacheKey key{
-        .library_path = std::string(library.path()),
+    const CompileRequestView request{
+        .library_path = library.path(),
         .version = loaded_version,
-        .source = std::string(source),
-        .source_name = std::string(source_name),
-        .options = options.values,
+        .source = source,
+        .source_name = source_name,
+        .options = &options.values,
     };
-    return compile_coordinator().compile(
-        key, [&] { return compile_uncached(key.source, key.source_name, key.options); });
+    return compile_coordinator().compile(request, [&](const CompileCacheKey& key) {
+      return compile_uncached(key.source, key.source_name, key.options);
+    });
   }
 
   [[nodiscard]] NvrtcCompileResult compile_uncached(const std::string& source_text,

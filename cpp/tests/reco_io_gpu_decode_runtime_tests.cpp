@@ -183,6 +183,8 @@ void production_source_retains_mapped_sample() {
 
   source.reset();
   events = read_events(event_path);
+  expect_eq(count_event(events, "send-flush-start"), 1U,
+            "source destruction interrupts decoding while a frame is retained");
   expect_eq(count_event(events, "state-null"), 0U,
             "source shutdown defers pipeline stop while a frame is retained");
   expect_eq(count_event(events, "remove-display-probe"), 0U,
@@ -225,6 +227,43 @@ void production_source_retains_mapped_sample() {
   events = read_events(event_path);
   expect_eq(count_event(events, "pull"), 3U,
             "idempotent EOS does not perform a third pull on either source");
+}
+
+void source_destruction_stops_decode_with_a_retained_frame() {
+  set_scenario("retained-frame-running");
+  const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
+  std::filesystem::remove(event_path);
+
+  auto source =
+      open_gstreamer_gpu_file_decode_source(valid_config(), NvbufSurfaceAbi::DeepStream9_1);
+  auto result = source->read();
+  expect_true(result.frame.has_value(), "retained-frame fixture returns a frame");
+  expect_true(wait_for_event(event_path, "decode-running", std::chrono::seconds(2)),
+              "retained-frame fixture starts background decoding");
+
+  const auto started = std::chrono::steady_clock::now();
+  source.reset();
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  expect_true(elapsed < std::chrono::seconds(2),
+              "source destruction interrupts retained-frame decoding promptly");
+  expect_true(wait_for_event(event_path, "decode-stopped", std::chrono::seconds(2)),
+              "source destruction stops fake background decoding");
+
+  auto events = read_events(event_path);
+  expect_eq(count_event(events, "send-flush-start"), 1U,
+            "source destruction flushes its PLAYING pipeline once");
+  expect_eq(count_event(events, "state-null"), 0U,
+            "retained frame still defers final NULL teardown");
+  const auto running_before_wait = count_event(events, "decode-running");
+  std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  events = read_events(event_path);
+  expect_eq(count_event(events, "decode-running"), running_before_wait,
+            "destroyed source performs no continued decoding");
+
+  result.frame.reset();
+  events = read_events(event_path);
+  expect_eq(count_event(events, "state-null"), 1U,
+            "retained-frame release performs deferred NULL teardown once");
 }
 
 void persistent_stereo_session_pairs_gstreamer_sources() {
@@ -306,6 +345,8 @@ void early_stereo_stop_flushes_both_pipelines_before_teardown() {
 
   session.reset();
   events = read_events(event_path);
+  expect_eq(count_event(events, "send-flush-start"), 2U,
+            "session destruction does not flush stopped pipelines twice");
   expect_eq(count_event(events, "state-null"), 2U,
             "session destruction closes both flushed pipelines once");
 }
@@ -338,7 +379,10 @@ void stop_flushes_a_blocked_appsink_read_before_teardown() {
               "source stop flushes and joins a blocked appsink pull promptly");
   expect_true(read_returned.load(), "flushed appsink read returns end-of-stream");
   expect_true(!read_failed.load(), "flushed appsink read does not fail");
+  source->request_stop();
   const auto events = read_events(event_path);
+  expect_eq(count_event(events, "send-flush-start"), 1U,
+            "repeated source stop does not flush the pipeline twice");
   expect_eq(count_event(events, "post-flush-drain"), 1U,
             "source stop drains queued appsink samples after the blocked pull exits");
   const auto blocked = std::find(events.begin(), events.end(), "pull-blocked");
@@ -952,6 +996,7 @@ int run_tests() {
   set_environment("RECO_FAKE_GST_EVENT_PATH", event_path.string());
 
   production_source_retains_mapped_sample();
+  source_destruction_stops_decode_with_a_retained_frame();
   persistent_stereo_session_pairs_gstreamer_sources();
   early_stereo_stop_flushes_both_pipelines_before_teardown();
   stop_flushes_a_blocked_appsink_read_before_teardown();
