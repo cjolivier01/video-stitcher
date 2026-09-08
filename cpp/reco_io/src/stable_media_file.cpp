@@ -3,6 +3,7 @@
 #include "reco/core/path.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstring>
 #include <limits>
@@ -21,6 +22,9 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <sys/param.h>
+#endif
 #endif
 
 namespace reco::io {
@@ -80,6 +84,14 @@ bool same_windows_snapshot(const WindowsFileSnapshot& left, const WindowsFileSna
          left.identity.nFileSizeLow == right.identity.nFileSizeLow &&
          left.basic.LastWriteTime.QuadPart == right.basic.LastWriteTime.QuadPart &&
          left.basic.ChangeTime.QuadPart == right.basic.ChangeTime.QuadPart;
+}
+
+bool same_windows_cursor_source(const WindowsFileSnapshot& left, const WindowsFileSnapshot& right) {
+  return same_windows_object(left, right) &&
+         left.identity.dwFileAttributes == right.identity.dwFileAttributes &&
+         left.identity.nFileSizeHigh == right.identity.nFileSizeHigh &&
+         left.identity.nFileSizeLow == right.identity.nFileSizeLow &&
+         left.basic.LastWriteTime.QuadPart == right.basic.LastWriteTime.QuadPart;
 }
 
 WindowsFileSnapshot inspect_windows_handle(HANDLE handle, const std::filesystem::path& path,
@@ -159,6 +171,11 @@ bool same_posix_snapshot(const struct stat& left, const struct stat& right) {
   return same_posix_object(left, right) && left.st_mode == right.st_mode &&
          left.st_size == right.st_size && modified_time(left) == modified_time(right) &&
          changed_time(left) == changed_time(right);
+}
+
+bool same_posix_cursor_source(const struct stat& left, const struct stat& right) {
+  return same_posix_object(left, right) && left.st_mode == right.st_mode &&
+         left.st_size == right.st_size && modified_time(left) == modified_time(right);
 }
 
 int open_posix_target(const std::filesystem::path& path) {
@@ -247,20 +264,42 @@ std::shared_ptr<const StableMediaFile> StableMediaFile::open_cursor() const {
   auto cursor = std::make_unique<Impl>();
   cursor->path = impl_->path;
 #if defined(_WIN32)
-  auto target = open_windows_target(impl_->path);
+  const auto retained = reinterpret_cast<HANDLE>(_get_osfhandle(impl_->descriptor));
+  if (retained == INVALID_HANDLE_VALUE) {
+    throw_file_error("cannot access retained media input", impl_->path, errno);
+  }
+  UniqueHandle target(ReOpenFile(retained, GENERIC_READ | FILE_READ_ATTRIBUTES,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0));
+  if (target.get() == INVALID_HANDLE_VALUE) {
+    throw_file_error("cannot reopen retained media cursor", impl_->path,
+                     static_cast<int>(GetLastError()));
+  }
   cursor->target_identity =
       inspect_windows_handle(target.get(), impl_->path, "cannot inspect media cursor");
-  if (!same_windows_snapshot(cursor->target_identity, impl_->target_identity)) {
+  if (!same_windows_cursor_source(cursor->target_identity, impl_->target_identity)) {
     throw std::runtime_error("stable media input pathname selected a different file: " +
                              core::path_to_utf8(impl_->path));
   }
   cursor->descriptor = descriptor_from_windows_handle(std::move(target), impl_->path);
 #else
+#if defined(__linux__)
+  const auto retained_path =
+      std::filesystem::path("/proc/self/fd") / std::to_string(impl_->descriptor);
+  cursor->descriptor = open_posix_target(retained_path);
+#elif defined(__APPLE__)
+  std::array<char, MAXPATHLEN> retained_path{};
+  if (::fcntl(impl_->descriptor, F_GETPATH, retained_path.data()) != 0 ||
+      retained_path.front() == '\0') {
+    throw_file_error("cannot resolve retained media cursor", impl_->path, errno);
+  }
+  cursor->descriptor = open_posix_target(std::filesystem::path(retained_path.data()));
+#else
   cursor->descriptor = open_posix_target(impl_->path);
+#endif
   if (::fstat(cursor->descriptor, &cursor->target_identity) != 0) {
     throw_file_error("cannot inspect stable media cursor", impl_->path, errno);
   }
-  if (!same_posix_snapshot(cursor->target_identity, impl_->target_identity)) {
+  if (!same_posix_cursor_source(cursor->target_identity, impl_->target_identity)) {
     throw std::runtime_error("stable media input pathname selected a different file: " +
                              core::path_to_utf8(impl_->path));
   }

@@ -18,7 +18,8 @@ namespace reco::io {
 struct AudioPassthroughSegment {
   /// User-facing input path used for explicit container selection and diagnostics.
   std::string path;
-  /// Optional retained descriptor. When present, the pathname is never reopened.
+  /// Optional retained authority. An independent cursor is acquired only while this segment is
+  /// active, and a pathname substitute is never consumed.
   std::shared_ptr<const StableMediaFile> stable_source;
   /// Probed video duration used to preserve the joined video timeline when audio is absent.
   std::uint64_t video_duration_ns = 0;

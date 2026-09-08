@@ -107,8 +107,9 @@ void retained_cursor_survives_swap_and_restore() {
   expect_value_or_fail_closed(
       [&] { return processing_cursor->read_all(1024); }, "pinned-media-bytes",
       "processing cursor reads only the identity pinned before pathname substitution");
-  expect_failure([&] { (void)retained->open_cursor(); }, "different file",
-                 "cursor acquisition during pathname substitution fails closed");
+  expect_value_or_fail_closed(
+      [&] { return retained->open_cursor()->read_all(1024); }, "pinned-media-bytes",
+      "cursor acquisition uses retained authority during pathname substitution");
   expect_failure([&] { retained->verify_unchanged(); }, "changed while it was retained",
                  "retained owner detects a substituted pathname");
 

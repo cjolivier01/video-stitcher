@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -175,6 +176,18 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err,
 
 namespace detail {
 
+/// Fixed descriptor headroom for output, one transient cursor, multimedia, and probe IPC.
+inline constexpr std::size_t kStitchTransientDescriptorReserve = 64;
+
+/// Persistent input authorities plus bounded output, probe, decoder, and audio headroom.
+[[nodiscard]] std::size_t stitch_descriptor_requirement(std::size_t input_segments);
+/// Pure descriptor-admission boundary used by the CLI and platform tests.
+[[nodiscard]] bool stitch_descriptor_budget_fits(std::size_t open_descriptors,
+                                                 std::size_t descriptor_limit,
+                                                 std::size_t input_segments);
+/// Rejects a stitch before opening any input when its process descriptor budget is insufficient.
+void require_stitch_descriptor_budget(std::size_t input_segments);
+
 /// Rounds non-negative seconds to the full unsigned GStreamer nanosecond range.
 [[nodiscard]] std::uint64_t nanoseconds_from_seconds(double seconds, std::string_view label);
 
@@ -204,8 +217,8 @@ public:
 
   /// Borrowed descriptor passed directly to GStreamer's `fdsink`.
   [[nodiscard]] int descriptor() const;
-  /// Stable identity path used for post-mux stream discovery.
-  [[nodiscard]] std::filesystem::path verification_path() const;
+  /// Readable retained authority for post-mux stream discovery.
+  [[nodiscard]] std::shared_ptr<const io::StableMediaFile> verification_source() const;
   /// Original temporary entry, exposed only for diagnostics and race tests.
   [[nodiscard]] const std::filesystem::path& temporary_path() const;
   /// Flushes, validates, and atomically publishes the retained file.

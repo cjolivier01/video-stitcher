@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -29,6 +30,17 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <cerrno>
+#include <climits>
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
 
 namespace reco::cli::detail {
 
@@ -57,18 +69,71 @@ constexpr std::size_t kStitchDecodeSourceCapacity = 4;
 constexpr std::size_t kStitchStereoQueueCapacity = 4;
 constexpr std::size_t kStitchEncodePoolCapacity = 8;
 
+std::size_t open_descriptor_count() {
+#if defined(_WIN32)
+  const int limit = _getmaxstdio();
+  std::size_t count = 0;
+  for (int descriptor = 0; descriptor < limit; ++descriptor) {
+    if (_get_osfhandle(descriptor) != -1) {
+      ++count;
+    }
+  }
+  return count;
+#else
+#if defined(__APPLE__)
+  constexpr const char* descriptor_directory = "/dev/fd";
+#else
+  constexpr const char* descriptor_directory = "/proc/self/fd";
+#endif
+  if (auto* directory = ::opendir(descriptor_directory); directory != nullptr) {
+    std::size_t count = 0;
+    while (const auto* entry = ::readdir(directory)) {
+      if (entry->d_name[0] >= '0' && entry->d_name[0] <= '9') {
+        ++count;
+      }
+    }
+    (void)::closedir(directory);
+    return count;
+  }
+
+  struct rlimit limits{};
+  if (::getrlimit(RLIMIT_NOFILE, &limits) != 0 || limits.rlim_cur == RLIM_INFINITY ||
+      limits.rlim_cur > static_cast<rlim_t>(INT_MAX)) {
+    throw std::runtime_error("cannot inspect the process descriptor budget");
+  }
+  std::size_t count = 0;
+  for (int descriptor = 0; descriptor < static_cast<int>(limits.rlim_cur); ++descriptor) {
+    if (::fcntl(descriptor, F_GETFD) >= 0 || errno != EBADF) {
+      ++count;
+    }
+  }
+  return count;
+#endif
+}
+
+std::size_t descriptor_limit() {
+#if defined(_WIN32)
+  return static_cast<std::size_t>(_getmaxstdio());
+#else
+  struct rlimit limits{};
+  if (::getrlimit(RLIMIT_NOFILE, &limits) != 0) {
+    throw std::runtime_error("cannot inspect the process descriptor limit");
+  }
+  return limits.rlim_cur == RLIM_INFINITY
+             ? std::numeric_limits<std::size_t>::max()
+             : static_cast<std::size_t>(std::min<rlim_t>(
+                   limits.rlim_cur, static_cast<rlim_t>(std::numeric_limits<std::size_t>::max())));
+#endif
+}
+
 struct ProbedInput {
   std::vector<std::string> paths;
   std::vector<std::shared_ptr<const StableMediaFile>> stable_sources;
-  std::vector<std::shared_ptr<const StableMediaFile>> probe_sources;
-  std::vector<std::shared_ptr<const StableMediaFile>> audio_sources;
   std::vector<GpuVideoProbe> probes;
 };
 
 struct RetainedInputSources {
   std::vector<std::shared_ptr<const StableMediaFile>> decode;
-  std::vector<std::shared_ptr<const StableMediaFile>> probe;
-  std::vector<std::shared_ptr<const StableMediaFile>> audio;
 };
 
 struct AudioSelection {
@@ -129,20 +194,17 @@ GpuFileDecodeConfig decode_config(const std::string& path,
 
 ProbedInput probe_input(std::vector<std::string> paths, RetainedInputSources sources,
                         const std::filesystem::path& worker, std::string_view label) {
-  if (paths.size() != sources.decode.size() || paths.size() != sources.probe.size() ||
-      paths.size() != sources.audio.size()) {
+  if (paths.size() != sources.decode.size()) {
     throw std::logic_error("stable stitch input count does not match its paths");
   }
-  ProbedInput input{.paths = std::move(paths),
-                    .stable_sources = std::move(sources.decode),
-                    .probe_sources = std::move(sources.probe),
-                    .audio_sources = std::move(sources.audio)};
+  ProbedInput input{.paths = std::move(paths), .stable_sources = std::move(sources.decode)};
   input.probes.reserve(input.paths.size());
   for (std::size_t index = 0; index < input.paths.size(); ++index) {
     const auto& path = input.paths[index];
+    auto probe_source = input.stable_sources[index]->open_cursor();
     input.probes.push_back(
         probe_gpu_video({.path = path,
-                         .stable_source = input.probe_sources[index],
+                         .stable_source = std::move(probe_source),
                          .codec = gpu_decode_codec_for_path(path),
                          .elementary_stream = gpu_decode_path_is_elementary_stream(path),
                          .container = gpu_decode_container_for_path(path)},
@@ -271,7 +333,7 @@ AudioSelection select_audio_segments(const ProbedInput& input, std::uint64_t sta
   AudioSelection selection;
   for (std::size_t index = first_segment; index < input.paths.size(); ++index) {
     selection.segments.push_back({.path = input.paths[index],
-                                  .stable_source = input.audio_sources[index],
+                                  .stable_source = input.stable_sources[index],
                                   .video_duration_ns = segment_duration(index)});
   }
   selection.local_start_time_ns = local_start;
@@ -310,15 +372,9 @@ void reject_unported_stitch_options(const StitchCommand& command) {
 RetainedInputSources retain_media_inputs(const std::vector<std::string>& paths) {
   RetainedInputSources retained;
   retained.decode.reserve(paths.size());
-  retained.probe.reserve(paths.size());
-  retained.audio.reserve(paths.size());
   for (const auto& path : paths) {
     auto source = StableMediaFile::open(core::path_from_utf8(path));
-    auto probe = source->open_cursor();
-    auto audio = source->open_cursor();
     retained.decode.push_back(std::move(source));
-    retained.probe.push_back(std::move(probe));
-    retained.audio.push_back(std::move(audio));
   }
   return retained;
 }
@@ -335,6 +391,46 @@ void verify_retained_inputs(const ProbedInput& left, const ProbedInput& right,
 }
 
 } // namespace
+
+std::size_t stitch_descriptor_requirement(std::size_t input_segments) {
+  constexpr std::size_t calibration_authority = 1;
+  if (input_segments > std::numeric_limits<std::size_t>::max() - calibration_authority -
+                           kStitchTransientDescriptorReserve) {
+    throw std::overflow_error("stitch input descriptor requirement overflows");
+  }
+  return input_segments + calibration_authority + kStitchTransientDescriptorReserve;
+}
+
+bool stitch_descriptor_budget_fits(std::size_t open_descriptors, std::size_t limit,
+                                   std::size_t input_segments) {
+  const auto required = stitch_descriptor_requirement(input_segments);
+  return open_descriptors <= limit && required <= limit - open_descriptors;
+}
+
+void require_stitch_descriptor_budget(std::size_t input_segments) {
+  const auto required = stitch_descriptor_requirement(input_segments);
+#if defined(_WIN32)
+  const auto initial_open = open_descriptor_count();
+  constexpr std::size_t kMaximumWindowsCrtDescriptors = 8192;
+  if (required <=
+      kMaximumWindowsCrtDescriptors - std::min(initial_open, kMaximumWindowsCrtDescriptors)) {
+    const auto requested = std::min(kMaximumWindowsCrtDescriptors, initial_open + required);
+    if (requested > descriptor_limit()) {
+      (void)_setmaxstdio(static_cast<int>(requested));
+    }
+  }
+#endif
+  const auto current = open_descriptor_count();
+  const auto limit = descriptor_limit();
+  if (!stitch_descriptor_budget_fits(current, limit, input_segments)) {
+    throw std::runtime_error("stitch requires " + std::to_string(required) +
+                             " additional file descriptors for " + std::to_string(input_segments) +
+                             " input segments, but only " +
+                             std::to_string(current > limit ? 0 : limit - current) +
+                             " are available; raise the process descriptor limit or use fewer "
+                             "recording segments");
+  }
+}
 
 std::uint64_t stitch_timeline_duration_ns(std::uint64_t frame_count, std::uint32_t fps_numerator,
                                           std::uint32_t fps_denominator) {
@@ -402,6 +498,10 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
     reject_unported_stitch_options(command);
     auto left_paths = split_input_segments(command.left, "left");
     auto right_paths = split_input_segments(command.right, "right");
+    if (left_paths.size() > std::numeric_limits<std::size_t>::max() - right_paths.size()) {
+      throw std::overflow_error("combined stitch input segment count overflows");
+    }
+    require_stitch_descriptor_budget(left_paths.size() + right_paths.size());
     const auto calibration_path = core::path_from_utf8(command.calibration);
     const auto output_path = core::path_from_utf8(command.output);
     auto left_sources = retain_media_inputs(left_paths);
@@ -643,7 +743,8 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
       throw std::runtime_error("stereo inputs produced no aligned video frames");
     }
     encoder.finish();
-    verify_muxed_gpu_video_output(output.temporary_path(), *codec, format, *worker, kProbeTimeout);
+    verify_muxed_gpu_video_output(output.verification_source(), *codec, format, *worker,
+                                  kProbeTimeout);
     verify_retained_inputs(left_input, right_input, *calibration_source);
     output.commit();
     const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started);

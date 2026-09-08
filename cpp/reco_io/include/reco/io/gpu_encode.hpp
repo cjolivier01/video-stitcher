@@ -135,5 +135,9 @@ private:
 void verify_muxed_gpu_video_output(const std::filesystem::path& path, Codec codec, Format format,
                                    const std::filesystem::path& probe_worker,
                                    std::chrono::milliseconds timeout = std::chrono::seconds(10));
+/// Verifies the exact retained file authority without reopening its diagnostic pathname.
+void verify_muxed_gpu_video_output(std::shared_ptr<const StableMediaFile> source, Codec codec,
+                                   Format format, const std::filesystem::path& probe_worker,
+                                   std::chrono::milliseconds timeout = std::chrono::seconds(10));
 
 } // namespace reco::io

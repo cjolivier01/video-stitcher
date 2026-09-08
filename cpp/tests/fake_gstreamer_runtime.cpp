@@ -873,6 +873,10 @@ RECO_FAKE_EXPORT void* gst_parse_launch(const char* description, GErrorAbi** err
          : audio_demux  ? "parse-audio"
          : parser_probe ? "parse-probe"
                         : "parse-decoder");
+  if (parser_probe) {
+    record(std::strstr(description, "fdsrc fd=") != nullptr ? "probe-fd-source"
+                                                            : "probe-file-source");
+  }
   if (parser_probe && (std::strstr(description, "video/x-h264") != nullptr ||
                        std::strstr(description, "video/x-h265") != nullptr)) {
     record("probe-codec-filter");

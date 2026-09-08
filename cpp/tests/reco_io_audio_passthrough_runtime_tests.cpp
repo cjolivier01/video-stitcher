@@ -99,13 +99,12 @@ void run_real_runtime_checks() {
 
   const auto retained_video_path = temporary.path() / "video-retained.mp4";
   const auto retained_video = StableMediaFile::open(video_only);
-  const auto video_cursor = retained_video->open_cursor();
   std::filesystem::rename(video_only, retained_video_path);
   std::filesystem::copy_file(audio_only, video_only);
   {
     auto pinned_silence =
         AudioPassthroughSource::open({.segments = {{.path = video_only.string(),
-                                                    .stable_source = video_cursor,
+                                                    .stable_source = retained_video,
                                                     .video_duration_ns = 1'000'000'000ULL}},
                                       .read_timeout = std::chrono::seconds(2)});
     if (pinned_silence.caps().has_value() ||
@@ -119,13 +118,12 @@ void run_real_runtime_checks() {
 
   const auto retained_path = temporary.path() / "audio-retained.mp4";
   const auto retained = StableMediaFile::open(audio_only);
-  const auto cursor = retained->open_cursor();
   std::filesystem::rename(audio_only, retained_path);
   std::filesystem::copy_file(video_only, audio_only);
   {
     auto pinned_audio =
         AudioPassthroughSource::open({.segments = {{.path = audio_only.string(),
-                                                    .stable_source = cursor,
+                                                    .stable_source = retained,
                                                     .video_duration_ns = 1'000'000'000ULL}},
                                       .read_timeout = std::chrono::seconds(2)});
     consume_audio(pinned_audio);

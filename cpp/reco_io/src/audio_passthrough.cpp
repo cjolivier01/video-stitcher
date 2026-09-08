@@ -490,6 +490,7 @@ struct AudioPassthroughSource::Impl {
       api->object_unref(pipeline);
       pipeline = nullptr;
     }
+    active_stable_source.reset();
   }
 
   void close_segment() noexcept {
@@ -700,8 +701,15 @@ struct AudioPassthroughSource::Impl {
       trim_before_ns = trim;
       const bool supported_container = !gpu_decode_path_is_elementary_stream(segment->path) &&
                                        gpu_decode_container_for_path(segment->path).has_value();
-      if (supported_container && segment_has_audio(*segment)) {
-        break;
+      if (supported_container) {
+        auto readable_segment = *segment;
+        if (segment->stable_source) {
+          readable_segment.stable_source = segment->stable_source->open_cursor();
+        }
+        if (segment_has_audio(readable_segment)) {
+          active_stable_source = std::move(readable_segment.stable_source);
+          break;
+        }
       }
       next_output_ns = *segment_output_end;
       segment_output_end.reset();
@@ -709,7 +717,9 @@ struct AudioPassthroughSource::Impl {
         return false;
       }
     }
-    const auto description = build_audio_passthrough_pipeline(*segment);
+    auto readable_segment = *segment;
+    readable_segment.stable_source = active_stable_source;
+    const auto description = build_audio_passthrough_pipeline(readable_segment);
     GErrorAbi* error = nullptr;
     void* candidate_pipeline = api->parse_launch(description.c_str(), &error);
     const std::unique_ptr<GErrorAbi, GstreamerAudioApi::ErrorFree> parse_error_owner(
@@ -915,6 +925,7 @@ struct AudioPassthroughSource::Impl {
   void* bus = nullptr;
   void* active_discoverer = nullptr;
   void* active_discovery_context = nullptr;
+  std::shared_ptr<const StableMediaFile> active_stable_source;
   std::optional<std::string> caps_value;
   std::optional<CompressedAudioPacket> pending;
   std::optional<std::uint64_t> segment_output_end;

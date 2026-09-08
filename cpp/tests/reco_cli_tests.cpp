@@ -2,6 +2,7 @@
 
 #include "reco/calibrate/pipeline.hpp"
 #include "reco/core/path.hpp"
+#include "reco/io/stable_media_file.hpp"
 
 #include <algorithm>
 #include <array>
@@ -37,6 +38,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -588,6 +590,25 @@ AtomicReadResult read_atomic_output(const std::filesystem::path& path) {
 #endif
 }
 
+std::size_t retained_io_resource_count() {
+#if defined(_WIN32)
+  DWORD count = 0;
+  if (GetProcessHandleCount(GetCurrentProcess(), &count) == 0) {
+    throw std::runtime_error("cannot count process handles");
+  }
+  return count;
+#else
+#if defined(__APPLE__)
+  constexpr const char* descriptor_directory = "/dev/fd";
+#else
+  constexpr const char* descriptor_directory = "/proc/self/fd";
+#endif
+  return static_cast<std::size_t>(
+      std::distance(std::filesystem::directory_iterator(descriptor_directory),
+                    std::filesystem::directory_iterator{}));
+#endif
+}
+
 void make_executable(const std::filesystem::path& path) {
 #if !defined(_WIN32)
   std::error_code error;
@@ -867,20 +888,97 @@ void stitch_frame_window_uses_one_rounded_timeline() {
             "chained segment duration does not inherit container duration drift");
 }
 
+void stitch_descriptor_budget_is_checked_before_input_acquisition() {
+  const auto required = detail::stitch_descriptor_requirement(8192);
+  expect_eq(required, std::size_t{8192 + 1 + detail::kStitchTransientDescriptorReserve},
+            "stitch descriptor estimate retains one authority per segment");
+  expect_true(detail::stitch_descriptor_budget_fits(7, required + 7, 8192),
+              "stitch descriptor budget accepts the exact available boundary");
+  expect_true(!detail::stitch_descriptor_budget_fits(7, required + 6, 8192),
+              "stitch descriptor budget rejects one descriptor below the boundary");
+
+  bool overflow_rejected = false;
+  try {
+    (void)detail::stitch_descriptor_requirement(std::numeric_limits<std::size_t>::max());
+  } catch (const std::overflow_error&) {
+    overflow_rejected = true;
+  }
+  expect_true(overflow_rejected, "stitch descriptor estimate rejects arithmetic overflow");
+
+#if !defined(_WIN32)
+  struct rlimit original{};
+  if (::getrlimit(RLIMIT_NOFILE, &original) != 0) {
+    throw std::runtime_error("cannot inspect the test descriptor limit");
+  }
+  struct RestoreLimit {
+    struct rlimit value{};
+    ~RestoreLimit() { (void)::setrlimit(RLIMIT_NOFILE, &value); }
+  } restore{original};
+  struct rlimit constrained = original;
+  constrained.rlim_cur = std::min<rlim_t>(original.rlim_cur, 32);
+  if (::setrlimit(RLIMIT_NOFILE, &constrained) != 0) {
+    throw std::runtime_error("cannot constrain the test descriptor limit");
+  }
+  const auto descriptor_count = [&] {
+    std::size_t count = 0;
+    for (int descriptor = 0; descriptor < static_cast<int>(constrained.rlim_cur); ++descriptor) {
+      if (::fcntl(descriptor, F_GETFD) >= 0 || errno != EBADF) {
+        ++count;
+      }
+    }
+    return count;
+  };
+  const auto before = descriptor_count();
+
+  for (int attempt = 0; attempt < 16; ++attempt) {
+    bool rejected = false;
+    try {
+      detail::require_stitch_descriptor_budget(2);
+    } catch (const std::runtime_error& error) {
+      rejected = std::string_view(error.what()).find("raise the process descriptor limit") !=
+                 std::string_view::npos;
+    }
+    expect_true(rejected, "low descriptor limit is rejected without partial acquisition");
+  }
+  expect_eq(descriptor_count(), before,
+            "repeated low-limit admission failures do not leak descriptors");
+#endif
+}
+
 void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
   TemporaryDirectory root;
   const auto destination = root.path() / "stitched.mp4";
+
+  const auto descriptor_budget_input = root.path() / "descriptor-budget-input.mp4";
+  write_text_file(descriptor_budget_input, "descriptor budget input\n");
+  const auto retained_input = reco::io::StableMediaFile::open(descriptor_budget_input);
+  std::vector<detail::AtomicOutputProtectedPath> repeated_protected_paths;
+  repeated_protected_paths.reserve(128);
+  for (int index = 0; index < 128; ++index) {
+    repeated_protected_paths.push_back({.path = descriptor_budget_input,
+                                        .label = "the repeated protected input",
+                                        .stable_source = retained_input});
+  }
+  const auto retained_resources_before = retained_io_resource_count();
+  {
+    detail::AtomicOutputFile output(root.path() / "descriptor-budget-output.mp4", {}, {},
+                                    repeated_protected_paths);
+    expect_true(retained_io_resource_count() <= retained_resources_before + 8,
+                "publication protection reuses retained input authorities");
+    write_text_descriptor(output.descriptor(), "descriptor budget output\n");
+  }
+  expect_true(retained_io_resource_count() <= retained_resources_before + 1,
+              "publication protection cleanup releases transaction resources");
+
   {
     detail::AtomicOutputFile output(destination);
     write_text_descriptor(output.descriptor(), "first encoded output\n");
     expect_true(output.descriptor() >= 0, "stitch output exposes a retained descriptor");
-    const auto verification = read_atomic_output(output.verification_path());
-    expect_true(verification.status == AtomicReadStatus::Success,
-                "stitch output exposes a readable verification stream");
-    expect_eq(verification.contents, std::string("first encoded output\n"),
+    const auto verification = output.verification_source();
+    expect_eq(verification->read_all(4096), std::string("first encoded output\n"),
               "verification stream reads independently from the write descriptor");
 #if defined(_WIN32)
-    const HANDLE ordinary_reader = CreateFileW(output.verification_path().c_str(), GENERIC_READ,
+    const HANDLE ordinary_reader = CreateFileW(output.temporary_path().c_str(), GENERIC_READ,
                                                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     expect_true(ordinary_reader != INVALID_HANDLE_VALUE,
@@ -923,15 +1021,13 @@ void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
           }
         });
     write_text_descriptor(output.descriptor(), "verified encoded output\n");
-    const auto verification = read_atomic_output(output.verification_path());
-    expect_true(verification.status == AtomicReadStatus::Success,
-                "Windows write-locked output remains readable for verification");
-    expect_eq(verification.contents, std::string("verified encoded output\n"),
+    const auto verification = output.verification_source();
+    expect_eq(verification->read_all(4096), std::string("verified encoded output\n"),
               "Windows verification observes the descriptor-bound bytes");
 
     SetLastError(ERROR_SUCCESS);
     const HANDLE competing_writer =
-        CreateFileW(output.verification_path().c_str(), GENERIC_WRITE,
+        CreateFileW(output.temporary_path().c_str(), GENERIC_WRITE,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                     FILE_ATTRIBUTE_NORMAL, nullptr);
     const DWORD writer_error = GetLastError();
@@ -1049,6 +1145,9 @@ void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
     write_text_descriptor(output.descriptor(), "retained parent output\n");
     std::filesystem::remove(active_output_parent);
     std::filesystem::create_directory_symlink(redirected_output_parent, active_output_parent);
+    const auto verification = output.verification_source();
+    expect_eq(verification->read_all(4096), std::string("retained parent output\n"),
+              "verification follows the retained output parent after path retargeting");
     output.commit();
     expect_eq(read_text_file(retained_output_parent / "parent-race.mp4"),
               std::string("retained parent output\n"),
@@ -1056,6 +1155,32 @@ void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
     expect_eq(read_text_file(redirected_victim), std::string("redirected victim\n"),
               "redirected output parent cannot replace a protected file");
   }
+
+#if !defined(_WIN32)
+  const auto staging_destination = root.path() / "staging-race.mp4";
+  const auto retained_staging = root.path() / "retained-staging";
+  std::filesystem::path substituted_staging;
+  {
+    detail::AtomicOutputFile output(staging_destination);
+    write_text_descriptor(output.descriptor(), "retained staging output\n");
+    substituted_staging = output.temporary_path().parent_path();
+    std::filesystem::rename(substituted_staging, retained_staging);
+    std::filesystem::create_directory(substituted_staging);
+    write_text_file(substituted_staging / output.temporary_path().filename(),
+                    "staging pathname substitute\n");
+    const auto verification = output.verification_source();
+    expect_eq(verification->read_all(4096), std::string("retained staging output\n"),
+              "verification opens the retained staging directory identity");
+    output.commit();
+  }
+  expect_eq(read_text_file(staging_destination), std::string("retained staging output\n"),
+            "publication moves the verified retained staging identity");
+  expect_eq(read_text_file(substituted_staging / "output"),
+            std::string("staging pathname substitute\n"),
+            "retained publication leaves the substituted staging tree untouched");
+  std::filesystem::remove_all(substituted_staging);
+  std::filesystem::remove_all(retained_staging);
+#endif
 
   std::vector<std::filesystem::path> retained_windows_temporaries;
   const auto remove_transaction_temporary = [&](const std::filesystem::path& publication) {
@@ -1198,10 +1323,8 @@ void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
     write_text_descriptor(output.descriptor(), "retained parent encoded output\n");
     std::filesystem::remove(active_parent);
     std::filesystem::create_directory_symlink(redirected_parent, active_parent);
-    const auto verification = read_atomic_output(output.verification_path());
-    expect_true(verification.status == AtomicReadStatus::Success,
-                "Windows verification path remains readable while output is retained");
-    expect_eq(verification.contents, std::string("retained parent encoded output\n"),
+    const auto verification = output.verification_source();
+    expect_eq(verification->read_all(4096), std::string("retained parent encoded output\n"),
               "Windows verification follows the retained output directory");
     output.commit();
     expect_eq(read_text_file(retained_parent / "stitched.mp4"),
@@ -3155,6 +3278,8 @@ int main(int argc, char** argv) {
                 stitch_second_conversion_supports_the_unsigned_gstreamer_range);
   run_test_case("stitch_frame_window_uses_one_rounded_timeline",
                 stitch_frame_window_uses_one_rounded_timeline);
+  run_test_case("stitch_descriptor_budget_is_checked_before_input_acquisition",
+                stitch_descriptor_budget_is_checked_before_input_acquisition);
   run_test_case("stitch_output_transaction_is_descriptor_pinned_and_atomic",
                 stitch_output_transaction_is_descriptor_pinned_and_atomic);
   run_test_case("preview_and_calibrate_parse_matches_rust_defaults",

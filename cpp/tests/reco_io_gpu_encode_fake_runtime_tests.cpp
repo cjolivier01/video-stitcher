@@ -553,6 +553,25 @@ void finalized_output_requires_a_compressed_video_sample(const std::filesystem::
   expect_eq(count_event(events, "discover-audio"), 0U,
             "output verification never invokes GstDiscoverer");
 
+  auto retained_path = output_path;
+  retained_path += ".retained";
+  const auto retained_output = StableMediaFile::open(output_path);
+  std::filesystem::rename(output_path, retained_path);
+  {
+    std::ofstream substitute(output_path, std::ios::binary | std::ios::trunc);
+    substitute << "pathname substitute that must not be probed";
+  }
+  std::filesystem::remove(event_path);
+  verify_muxed_gpu_video_output(retained_output, Codec::H264, Format::Mp4, worker,
+                                std::chrono::seconds(10));
+  events = read_events(event_path);
+  expect_eq(count_event(events, "probe-fd-source"), 1U,
+            "output verification transfers the retained readable authority");
+  expect_eq(count_event(events, "probe-file-source"), 0U,
+            "output verification never reopens the substituted diagnostic pathname");
+  std::filesystem::remove(output_path);
+  std::filesystem::rename(retained_path, output_path);
+
   std::filesystem::remove(event_path);
   set_scenario("probe-av1-exact-frame-count");
   verify_muxed_gpu_video_output(output_path, Codec::AV1, Format::Mkv, worker,
