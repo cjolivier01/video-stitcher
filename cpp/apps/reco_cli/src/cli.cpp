@@ -450,7 +450,7 @@ pin_windows_output_directory(const std::filesystem::path& destination) {
       destination.has_parent_path() ? destination.parent_path() : std::filesystem::path(".");
   const HANDLE directory =
       CreateFileW(parent.c_str(), FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
-                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                  FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
                   FILE_FLAG_BACKUP_SEMANTICS, nullptr);
   if (directory == INVALID_HANDLE_VALUE) {
     throw_file_error("cannot retain calibration output directory", parent,
@@ -608,7 +608,8 @@ public:
 }
 
 void rename_open_file(HANDLE handle, HANDLE directory, std::wstring_view destination_name,
-                      const std::filesystem::path& destination, bool replace_existing) {
+                      const std::filesystem::path& destination, bool replace_existing,
+                      bool force_legacy) {
   const auto filename_bytes = destination_name.size() * sizeof(wchar_t);
   struct ExtendedRenameInfo {
     DWORD flags;
@@ -644,45 +645,34 @@ void rename_open_file(HANDLE handle, HANDLE directory, std::wstring_view destina
 
   constexpr DWORD retry_delay_ms = 10;
   constexpr int maximum_replace_attempts = 200;
-  DWORD replace_error = ERROR_SUCCESS;
-  bool extended_rename_unsupported = false;
-  for (int attempt = 0; attempt < maximum_replace_attempts; ++attempt) {
-    replace_error = set_windows_file_information(
-        handle, storage.data(), static_cast<ULONG>(info_bytes), kFileRenameInformationEx);
-    if (replace_error == ERROR_SUCCESS) {
-      return;
-    }
-    if (replace_error == ERROR_INVALID_FUNCTION || replace_error == ERROR_NOT_SUPPORTED ||
-        replace_error == ERROR_INVALID_PARAMETER) {
-      extended_rename_unsupported = true;
-      break;
-    }
-    if (replace_error != ERROR_SHARING_VIOLATION && replace_error != ERROR_ACCESS_DENIED) {
-      throw_file_error("failed to rename calibration output", destination,
-                       static_cast<int>(replace_error));
-    }
-    if (attempt + 1 < maximum_replace_attempts) {
-      Sleep(retry_delay_ms);
-    } else {
-      throw_file_error("failed to rename calibration output", destination,
-                       static_cast<int>(replace_error));
+  DWORD replace_error = force_legacy ? ERROR_NOT_SUPPORTED : ERROR_SUCCESS;
+  bool extended_rename_unsupported = force_legacy;
+  if (!force_legacy) {
+    for (int attempt = 0; attempt < maximum_replace_attempts; ++attempt) {
+      replace_error = set_windows_file_information(
+          handle, storage.data(), static_cast<ULONG>(info_bytes), kFileRenameInformationEx);
+      if (replace_error == ERROR_SUCCESS) {
+        return;
+      }
+      if (replace_error == ERROR_INVALID_FUNCTION || replace_error == ERROR_NOT_SUPPORTED ||
+          replace_error == ERROR_INVALID_PARAMETER) {
+        extended_rename_unsupported = true;
+        break;
+      }
+      if (replace_error != ERROR_SHARING_VIOLATION && replace_error != ERROR_ACCESS_DENIED) {
+        throw_file_error("failed to rename calibration output", destination,
+                         static_cast<int>(replace_error));
+      }
+      if (attempt + 1 < maximum_replace_attempts) {
+        Sleep(retry_delay_ms);
+      } else {
+        throw_file_error("failed to rename calibration output", destination,
+                         static_cast<int>(replace_error));
+      }
     }
   }
 
-  DWORD destination_error = ERROR_SUCCESS;
-  const HANDLE destination_handle = open_windows_file_relative(
-      directory, destination_name, FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN,
-      FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
-      destination_error);
-  UniqueWindowsHandle retained_destination(destination_handle);
-  FILE_ATTRIBUTE_TAG_INFO destination_attributes{};
-  const bool destination_is_reparse_point =
-      destination_handle != INVALID_HANDLE_VALUE &&
-      GetFileInformationByHandleEx(destination_handle, FileAttributeTagInfo,
-                                   &destination_attributes, sizeof(destination_attributes)) != 0 &&
-      (destination_attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-  if (!extended_rename_unsupported || destination_is_reparse_point) {
+  if (!extended_rename_unsupported || replace_existing) {
     throw_file_error(
         "failed to rename calibration output", destination,
         static_cast<int>(replace_error == ERROR_SUCCESS ? ERROR_NOT_SUPPORTED : replace_error));
@@ -718,8 +708,9 @@ void publish_windows_output(HANDLE directory, const std::filesystem::path& resol
                             HANDLE& temporary_handle, const std::filesystem::path& destination,
                             bool& destination_published,
                             const std::function<void(const std::filesystem::path&)>& before_replace,
-                            const std::function<void()>& final_commit_gate) {
-  constexpr ACCESS_MASK access = FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+                            const std::function<void()>& final_commit_gate,
+                            bool force_legacy_rename) {
+  constexpr ACCESS_MASK access = FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
   constexpr ULONG sharing = FILE_SHARE_READ;
   constexpr ULONG options =
       FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT;
@@ -779,8 +770,18 @@ void publish_windows_output(HANDLE directory, const std::filesystem::path& resol
       if (final_commit_gate) {
         final_commit_gate();
       }
+      if (!path_identifies_windows_handle(resolved_directory, directory, true)) {
+        throw WindowsPublicationIdentityError(
+            "calibration output directory changed at the Windows create commit boundary");
+      }
+      if (!relative_path_identifies_windows_handle(directory, temporary_name, temporary_handle,
+                                                   false)) {
+        throw WindowsPublicationIdentityError(
+            "temporary output changed at the Windows create commit boundary");
+      }
       try {
-        rename_open_file(temporary_handle, directory, destination_name, destination, false);
+        rename_open_file(temporary_handle, directory, destination_name, destination, false,
+                         force_legacy_rename);
         destination_published = true;
       } catch (const std::system_error& error) {
         if (error.code().value() == ERROR_FILE_EXISTS ||
@@ -810,7 +811,8 @@ void publish_windows_output(HANDLE directory, const std::filesystem::path& resol
       throw WindowsPublicationIdentityError(
           "destination output changed at the Windows commit boundary");
     }
-    rename_open_file(temporary_handle, directory, destination_name, destination, true);
+    rename_open_file(temporary_handle, directory, destination_name, destination, true,
+                     force_legacy_rename);
     destination_published = true;
     return;
   }
@@ -2075,7 +2077,6 @@ void write_calibration_json_atomically_impl(
   std::string contents(json);
   contents.push_back('\n');
 #if defined(_WIN32)
-  (void)force_rename_fallback;
   const auto destination_name = destination.filename().wstring();
   if (destination_name.empty() || destination_name == L"." || destination_name == L"..") {
     throw std::runtime_error("calibration output path must name a file: " + destination.string());
@@ -2144,8 +2145,8 @@ void write_calibration_json_atomically_impl(
     const auto temporary_name = temporary.filename().wstring();
     publish_windows_output(output_directory.handle.get(), output_directory.resolved_path,
                            destination_name, temporary_name, handle, destination,
-                           destination_published, before_windows_publish_replace,
-                           final_commit_gate);
+                           destination_published, before_windows_publish_replace, final_commit_gate,
+                           force_rename_fallback);
     temporary_exists = false;
     destination_published = true;
     (void)CloseHandle(handle);

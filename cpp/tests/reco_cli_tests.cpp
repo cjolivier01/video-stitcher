@@ -2198,177 +2198,177 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
                 "Windows replacement parent cannot redirect publication");
   }
 
+  const auto windows_directory_race_parent = root.path() / "windows-directory-race-parent";
+  const auto windows_directory_race_moved = root.path() / "windows-directory-race-moved";
+  const auto windows_directory_race_destination = windows_directory_race_parent / "match.json";
+  std::filesystem::create_directory(windows_directory_race_parent);
+  bool windows_directory_race_blocked = false;
+  detail::write_calibration_json_atomically(
+      R"json({"writer":"windows-directory-race"})json", windows_directory_race_destination,
+      left_input, right_input, {}, {}, {}, false, [&] {
+        std::error_code rename_error;
+        std::filesystem::rename(windows_directory_race_parent, windows_directory_race_moved,
+                                rename_error);
+        windows_directory_race_blocked = static_cast<bool>(rename_error);
+      });
+  expect_true(windows_directory_race_blocked,
+              "Windows final commit gate blocks output-directory replacement");
+  expect_eq(read_text_file(windows_directory_race_destination),
+            std::string("{\"writer\":\"windows-directory-race\"}\n"),
+            "Windows directory race publishes into the pinned directory");
+  expect_true(!std::filesystem::exists(windows_directory_race_moved),
+              "blocked Windows directory race moves no directory");
+
+  const auto windows_reader_destination = root.path() / "windows-reader.json";
+  write_text_file(windows_reader_destination, "Windows retained reader output\n");
+  const HANDLE windows_reader = CreateFileW(windows_reader_destination.c_str(), GENERIC_READ,
+                                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  expect_true(windows_reader != INVALID_HANDLE_VALUE,
+              "Windows retained destination reader fixture opens");
+  if (windows_reader != INVALID_HANDLE_VALUE) {
+    detail::write_calibration_json_atomically(R"json({"writer":"windows-reader"})json",
+                                              windows_reader_destination, left_input, right_input);
+    std::array<char, 128> old_contents{};
+    DWORD old_contents_size = 0;
+    expect_true(ReadFile(windows_reader, old_contents.data(),
+                         static_cast<DWORD>(old_contents.size()), &old_contents_size, nullptr) != 0,
+                "Windows retained destination reader remains readable after replacement");
+    expect_eq(std::string(old_contents.data(), old_contents_size),
+              std::string("Windows retained reader output\n"),
+              "Windows retained destination reader observes the displaced file");
+    expect_eq(read_text_file(windows_reader_destination),
+              std::string("{\"writer\":\"windows-reader\"}\n"),
+              "Windows destination path observes the committed replacement");
+    (void)CloseHandle(windows_reader);
+  }
+
+  const auto windows_legacy_create = root.path() / "windows-legacy-create.json";
+  detail::write_calibration_json_atomically(R"json({"writer":"windows-legacy-create"})json",
+                                            windows_legacy_create, left_input, right_input, {}, {},
+                                            {}, true);
+  expect_eq(read_text_file(windows_legacy_create),
+            std::string("{\"writer\":\"windows-legacy-create\"}\n"),
+            "Windows class-10 fallback can publish a new output without replacement");
+  const auto windows_legacy_replace = root.path() / "windows-legacy-replace.json";
+  write_text_file(windows_legacy_replace, "Windows legacy replacement original\n");
+  bool windows_legacy_replace_rejected = false;
+  try {
+    detail::write_calibration_json_atomically(R"json({"writer":"windows-legacy-replace"})json",
+                                              windows_legacy_replace, left_input, right_input, {},
+                                              {}, {}, true);
+  } catch (const std::system_error& error) {
+    windows_legacy_replace_rejected = error.code().value() == ERROR_NOT_SUPPORTED;
+  }
+  expect_true(windows_legacy_replace_rejected,
+              "Windows class-10 fallback rejects existing-output replacement");
+  expect_eq(read_text_file(windows_legacy_replace),
+            std::string("Windows legacy replacement original\n"),
+            "rejected Windows class-10 replacement preserves the original output");
+
   const auto windows_post_publish_destination = root.path() / "windows-post-publish-race.json";
   const auto windows_post_publish_retained =
       root.path() / "windows-post-publish-race-retained.json";
   write_text_file(windows_post_publish_destination, "Windows pre-commit original output\n");
   bool windows_post_publish_hook_ran = false;
   bool windows_post_publish_substitution_blocked = false;
-  bool windows_post_publish_substitution_rejected = false;
-  try {
-    detail::write_calibration_json_atomically(
-        R"json({"writer":"windows-post-publish-race"})json", windows_post_publish_destination,
-        left_input, right_input, {}, {}, {}, false, [&] {
-          windows_post_publish_hook_ran = true;
-          std::error_code rename_error;
-          std::filesystem::rename(windows_post_publish_destination, windows_post_publish_retained,
-                                  rename_error);
-          windows_post_publish_substitution_blocked = static_cast<bool>(rename_error);
-          if (!rename_error) {
-            write_text_file(windows_post_publish_destination, "Windows pre-commit replacement\n");
-          }
-        });
-  } catch (const std::exception& error) {
-    windows_post_publish_substitution_rejected =
-        std::string_view(error.what()).find("destination output changed at the Windows commit") !=
-        std::string_view::npos;
-  }
+  detail::write_calibration_json_atomically(
+      R"json({"writer":"windows-post-publish-race"})json", windows_post_publish_destination,
+      left_input, right_input, {}, {}, {}, false, [&] {
+        windows_post_publish_hook_ran = true;
+        std::error_code rename_error;
+        std::filesystem::rename(windows_post_publish_destination, windows_post_publish_retained,
+                                rename_error);
+        windows_post_publish_substitution_blocked = static_cast<bool>(rename_error);
+        if (!rename_error) {
+          write_text_file(windows_post_publish_destination, "Windows pre-commit replacement\n");
+        }
+      });
   expect_true(windows_post_publish_hook_ran, "Windows final commit gate hook runs");
-  expect_true(windows_post_publish_substitution_blocked ||
-                  windows_post_publish_substitution_rejected,
-              "Windows final commit gate blocks or rejects destination substitution");
-  if (windows_post_publish_substitution_blocked) {
-    expect_eq(read_text_file(windows_post_publish_destination),
-              std::string("{\"writer\":\"windows-post-publish-race\"}\n"),
-              "blocked Windows final commit race publishes the intended output");
-    expect_true(!std::filesystem::exists(windows_post_publish_retained),
-                "blocked Windows final commit race creates no retained substitute");
-  } else {
-    expect_eq(read_text_file(windows_post_publish_destination),
-              std::string("Windows pre-commit replacement\n"),
-              "rejected Windows final commit race preserves the concurrent replacement");
-    expect_eq(read_text_file(windows_post_publish_retained),
-              std::string("Windows pre-commit original output\n"),
-              "rejected Windows final commit race preserves the moved original output");
-  }
+  expect_true(windows_post_publish_substitution_blocked,
+              "Windows final commit gate blocks destination substitution");
+  expect_eq(read_text_file(windows_post_publish_destination),
+            std::string("{\"writer\":\"windows-post-publish-race\"}\n"),
+            "Windows final commit gate publishes the intended output");
+  expect_true(!std::filesystem::exists(windows_post_publish_retained),
+              "blocked Windows final commit race creates no retained substitute");
 
   const auto windows_replace_race_destination = root.path() / "windows-replace-race.json";
   const auto windows_replace_race_retained = root.path() / "windows-replace-race-retained.json";
   write_text_file(windows_replace_race_destination, "Windows replace original output\n");
   bool windows_replace_race_hook_ran = false;
   bool windows_replace_race_blocked = false;
-  bool windows_replace_race_rejected = false;
-  try {
-    detail::write_calibration_json_atomically(
-        R"json({"writer":"windows-replace-race"})json", windows_replace_race_destination,
-        left_input, right_input, {}, {}, {}, false, {}, {}, std::chrono::seconds(2),
-        [&](const std::filesystem::path&) {
-          windows_replace_race_hook_ran = true;
-          std::error_code rename_error;
-          std::filesystem::rename(windows_replace_race_destination, windows_replace_race_retained,
-                                  rename_error);
-          windows_replace_race_blocked = static_cast<bool>(rename_error);
-          if (!rename_error) {
-            write_text_file(windows_replace_race_destination, "Windows concurrent replacement\n");
-          }
-        });
-  } catch (const std::exception& error) {
-    windows_replace_race_rejected =
-        std::string_view(error.what()).find("destination output changed before Windows") !=
-        std::string_view::npos;
-  }
+  detail::write_calibration_json_atomically(
+      R"json({"writer":"windows-replace-race"})json", windows_replace_race_destination, left_input,
+      right_input, {}, {}, {}, false, {}, {}, std::chrono::seconds(2),
+      [&](const std::filesystem::path&) {
+        windows_replace_race_hook_ran = true;
+        std::error_code rename_error;
+        std::filesystem::rename(windows_replace_race_destination, windows_replace_race_retained,
+                                rename_error);
+        windows_replace_race_blocked = static_cast<bool>(rename_error);
+        if (!rename_error) {
+          write_text_file(windows_replace_race_destination, "Windows concurrent replacement\n");
+        }
+      });
   expect_true(windows_replace_race_hook_ran, "Windows exact-replacement race hook runs");
-  expect_true(windows_replace_race_blocked || windows_replace_race_rejected,
-              "Windows exact-replacement race is blocked or rejected");
-  if (windows_replace_race_blocked) {
-    expect_eq(read_text_file(windows_replace_race_destination),
-              std::string("{\"writer\":\"windows-replace-race\"}\n"),
-              "blocked Windows exact-replacement race publishes the intended output");
-    expect_true(!std::filesystem::exists(windows_replace_race_retained),
-                "blocked Windows exact-replacement race creates no retained substitute");
-  } else {
-    expect_eq(read_text_file(windows_replace_race_destination),
-              std::string("Windows concurrent replacement\n"),
-              "rejected Windows exact-replacement race preserves the concurrent output");
-    expect_eq(read_text_file(windows_replace_race_retained),
-              std::string("Windows replace original output\n"),
-              "rejected Windows exact-replacement race preserves the moved original output");
-  }
+  expect_true(windows_replace_race_blocked,
+              "Windows exact-replacement race is blocked by the retained destination handle");
+  expect_eq(read_text_file(windows_replace_race_destination),
+            std::string("{\"writer\":\"windows-replace-race\"}\n"),
+            "Windows exact-replacement race publishes the intended output");
+  expect_true(!std::filesystem::exists(windows_replace_race_retained),
+              "blocked Windows exact-replacement race creates no retained substitute");
 
   const auto windows_removed_destination = root.path() / "windows-removed-destination.json";
   const auto windows_removed_destination_retained =
       root.path() / "windows-removed-destination-retained.json";
   write_text_file(windows_removed_destination, "Windows removed destination original output\n");
   bool windows_removed_destination_blocked = false;
-  bool windows_removed_destination_rejected = false;
-  try {
-    detail::write_calibration_json_atomically(
-        R"json({"writer":"windows-removed-destination"})json", windows_removed_destination,
-        left_input, right_input, {}, {}, {}, false, {}, {}, std::chrono::seconds(2),
-        [&](const std::filesystem::path&) {
-          std::error_code rename_error;
-          std::filesystem::rename(windows_removed_destination, windows_removed_destination_retained,
-                                  rename_error);
-          windows_removed_destination_blocked = static_cast<bool>(rename_error);
-        });
-  } catch (const std::exception& error) {
-    windows_removed_destination_rejected =
-        std::string_view(error.what()).find("destination output changed before Windows") !=
-        std::string_view::npos;
-  }
-  expect_true(windows_removed_destination_blocked || windows_removed_destination_rejected,
-              "Windows destination removal is blocked or rejected");
-  if (windows_removed_destination_blocked) {
-    expect_eq(read_text_file(windows_removed_destination),
-              std::string("{\"writer\":\"windows-removed-destination\"}\n"),
-              "blocked Windows destination removal publishes the intended output");
-    expect_true(!std::filesystem::exists(windows_removed_destination_retained),
-                "blocked Windows destination removal creates no retained entry");
-  } else {
-    expect_true(!std::filesystem::exists(windows_removed_destination),
-                "rejected Windows destination removal does not recreate the output");
-    expect_eq(read_text_file(windows_removed_destination_retained),
-              std::string("Windows removed destination original output\n"),
-              "rejected Windows destination removal preserves the moved original output");
-  }
+  detail::write_calibration_json_atomically(
+      R"json({"writer":"windows-removed-destination"})json", windows_removed_destination,
+      left_input, right_input, {}, {}, {}, false, {}, {}, std::chrono::seconds(2),
+      [&](const std::filesystem::path&) {
+        std::error_code rename_error;
+        std::filesystem::rename(windows_removed_destination, windows_removed_destination_retained,
+                                rename_error);
+        windows_removed_destination_blocked = static_cast<bool>(rename_error);
+      });
+  expect_true(windows_removed_destination_blocked,
+              "Windows destination removal is blocked by the retained handle");
+  expect_eq(read_text_file(windows_removed_destination),
+            std::string("{\"writer\":\"windows-removed-destination\"}\n"),
+            "Windows replacement publishes after blocking destination removal");
+  expect_true(!std::filesystem::exists(windows_removed_destination_retained),
+              "blocked Windows destination removal creates no retained entry");
 
   const auto windows_source_race_destination = root.path() / "windows-source-race.json";
   const auto windows_source_race_retained = root.path() / "windows-source-race-retained.json";
   write_text_file(windows_source_race_destination, "Windows source original output\n");
   std::filesystem::path windows_source_race_substitute;
   bool windows_source_race_blocked = false;
-  bool windows_source_race_rejected = false;
-  try {
-    detail::write_calibration_json_atomically(
-        R"json({"writer":"windows-source-race"})json", windows_source_race_destination, left_input,
-        right_input, {}, {}, {}, false, {}, {}, std::chrono::seconds(2),
-        [&](const std::filesystem::path& temporary) {
-          windows_source_race_substitute = temporary;
-          std::error_code rename_error;
-          std::filesystem::rename(temporary, windows_source_race_retained, rename_error);
-          windows_source_race_blocked = static_cast<bool>(rename_error);
-          if (!rename_error) {
-            write_text_file(windows_source_race_substitute,
-                            "Windows source concurrent replacement\n");
-          }
-        });
-  } catch (const std::exception& error) {
-    windows_source_race_rejected =
-        std::string_view(error.what()).find("temporary output changed before Windows") !=
-        std::string_view::npos;
-  }
-  expect_true(windows_source_race_blocked || windows_source_race_rejected,
-              "Windows replacement-source race is blocked or rejected");
-  if (windows_source_race_blocked) {
-    expect_eq(read_text_file(windows_source_race_destination),
-              std::string("{\"writer\":\"windows-source-race\"}\n"),
-              "blocked Windows replacement-source race publishes the intended output");
-    expect_true(!std::filesystem::exists(windows_source_race_retained),
-                "blocked Windows replacement-source race moves no output");
-    expect_true(!std::filesystem::exists(windows_source_race_substitute),
-                "published Windows temporary name no longer exists");
-  } else {
-    expect_eq(read_text_file(windows_source_race_destination),
-              std::string("Windows source original output\n"),
-              "rejected Windows replacement-source race preserves the destination output");
-    expect_eq(read_text_file(windows_source_race_retained),
-              std::string("{\"writer\":\"windows-source-race\"}\n"),
-              "rejected Windows replacement-source race preserves the moved temporary output");
-    expect_eq(read_text_file(windows_source_race_substitute),
-              std::string("Windows source concurrent replacement\n"),
-              "rejected Windows replacement-source race preserves the concurrent temporary");
-    std::filesystem::remove(windows_source_race_substitute);
-  }
+  detail::write_calibration_json_atomically(
+      R"json({"writer":"windows-source-race"})json", windows_source_race_destination, left_input,
+      right_input, {}, {}, {}, false, {}, {}, std::chrono::seconds(2),
+      [&](const std::filesystem::path& temporary) {
+        windows_source_race_substitute = temporary;
+        std::error_code rename_error;
+        std::filesystem::rename(temporary, windows_source_race_retained, rename_error);
+        windows_source_race_blocked = static_cast<bool>(rename_error);
+        if (!rename_error) {
+          write_text_file(windows_source_race_substitute,
+                          "Windows source concurrent replacement\n");
+        }
+      });
+  expect_true(windows_source_race_blocked,
+              "Windows replacement-source race is blocked by the retained temporary handle");
+  expect_eq(read_text_file(windows_source_race_destination),
+            std::string("{\"writer\":\"windows-source-race\"}\n"),
+            "Windows replacement-source race publishes the intended output");
+  expect_true(!std::filesystem::exists(windows_source_race_retained),
+              "blocked Windows replacement-source race moves no output");
+  expect_true(!std::filesystem::exists(windows_source_race_substitute),
+              "published Windows temporary name no longer exists");
 
 #endif
 
