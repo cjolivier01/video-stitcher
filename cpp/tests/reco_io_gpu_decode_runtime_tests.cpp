@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -437,6 +438,41 @@ void chained_source_stop_interrupts_a_lazy_segment_open() {
             "chained stop flushes the partially opened GPU pipeline once");
   expect_eq(count_event(events, "state-playing-unblocked"), 1U,
             "startup returns after the stop flush reaches GStreamer");
+}
+
+void opening_observer_interrupts_a_direct_source_open() {
+  using namespace std::chrono_literals;
+  set_scenario("stop-blocked-open");
+  const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
+  std::filesystem::remove(event_path);
+  std::atomic<GpuFileDecodeSource*> opening_source{nullptr};
+  auto opening = std::async(std::launch::async, [&] {
+    return open_gstreamer_gpu_file_decode_source(
+        valid_config(), NvbufSurfaceAbi::DeepStream9_1, [&](GpuFileDecodeSource* source) {
+          opening_source.store(source, std::memory_order_release);
+          return true;
+        });
+  });
+
+  expect_true(wait_for_event(event_path, "state-playing-blocked", 2s),
+              "direct source blocks after its opening observer attaches");
+  auto* partial_source = opening_source.load(std::memory_order_acquire);
+  expect_true(partial_source != nullptr, "opening observer exposes the partial decoder source");
+  if (partial_source != nullptr) {
+    partial_source->request_stop();
+  }
+  expect_true(opening.wait_for(500ms) == std::future_status::ready,
+              "partial decoder stop interrupts direct source startup");
+  auto source = opening.get();
+  expect_true(opening_source.load(std::memory_order_acquire) == nullptr,
+              "decoder opening observer is cleared before return");
+  expect_true(source->read().status == GpuDecodeFrameStatus::EndOfStream,
+              "interrupted direct source returns in the stopped state");
+  const auto events = read_events(event_path);
+  expect_eq(count_event(events, "send-flush-start"), 1U,
+            "direct opening cancellation flushes the partial pipeline once");
+  expect_eq(count_event(events, "state-playing-unblocked"), 1U,
+            "direct decoder startup returns after its stop request");
 }
 
 void persistent_stereo_session_pairs_gstreamer_sources() {
@@ -1205,6 +1241,7 @@ int run_tests() {
   chained_sources_open_lazily_and_preserve_global_indices();
   chained_source_stop_interrupts_the_active_segment();
   chained_source_stop_interrupts_a_lazy_segment_open();
+  opening_observer_interrupts_a_direct_source_open();
   persistent_stereo_session_pairs_gstreamer_sources();
   early_stereo_stop_flushes_both_pipelines_before_teardown();
   stop_flushes_a_blocked_appsink_read_before_teardown();

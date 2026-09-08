@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -87,16 +88,33 @@ private:
   friend class GpuVideoEncodeSession;
 };
 
+class GpuVideoEncodeSession;
+
+/// Observes a partially opened encoder so another thread can interrupt native startup.
+///
+/// The observer receives the session before the pipeline enters PLAYING, followed by `nullptr`
+/// when opening finishes. Returning false requests an immediately aborted session.
+using GpuEncodeOpeningSessionObserver = std::function<bool(GpuVideoEncodeSession*)>;
+
 /// Bounded `memory:NVMM` appsrc session feeding only NVIDIA hardware encoders.
 class GpuVideoEncodeSession final {
 public:
   /// Opens the production GStreamer and DeepStream runtime bindings.
   [[nodiscard]] static GpuVideoEncodeSession
   open(GpuEncodeConfig config, std::shared_ptr<GpuEncodeTraceSink> trace_sink = {});
+  /// Opens the production bindings while making partial startup interruptible through `observer`.
+  [[nodiscard]] static GpuVideoEncodeSession open(GpuEncodeConfig config,
+                                                  std::shared_ptr<GpuEncodeTraceSink> trace_sink,
+                                                  const GpuEncodeOpeningSessionObserver& observer);
   /// Opens against an already retained NvBufSurface runtime.
   [[nodiscard]] static GpuVideoEncodeSession
   open(GpuEncodeConfig config, std::shared_ptr<const NvbufSurfaceRuntime> runtime,
        std::shared_ptr<GpuEncodeTraceSink> trace_sink = {});
+  /// Opens retained bindings while making partial startup interruptible through `observer`.
+  [[nodiscard]] static GpuVideoEncodeSession
+  open(GpuEncodeConfig config, std::shared_ptr<const NvbufSurfaceRuntime> runtime,
+       std::shared_ptr<GpuEncodeTraceSink> trace_sink,
+       const GpuEncodeOpeningSessionObserver& observer);
 
   GpuVideoEncodeSession(const GpuVideoEncodeSession&) = delete;
   GpuVideoEncodeSession& operator=(const GpuVideoEncodeSession&) = delete;

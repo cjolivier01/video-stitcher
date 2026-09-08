@@ -238,6 +238,8 @@ void verify_muxed_gpu_video_output_impl(
       throw GpuEncodeError(
           "completed GPU output contains no parser-verified compressed video sample");
     }
+  } catch (const GpuVideoProbeCancelled&) {
+    throw;
   } catch (const GpuVideoProbeError& error) {
     throw GpuEncodeError(
         "completed GPU output failed parser-only compressed-sample verification: " +

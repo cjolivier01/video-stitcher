@@ -464,6 +464,9 @@ struct AudioPassthroughSource::Impl {
       }
       throw AudioPassthroughError(detail);
     }
+  }
+
+  void start() {
     try {
       prime();
     } catch (...) {
@@ -938,10 +941,40 @@ struct AudioPassthroughSource::Impl {
 };
 
 AudioPassthroughSource AudioPassthroughSource::open(AudioPassthroughConfig config) {
+  return open(std::move(config), {});
+}
+
+AudioPassthroughSource
+AudioPassthroughSource::open(AudioPassthroughConfig config,
+                             const AudioPassthroughOpeningSourceObserver& observer) {
   if (const auto error = validate_audio_passthrough_config(config); error.has_value()) {
     throw std::invalid_argument(*error);
   }
-  return AudioPassthroughSource(std::make_unique<Impl>(std::move(config)));
+  AudioPassthroughSource source(std::make_unique<Impl>(std::move(config)));
+  bool observed = false;
+  if (observer) {
+    observed = true;
+    if (!observer(&source)) {
+      source.request_stop();
+      (void)observer(nullptr);
+      return source;
+    }
+  }
+  try {
+    source.impl_->start();
+  } catch (...) {
+    if (observed) {
+      try {
+        (void)observer(nullptr);
+      } catch (...) {
+      }
+    }
+    throw;
+  }
+  if (observed) {
+    (void)observer(nullptr);
+  }
+  return source;
 }
 
 AudioPassthroughSource::AudioPassthroughSource(std::unique_ptr<Impl> impl)

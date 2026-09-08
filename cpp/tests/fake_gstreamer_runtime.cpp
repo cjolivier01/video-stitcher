@@ -1060,6 +1060,13 @@ RECO_FAKE_EXPORT int gst_element_set_state(void* pipeline_pointer, int state) {
     return 0;
   }
   pipeline->state = state;
+  if (state == 1 && pipeline->encoder && scenario() == "encode-stop-blocked-open") {
+    {
+      std::lock_guard lock(pipeline->flush_mutex);
+      pipeline->flush_started = true;
+    }
+    pipeline->flush_changed.notify_all();
+  }
   if (state == 4 && scenario() == "retained-frame-running" && !pipeline->decode_thread.joinable()) {
     pipeline->decode_thread = std::thread([pipeline] {
       std::unique_lock lock(pipeline->flush_mutex);
@@ -1127,6 +1134,12 @@ RECO_FAKE_EXPORT int gst_element_get_state(void* pipeline_pointer, int* state, i
       *state = 2;
     }
     return 2;
+  }
+  if (pipeline->encoder && scenario() == "encode-stop-blocked-open") {
+    std::unique_lock lock(pipeline->flush_mutex);
+    record("encode-get-state-blocked");
+    pipeline->flush_changed.wait(lock, [&] { return pipeline->flush_started; });
+    record("encode-get-state-unblocked");
   }
   if (pipeline->encoder && scenario() == "encode-startup-timeout") {
     if (state != nullptr) {

@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -63,10 +64,22 @@ public:
   using std::runtime_error::runtime_error;
 };
 
+class AudioPassthroughSource;
+
+/// Observes a partially opened source so another thread can interrupt native startup.
+///
+/// The observer receives the source before discovery or pipeline startup can block, followed by
+/// `nullptr` when opening finishes. Returning false requests an immediate stopped source.
+using AudioPassthroughOpeningSourceObserver = std::function<bool(AudioPassthroughSource*)>;
+
 /// GStreamer compressed-audio reader. Video pads are never decoded or materialized.
 class AudioPassthroughSource final {
 public:
+  /// Opens without observing partial startup.
   [[nodiscard]] static AudioPassthroughSource open(AudioPassthroughConfig config);
+  /// Opens while making partial startup interruptible through `observer`.
+  [[nodiscard]] static AudioPassthroughSource
+  open(AudioPassthroughConfig config, const AudioPassthroughOpeningSourceObserver& observer);
 
   AudioPassthroughSource(const AudioPassthroughSource&) = delete;
   AudioPassthroughSource& operator=(const AudioPassthroughSource&) = delete;

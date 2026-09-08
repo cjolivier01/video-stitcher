@@ -442,18 +442,36 @@ struct GpuVideoEncodeSession::Impl {
       close_resources();
       throw GpuEncodeError("GPU encode pipeline is missing appsrc or bus resources");
     }
-    if (api->element_set_state(pipeline, kGstStatePlaying) == kGstStateChangeFailure) {
+  }
+
+  [[nodiscard]] bool is_aborted() const noexcept {
+    std::lock_guard lock(pool->mutex);
+    return aborted;
+  }
+
+  void start() {
+    if (is_aborted()) {
+      return;
+    }
+    const int state_change = api->element_set_state(pipeline, kGstStatePlaying);
+    if (is_aborted()) {
       (void)api->element_set_state(pipeline, kGstStateNull);
-      close_resources();
+      return;
+    }
+    if (state_change == kGstStateChangeFailure) {
+      (void)api->element_set_state(pipeline, kGstStateNull);
       throw GpuEncodeError("GStreamer GPU encode pipeline failed to enter PLAYING");
     }
     int current = 0;
     int pending = 0;
     const int startup =
         api->element_get_state(pipeline, &current, &pending, timeout_ns(config.startup_timeout));
+    if (is_aborted()) {
+      (void)api->element_set_state(pipeline, kGstStateNull);
+      return;
+    }
     if (startup != kGstStateChangeSuccess || current != kGstStatePlaying || pending != 0) {
       (void)api->element_set_state(pipeline, kGstStateNull);
-      close_resources();
       if (startup == kGstStateChangeFailure) {
         throw GpuEncodeError("GStreamer GPU encode pipeline failed during startup");
       }
@@ -838,13 +856,29 @@ GpuEncodeFrameLease::operator bool() const noexcept { return state_ && state_->a
 
 GpuVideoEncodeSession GpuVideoEncodeSession::open(GpuEncodeConfig config,
                                                   std::shared_ptr<GpuEncodeTraceSink> trace_sink) {
-  return open(std::move(config), discover_nvbufsurface_runtime(), std::move(trace_sink));
+  return open(std::move(config), discover_nvbufsurface_runtime(), std::move(trace_sink),
+              GpuEncodeOpeningSessionObserver{});
+}
+
+GpuVideoEncodeSession GpuVideoEncodeSession::open(GpuEncodeConfig config,
+                                                  std::shared_ptr<GpuEncodeTraceSink> trace_sink,
+                                                  const GpuEncodeOpeningSessionObserver& observer) {
+  return open(std::move(config), discover_nvbufsurface_runtime(), std::move(trace_sink), observer);
 }
 
 GpuVideoEncodeSession
 GpuVideoEncodeSession::open(GpuEncodeConfig config,
                             std::shared_ptr<const NvbufSurfaceRuntime> runtime,
                             std::shared_ptr<GpuEncodeTraceSink> trace_sink) {
+  return open(std::move(config), std::move(runtime), std::move(trace_sink),
+              GpuEncodeOpeningSessionObserver{});
+}
+
+GpuVideoEncodeSession
+GpuVideoEncodeSession::open(GpuEncodeConfig config,
+                            std::shared_ptr<const NvbufSurfaceRuntime> runtime,
+                            std::shared_ptr<GpuEncodeTraceSink> trace_sink,
+                            const GpuEncodeOpeningSessionObserver& observer) {
   if (const auto error = validate_gpu_encode_config(config); error.has_value()) {
     throw GpuEncodeError(*error);
   }
@@ -859,8 +893,32 @@ GpuVideoEncodeSession::open(GpuEncodeConfig config,
   } catch (const std::exception& error) {
     throw GpuEncodeError("GPU encode memory preflight failed: " + std::string(error.what()));
   }
-  return GpuVideoEncodeSession(
+  GpuVideoEncodeSession session(
       std::make_unique<Impl>(std::move(config), std::move(runtime), std::move(trace_sink)));
+  bool observed = false;
+  if (observer) {
+    observed = true;
+    if (!observer(&session)) {
+      session.abort();
+      (void)observer(nullptr);
+      return session;
+    }
+  }
+  try {
+    session.impl_->start();
+  } catch (...) {
+    if (observed) {
+      try {
+        (void)observer(nullptr);
+      } catch (...) {
+      }
+    }
+    throw;
+  }
+  if (observed) {
+    (void)observer(nullptr);
+  }
+  return session;
 }
 
 GpuVideoEncodeSession::GpuVideoEncodeSession(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}

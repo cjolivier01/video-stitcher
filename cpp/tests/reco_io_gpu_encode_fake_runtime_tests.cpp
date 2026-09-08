@@ -306,6 +306,41 @@ void startup_failures_release_partial_resources(
   }
 }
 
+void encoder_opening_observer_interrupts_startup(
+    const std::shared_ptr<const NvbufSurfaceRuntime>& runtime,
+    const std::filesystem::path& event_path) {
+  using namespace std::chrono_literals;
+  std::filesystem::remove(event_path);
+  set_scenario("encode-stop-blocked-open");
+  std::atomic<GpuVideoEncodeSession*> opening_session{nullptr};
+  auto opening = std::async(std::launch::async, [&] {
+    return GpuVideoEncodeSession::open(config(), runtime, {}, [&](GpuVideoEncodeSession* session) {
+      opening_session.store(session, std::memory_order_release);
+      return true;
+    });
+  });
+
+  expect_true(wait_for_event(event_path, "encode-get-state-blocked"),
+              "encoder blocks after its opening observer attaches");
+  auto* partial_session = opening_session.load(std::memory_order_acquire);
+  expect_true(partial_session != nullptr, "opening observer exposes the partial encoder session");
+  if (partial_session != nullptr) {
+    partial_session->abort();
+  }
+  expect_true(opening.wait_for(500ms) == std::future_status::ready,
+              "partial encoder abort interrupts native startup");
+  auto session = opening.get();
+  expect_true(opening_session.load(std::memory_order_acquire) == nullptr,
+              "encoder opening observer is cleared before return");
+  expect_encode_error([&] { (void)session.acquire_frame(); }, "no longer accepting frames",
+                      "interrupted encoder returns in the aborted state");
+  const auto events = read_events(event_path);
+  expect_eq(count_event(events, "encode-get-state-unblocked"), 1U,
+            "encoder startup returns after its abort request");
+  expect_true(count_event(events, "state-null") >= 1U,
+              "encoder opening cancellation stops the partial pipeline");
+}
+
 void wrapped_callbacks_and_move_assignment_release_exactly_once(
     const std::shared_ptr<const NvbufSurfaceRuntime>& runtime) {
   set_scenario("encode-success");
@@ -619,16 +654,38 @@ void finalized_output_requires_a_compressed_video_sample(const std::filesystem::
     cancel.store(true, std::memory_order_release);
   });
   const auto started = std::chrono::steady_clock::now();
-  expect_encode_error(
-      [&] {
-        verify_muxed_gpu_video_output(output_path, Codec::H264, Format::Mp4, worker,
-                                      std::chrono::seconds(30),
-                                      [&] { return cancel.load(std::memory_order_acquire); });
-      },
-      "video probe cancelled", "output verification forwards cancellation to its probe worker");
+  bool cancellation_reported = false;
+  try {
+    verify_muxed_gpu_video_output(output_path, Codec::H264, Format::Mp4, worker,
+                                  std::chrono::seconds(30),
+                                  [&] { return cancel.load(std::memory_order_acquire); });
+  } catch (const GpuVideoProbeCancelled&) {
+    cancellation_reported = true;
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: output verification returned the wrong cancellation error: " << error.what()
+              << '\n';
+    ++failures;
+  }
   requester.join();
+  expect_true(cancellation_reported, "output verification preserves explicit probe cancellation");
   expect_true(std::chrono::steady_clock::now() - started < std::chrono::seconds(3),
               "output-verification cancellation does not wait for the parser timeout");
+
+  std::uint32_t cancellation_queries = 0;
+  cancellation_reported = false;
+  try {
+    verify_muxed_gpu_video_output(output_path, Codec::H264, Format::Mp4, worker,
+                                  std::chrono::seconds(10),
+                                  [&] { return cancellation_queries++ == 0U; });
+  } catch (const GpuVideoProbeCancelled&) {
+    cancellation_reported = true;
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: one-shot output cancellation returned the wrong error: " << error.what()
+              << '\n';
+    ++failures;
+  }
+  expect_true(cancellation_reported,
+              "one-shot cancellation remains distinguishable without callback relatching");
   std::filesystem::remove(output_path);
 }
 
@@ -919,6 +976,40 @@ void compressed_audio_prime_failures_release_resources(const std::filesystem::pa
   }
 }
 
+void compressed_audio_opening_observer_interrupts_discovery(
+    const std::filesystem::path& event_path) {
+  using namespace std::chrono_literals;
+  std::filesystem::remove(event_path);
+  set_scenario("audio-stop-blocked-discovery");
+  std::atomic<AudioPassthroughSource*> opening_source{nullptr};
+  auto opening = std::async(std::launch::async, [&] {
+    return AudioPassthroughSource::open(
+        {.segments = {{.path = "second.mp4", .video_duration_ns = 80'000'000ULL}},
+         .read_timeout = std::chrono::seconds(30)},
+        [&](AudioPassthroughSource* source) {
+          opening_source.store(source, std::memory_order_release);
+          return true;
+        });
+  });
+
+  expect_true(wait_for_event(event_path, "discover-audio-blocked"),
+              "audio discovery blocks after its opening observer attaches");
+  auto* partial_source = opening_source.load(std::memory_order_acquire);
+  expect_true(partial_source != nullptr, "opening observer exposes the partial audio source");
+  if (partial_source != nullptr) {
+    partial_source->request_stop();
+  }
+  expect_true(opening.wait_for(500ms) == std::future_status::ready,
+              "partial audio stop interrupts initial stream discovery");
+  auto source = opening.get();
+  expect_true(opening_source.load(std::memory_order_acquire) == nullptr,
+              "audio opening observer is cleared before return");
+  expect_true(source.read().status == AudioPassthroughStatus::EndOfStream,
+              "interrupted audio open returns in the stopped state");
+  expect_eq(count_event(read_events(event_path), "unref-discoverer"), 1U,
+            "interrupted initial audio discovery releases its discoverer");
+}
+
 void compressed_audio_stop_interrupts_concurrent_read(const std::filesystem::path& event_path) {
   using namespace std::chrono_literals;
   std::filesystem::remove(event_path);
@@ -997,6 +1088,7 @@ int main() {
     const auto runtime = discover_nvbufsurface_runtime();
     gpu_memory_preflight_prevents_partial_nvmm_pool_allocation(runtime, nvbuf_control);
     startup_failures_release_partial_resources(runtime, event_path);
+    encoder_opening_observer_interrupts_startup(runtime, event_path);
     wrapped_callbacks_and_move_assignment_release_exactly_once(runtime);
     wrapping_and_push_failures_preserve_pool_ownership(runtime);
     bus_errors_and_early_eos_are_sticky(runtime);
@@ -1014,6 +1106,7 @@ int main() {
     compressed_audio_source_handles_absence_and_incompatible_caps(event_path);
     compressed_audio_preserves_stream_time_offsets(event_path);
     compressed_audio_prime_failures_release_resources(event_path);
+    compressed_audio_opening_observer_interrupts_discovery(event_path);
     compressed_audio_stop_interrupts_concurrent_read(event_path);
     compressed_audio_stop_interrupts_discovery(event_path);
   } catch (const std::exception& error) {
