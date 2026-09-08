@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -126,6 +127,7 @@ struct FakeSource : FakeObject {
 struct FakeBus : FakeObject {
   explicit FakeBus(FakePipeline* owner) : FakeObject(ObjectKind::Bus), pipeline(owner) {}
   FakePipeline* pipeline = nullptr;
+  std::mutex mutex;
   bool emitted_error = false;
   bool emitted_eos = false;
   bool emitted_tag = false;
@@ -212,7 +214,7 @@ struct FakePipeline : FakeObject {
   bool encoder = false;
   bool audio_demux = false;
   std::string description;
-  bool eos_sent = false;
+  std::atomic<bool> eos_sent{false};
   std::uint32_t pushed_buffers = 0;
   std::vector<FakeWrappedBuffer*> retained_buffers;
 };
@@ -2525,11 +2527,23 @@ RECO_FAKE_EXPORT int gst_buffer_map(void* buffer, GstMapInfoAbi* map, std::uint3
 
 RECO_FAKE_EXPORT void gst_buffer_unmap(void*, GstMapInfoAbi*) { record("unmap"); }
 
-RECO_FAKE_EXPORT void* gst_bus_timed_pop_filtered(void* bus_pointer, std::uint64_t,
+RECO_FAKE_EXPORT void* gst_bus_timed_pop_filtered(void* bus_pointer, std::uint64_t wait_ns,
                                                   std::uint32_t types) {
   auto* bus = static_cast<FakeBus*>(bus_pointer);
+  std::unique_lock bus_lock(bus->mutex);
   ++bus->poll_count;
   if (bus->pipeline != nullptr && bus->pipeline->encoder) {
+    if (scenario() == "encode-concurrent-acquire-finish" && wait_ns != 0U) {
+      bus_lock.unlock();
+      record("encode-final-poll-blocked");
+      const char* gate_path = std::getenv("RECO_FAKE_GST_FINAL_POLL_GATE_PATH");
+      const auto gate_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+      while (gate_path != nullptr && gate_path[0] != '\0' && !std::ifstream(gate_path).good() &&
+             std::chrono::steady_clock::now() < gate_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      bus_lock.lock();
+    }
     if (scenario() == "encode-bus-error" && bus->pipeline->pushed_buffers != 0 &&
         !bus->emitted_error && (types & (1U << 1U)) != 0) {
       bus->emitted_error = true;

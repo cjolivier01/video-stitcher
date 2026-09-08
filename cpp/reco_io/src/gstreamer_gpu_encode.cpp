@@ -588,11 +588,12 @@ struct GpuVideoEncodeSession::Impl {
   GpuEncodeFrameLease acquire() {
     const auto deadline = std::chrono::steady_clock::now() + config.acquire_timeout;
     while (true) {
+      std::unique_lock submission_lock(submission_mutex);
       if (const auto bus_result = poll_bus(0, false);
           bus_result.has_value() && !bus_result->empty()) {
         throw GpuEncodeError(*bus_result);
       }
-      std::unique_lock lock(pool->mutex);
+      std::unique_lock pool_lock(pool->mutex);
       if (pool->sticky_error.has_value()) {
         throw GpuEncodeError(*pool->sticky_error);
       }
@@ -602,7 +603,8 @@ struct GpuVideoEncodeSession::Impl {
       for (std::size_t index = 0; index < pool->slots.size(); ++index) {
         if (pool->slots[index]->status == SlotStatus::Free) {
           pool->slots[index]->status = SlotStatus::Acquired;
-          lock.unlock();
+          pool_lock.unlock();
+          submission_lock.unlock();
           if (pool->trace) {
             pool->trace->surface_acquired();
           }
@@ -613,7 +615,9 @@ struct GpuVideoEncodeSession::Impl {
       if (now >= deadline) {
         throw GpuEncodeError("timed out waiting for a free GPU encode surface");
       }
-      pool->available.wait_until(lock, std::min(deadline, now + std::chrono::milliseconds(100)));
+      submission_lock.unlock();
+      pool->available.wait_until(pool_lock,
+                                 std::min(deadline, now + std::chrono::milliseconds(100)));
     }
   }
 
@@ -872,6 +876,7 @@ struct GpuVideoEncodeSession::Impl {
   std::shared_ptr<GstreamerEncodeApi> api;
   std::shared_ptr<EncodePoolState> pool;
   std::shared_ptr<AudioPacketPoolState> audio_pool;
+  // Serializes appsrc admission and bus polling with terminal EOS finalization.
   std::mutex submission_mutex;
   void* pipeline = nullptr;
   void* source = nullptr;

@@ -343,6 +343,38 @@ void successful_finish_waits_for_downstream_release(
   session.finish();
 }
 
+void concurrent_acquire_cannot_consume_final_eos(
+    const std::shared_ptr<const NvbufSurfaceRuntime>& runtime,
+    const std::filesystem::path& event_path) {
+  using namespace std::chrono_literals;
+  std::filesystem::remove(event_path);
+  auto gate_path = event_path;
+  gate_path += ".final-poll-gate";
+  std::filesystem::remove(gate_path);
+  set_environment("RECO_FAKE_GST_FINAL_POLL_GATE_PATH", gate_path.string());
+  set_scenario("encode-concurrent-acquire-finish");
+
+  auto finish_config = config();
+  finish_config.finalize_timeout = 2s;
+  auto session = GpuVideoEncodeSession::open(std::move(finish_config), runtime);
+  auto finish = std::async(std::launch::async, [&] { session.finish(); });
+  expect_true(wait_for_event(event_path, "encode-final-poll-blocked"),
+              "finish reaches the gated terminal bus poll");
+
+  auto acquire = std::async(std::launch::async, [&] { return session.acquire_frame(); });
+  expect_true(acquire.wait_for(50ms) == std::future_status::timeout,
+              "concurrent acquire cannot poll the bus during finalization");
+  {
+    std::ofstream gate(gate_path);
+    gate << "release\n";
+  }
+
+  finish.get();
+  expect_encode_error([&] { (void)acquire.get(); }, "no longer accepting",
+                      "concurrent acquire observes completed finalization");
+  std::filesystem::remove(gate_path);
+}
+
 void outstanding_leases_survive_session_destruction(
     const std::shared_ptr<const NvbufSurfaceRuntime>& runtime) {
   set_scenario("encode-success");
@@ -679,6 +711,7 @@ int main() {
     bounded_pool_times_out_and_releases_on_abort(runtime);
     finalization_failures_abort_and_release(runtime);
     successful_finish_waits_for_downstream_release(runtime);
+    concurrent_acquire_cannot_consume_final_eos(runtime, event_path);
     outstanding_leases_survive_session_destruction(runtime);
     compressed_audio_packets_use_the_bounded_audio_appsrc(runtime, event_path);
     finalized_output_requires_a_discoverable_video_stream();
