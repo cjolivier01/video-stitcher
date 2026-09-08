@@ -1,5 +1,6 @@
 #include "gpu_video_probe_internal.hpp"
 #include "gpu_video_probe_protocol.hpp"
+#include "gpu_video_probe_worker_request.hpp"
 #include "stable_media_file_internal.hpp"
 
 #include <array>
@@ -63,21 +64,6 @@ private:
 };
 #endif
 
-struct ReceivedRequest {
-  std::string payload;
-#if !defined(_WIN32)
-  int descriptor = -1;
-
-  ~ReceivedRequest() {
-    if (descriptor >= 0) {
-      (void)::close(descriptor);
-    }
-  }
-
-  [[nodiscard]] int release_descriptor() { return std::exchange(descriptor, -1); }
-#endif
-};
-
 ReceivedRequest read_request() {
 #if defined(_WIN32)
   const auto read_exact = [](char* destination, std::size_t size) {
@@ -90,7 +76,7 @@ ReceivedRequest read_request() {
   read_exact(header.data(), header.size());
   std::string request(decode_probe_ipc_frame_header(header), '\0');
   read_exact(request.data(), request.size());
-  return {.payload = std::move(request)};
+  return ReceivedRequest(std::move(request));
 #else
   ProbeIpcFrameHeader header{};
   std::array<char, CMSG_SPACE(sizeof(int))> control{};
@@ -151,9 +137,8 @@ ReceivedRequest read_request() {
   if (static_cast<std::size_t>(received) < header.size()) {
     read_exact(header.data() + received, header.size() - static_cast<std::size_t>(received));
   }
-  ReceivedRequest request{.payload = std::string(decode_probe_ipc_frame_header(header), '\0'),
-                          .descriptor = descriptor};
-  read_exact(request.payload.data(), request.payload.size());
+  ReceivedRequest request(std::string(decode_probe_ipc_frame_header(header), '\0'), descriptor);
+  read_exact(request.payload().data(), request.payload().size());
   return request;
 #endif
 }
@@ -234,7 +219,7 @@ int run_gpu_video_probe_worker(std::intptr_t inherited_handle) {
   std::string response;
   try {
     auto received = read_request();
-    auto request = decode_probe_request(received.payload);
+    auto request = decode_probe_request(received.payload());
     if (request.expects_stable_source) {
 #if defined(_WIN32)
       if (inherited_handle <= 0) {
@@ -246,7 +231,7 @@ int run_gpu_video_probe_worker(std::intptr_t inherited_handle) {
       }
       inherited_handle = -1;
 #else
-      if (received.descriptor < 0) {
+      if (received.descriptor() < 0) {
         throw GpuVideoProbeError("video probe worker did not receive its stable media descriptor");
       }
       const int descriptor = received.release_descriptor();
@@ -259,7 +244,7 @@ int run_gpu_video_probe_worker(std::intptr_t inherited_handle) {
         throw GpuVideoProbeError("video probe worker received unexpected stable media authority");
       }
 #else
-      if (received.descriptor >= 0) {
+      if (received.descriptor() >= 0) {
         throw GpuVideoProbeError("video probe worker received unexpected stable media authority");
       }
 #endif

@@ -75,6 +75,13 @@ cc_library(
 )
 
 cc_library(
+    name = "gpu_video_probe_worker_request",
+    srcs = ["src/gpu_video_probe_worker_request.cpp"],
+    hdrs = ["src/gpu_video_probe_worker_request.hpp"],
+    includes = ["src"],
+)
+
+cc_library(
     name = "reco_io_forced_guardian_fallbacks",
     testonly = True,
     srcs = _RECO_IO_SRCS,
@@ -105,7 +112,10 @@ cc_binary(
         "src/gpu_video_probe_worker_main.cpp",
     ],
     visibility = ["//visibility:public"],
-    deps = [":reco_io"],
+    deps = [
+        ":gpu_video_probe_worker_request",
+        ":reco_io",
+    ],
 )
 
 cc_binary(
@@ -119,7 +129,17 @@ cc_binary(
     ],
     local_defines = ["RECO_PROBE_TEST_WORKER_DESCRIPTOR_REUSE"],
     visibility = ["//cpp/tests:__pkg__"],
-    deps = [":reco_io_forced_guardian_fallbacks"],
+    deps = [
+        ":gpu_video_probe_worker_request",
+        ":reco_io_forced_guardian_fallbacks",
+    ],
+)
+
+cc_test(
+    name = "gpu_video_probe_worker_request_tests",
+    size = "small",
+    srcs = ["src/gpu_video_probe_worker_request_tests.cpp"],
+    deps = [":gpu_video_probe_worker_request"],
 )
 
 cc_test(
