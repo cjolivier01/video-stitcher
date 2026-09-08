@@ -2258,49 +2258,71 @@ void write_calibration_json_atomically_impl(
                                                                      destination_name, handle);
             return false;
           }
-          // Keep the no-delete-share handle through every observable hook, then
-          // revalidate through a delete-sharing handle so replacement can proceed.
           BY_HANDLE_FILE_INFORMATION published_identity{};
           if (GetFileInformationByHandle(handle, &published_identity) == 0) {
             throw_file_error("cannot inspect published calibration output before rollback",
                              destination, static_cast<int>(GetLastError()));
           }
-          const HANDLE blocking_handle = std::exchange(handle, INVALID_HANDLE_VALUE);
-          if (CloseHandle(blocking_handle) == 0) {
-            throw_file_error("cannot release published calibration output for rollback",
-                             destination, static_cast<int>(GetLastError()));
+          const auto retain_published_error =
+              link_open_file(handle, output_directory.handle.get(), temporary_name);
+          if (retain_published_error != ERROR_SUCCESS) {
+            throw_file_error("cannot retain published calibration output for rollback", temporary,
+                             static_cast<int>(retain_published_error));
           }
-          DWORD rollback_target_error = ERROR_SUCCESS;
-          const HANDLE rollback_target = open_windows_file_relative(
-              output_directory.handle.get(), destination_name, FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN,
-              FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
-              rollback_target_error);
-          if (rollback_target == INVALID_HANDLE_VALUE) {
-            throw_file_error("cannot revalidate published calibration output for rollback",
-                             destination, static_cast<int>(rollback_target_error));
-          }
-          UniqueWindowsHandle retained_rollback_target(rollback_target);
-          FILE_ATTRIBUTE_TAG_INFO rollback_target_attributes{};
-          BY_HANDLE_FILE_INFORMATION rollback_target_identity{};
-          if (GetFileInformationByHandleEx(rollback_target, FileAttributeTagInfo,
-                                           &rollback_target_attributes,
-                                           sizeof(rollback_target_attributes)) == 0 ||
-              (rollback_target_attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
-              GetFileInformationByHandle(rollback_target, &rollback_target_identity) == 0 ||
-              !same_windows_file_identity(published_identity, rollback_target_identity)) {
+          temporary_exists = true;
+          if (!relative_path_identifies_windows_handle(output_directory.handle.get(),
+                                                       temporary_name, handle, false)) {
             throw WindowsPublicationIdentityError(
-                "published calibration output changed during rollback handoff");
+                "retained published calibration output changed before rollback");
           }
           rename_open_file(displaced_output->handle.get(), output_directory.handle.get(),
                            destination_name, destination, true, true);
           destination_published = false;
           if (!relative_path_identifies_windows_handle(output_directory.handle.get(),
                                                        destination_name,
-                                                       displaced_output->handle.get(), true)) {
+                                                       displaced_output->handle.get(), true) ||
+              !relative_path_identifies_windows_handle(output_directory.handle.get(),
+                                                       temporary_name, handle, false)) {
             return false;
           }
           displaced_output.reset();
+
+          if (CloseHandle(handle) == 0) {
+            throw_file_error("cannot release retained published calibration output", temporary,
+                             static_cast<int>(GetLastError()));
+          }
+          handle = INVALID_HANDLE_VALUE;
+          DWORD cleanup_error = ERROR_SUCCESS;
+          const HANDLE cleanup_handle = open_windows_file_relative(
+              output_directory.handle.get(), temporary_name,
+              DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE, FILE_SHARE_READ, FILE_OPEN,
+              FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+              cleanup_error);
+          if (cleanup_handle == INVALID_HANDLE_VALUE) {
+            throw_file_error("cannot reopen retained published calibration output", temporary,
+                             static_cast<int>(cleanup_error));
+          }
+          UniqueWindowsHandle retained_cleanup(cleanup_handle);
+          FILE_ATTRIBUTE_TAG_INFO cleanup_attributes{};
+          BY_HANDLE_FILE_INFORMATION cleanup_identity{};
+          if (GetFileInformationByHandleEx(cleanup_handle, FileAttributeTagInfo,
+                                           &cleanup_attributes, sizeof(cleanup_attributes)) == 0 ||
+              (cleanup_attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+              GetFileInformationByHandle(cleanup_handle, &cleanup_identity) == 0 ||
+              !same_windows_file_identity(published_identity, cleanup_identity)) {
+            throw WindowsPublicationIdentityError(
+                "retained published calibration output changed before cleanup");
+          }
+          if (!discard_open_file(cleanup_handle)) {
+            throw_file_error("cannot remove retained published calibration output", temporary,
+                             static_cast<int>(GetLastError()));
+          }
+          if (CloseHandle(retained_cleanup.get()) == 0) {
+            throw_file_error("cannot close retained published calibration output", temporary,
+                             static_cast<int>(GetLastError()));
+          }
+          (void)retained_cleanup.release();
+          temporary_exists = false;
         } else {
           rename_open_file(handle, output_directory.handle.get(), temporary_name, temporary, false,
                            false);
