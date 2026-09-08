@@ -164,7 +164,9 @@ public:
   using AppSinkIsEos = int (*)(void*);
   using SampleGetBuffer = void* (*)(void*);
   using SampleGetCaps = void* (*)(void*);
+  using SampleGetSegment = const void* (*)(void*);
   using SampleUnref = void (*)(void*);
+  using SegmentToStreamTime = std::uint64_t (*)(const void*, int, std::uint64_t);
   using CapsToString = char* (*)(const void*);
   using BufferGetSize = std::size_t (*)(const void*);
   using BufferExtract = std::size_t (*)(const void*, std::size_t, void*, std::size_t);
@@ -174,11 +176,24 @@ public:
   using ErrorFree = void (*)(GErrorAbi*);
   using Free = void (*)(void*);
   using DiscovererNew = void* (*)(std::uint64_t, GErrorAbi**);
-  using DiscovererDiscoverUri = void* (*)(void*, const char*, GErrorAbi**);
+  using DiscovererStart = void (*)(void*);
+  using DiscovererStop = void (*)(void*);
+  using DiscovererDiscoverUriAsync = int (*)(void*, const char*);
   using DiscovererInfoGetResult = int (*)(const void*);
   using DiscovererInfoGetAudioStreams = void* (*)(void*);
   using DiscovererStreamInfoListFree = void (*)(void*);
   using GObjectUnref = void (*)(void*);
+  using GenericCallback = void (*)();
+  using DestroyNotify = void (*)(void*);
+  using SignalConnectData = unsigned long (*)(void*, const char*, GenericCallback, void*,
+                                              DestroyNotify, int);
+  using SignalHandlerDisconnect = void (*)(void*, unsigned long);
+  using MainContextNew = void* (*)();
+  using MainContextPushThreadDefault = void (*)(void*);
+  using MainContextPopThreadDefault = void (*)(void*);
+  using MainContextIteration = int (*)(void*, int);
+  using MainContextWakeup = void (*)(void*);
+  using MainContextUnref = void (*)(void*);
 
   GstreamerAudioApi() {
 #if defined(_WIN32)
@@ -223,7 +238,9 @@ public:
     object_unref = core->symbol<ObjectUnref>("gst_object_unref");
     sample_get_buffer = core->symbol<SampleGetBuffer>("gst_sample_get_buffer");
     sample_get_caps = core->symbol<SampleGetCaps>("gst_sample_get_caps");
+    sample_get_segment = core->symbol<SampleGetSegment>("gst_sample_get_segment");
     sample_unref = core->symbol<SampleUnref>("gst_sample_unref");
+    segment_to_stream_time = core->symbol<SegmentToStreamTime>("gst_segment_to_stream_time");
     caps_to_string = core->symbol<CapsToString>("gst_caps_to_string");
     buffer_get_size = core->symbol<BufferGetSize>("gst_buffer_get_size");
     buffer_extract = core->symbol<BufferExtract>("gst_buffer_extract");
@@ -234,8 +251,19 @@ public:
     app_sink_is_eos = app->symbol<AppSinkIsEos>("gst_app_sink_is_eos");
     error_free = glib->symbol<ErrorFree>("g_error_free");
     free = glib->symbol<Free>("g_free");
+    main_context_new = glib->symbol<MainContextNew>("g_main_context_new");
+    main_context_push_thread_default =
+        glib->symbol<MainContextPushThreadDefault>("g_main_context_push_thread_default");
+    main_context_pop_thread_default =
+        glib->symbol<MainContextPopThreadDefault>("g_main_context_pop_thread_default");
+    main_context_iteration = glib->symbol<MainContextIteration>("g_main_context_iteration");
+    main_context_wakeup = glib->symbol<MainContextWakeup>("g_main_context_wakeup");
+    main_context_unref = glib->symbol<MainContextUnref>("g_main_context_unref");
     discoverer_new = pbutils->symbol<DiscovererNew>("gst_discoverer_new");
-    discoverer_discover_uri = pbutils->symbol<DiscovererDiscoverUri>("gst_discoverer_discover_uri");
+    discoverer_start = pbutils->symbol<DiscovererStart>("gst_discoverer_start");
+    discoverer_stop = pbutils->symbol<DiscovererStop>("gst_discoverer_stop");
+    discoverer_discover_uri_async =
+        pbutils->symbol<DiscovererDiscoverUriAsync>("gst_discoverer_discover_uri_async");
     discoverer_info_get_result =
         pbutils->symbol<DiscovererInfoGetResult>("gst_discoverer_info_get_result");
     discoverer_info_get_audio_streams =
@@ -243,6 +271,9 @@ public:
     discoverer_stream_info_list_free =
         pbutils->symbol<DiscovererStreamInfoListFree>("gst_discoverer_stream_info_list_free");
     g_object_unref = gobject->symbol<GObjectUnref>("g_object_unref");
+    signal_connect_data = gobject->symbol<SignalConnectData>("g_signal_connect_data");
+    signal_handler_disconnect =
+        gobject->symbol<SignalHandlerDisconnect>("g_signal_handler_disconnect");
   }
 
   std::shared_ptr<DynamicLibrary> core;
@@ -263,7 +294,9 @@ public:
   AppSinkIsEos app_sink_is_eos = nullptr;
   SampleGetBuffer sample_get_buffer = nullptr;
   SampleGetCaps sample_get_caps = nullptr;
+  SampleGetSegment sample_get_segment = nullptr;
   SampleUnref sample_unref = nullptr;
+  SegmentToStreamTime segment_to_stream_time = nullptr;
   CapsToString caps_to_string = nullptr;
   BufferGetSize buffer_get_size = nullptr;
   BufferExtract buffer_extract = nullptr;
@@ -272,12 +305,22 @@ public:
   MessageUnref message_unref = nullptr;
   ErrorFree error_free = nullptr;
   Free free = nullptr;
+  MainContextNew main_context_new = nullptr;
+  MainContextPushThreadDefault main_context_push_thread_default = nullptr;
+  MainContextPopThreadDefault main_context_pop_thread_default = nullptr;
+  MainContextIteration main_context_iteration = nullptr;
+  MainContextWakeup main_context_wakeup = nullptr;
+  MainContextUnref main_context_unref = nullptr;
   DiscovererNew discoverer_new = nullptr;
-  DiscovererDiscoverUri discoverer_discover_uri = nullptr;
+  DiscovererStart discoverer_start = nullptr;
+  DiscovererStop discoverer_stop = nullptr;
+  DiscovererDiscoverUriAsync discoverer_discover_uri_async = nullptr;
   DiscovererInfoGetResult discoverer_info_get_result = nullptr;
   DiscovererInfoGetAudioStreams discoverer_info_get_audio_streams = nullptr;
   DiscovererStreamInfoListFree discoverer_stream_info_list_free = nullptr;
   GObjectUnref g_object_unref = nullptr;
+  SignalConnectData signal_connect_data = nullptr;
+  SignalHandlerDisconnect signal_handler_disconnect = nullptr;
 };
 
 std::string quote_property(std::string_view value) {
@@ -302,16 +345,48 @@ std::optional<std::uint64_t> finite_timestamp(std::uint64_t value) {
   return value == kGstClockTimeNone ? std::nullopt : std::optional(value);
 }
 
-std::uint64_t adjusted_timestamp(std::uint64_t value, std::uint64_t source_anchor,
+std::uint64_t adjusted_timestamp(std::uint64_t stream_time, std::uint64_t trim_before,
                                  std::uint64_t output_anchor) {
-  if (value <= source_anchor) {
-    return output_anchor;
+  if (stream_time < trim_before) {
+    throw AudioPassthroughError("compressed audio timestamp precedes the selected video range");
   }
-  const auto delta = value - source_anchor;
+  const auto delta = stream_time - trim_before;
   if (output_anchor > std::numeric_limits<std::uint64_t>::max() - delta) {
     throw AudioPassthroughError("compressed audio timestamp overflows the output timeline");
   }
   return output_anchor + delta;
+}
+
+struct DiscoverySignalState {
+  GstreamerAudioApi* api = nullptr;
+  bool completed = false;
+  bool has_audio = false;
+  bool callback_failed = false;
+  int result = -1;
+  std::string error;
+};
+
+void discovery_completed(void*, void* info, GErrorAbi* error, void* user_data) noexcept {
+  auto* state = static_cast<DiscoverySignalState*>(user_data);
+  if (state == nullptr || state->api == nullptr) {
+    return;
+  }
+  try {
+    if (error != nullptr && error->message != nullptr && error->message[0] != '\0') {
+      state->error = error->message;
+    }
+    if (info != nullptr) {
+      state->result = state->api->discoverer_info_get_result(info);
+      void* streams = state->api->discoverer_info_get_audio_streams(info);
+      state->has_audio = streams != nullptr;
+      if (streams != nullptr) {
+        state->api->discoverer_stream_info_list_free(streams);
+      }
+    }
+  } catch (...) {
+    state->callback_failed = true;
+  }
+  state->completed = true;
 }
 
 } // namespace
@@ -371,17 +446,22 @@ struct AudioPassthroughSource::Impl {
   explicit Impl(AudioPassthroughConfig config_value)
       : config(std::move(config_value)), api(std::make_shared<GstreamerAudioApi>()) {
     GErrorAbi* error = nullptr;
-    if (api->init_check(nullptr, nullptr, &error) == 0) {
+    const int initialized = api->init_check(nullptr, nullptr, &error);
+    const std::unique_ptr<GErrorAbi, GstreamerAudioApi::ErrorFree> error_owner(error,
+                                                                               api->error_free);
+    if (initialized == 0) {
       std::string detail = "GStreamer initialization failed";
-      if (error != nullptr) {
-        if (error->message != nullptr) {
-          detail = error->message;
-        }
-        api->error_free(error);
+      if (error_owner != nullptr && error_owner->message != nullptr) {
+        detail = error_owner->message;
       }
       throw AudioPassthroughError(detail);
     }
-    prime();
+    try {
+      prime();
+    } catch (...) {
+      close_segment();
+      throw;
+    }
   }
 
   ~Impl() { stop(); }
@@ -413,6 +493,12 @@ struct AudioPassthroughSource::Impl {
     stopped.store(true, std::memory_order_release);
     {
       std::lock_guard lock(resources_mutex);
+      if (active_discoverer != nullptr) {
+        api->discoverer_stop(active_discoverer);
+      }
+      if (active_discovery_context != nullptr) {
+        api->main_context_wakeup(active_discovery_context);
+      }
       if (pipeline != nullptr) {
         (void)api->element_set_state(pipeline, kGstStateNull);
       }
@@ -423,24 +509,39 @@ struct AudioPassthroughSource::Impl {
   }
 
   std::string take_error(GErrorAbi*& error, std::string_view fallback) const {
+    const std::unique_ptr<GErrorAbi, GstreamerAudioApi::ErrorFree> error_owner(
+        std::exchange(error, nullptr), api->error_free);
     std::string detail(fallback);
-    if (error != nullptr) {
-      if (error->message != nullptr && error->message[0] != '\0') {
-        detail = error->message;
-      }
-      api->error_free(error);
-      error = nullptr;
+    if (error_owner != nullptr && error_owner->message != nullptr &&
+        error_owner->message[0] != '\0') {
+      detail = error_owner->message;
     }
     return detail;
   }
 
-  bool segment_has_audio(std::string_view path) const {
+  bool segment_has_audio(std::string_view path) {
     GErrorAbi* error = nullptr;
     char* uri = api->filename_to_uri(std::string(path).c_str(), &error);
     if (uri == nullptr) {
       throw AudioPassthroughError(take_error(error, "failed to create an audio input URI"));
     }
     const std::unique_ptr<void, GstreamerAudioApi::Free> uri_owner(uri, api->free);
+    if (error != nullptr) {
+      api->error_free(std::exchange(error, nullptr));
+    }
+
+    void* context = api->main_context_new();
+    if (context == nullptr) {
+      throw AudioPassthroughError("failed to create an audio discovery main context");
+    }
+    const std::unique_ptr<void, GstreamerAudioApi::MainContextUnref> context_owner(
+        context, api->main_context_unref);
+    api->main_context_push_thread_default(context);
+    struct PopThreadDefault {
+      std::shared_ptr<GstreamerAudioApi> api;
+      void* context = nullptr;
+      ~PopThreadDefault() { api->main_context_pop_thread_default(context); }
+    } pop_thread_default{api, context};
 
     void* discoverer = api->discoverer_new(timeout_ns(config.read_timeout), &error);
     if (discoverer == nullptr) {
@@ -448,27 +549,77 @@ struct AudioPassthroughSource::Impl {
     }
     const std::unique_ptr<void, GstreamerAudioApi::GObjectUnref> discoverer_owner(
         discoverer, api->g_object_unref);
-    void* info = api->discoverer_discover_uri(discoverer, static_cast<const char*>(uri), &error);
-    if (info == nullptr) {
-      throw AudioPassthroughError(take_error(error, "failed to inspect audio input streams"));
-    }
-    const std::unique_ptr<void, GstreamerAudioApi::GObjectUnref> info_owner(info,
-                                                                            api->g_object_unref);
-    const int result = api->discoverer_info_get_result(info);
-    constexpr int kDiscovererOk = 0;
-    constexpr int kDiscovererMissingPlugins = 5;
-    if (result != kDiscovererOk && result != kDiscovererMissingPlugins) {
-      throw AudioPassthroughError(take_error(error, "GStreamer audio stream discovery failed"));
-    }
     if (error != nullptr) {
       api->error_free(error);
+      error = nullptr;
     }
-    void* streams = api->discoverer_info_get_audio_streams(info);
-    if (streams == nullptr) {
+
+    DiscoverySignalState discovery{.api = api.get()};
+    const auto signal_id = api->signal_connect_data(
+        discoverer, "discovered",
+        reinterpret_cast<GstreamerAudioApi::GenericCallback>(discovery_completed), &discovery,
+        nullptr, 0);
+    if (signal_id == 0) {
+      throw AudioPassthroughError("failed to connect the audio discovery result handler");
+    }
+    struct DisconnectSignal {
+      std::shared_ptr<GstreamerAudioApi> api;
+      void* discoverer = nullptr;
+      unsigned long signal_id = 0;
+      ~DisconnectSignal() { api->signal_handler_disconnect(discoverer, signal_id); }
+    } disconnect_signal{api, discoverer, signal_id};
+
+    struct ActiveDiscovery {
+      Impl* owner = nullptr;
+      void* discoverer = nullptr;
+      void* context = nullptr;
+      bool started = false;
+      ~ActiveDiscovery() {
+        {
+          std::lock_guard lock(owner->resources_mutex);
+          if (owner->active_discoverer == discoverer) {
+            owner->active_discoverer = nullptr;
+            owner->active_discovery_context = nullptr;
+          }
+        }
+        if (started) {
+          owner->api->discoverer_stop(discoverer);
+        }
+      }
+    } active{this, discoverer, context};
+
+    int queued = 0;
+    {
+      std::lock_guard lock(resources_mutex);
+      if (stopped.load(std::memory_order_acquire)) {
+        return false;
+      }
+      active_discoverer = discoverer;
+      active_discovery_context = context;
+      api->discoverer_start(discoverer);
+      active.started = true;
+      queued = api->discoverer_discover_uri_async(discoverer, static_cast<const char*>(uri));
+    }
+    if (queued == 0) {
+      throw AudioPassthroughError("failed to queue audio input stream discovery");
+    }
+    while (!discovery.completed && !stopped.load(std::memory_order_acquire)) {
+      (void)api->main_context_iteration(context, 1);
+    }
+    if (stopped.load(std::memory_order_acquire)) {
       return false;
     }
-    api->discoverer_stream_info_list_free(streams);
-    return true;
+    if (discovery.callback_failed) {
+      throw AudioPassthroughError("audio discovery result handling failed");
+    }
+    constexpr int kDiscovererOk = 0;
+    constexpr int kDiscovererMissingPlugins = 5;
+    if (discovery.result != kDiscovererOk && discovery.result != kDiscovererMissingPlugins) {
+      throw AudioPassthroughError(discovery.error.empty()
+                                      ? "GStreamer audio stream discovery failed"
+                                      : std::move(discovery.error));
+    }
+    return discovery.has_audio;
   }
 
   std::optional<std::string> take_bus_error() {
@@ -476,20 +627,18 @@ struct AudioPassthroughSource::Impl {
     if (message == nullptr) {
       return std::nullopt;
     }
+    const std::unique_ptr<void, GstreamerAudioApi::MessageUnref> message_owner(message,
+                                                                               api->message_unref);
     GErrorAbi* error = nullptr;
     char* debug = nullptr;
     api->message_parse_error(message, &error, &debug);
+    const std::unique_ptr<GErrorAbi, GstreamerAudioApi::ErrorFree> error_owner(error,
+                                                                               api->error_free);
+    const std::unique_ptr<void, GstreamerAudioApi::Free> debug_owner(debug, api->free);
     std::string detail = "compressed audio pipeline failed";
     if (error != nullptr && error->message != nullptr) {
       detail = error->message;
     }
-    if (error != nullptr) {
-      api->error_free(error);
-    }
-    if (debug != nullptr) {
-      api->free(debug);
-    }
-    api->message_unref(message);
     return detail;
   }
 
@@ -517,7 +666,6 @@ struct AudioPassthroughSource::Impl {
       segment_output_anchor = next_output_ns;
       segment_output_end = next_output_ns + selected_duration;
       trim_before_ns = trim;
-      segment_source_anchor.reset();
       const bool supported_container = !gpu_decode_path_is_elementary_stream(segment->path) &&
                                        gpu_decode_container_for_path(segment->path).has_value();
       if (supported_container && segment_has_audio(segment->path)) {
@@ -532,44 +680,34 @@ struct AudioPassthroughSource::Impl {
     const auto description = build_gstreamer_audio_passthrough_pipeline(segment->path);
     GErrorAbi* error = nullptr;
     void* candidate_pipeline = api->parse_launch(description.c_str(), &error);
+    const std::unique_ptr<GErrorAbi, GstreamerAudioApi::ErrorFree> parse_error_owner(
+        error, api->error_free);
+    std::unique_ptr<void, GstreamerAudioApi::ObjectUnref> candidate_pipeline_owner(
+        candidate_pipeline, api->object_unref);
     if (candidate_pipeline == nullptr || error != nullptr) {
       std::string detail = "failed to construct compressed audio pipeline";
-      if (error != nullptr) {
-        if (error->message != nullptr) {
-          detail = error->message;
-        }
-        api->error_free(error);
-      }
-      if (candidate_pipeline != nullptr) {
-        api->object_unref(candidate_pipeline);
+      if (parse_error_owner != nullptr && parse_error_owner->message != nullptr) {
+        detail = parse_error_owner->message;
       }
       throw AudioPassthroughError(detail);
     }
     void* candidate_sink = api->bin_get_by_name(candidate_pipeline, "audio_sink");
     void* candidate_bus = api->element_get_bus(candidate_pipeline);
-    const auto close_candidate = [&]() noexcept {
-      (void)api->element_set_state(candidate_pipeline, kGstStateNull);
-      if (candidate_sink != nullptr) {
-        api->object_unref(candidate_sink);
-      }
-      if (candidate_bus != nullptr) {
-        api->object_unref(candidate_bus);
-      }
-      api->object_unref(candidate_pipeline);
-    };
+    std::unique_ptr<void, GstreamerAudioApi::ObjectUnref> candidate_sink_owner(candidate_sink,
+                                                                               api->object_unref);
+    std::unique_ptr<void, GstreamerAudioApi::ObjectUnref> candidate_bus_owner(candidate_bus,
+                                                                              api->object_unref);
     if (candidate_sink == nullptr || candidate_bus == nullptr) {
-      close_candidate();
       throw AudioPassthroughError("compressed audio pipeline is missing appsink or bus resources");
     }
     {
       std::lock_guard lock(resources_mutex);
       if (stopped.load(std::memory_order_acquire)) {
-        close_candidate();
         return false;
       }
-      pipeline = candidate_pipeline;
-      sink = candidate_sink;
-      bus = candidate_bus;
+      pipeline = candidate_pipeline_owner.release();
+      sink = candidate_sink_owner.release();
+      bus = candidate_bus_owner.release();
       if (api->element_set_state(pipeline, kGstStatePlaying) == kGstStateChangeFailure) {
         close_segment_locked();
         throw AudioPassthroughError("compressed audio pipeline failed to enter PLAYING");
@@ -601,10 +739,9 @@ struct AudioPassthroughSource::Impl {
   std::optional<CompressedAudioPacket> pull_current() {
     for (;;) {
       void* sample = api->app_sink_try_pull_sample(sink, timeout_ns(config.read_timeout));
+      const std::unique_ptr<void, GstreamerAudioApi::SampleUnref> sample_owner(sample,
+                                                                               api->sample_unref);
       if (stopped.load(std::memory_order_acquire)) {
-        if (sample != nullptr) {
-          api->sample_unref(sample);
-        }
         return std::nullopt;
       }
       if (sample == nullptr) {
@@ -623,73 +760,72 @@ struct AudioPassthroughSource::Impl {
 
       void* buffer = api->sample_get_buffer(sample);
       void* sample_caps = api->sample_get_caps(sample);
-      if (buffer == nullptr || sample_caps == nullptr) {
-        api->sample_unref(sample);
+      const void* segment = api->sample_get_segment(sample);
+      if (buffer == nullptr || sample_caps == nullptr || segment == nullptr) {
         throw AudioPassthroughError("compressed audio sample is missing buffer or caps metadata");
       }
       char* caps_text = api->caps_to_string(sample_caps);
+      const std::unique_ptr<void, GstreamerAudioApi::Free> caps_text_owner(caps_text, api->free);
       if (caps_text == nullptr || caps_text[0] == '\0') {
-        if (caps_text != nullptr) {
-          api->free(caps_text);
-        }
-        api->sample_unref(sample);
         throw AudioPassthroughError("compressed audio sample has empty negotiated caps");
       }
       const std::string negotiated_caps(caps_text);
-      api->free(caps_text);
       if (!caps_value.has_value()) {
         caps_value = negotiated_caps;
       } else if (*caps_value != negotiated_caps) {
-        api->sample_unref(sample);
         throw AudioPassthroughError("chained audio segments negotiated incompatible caps");
       }
 
       const auto* header = static_cast<const GstBufferAbi*>(buffer);
-      const auto pts = finite_timestamp(header->pts);
-      const auto dts = finite_timestamp(header->dts);
+      const auto to_stream_time = [&](std::uint64_t value,
+                                      std::string_view name) -> std::optional<std::uint64_t> {
+        if (!finite_timestamp(value).has_value()) {
+          return std::nullopt;
+        }
+        const auto stream_time = api->segment_to_stream_time(segment, kGstFormatTime, value);
+        if (stream_time == kGstClockTimeNone) {
+          throw AudioPassthroughError("compressed audio " + std::string(name) +
+                                      " cannot be converted to stream time");
+        }
+        return stream_time;
+      };
+      const auto pts = to_stream_time(header->pts, "PTS");
+      const auto dts = to_stream_time(header->dts, "DTS");
       const auto timestamp = pts.has_value() && dts.has_value()
                                  ? std::optional(std::min(*pts, *dts))
                                  : (pts.has_value() ? pts : dts);
       if (!timestamp.has_value()) {
-        api->sample_unref(sample);
         throw AudioPassthroughError(
             "compressed audio packet has no presentation or decode timestamp");
       }
       if (*timestamp < trim_before_ns) {
-        api->sample_unref(sample);
         continue;
-      }
-      if (!segment_source_anchor.has_value()) {
-        segment_source_anchor = trim_before_ns > 0 ? trim_before_ns : *timestamp;
       }
 
       const auto packet_size = api->buffer_get_size(buffer);
       if (packet_size == 0 || packet_size > kMaximumCompressedAudioPacketBytes) {
-        api->sample_unref(sample);
         throw AudioPassthroughError("compressed audio packet size is outside the supported bound");
       }
       CompressedAudioPacket packet;
       packet.bytes.resize(packet_size);
       if (api->buffer_extract(buffer, 0, packet.bytes.data(), packet.bytes.size()) !=
           packet.bytes.size()) {
-        api->sample_unref(sample);
         throw AudioPassthroughError("failed to copy the bounded compressed audio packet");
       }
-      const auto source_anchor = *segment_source_anchor;
       if (pts.has_value()) {
-        packet.pts_ns = adjusted_timestamp(*pts, source_anchor, segment_output_anchor);
+        packet.pts_ns = adjusted_timestamp(*pts, trim_before_ns, segment_output_anchor);
       }
       if (dts.has_value()) {
-        packet.dts_ns = adjusted_timestamp(*dts, source_anchor, segment_output_anchor);
+        packet.dts_ns = adjusted_timestamp(*dts, trim_before_ns, segment_output_anchor);
       }
       packet.duration_ns = header->duration == kGstClockTimeNone ? 0 : header->duration;
       packet.flags = header->mini_object.flags;
-      api->sample_unref(sample);
 
-      const auto output_timestamp = packet.pts_ns.value_or(packet.dts_ns.value_or(0));
+      const auto output_timestamp = packet.timestamp_ns().value_or(0);
       if (!segment_output_end.has_value() || output_timestamp >= *segment_output_end) {
         return std::nullopt;
       }
+      packet.duration_ns = std::min(packet.duration_ns, *segment_output_end - output_timestamp);
       const auto duration = packet.duration_ns;
       next_output_ns = output_timestamp > std::numeric_limits<std::uint64_t>::max() - duration
                            ? std::numeric_limits<std::uint64_t>::max()
@@ -742,9 +878,10 @@ struct AudioPassthroughSource::Impl {
   void* pipeline = nullptr;
   void* sink = nullptr;
   void* bus = nullptr;
+  void* active_discoverer = nullptr;
+  void* active_discovery_context = nullptr;
   std::optional<std::string> caps_value;
   std::optional<CompressedAudioPacket> pending;
-  std::optional<std::uint64_t> segment_source_anchor;
   std::optional<std::uint64_t> segment_output_end;
   std::uint64_t segment_output_anchor = 0;
   std::uint64_t trim_before_ns = 0;

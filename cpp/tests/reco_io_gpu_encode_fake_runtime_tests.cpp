@@ -666,6 +666,65 @@ void compressed_audio_source_handles_absence_and_incompatible_caps(
                      "incompatible chained compressed audio fails closed");
 }
 
+void compressed_audio_preserves_stream_time_offsets(const std::filesystem::path& event_path) {
+  std::filesystem::remove(event_path);
+  set_scenario("audio-nonzero-origin-delayed");
+  auto source = AudioPassthroughSource::open(
+      {.segments = {{.path = "first.mp4", .video_duration_ns = 80'000'000ULL},
+                    {.path = "second.mp4", .video_duration_ns = 80'000'000ULL}},
+       .start_time_ns = 20'000'000ULL});
+
+  std::vector<std::uint64_t> timestamps;
+  std::vector<std::uint64_t> durations;
+  for (;;) {
+    auto result = source.read();
+    if (result.status == AudioPassthroughStatus::EndOfStream) {
+      break;
+    }
+    expect_true(result.packet.has_value(), "offset audio result contains a packet");
+    if (result.packet.has_value()) {
+      timestamps.push_back(
+          result.packet->pts_ns.value_or(std::numeric_limits<std::uint64_t>::max()));
+      durations.push_back(result.packet->duration_ns);
+    }
+  }
+  expect_true(timestamps ==
+                  std::vector<std::uint64_t>({10'000'000, 30'000'000, 50'000'000, 70'000'000,
+                                              90'000'000, 110'000'000, 130'000'000}),
+              "stream-time conversion preserves delayed audio across trimmed video segments");
+  expect_true(durations ==
+                  std::vector<std::uint64_t>({20'000'000, 20'000'000, 10'000'000, 20'000'000,
+                                              20'000'000, 20'000'000, 10'000'000}),
+              "audio packets are clipped to cumulative video segment boundaries");
+}
+
+void compressed_audio_prime_failures_release_resources(const std::filesystem::path& event_path) {
+  for (const auto& [scenario, error] : std::vector<std::pair<std::string_view, std::string_view>>{
+           {"audio-prime-timeout", "timed out waiting"},
+           {"audio-invalid-segment-time", "cannot be converted to stream time"},
+       }) {
+    std::filesystem::remove(event_path);
+    set_scenario(scenario);
+    expect_audio_error(
+        [&] {
+          (void)AudioPassthroughSource::open(
+              {.segments = {{.path = "first.mp4", .video_duration_ns = 80'000'000ULL}}});
+        },
+        error, "audio prime failure is reported");
+    const auto events = read_events(event_path);
+    expect_eq(count_event(events, "state-playing"), 1U, "audio prime failure starts one pipeline");
+    expect_eq(count_event(events, "state-null"), 1U,
+              "audio prime failure stops the partial pipeline");
+    expect_eq(count_event(events, "unref-sink"), 1U,
+              "audio prime failure releases the partial sink");
+    expect_eq(count_event(events, "unref-bus"), 1U, "audio prime failure releases the partial bus");
+    expect_eq(count_event(events, "unref-pipeline"), 1U,
+              "audio prime failure releases the partial pipeline");
+    expect_eq(count_event(events, "unref-discoverer"), 1U,
+              "audio prime failure releases its discoverer");
+  }
+}
+
 void compressed_audio_stop_interrupts_concurrent_read(const std::filesystem::path& event_path) {
   using namespace std::chrono_literals;
   std::filesystem::remove(event_path);
@@ -687,6 +746,31 @@ void compressed_audio_stop_interrupts_concurrent_read(const std::filesystem::pat
   expect_true(read.get().status == AudioPassthroughStatus::EndOfStream,
               "interrupted compressed audio read reports terminal status");
   source.request_stop();
+}
+
+void compressed_audio_stop_interrupts_discovery(const std::filesystem::path& event_path) {
+  using namespace std::chrono_literals;
+  std::filesystem::remove(event_path);
+  set_scenario("audio-stop-blocked-discovery");
+  auto source = AudioPassthroughSource::open(
+      {.segments = {{.path = "first.mp4", .video_duration_ns = 20'000'000ULL},
+                    {.path = "second.mp4", .video_duration_ns = 80'000'000ULL}},
+       .read_timeout = std::chrono::seconds(30)});
+  expect_true(source.read().status == AudioPassthroughStatus::Packet,
+              "primed audio packet is returned before blocked discovery");
+  auto read = std::async(std::launch::async, [&] { return source.read(); });
+  expect_true(wait_for_event(event_path, "discover-audio-blocked"),
+              "compressed audio read entered blocked segment discovery");
+  auto stop = std::async(std::launch::async, [&] { source.request_stop(); });
+  expect_true(stop.wait_for(500ms) == std::future_status::ready,
+              "audio request_stop interrupts and joins segment discovery");
+  stop.get();
+  expect_true(read.wait_for(500ms) == std::future_status::ready,
+              "interrupted segment discovery returns promptly");
+  expect_true(read.get().status == AudioPassthroughStatus::EndOfStream,
+              "interrupted segment discovery reports terminal status");
+  expect_eq(count_event(read_events(event_path), "unref-discoverer"), 2U,
+            "interrupted segment discovery releases every discoverer");
 }
 
 } // namespace
@@ -728,7 +812,10 @@ int main() {
     finish_is_serialized_and_abort_interrupts_waits(runtime, event_path);
     compressed_audio_source_trims_and_rebases_chained_segments(event_path);
     compressed_audio_source_handles_absence_and_incompatible_caps(event_path);
+    compressed_audio_preserves_stream_time_offsets(event_path);
+    compressed_audio_prime_failures_release_resources(event_path);
     compressed_audio_stop_interrupts_concurrent_read(event_path);
+    compressed_audio_stop_interrupts_discovery(event_path);
   } catch (const std::exception& error) {
     std::cerr << "FAIL: unexpected top-level error: " << error.what() << '\n';
     ++failures;

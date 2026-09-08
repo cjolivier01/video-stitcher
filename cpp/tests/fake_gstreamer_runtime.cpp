@@ -102,10 +102,13 @@ struct FakeObject {
 };
 
 struct FakePipeline;
+struct FakeDiscoverer;
+struct FakeMainContext;
 
 using FakePadProbeCallback = int (*)(void*, void*, void*);
 using FakeDestroyNotify = void (*)(void*);
 using FakeSignalCallback = void (*)(void*, void*, void*);
+using FakeDiscovererSignalCallback = void (*)(void*, void*, GErrorAbi*, void*);
 
 struct FakeSink : FakeObject {
   explicit FakeSink(FakePipeline* owner) : FakeObject(ObjectKind::Sink), pipeline(owner) {}
@@ -181,6 +184,23 @@ struct FakePad : FakeObject {
 
 struct FakeDiscoverer : FakeObject {
   FakeDiscoverer() : FakeObject(ObjectKind::Discoverer) {}
+  FakeMainContext* context = nullptr;
+  FakeDiscovererSignalCallback callback = nullptr;
+  void* callback_data = nullptr;
+  FakeDestroyNotify destroy_notify = nullptr;
+  unsigned long signal_id = 0;
+  std::string uri;
+  bool started = false;
+  bool stopped = false;
+  bool pending = false;
+  bool blocked = false;
+};
+
+struct FakeMainContext {
+  std::mutex mutex;
+  std::condition_variable changed;
+  FakeDiscoverer* discoverer = nullptr;
+  bool wake = false;
 };
 
 struct FakeDiscovererInfo : FakeObject {
@@ -277,6 +297,7 @@ struct FakeSample {
 };
 
 std::mutex event_mutex;
+thread_local FakeMainContext* thread_default_context = nullptr;
 
 std::string scenario() {
   const char* value = std::getenv("RECO_FAKE_GST_SCENARIO");
@@ -1428,9 +1449,17 @@ RECO_FAKE_EXPORT void gst_object_unref(void* object) {
     delete pad;
     break;
   }
-  case ObjectKind::Discoverer:
-    delete static_cast<FakeDiscoverer*>(object);
-    break;
+  case ObjectKind::Discoverer: {
+    auto* discoverer = static_cast<FakeDiscoverer*>(object);
+    if (discoverer->context != nullptr) {
+      std::lock_guard lock(discoverer->context->mutex);
+      if (discoverer->context->discoverer == discoverer) {
+        discoverer->context->discoverer = nullptr;
+      }
+    }
+    record("unref-discoverer");
+    delete discoverer;
+  } break;
   case ObjectKind::DiscovererInfo:
     delete static_cast<FakeDiscovererInfo*>(object);
     break;
@@ -1445,12 +1474,139 @@ RECO_FAKE_EXPORT char* gst_filename_to_uri(const char* path, GErrorAbi**) {
 
 RECO_FAKE_EXPORT void* gst_discoverer_new(std::uint64_t, GErrorAbi**) { return new FakeDiscoverer; }
 
+RECO_FAKE_EXPORT void gst_discoverer_start(void* discoverer_pointer) {
+  auto* discoverer = static_cast<FakeDiscoverer*>(discoverer_pointer);
+  discoverer->context = thread_default_context;
+  discoverer->started = true;
+  discoverer->stopped = false;
+  if (discoverer->context != nullptr) {
+    std::lock_guard lock(discoverer->context->mutex);
+    discoverer->context->discoverer = discoverer;
+  }
+  record("start-discoverer");
+}
+
+RECO_FAKE_EXPORT void gst_discoverer_stop(void* discoverer_pointer) {
+  auto* discoverer = static_cast<FakeDiscoverer*>(discoverer_pointer);
+  if (discoverer == nullptr) {
+    return;
+  }
+  if (discoverer->context != nullptr) {
+    {
+      std::lock_guard lock(discoverer->context->mutex);
+      discoverer->stopped = true;
+      discoverer->pending = false;
+    }
+    discoverer->context->changed.notify_all();
+  } else {
+    discoverer->stopped = true;
+    discoverer->pending = false;
+  }
+  record("stop-discoverer");
+}
+
+RECO_FAKE_EXPORT int gst_discoverer_discover_uri_async(void* discoverer_pointer, const char* uri) {
+  auto* discoverer = static_cast<FakeDiscoverer*>(discoverer_pointer);
+  if (discoverer == nullptr || !discoverer->started || discoverer->context == nullptr ||
+      uri == nullptr) {
+    return 0;
+  }
+  {
+    std::lock_guard lock(discoverer->context->mutex);
+    if (discoverer->stopped) {
+      return 0;
+    }
+    discoverer->uri = uri;
+    discoverer->pending = true;
+  }
+  discoverer->context->changed.notify_all();
+  return 1;
+}
+
 RECO_FAKE_EXPORT void* gst_discoverer_discover_uri(void*, const char* uri, GErrorAbi**) {
   record("discover-audio");
   const bool silent_middle = scenario() == "audio-silent-middle" && uri != nullptr &&
                              std::string_view(uri).find("silent") != std::string_view::npos;
   return new FakeDiscovererInfo(scenario() != "audio-no-stream" && !silent_middle,
                                 scenario() != "encoded-output-no-video");
+}
+
+RECO_FAKE_EXPORT void* g_main_context_new() { return new FakeMainContext; }
+
+RECO_FAKE_EXPORT void g_main_context_push_thread_default(void* context) {
+  thread_default_context = static_cast<FakeMainContext*>(context);
+}
+
+RECO_FAKE_EXPORT void g_main_context_pop_thread_default(void* context) {
+  if (thread_default_context == context) {
+    thread_default_context = nullptr;
+  }
+}
+
+RECO_FAKE_EXPORT int g_main_context_iteration(void* context_pointer, int may_block) {
+  auto* context = static_cast<FakeMainContext*>(context_pointer);
+  if (context == nullptr) {
+    return 0;
+  }
+  std::unique_lock lock(context->mutex);
+  const auto ready = [&] {
+    return context->wake || (context->discoverer != nullptr &&
+                             (context->discoverer->pending || context->discoverer->stopped));
+  };
+  if (may_block != 0) {
+    context->changed.wait(lock, ready);
+  } else if (!ready()) {
+    return 0;
+  }
+  context->wake = false;
+  auto* discoverer = context->discoverer;
+  if (discoverer == nullptr || discoverer->stopped || !discoverer->pending) {
+    return 0;
+  }
+  const bool block_discovery = scenario() == "audio-stop-blocked-discovery" &&
+                               discoverer->uri.find("second.mp4") != std::string::npos;
+  if (block_discovery) {
+    if (!discoverer->blocked) {
+      discoverer->blocked = true;
+      record("discover-audio-blocked");
+    }
+    context->changed.wait(lock, [&] { return discoverer->stopped || context->wake; });
+    context->wake = false;
+    return 0;
+  }
+
+  const auto uri = discoverer->uri;
+  const auto callback = discoverer->callback;
+  void* callback_data = discoverer->callback_data;
+  discoverer->pending = false;
+  lock.unlock();
+
+  record("discover-audio");
+  const bool silent_middle =
+      scenario() == "audio-silent-middle" && uri.find("silent") != std::string::npos;
+  auto* info = new FakeDiscovererInfo(scenario() != "audio-no-stream" && !silent_middle,
+                                      scenario() != "encoded-output-no-video");
+  if (callback != nullptr) {
+    callback(discoverer, info, nullptr, callback_data);
+  }
+  delete info;
+  return 1;
+}
+
+RECO_FAKE_EXPORT void g_main_context_wakeup(void* context_pointer) {
+  auto* context = static_cast<FakeMainContext*>(context_pointer);
+  if (context == nullptr) {
+    return;
+  }
+  {
+    std::lock_guard lock(context->mutex);
+    context->wake = true;
+  }
+  context->changed.notify_all();
+}
+
+RECO_FAKE_EXPORT void g_main_context_unref(void* context) {
+  delete static_cast<FakeMainContext*>(context);
 }
 
 RECO_FAKE_EXPORT int gst_discoverer_info_get_result(const void*) { return 0; }
@@ -1567,13 +1723,29 @@ RECO_FAKE_EXPORT void* gst_mini_object_get_qdata(void* object, std::uint32_t) {
 
 RECO_FAKE_EXPORT std::uint32_t g_quark_from_static_string(const char*) { return 1; }
 
-RECO_FAKE_EXPORT unsigned long g_signal_connect_data(void* instance, const char*,
+RECO_FAKE_EXPORT unsigned long g_signal_connect_data(void* instance, const char* signal,
                                                      void (*callback)(), void* data,
                                                      FakeDestroyNotify destroy_notify, int) {
-  auto* budget = static_cast<FakeInputBudget*>(instance);
-  if (budget == nullptr || budget->kind != ObjectKind::InputBudget || callback == nullptr) {
+  auto* object = static_cast<FakeObject*>(instance);
+  if (object == nullptr || callback == nullptr) {
     return 0;
   }
+  if (object->kind == ObjectKind::Discoverer) {
+    if (signal == nullptr || std::strcmp(signal, "discovered") != 0) {
+      return 0;
+    }
+    auto* discoverer = static_cast<FakeDiscoverer*>(instance);
+    discoverer->callback = reinterpret_cast<FakeDiscovererSignalCallback>(callback);
+    discoverer->callback_data = data;
+    discoverer->destroy_notify = destroy_notify;
+    discoverer->signal_id = 1;
+    record("connect-discoverer");
+    return discoverer->signal_id;
+  }
+  if (object->kind != ObjectKind::InputBudget) {
+    return 0;
+  }
+  auto* budget = static_cast<FakeInputBudget*>(instance);
   budget->callback = reinterpret_cast<FakeSignalCallback>(callback);
   budget->callback_data = data;
   budget->destroy_notify = destroy_notify;
@@ -1583,9 +1755,30 @@ RECO_FAKE_EXPORT unsigned long g_signal_connect_data(void* instance, const char*
 }
 
 RECO_FAKE_EXPORT void g_signal_handler_disconnect(void* instance, unsigned long signal_id) {
+  auto* object = static_cast<FakeObject*>(instance);
+  if (object == nullptr) {
+    return;
+  }
+  if (object->kind == ObjectKind::Discoverer) {
+    auto* discoverer = static_cast<FakeDiscoverer*>(instance);
+    if (signal_id != discoverer->signal_id) {
+      return;
+    }
+    if (discoverer->destroy_notify != nullptr && discoverer->callback_data != nullptr) {
+      discoverer->destroy_notify(discoverer->callback_data);
+    }
+    discoverer->callback = nullptr;
+    discoverer->callback_data = nullptr;
+    discoverer->destroy_notify = nullptr;
+    discoverer->signal_id = 0;
+    record("disconnect-discoverer");
+    return;
+  }
+  if (object->kind != ObjectKind::InputBudget) {
+    return;
+  }
   auto* budget = static_cast<FakeInputBudget*>(instance);
-  if (budget == nullptr || budget->kind != ObjectKind::InputBudget ||
-      signal_id != budget->signal_id) {
+  if (signal_id != budget->signal_id) {
     return;
   }
   if (budget->destroy_notify != nullptr && budget->callback_data != nullptr) {
@@ -2028,6 +2221,9 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
       record("audio-pull-unblocked");
       return nullptr;
     }
+    if (current_scenario == "audio-prime-timeout") {
+      return nullptr;
+    }
     if (current_scenario == "audio-no-stream") {
       ++sink->pull_count;
       return nullptr;
@@ -2044,7 +2240,12 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
     }
     auto* sample = make_sample(packet_index);
     sample->pipeline = sink->pipeline;
-    sample->buffer.pts = static_cast<std::uint64_t>(packet_index) * 20'000'000ULL;
+    const bool nonzero_origin = current_scenario == "audio-nonzero-origin-delayed";
+    const auto origin = nonzero_origin ? 5'000'000'000ULL : 0ULL;
+    const auto delay = nonzero_origin ? 10'000'000ULL : 0ULL;
+    sample->segment_pts_offset_ns = origin;
+    sample->segment_outside = current_scenario == "audio-invalid-segment-time";
+    sample->buffer.pts = origin + delay + static_cast<std::uint64_t>(packet_index) * 20'000'000ULL;
     sample->buffer.dts = sample->buffer.pts;
     sample->buffer.duration = 20'000'000ULL;
     sample->buffer.offset = 4U;
