@@ -345,12 +345,15 @@ RECO_FAKE_CUDA_EXPORT int cuMemAddressFree(std::uint64_t, std::size_t) { return 
 #include <functional>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+#include "rules_cc/cc/runfiles/runfiles.h"
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -517,12 +520,22 @@ std::filesystem::path runtime_path(const char* environment_name, std::string_vie
   if (const char* explicit_path = std::getenv(environment_name); explicit_path != nullptr) {
     return explicit_path;
   }
-  const char* source_root = std::getenv("TEST_SRCDIR");
   const char* workspace = std::getenv("TEST_WORKSPACE");
-  if (source_root != nullptr && workspace != nullptr) {
-    return std::filesystem::path(source_root) / workspace / runfile;
+  if (workspace == nullptr || workspace[0] == '\0') {
+    throw std::runtime_error("TEST_WORKSPACE is not set");
   }
-  throw std::runtime_error(std::string("set ") + environment_name + " to the test runtime path");
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(&error));
+  if (!runfiles) {
+    throw std::runtime_error("failed to initialize Bazel runfiles: " + error);
+  }
+  const auto logical_path = std::string(workspace) + "/" + std::string(runfile);
+  const auto resolved = std::filesystem::path(runfiles->Rlocation(logical_path));
+  if (!resolved.empty() && std::filesystem::is_regular_file(resolved)) {
+    return resolved;
+  }
+  throw std::runtime_error(std::string("test runtime runfile not found: ") + std::string(runfile));
 }
 
 CudaRgbaFrameView rgba_frame(CudaDevicePtr base, CudaContextId context, int device = 0,
@@ -949,44 +962,54 @@ void hardware_parity_if_available() {
 } // namespace
 
 int main() {
+  try {
 #if defined(_WIN32)
-  constexpr std::string_view kFakeCudaRunfile =
-      "cpp/tests/reco_core_fake_cuda_rgba_to_nv12_driver.dll";
-  constexpr std::string_view kFakeNvrtcRunfile = "cpp/tests/reco_core_fake_nvrtc_runtime.dll";
+    constexpr std::string_view kFakeCudaRunfile =
+        "cpp/tests/reco_core_fake_cuda_rgba_to_nv12_driver.dll";
+    constexpr std::string_view kFakeNvrtcRunfile = "cpp/tests/reco_core_fake_nvrtc_runtime.dll";
 #else
-  constexpr std::string_view kFakeCudaRunfile =
-      "cpp/tests/libreco_core_fake_cuda_rgba_to_nv12_driver.so";
-  constexpr std::string_view kFakeNvrtcRunfile = "cpp/tests/libreco_core_fake_nvrtc_runtime.so";
+    constexpr std::string_view kFakeCudaRunfile =
+        "cpp/tests/libreco_core_fake_cuda_rgba_to_nv12_driver.so";
+    constexpr std::string_view kFakeNvrtcRunfile = "cpp/tests/libreco_core_fake_nvrtc_runtime.so";
 #endif
-  const auto cuda_runtime = runtime_path("RECO_TEST_FAKE_CUDA_DRIVER", kFakeCudaRunfile);
-  const auto nvrtc_runtime = runtime_path("RECO_TEST_FAKE_NVRTC_RUNTIME", kFakeNvrtcRunfile);
-  FakeCudaControl cuda_control(cuda_runtime);
-  FakeNvrtcControl nvrtc_control(nvrtc_runtime);
+    std::cerr << "RUN: fake runtime setup" << std::endl;
+    const auto cuda_runtime = runtime_path("RECO_TEST_FAKE_CUDA_DRIVER", kFakeCudaRunfile);
+    const auto nvrtc_runtime = runtime_path("RECO_TEST_FAKE_NVRTC_RUNTIME", kFakeNvrtcRunfile);
+    FakeCudaControl cuda_control(cuda_runtime);
+    FakeNvrtcControl nvrtc_control(nvrtc_runtime);
 
-  run_case("compile once and synchronize", [&] {
-    compiles_once_and_synchronizes(cuda_runtime, nvrtc_runtime, cuda_control, nvrtc_control);
-  });
-  run_case("configuration validation",
-           [&] { rejects_invalid_configuration(cuda_runtime, nvrtc_runtime, nvrtc_control); });
-  run_case("frame contract validation",
-           [&] { rejects_unsafe_frames(cuda_runtime, nvrtc_runtime, cuda_control); });
-  run_case("device access validation",
-           [&] { enforces_device_access_permissions(cuda_runtime, nvrtc_runtime, cuda_control); });
-  run_case("retained validation conversion path", [&] {
-    retained_validation_avoids_conversion_time_queries(cuda_runtime, nvrtc_runtime, cuda_control);
-  });
-  run_case("physical VMM alias validation",
-           [&] { rejects_physical_vmm_aliases(cuda_runtime, nvrtc_runtime, cuda_control); });
-  run_case("moved-from converter",
-           [&] { moved_from_converter_is_diagnosed(cuda_runtime, nvrtc_runtime); });
-  run_case("hardware parity", hardware_parity_if_available);
+    run_case("compile once and synchronize", [&] {
+      compiles_once_and_synchronizes(cuda_runtime, nvrtc_runtime, cuda_control, nvrtc_control);
+    });
+    run_case("configuration validation",
+             [&] { rejects_invalid_configuration(cuda_runtime, nvrtc_runtime, nvrtc_control); });
+    run_case("frame contract validation",
+             [&] { rejects_unsafe_frames(cuda_runtime, nvrtc_runtime, cuda_control); });
+    run_case("device access validation", [&] {
+      enforces_device_access_permissions(cuda_runtime, nvrtc_runtime, cuda_control);
+    });
+    run_case("retained validation conversion path", [&] {
+      retained_validation_avoids_conversion_time_queries(cuda_runtime, nvrtc_runtime, cuda_control);
+    });
+    run_case("physical VMM alias validation",
+             [&] { rejects_physical_vmm_aliases(cuda_runtime, nvrtc_runtime, cuda_control); });
+    run_case("moved-from converter",
+             [&] { moved_from_converter_is_diagnosed(cuda_runtime, nvrtc_runtime); });
+    run_case("hardware parity", hardware_parity_if_available);
 
-  if (failures != 0) {
-    std::cerr << failures << " test(s) failed\n";
+    if (failures != 0) {
+      std::cerr << failures << " test(s) failed\n";
+      return EXIT_FAILURE;
+    }
+    std::cout << "all tests passed\n";
+    return EXIT_SUCCESS;
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: test setup: " << error.what() << '\n';
+    return EXIT_FAILURE;
+  } catch (...) {
+    std::cerr << "FAIL: test setup threw a non-standard exception\n";
     return EXIT_FAILURE;
   }
-  std::cout << "all tests passed\n";
-  return EXIT_SUCCESS;
 }
 
 #endif

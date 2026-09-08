@@ -217,10 +217,18 @@ void write_text_descriptor(int descriptor, std::string_view contents) {
     }
     offset += static_cast<std::size_t>(written);
   }
+#if defined(_WIN32)
+  if (_commit(descriptor) != 0) {
+    throw std::system_error(errno, std::generic_category(), "cannot flush test output descriptor");
+  }
+#endif
 }
 
 std::string read_text_file(const std::filesystem::path& path) {
   std::ifstream input(path, std::ios::binary);
+  if (!input) {
+    throw std::runtime_error("cannot open test file " + path.string());
+  }
   return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
 }
 
