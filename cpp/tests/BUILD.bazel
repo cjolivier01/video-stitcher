@@ -210,7 +210,10 @@ cc_test(
         "fixtures/audio_only_mp4.b64",
         "fixtures/video_only_mp4.b64",
     ],
-    deps = ["//cpp/reco_io"],
+    deps = [
+        "//cpp/reco_io",
+        "@rules_cc//cc/runfiles",
+    ],
 )
 
 cc_test(
@@ -224,6 +227,7 @@ cc_test(
     deps = [
         "//cpp/reco_core",
         "//cpp/reco_io",
+        "@rules_cc//cc/runfiles",
     ],
 )
 

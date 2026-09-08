@@ -27,7 +27,7 @@ jobs:
             test_target: "//cpp/tests:all //cpp/reco_io:gpu_video_probe_protocol_tests"
           - os: windows-latest
             bazel_args: "--cxxopt=/std:c++20 --host_cxxopt=/std:c++20"
-            test_args: ""
+            test_args: "--test_env=RECO_SKIP_CUDA_TEST=1"
             test_target: "//cpp/reco_io:gpu_video_probe_protocol_tests //cpp/tests:reco_core_cuda_backend_tests //cpp/tests:reco_core_cuda_frame_tests //cpp/tests:reco_core_nvrtc_tests //cpp/tests:reco_core_cuda_stitch_renderer_tests //cpp/tests:reco_core_cuda_stitch_parity_tests //cpp/tests:reco_core_cuda_rgba_to_nv12_tests //cpp/tests:reco_core_data_tests //cpp/tests:reco_io_config_tests //cpp/tests:reco_io_gpu_video_probe_tests //cpp/tests:reco_io_gpu_decode_runtime_tests //cpp/tests:reco_io_gpu_decode_session_tests //cpp/tests:reco_io_audio_passthrough_runtime_tests //cpp/tests:reco_io_gpu_encode_tests //cpp/tests:reco_io_gpu_encode_fake_runtime_tests //cpp/tests:reco_io_gpu_encode_runtime_tests //cpp/tests:reco_cli_tests //cpp/tests:reco_gui_state_tests //cpp/tests:reco_io_gstreamer_tests //cpp/tests:reco_detect_ncnn_session_fake_runtime_tests //cpp/tests:reco_detect_ort_session_fake_runtime_tests //cpp/tests:reco_detect_ort_session_null_get_api_tests //cpp/tests:reco_detect_ort_session_unsupported_api_tests //cpp/tests:reco_detect_trt_engine_fake_runtime_tests"
     runs-on: ${{ matrix.os }}
     steps:

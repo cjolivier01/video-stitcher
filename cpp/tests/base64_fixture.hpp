@@ -6,22 +6,31 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "rules_cc/cc/runfiles/runfiles.h"
+
 namespace reco::tests {
 
 inline std::filesystem::path find_runfile(std::string_view filename) {
-  const char* runfiles = std::getenv("TEST_SRCDIR");
-  if (runfiles == nullptr || runfiles[0] == '\0') {
-    throw std::runtime_error("TEST_SRCDIR is not set");
+  const char* workspace = std::getenv("TEST_WORKSPACE");
+  if (workspace == nullptr || workspace[0] == '\0') {
+    throw std::runtime_error("TEST_WORKSPACE is not set");
   }
-  for (const auto& entry : std::filesystem::recursive_directory_iterator(runfiles)) {
-    if (entry.path().filename() == filename) {
-      return entry.path();
-    }
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(&error));
+  if (!runfiles) {
+    throw std::runtime_error("failed to initialize Bazel runfiles: " + error);
+  }
+  const auto logical_path = std::string(workspace) + "/cpp/tests/fixtures/" + std::string(filename);
+  const auto resolved = std::filesystem::path(runfiles->Rlocation(logical_path));
+  if (!resolved.empty() && std::filesystem::is_regular_file(resolved)) {
+    return resolved;
   }
   throw std::runtime_error("fixture runfile not found: " + std::string(filename));
 }

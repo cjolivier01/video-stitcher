@@ -373,6 +373,7 @@ static_assert(std::is_nothrow_move_assignable_v<CudaRgbaToNv12Converter>);
 int failures = 0;
 
 template <typename Function> void run_case(std::string_view name, Function&& function) {
+  std::cerr << "RUN: " << name << std::endl;
   try {
     function();
     std::cout << "PASS: " << name << '\n';

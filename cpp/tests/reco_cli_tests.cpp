@@ -31,6 +31,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <io.h>
 #include <windows.h>
 #else
 #include <fcntl.h>
@@ -194,6 +195,27 @@ void write_text_file(const std::filesystem::path& path, std::string_view content
   output.close();
   if (!output) {
     throw std::runtime_error("cannot write test file " + path.string());
+  }
+}
+
+void write_text_descriptor(int descriptor, std::string_view contents) {
+  std::size_t offset = 0;
+  while (offset < contents.size()) {
+#if defined(_WIN32)
+    const auto chunk_size = static_cast<unsigned int>(
+        std::min<std::size_t>(contents.size() - offset, std::numeric_limits<unsigned int>::max()));
+    const int written = _write(descriptor, contents.data() + offset, chunk_size);
+#else
+    const auto written = ::write(descriptor, contents.data() + offset, contents.size() - offset);
+#endif
+    if (written < 0 && errno == EINTR) {
+      continue;
+    }
+    if (written <= 0) {
+      throw std::system_error(errno == 0 ? EIO : errno, std::generic_category(),
+                              "cannot write test output descriptor");
+    }
+    offset += static_cast<std::size_t>(written);
   }
 }
 
@@ -784,7 +806,7 @@ void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
   const auto destination = root.path() / "stitched.mp4";
   {
     detail::AtomicOutputFile output(destination);
-    write_text_file(output.temporary_path(), "first encoded output\n");
+    write_text_descriptor(output.descriptor(), "first encoded output\n");
     expect_true(output.descriptor() >= 0, "stitch output exposes a retained descriptor");
     output.commit();
     output.commit();
@@ -794,7 +816,7 @@ void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
 
   {
     detail::AtomicOutputFile output(destination);
-    write_text_file(output.temporary_path(), "replacement encoded output\n");
+    write_text_descriptor(output.descriptor(), "replacement encoded output\n");
     output.commit();
   }
   expect_eq(read_text_file(destination), std::string("replacement encoded output\n"),
@@ -853,7 +875,7 @@ void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
   expect_true(!parent_symlink_error, "Windows stitch output parent symlink fixture is available");
   if (!parent_symlink_error) {
     detail::AtomicOutputFile output(active_parent / "stitched.mp4");
-    write_text_file(output.temporary_path(), "retained parent encoded output\n");
+    write_text_descriptor(output.descriptor(), "retained parent encoded output\n");
     std::filesystem::remove(active_parent);
     std::filesystem::create_directory_symlink(redirected_parent, active_parent);
     expect_eq(read_text_file(output.verification_path()),
