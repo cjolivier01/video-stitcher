@@ -710,8 +710,11 @@ void publish_windows_output(HANDLE directory, const std::filesystem::path& resol
                             const std::function<void(const std::filesystem::path&)>& before_replace,
                             const std::function<void()>& final_commit_gate,
                             bool force_legacy_rename) {
-  constexpr ACCESS_MASK access = FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
-  constexpr ULONG sharing = FILE_SHARE_READ;
+  // Observe the current entry without denying replacement. A share-accounted handle that denies
+  // delete access also blocks this process's atomic rename; Windows has no owner exemption or
+  // destination-file-ID compare-and-replace primitive.
+  constexpr ACCESS_MASK access = FILE_READ_ATTRIBUTES | SYNCHRONIZE;
+  constexpr ULONG sharing = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
   constexpr ULONG options =
       FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT;
   constexpr int maximum_replace_attempts = 200;

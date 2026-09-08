@@ -181,8 +181,9 @@ resolve_calibration_worker(const std::filesystem::path& executable_path);
 /// Publishes serialized calibration JSON after rechecking that it cannot replace an input or
 /// selected lens profile. The trailing controls are deterministic race hooks for publication
 /// tests; production callers leave them at their defaults. On Windows, `publication_fault_hook`
-/// runs at the final protected pre-commit boundary because an open destination cannot be rolled
-/// back atomically.
+/// runs at the final recoverable pre-commit boundary and the class-65 rename is the commit point.
+/// Reco writers are serialized, but a non-cooperating writer that races after the final identity
+/// check has atomic last-writer-wins semantics because Windows has no identity-conditional rename.
 void write_calibration_json_atomically(
     std::string_view json, const std::filesystem::path& destination,
     const std::filesystem::path& left_input, const std::filesystem::path& right_input,
