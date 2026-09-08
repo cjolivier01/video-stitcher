@@ -157,8 +157,8 @@ CalibrationConfig config() {
   return result;
 }
 
-void verify_frame_identity(const std::filesystem::path& path, NvbufSurfaceAbi abi,
-                           std::string_view side) {
+void verify_frame_identity(CudaBackend& backend, const std::filesystem::path& path,
+                           NvbufSurfaceAbi abi, std::string_view side) {
   auto source = open_gstreamer_gpu_file_decode_source(decode_config(path), abi);
   expect_true(source->gpu_resident(), std::string(side) + " decoder reports GPU residency");
   expect_true(source->pipeline().find("nvv4l2decoder") != std::string_view::npos,
@@ -184,6 +184,8 @@ void verify_frame_identity(const std::filesystem::path& path, NvbufSurfaceAbi ab
     const auto mapped = map_gpu_decoded_frame_to_cuda(*decoded.frame);
     expect_true(mapped.y_ptr != 0 && mapped.uv_ptr != 0,
                 std::string(side) + " frame maps to CUDA without host staging");
+    backend.validate_device_span(mapped.y_ptr, mapped.y_accessible_bytes, mapped.device_ordinal);
+    backend.validate_device_span(mapped.uv_ptr, mapped.uv_accessible_bytes, mapped.device_ordinal);
     expect_eq(mapped.width, kWidth, std::string(side) + " CUDA frame width");
     expect_eq(mapped.height, kHeight, std::string(side) + " CUDA frame height");
   }
@@ -439,10 +441,9 @@ void decoded_video_matches_rust_golden(const std::filesystem::path& left,
   expect_true(golden.at("frame_pts_ns") == kFramePtsNs,
               "golden records selected presentation timestamps");
 
-  verify_frame_identity(left, abi, "left");
-  verify_frame_identity(right, abi, "right");
-
   auto backend = CudaBackend::create();
+  verify_frame_identity(backend, left, abi, "left");
+  verify_frame_identity(backend, right, abi, "right");
   auto first_trace = std::make_shared<DeviceToHostTrace>();
   const auto first = calibrate_once(backend, left, right, abi, first_trace);
   auto second_trace = std::make_shared<DeviceToHostTrace>();

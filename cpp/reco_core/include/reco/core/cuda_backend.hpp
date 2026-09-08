@@ -159,7 +159,7 @@ public:
   void copy_host_to_device_2d(const CudaHostToDevice2DCopy& copy) const;
   void copy_device_to_device_2d(const Cuda2DCopy& copy) const;
   void copy_device_to_host_2d(const CudaDeviceToHost2DCopy& copy) const;
-  /// Validates that a claimed span is live device memory in the retained primary context.
+  /// Validates that a claimed span is live device memory accessible to the retained device.
   void validate_device_span(CudaDevicePtr ptr, std::size_t accessible_bytes,
                             int device_ordinal = 0) const;
   /// Loads one PTX module that can resolve and share ownership across multiple kernels.

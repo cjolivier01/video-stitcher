@@ -190,7 +190,6 @@ struct FakeCudaControl {
     synchronize_sequence_fn = library.symbol<int (*)()>("recoFakeCudaStitchSynchronizeSequence");
     pointer_attribute_count_fn =
         library.symbol<int (*)()>("recoFakeCudaStitchPointerAttributeCount");
-    address_range_count_fn = library.symbol<int (*)()>("recoFakeCudaStitchAddressRangeCount");
     captured_u64_fn = library.symbol<std::uint64_t (*)(int)>("recoFakeCudaStitchCapturedU64");
     captured_u32_fn = library.symbol<std::uint32_t (*)(int)>("recoFakeCudaStitchCapturedU32");
     captured_float_fn = library.symbol<float (*)(int)>("recoFakeCudaStitchCapturedFloat");
@@ -202,7 +201,6 @@ struct FakeCudaControl {
   int launch_sequence() const { return launch_sequence_fn(); }
   int synchronize_sequence() const { return synchronize_sequence_fn(); }
   int pointer_attribute_count() const { return pointer_attribute_count_fn(); }
-  int address_range_count() const { return address_range_count_fn(); }
   std::uint64_t captured_u64(int index) const { return captured_u64_fn(index); }
   std::uint32_t captured_u32(int index) const { return captured_u32_fn(index); }
   float captured_float(int index) const { return captured_float_fn(index); }
@@ -214,7 +212,6 @@ struct FakeCudaControl {
   int (*launch_sequence_fn)() = nullptr;
   int (*synchronize_sequence_fn)() = nullptr;
   int (*pointer_attribute_count_fn)() = nullptr;
-  int (*address_range_count_fn)() = nullptr;
   std::uint64_t (*captured_u64_fn)(int) = nullptr;
   std::uint32_t (*captured_u32_fn)(int) = nullptr;
   float (*captured_float_fn)(int) = nullptr;
@@ -316,10 +313,8 @@ void compiles_once_and_synchronizes_each_render(const std::filesystem::path& cud
   expect_eq(nvrtc_control.create_count(), 1, "render never recompiles the kernel");
   expect_eq(cuda_control.launch_count(), 2, "one fused launch per render");
   expect_eq(cuda_control.synchronize_count(), 2, "each render synchronizes before return");
-  expect_eq(cuda_control.pointer_attribute_count(), 40,
-            "each render validates all five pointers through four CUDA attributes");
-  expect_eq(cuda_control.address_range_count(), 10,
-            "each render validates all five pointer allocation bounds");
+  expect_eq(cuda_control.pointer_attribute_count(), 60,
+            "each render validates all five pointers through six CUDA attributes");
   expect_true(cuda_control.launch_sequence() < cuda_control.synchronize_sequence(),
               "launch precedes synchronization");
   expect_eq(cuda_control.captured_u64(0), left.y_plane().ptr(), "left Y pointer propagated");
@@ -465,7 +460,7 @@ void hardware_kernel_smoke_if_available() {
   auto left_uv = backend.allocate_pitched(4, 1, 4);
   auto right_y = backend.allocate_pitched(4, 2, 4);
   auto right_uv = backend.allocate_pitched(4, 1, 4);
-  auto output_storage = backend.allocate_pitched(16, 2, 4);
+  auto output_storage = backend.allocate_shared_memory(32);
   const std::vector<std::uint8_t> left_y_host(8, 82);
   const std::vector<std::uint8_t> left_uv_host{90, 240, 90, 240};
   const std::vector<std::uint8_t> right_y_host(8, 145);
@@ -494,7 +489,13 @@ void hardware_kernel_smoke_if_available() {
                                   .dst_pitch = right_uv.pitch,
                                   .width_bytes = 4,
                                   .height = 1});
-  backend.memset_d8(output_storage.buffer, 0xCD);
+  const std::vector<std::uint8_t> initial_output(32, 0xCD);
+  backend.copy_host_to_device_2d({.src = initial_output.data(),
+                                  .src_pitch = 16,
+                                  .dst = output_storage.ptr(),
+                                  .dst_pitch = 16,
+                                  .width_bytes = 16,
+                                  .height = 2});
 
   const CudaNv12FrameView left(
       CudaPitchedPlaneView(left_y.buffer.ptr(), left_y.buffer.size(), left_y.pitch, 4, 2, context),
@@ -506,17 +507,15 @@ void hardware_kernel_smoke_if_available() {
                                 CudaPitchedPlaneView(right_uv.buffer.ptr(), right_uv.buffer.size(),
                                                      right_uv.pitch, 4, 1, context),
                                 4, 2, YuvColorMatrix::Bt2020, YuvColorRange::Full);
-  const CudaRgbaFrameView output(CudaPitchedPlaneView(output_storage.buffer.ptr(),
-                                                      output_storage.buffer.size(),
-                                                      output_storage.pitch, 16, 2, context),
-                                 4, 2);
+  const CudaRgbaFrameView output(
+      CudaPitchedPlaneView(output_storage.ptr(), output_storage.size(), 16, 16, 2, context), 4, 2);
   auto renderer = CudaStereoStitchRenderer::create(config(), backend, NvrtcCompiler::create());
   renderer.render(left, right, output);
   std::vector<std::uint8_t> pixels(32, 0);
   backend.copy_device_to_host_2d({.dst = pixels.data(),
                                   .dst_pitch = 16,
-                                  .src = output_storage.buffer.ptr(),
-                                  .src_pitch = output_storage.pitch,
+                                  .src = output_storage.ptr(),
+                                  .src_pitch = 16,
                                   .width_bytes = 16,
                                   .height = 2});
   expect_true(

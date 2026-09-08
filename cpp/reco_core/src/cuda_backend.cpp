@@ -37,6 +37,8 @@ constexpr int kPointerAttributeContext = 1;
 constexpr int kPointerAttributeMemoryType = 2;
 constexpr int kPointerAttributeDeviceOrdinal = 9;
 constexpr int kPointerAttributeMapped = 13;
+constexpr int kPointerAttributeMappingSize = 18;
+constexpr int kPointerAttributeMappingBaseAddress = 19;
 constexpr unsigned int kMemAllocationTypePinned = 1;
 constexpr unsigned int kMemLocationTypeDevice = 1;
 #if defined(_WIN32)
@@ -270,8 +272,6 @@ struct CudaBackend::Impl {
     cu_memcpy_2d = driver.symbol<decltype(cu_memcpy_2d)>("cuMemcpy2D_v2");
     cu_memcpy_dtoh = driver.symbol<decltype(cu_memcpy_dtoh)>("cuMemcpyDtoH_v2");
     cu_mem_get_info = driver.symbol<decltype(cu_mem_get_info)>("cuMemGetInfo_v2");
-    cu_mem_get_address_range =
-        driver.symbol<decltype(cu_mem_get_address_range)>("cuMemGetAddressRange_v2");
     cu_pointer_get_attribute =
         driver.symbol<decltype(cu_pointer_get_attribute)>("cuPointerGetAttribute");
     cu_mem_get_allocation_granularity =
@@ -365,7 +365,6 @@ struct CudaBackend::Impl {
   CUresult (*cu_memcpy_2d)(const CudaMemcpy2D*) = nullptr;
   CUresult (*cu_memcpy_dtoh)(void*, CUdeviceptr, std::size_t) = nullptr;
   CUresult (*cu_mem_get_info)(std::size_t*, std::size_t*) = nullptr;
-  CUresult (*cu_mem_get_address_range)(CUdeviceptr*, std::size_t*, CUdeviceptr) = nullptr;
   CUresult (*cu_pointer_get_attribute)(void*, int, CUdeviceptr) = nullptr;
   CUresult (*cu_mem_get_allocation_granularity)(std::size_t*, const CudaMemAllocationProp*,
                                                 unsigned int) = nullptr;
@@ -973,6 +972,8 @@ void CudaBackend::validate_device_span(CudaDevicePtr ptr, std::size_t accessible
     unsigned int memory_type = 0;
     int pointer_device = -1;
     unsigned int mapped = 0;
+    std::size_t mapping_size = 0;
+    CUdeviceptr mapping_base = 0;
     check_cuda_pointer(
         "cuPointerGetAttribute(CONTEXT)",
         impl_->cu_pointer_get_attribute(&pointer_context, kPointerAttributeContext, ptr));
@@ -984,7 +985,14 @@ void CudaBackend::validate_device_span(CudaDevicePtr ptr, std::size_t accessible
         impl_->cu_pointer_get_attribute(&pointer_device, kPointerAttributeDeviceOrdinal, ptr));
     check_cuda_pointer("cuPointerGetAttribute(MAPPED)",
                        impl_->cu_pointer_get_attribute(&mapped, kPointerAttributeMapped, ptr));
-    if (pointer_context != retained_context) {
+    check_cuda_pointer(
+        "cuPointerGetAttribute(MAPPING_SIZE)",
+        impl_->cu_pointer_get_attribute(&mapping_size, kPointerAttributeMappingSize, ptr));
+    check_cuda_pointer(
+        "cuPointerGetAttribute(MAPPING_BASE_ADDR)",
+        impl_->cu_pointer_get_attribute(&mapping_base, kPointerAttributeMappingBaseAddress, ptr));
+    // CUDA VMM mappings are context-independent and report a null owning context.
+    if (pointer_context != nullptr && pointer_context != retained_context) {
       throw std::invalid_argument("CUDA device span belongs to a different CUDA context");
     }
     if (memory_type != kMemoryTypeDevice) {
@@ -997,17 +1005,13 @@ void CudaBackend::validate_device_span(CudaDevicePtr ptr, std::size_t accessible
       throw std::invalid_argument("CUDA device span is not mapped to a live allocation");
     }
 
-    CUdeviceptr allocation_base = 0;
-    std::size_t allocation_size = 0;
-    check_cuda_pointer("cuMemGetAddressRange_v2",
-                       impl_->cu_mem_get_address_range(&allocation_base, &allocation_size, ptr));
-    if (ptr < allocation_base) {
-      throw std::invalid_argument("CUDA device span precedes its allocation");
+    if (ptr < mapping_base) {
+      throw std::invalid_argument("CUDA device span precedes its mapping");
     }
-    const auto allocation_offset = ptr - allocation_base;
-    if (allocation_offset > allocation_size ||
-        accessible_bytes > allocation_size - static_cast<std::size_t>(allocation_offset)) {
-      throw std::invalid_argument("CUDA device span exceeds its allocation");
+    const auto mapping_offset = ptr - mapping_base;
+    if (mapping_offset > mapping_size ||
+        accessible_bytes > mapping_size - static_cast<std::size_t>(mapping_offset)) {
+      throw std::invalid_argument("CUDA device span exceeds its mapping");
     }
   } catch (...) {
     try {
