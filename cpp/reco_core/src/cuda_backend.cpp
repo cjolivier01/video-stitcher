@@ -463,7 +463,7 @@ public:
       backend_->ensure_primary_context(device_ordinal);
       current_ = backend_->current_context();
     } catch (...) {
-      backend_->restore_context(previous_);
+      backend_->restore_context_noexcept(previous_);
       throw;
     }
   }
@@ -652,7 +652,7 @@ struct CudaModule::State {
       try {
         check_cuda("cuModuleUnload", backend->cu_module_unload(module));
       } catch (...) {
-        backend->restore_context(previous_context);
+        backend->restore_context_noexcept(previous_context);
         throw;
       }
       backend->restore_context(previous_context);
@@ -791,7 +791,7 @@ CudaKernel CudaModule::load_kernel(std::string_view function_name) const {
     check_cuda("cuModuleGetFunction", state->backend->cu_module_get_function(
                                           &function, state->module, terminated_name.data()));
   } catch (...) {
-    state->backend->restore_context(previous_context);
+    state->backend->restore_context_noexcept(previous_context);
     throw;
   }
   state->backend->restore_context(previous_context);
@@ -837,7 +837,7 @@ void CudaKernel::launch_and_synchronize(const CudaLaunchConfig& config,
                                          nullptr, kernel_args, nullptr));
     check_cuda("cuCtxSynchronize", backend->cu_ctx_synchronize());
   } catch (...) {
-    backend->restore_context(previous_context);
+    backend->restore_context_noexcept(previous_context);
     throw;
   }
   backend->restore_context(previous_context);
@@ -860,7 +860,7 @@ void CudaKernel::launch(const CudaLaunchConfig& config, std::span<void*> args) c
                                          config.block.y, config.block.z, config.shared_memory_bytes,
                                          nullptr, kernel_args, nullptr));
   } catch (...) {
-    backend->restore_context(previous_context);
+    backend->restore_context_noexcept(previous_context);
     throw;
   }
   backend->restore_context(previous_context);
@@ -876,7 +876,7 @@ void CudaKernel::synchronize() const {
   try {
     check_cuda("cuCtxSynchronize", backend->cu_ctx_synchronize());
   } catch (...) {
-    backend->restore_context(previous_context);
+    backend->restore_context_noexcept(previous_context);
     throw;
   }
   backend->restore_context(previous_context);

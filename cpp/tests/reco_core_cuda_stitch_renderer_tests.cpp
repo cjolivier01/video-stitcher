@@ -226,6 +226,7 @@ struct FakeCudaControl {
         library.symbol<void (*)(std::uintptr_t)>("recoFakeCudaStitchFailNextSetCurrent");
     current_context_fn = library.symbol<std::uintptr_t (*)()>("recoFakeCudaStitchCurrentContext");
     fail_module_load_fn = library.symbol<void (*)(int)>("recoFakeCudaStitchFailModuleLoad");
+    fail_kernel_launch_fn = library.symbol<void (*)()>("recoFakeCudaStitchFailKernelLaunch");
     captured_u64_fn = library.symbol<std::uint64_t (*)(int)>("recoFakeCudaStitchCapturedU64");
     captured_u32_fn = library.symbol<std::uint32_t (*)(int)>("recoFakeCudaStitchCapturedU32");
     captured_float_fn = library.symbol<float (*)(int)>("recoFakeCudaStitchCapturedFloat");
@@ -245,6 +246,7 @@ struct FakeCudaControl {
   void fail_next_set_current(std::uintptr_t context) const { fail_next_set_current_fn(context); }
   std::uintptr_t current_context() const { return current_context_fn(); }
   void fail_module_load(bool fail) const { fail_module_load_fn(fail ? 1 : 0); }
+  void fail_kernel_launch() const { fail_kernel_launch_fn(); }
   std::uint64_t captured_u64(int index) const { return captured_u64_fn(index); }
   std::uint32_t captured_u32(int index) const { return captured_u32_fn(index); }
   float captured_float(int index) const { return captured_float_fn(index); }
@@ -264,6 +266,7 @@ struct FakeCudaControl {
   void (*fail_next_set_current_fn)(std::uintptr_t) = nullptr;
   std::uintptr_t (*current_context_fn)() = nullptr;
   void (*fail_module_load_fn)(int) = nullptr;
+  void (*fail_kernel_launch_fn)() = nullptr;
   std::uint64_t (*captured_u64_fn)(int) = nullptr;
   std::uint32_t (*captured_u32_fn)(int) = nullptr;
   float (*captured_float_fn)(int) = nullptr;
@@ -454,16 +457,17 @@ void render_synchronizes_before_restoring_the_caller_context(
 
   cuda_control.reset();
   cuda_control.set_current_context(kCallerContext);
+  cuda_control.fail_kernel_launch();
   cuda_control.fail_next_set_current(kCallerContext);
   try {
     renderer.render(left, right, output);
-    expect_true(false, "caller-context restoration failure is reported");
-  } catch (const std::runtime_error&) {
+    expect_true(false, "combined launch and restoration failure is reported");
+  } catch (const std::runtime_error& error) {
+    expect_true(std::string_view(error.what()).find("cuLaunchKernel") != std::string_view::npos,
+                "launch failure is preserved when caller-context restoration also fails");
   }
-  expect_eq(cuda_control.launch_count(), 1,
-            "restoration failure occurs after the borrowed-memory kernel launch");
-  expect_eq(cuda_control.synchronize_count(), 1,
-            "restoration failure occurs after borrowed-memory synchronization");
+  expect_eq(cuda_control.launch_count(), 0, "failed launch is not reported as submitted work");
+  expect_eq(cuda_control.synchronize_count(), 0, "failed launch is not synchronized");
   expect_true(!backend.context_healthy(), "restoration failure poisons backend context health");
   expect_true(backend.context_health_error().find("restoration previously failed") !=
                   std::string::npos,

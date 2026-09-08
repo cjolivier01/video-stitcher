@@ -77,6 +77,14 @@ bool same_frame_info(const NvmmFrameInfo& lhs, const NvmmFrameInfo& rhs) {
          lhs.color_range == rhs.color_range && lhs.surface_ptr == rhs.surface_ptr;
 }
 
+std::pair<std::uint32_t, std::uint32_t> effective_plane_sizes(const NvmmFrameInfo& info) {
+  if (info.y_size == 0 && info.uv_size == 0 && info.uv_offset >= info.y_offset &&
+      info.total_size >= info.uv_offset) {
+    return {info.uv_offset - info.y_offset, info.total_size - info.uv_offset};
+  }
+  return {info.y_size, info.uv_size};
+}
+
 core::CudaDevicePtr checked_device_pointer(void* base, std::uint32_t offset) {
   if (base == nullptr) {
     throw NvmmError("NvBufSurface CUDA mapping returned a null data pointer");
@@ -853,11 +861,12 @@ std::optional<std::string> validate_nvmm_frame_info(const NvmmFrameInfo& info) {
   }
   const auto y_required = static_cast<std::uint64_t>(info.y_pitch) * info.height;
   const auto uv_required = static_cast<std::uint64_t>(info.uv_pitch) * (info.height / 2U);
-  if (info.y_size < y_required || info.uv_size < uv_required) {
+  const auto [y_size, uv_size] = effective_plane_sizes(info);
+  if (y_size < y_required || uv_size < uv_required) {
     return "NV12 plane allocation is smaller than its pitched extent";
   }
-  const auto y_end = static_cast<std::uint64_t>(info.y_offset) + info.y_size;
-  const auto uv_end = static_cast<std::uint64_t>(info.uv_offset) + info.uv_size;
+  const auto y_end = static_cast<std::uint64_t>(info.y_offset) + y_size;
+  const auto uv_end = static_cast<std::uint64_t>(info.uv_offset) + uv_size;
   if (info.uv_offset < y_end) {
     return "NV12 planes overlap";
   }
@@ -915,14 +924,20 @@ std::string nvmm_cuda_interop_availability_error() {
 #endif
 }
 
-NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& info, std::shared_ptr<void> owner) {
+NvmmCudaFrame map_nvmm_frame_to_cuda(const NvmmFrameInfo& provided_info,
+                                     std::shared_ptr<void> owner) {
   if (!owner) {
     throw NvmmError("NvBufSurface CUDA mapping requires a retained decoder owner");
   }
-  if (const auto error = validate_nvmm_frame_info(info); error.has_value()) {
+  if (const auto error = validate_nvmm_frame_info(provided_info); error.has_value()) {
     throw NvmmError(*error);
   }
-  const auto current = extract_nvmm_frame_info(info.surface_ptr, info.abi);
+  const auto current = extract_nvmm_frame_info(provided_info.surface_ptr, provided_info.abi);
+  auto info = provided_info;
+  if (info.y_size == 0 && info.uv_size == 0) {
+    info.y_size = current.y_size;
+    info.uv_size = current.uv_size;
+  }
   if (!same_frame_info(info, current)) {
     throw NvmmError("NvBufSurface metadata changed before CUDA mapping");
   }

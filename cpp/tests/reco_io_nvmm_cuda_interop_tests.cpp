@@ -373,6 +373,17 @@ void surface_array_mapping_retains_and_unmaps_owner() {
   mapped_again.runtime.reset();
   expect_true(runtime_lifetime.expired(), "CUDA frames release NvBufSurface runtime");
 
+  auto legacy_info = extract_info(&surface);
+  legacy_info.y_size = 0;
+  legacy_info.uv_size = 0;
+  auto legacy_mapping = map_nvmm_frame_to_cuda(legacy_info, std::make_shared<int>(33));
+  expect_eq(legacy_mapping.y_accessible_bytes, 1280U * 720U,
+            "legacy metadata receives the re-extracted Y plane size");
+  expect_eq(legacy_mapping.uv_accessible_bytes, 1280U * 360U,
+            "legacy metadata receives the re-extracted UV plane size");
+  legacy_mapping.owner.reset();
+  expect_true(params.mapped_addr.cuda_ptr == nullptr, "legacy metadata mapping unmaps cleanly");
+
   params = make_params();
   surface = make_surface(params);
   auto changed = extract_info(&surface);

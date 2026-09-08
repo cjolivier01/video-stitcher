@@ -148,14 +148,12 @@ public:
       if ((left_.eos && left_.frames.empty()) || (right_.eos && right_.frames.empty())) {
         terminal_eos_ = true;
         const bool first_stop = !workers_stopped_.exchange(true, std::memory_order_acq_rel);
-        std::deque<GpuDecodedFrame> discarded_left;
-        std::deque<GpuDecodedFrame> discarded_right;
-        discarded_left.swap(left_.frames);
-        discarded_right.swap(right_.frames);
+        discarded_left_.swap(left_.frames);
+        discarded_right_.swap(right_.frames);
         state_changed_.notify_all();
         lock.unlock();
-        discarded_left.clear();
-        discarded_right.clear();
+        discarded_left_.clear();
+        discarded_right_.clear();
         finish_stop(first_stop);
         return {.status = GpuStereoDecodeStatus::EndOfStream, .frames = std::nullopt};
       }
@@ -165,8 +163,6 @@ public:
   }
 
   void request_stop() noexcept {
-    std::deque<GpuDecodedFrame> discarded_left;
-    std::deque<GpuDecodedFrame> discarded_right;
     bool first_stop = false;
     {
       std::lock_guard lock(mutex_);
@@ -175,11 +171,11 @@ public:
       }
       external_stop_ = true;
       first_stop = !workers_stopped_.exchange(true, std::memory_order_acq_rel);
-      discarded_left.swap(left_.frames);
-      discarded_right.swap(right_.frames);
+      discarded_left_.swap(left_.frames);
+      discarded_right_.swap(right_.frames);
     }
-    discarded_left.clear();
-    discarded_right.clear();
+    discarded_left_.clear();
+    discarded_right_.clear();
     finish_stop(first_stop);
   }
 
@@ -199,15 +195,18 @@ private:
     try {
       left_thread_ = std::thread([this] { decode(GpuDecodeSide::Left); });
       right_thread_ = std::thread([this] { decode(GpuDecodeSide::Right); });
-    } catch (const std::exception& error) {
-      const std::string message = error.what();
-      signal_stop();
-      join_threads();
-      throw GpuDecodeError("failed to start GPU stereo decode threads: " + message);
     } catch (...) {
+      const auto failure = std::current_exception();
       signal_stop();
       join_threads();
-      throw GpuDecodeError("failed to start GPU stereo decode threads");
+      try {
+        std::rethrow_exception(failure);
+      } catch (const std::exception& error) {
+        throw GpuDecodeError(std::string("failed to start GPU stereo decode threads: ") +
+                             error.what());
+      } catch (...) {
+        throw GpuDecodeError("failed to start GPU stereo decode threads");
+      }
     }
   }
 
@@ -235,8 +234,7 @@ private:
   }
 
   void record_failure(GpuDecodeSide side, std::exception_ptr exception) noexcept {
-    std::deque<GpuDecodedFrame> discarded_left;
-    std::deque<GpuDecodedFrame> discarded_right;
+    bool first_stop = false;
     {
       std::lock_guard lock(mutex_);
       if (workers_stopped_.load(std::memory_order_acquire) || external_stop_) {
@@ -245,17 +243,14 @@ private:
       if (!failure_.has_value()) {
         failure_ = Failure{.side = side, .exception = std::move(exception)};
       }
-      const bool first_stop = !workers_stopped_.exchange(true, std::memory_order_acq_rel);
-      discarded_left.swap(left_.frames);
-      discarded_right.swap(right_.frames);
+      first_stop = !workers_stopped_.exchange(true, std::memory_order_acq_rel);
+      discarded_left_.swap(left_.frames);
+      discarded_right_.swap(right_.frames);
       state_changed_.notify_all();
-      if (!first_stop) {
-        return;
-      }
     }
-    discarded_left.clear();
-    discarded_right.clear();
-    finish_stop(true);
+    discarded_left_.clear();
+    discarded_right_.clear();
+    finish_stop(first_stop);
   }
 
   void decode(GpuDecodeSide side) noexcept {
@@ -326,6 +321,9 @@ private:
   std::condition_variable state_changed_;
   SideState left_;
   SideState right_;
+  // Constructed before workers start so stop/failure paths never allocate drain queues.
+  std::deque<GpuDecodedFrame> discarded_left_;
+  std::deque<GpuDecodedFrame> discarded_right_;
   std::optional<Failure> failure_;
   std::atomic<bool> workers_stopped_{false};
   bool external_stop_ = false;

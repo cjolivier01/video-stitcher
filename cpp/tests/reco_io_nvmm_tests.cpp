@@ -145,6 +145,9 @@ void deepstream_7_1_compatibility_overload_uses_original_abi() {
 
   auto params = make_params_as<abi7::SurfaceParams>();
   auto surface = make_surface_as<abi7::Surface>(params);
+  positional.surface_ptr = &surface;
+  expect_true(!validate_nvmm_frame_info(positional).has_value(),
+              "legacy positional frame-info infers omitted plane sizes");
   const auto info = extract_nvmm_frame_info(&surface);
   expect_true(info.abi == NvbufSurfaceAbi::DeepStream7_1, "compatibility overload uses 7.1 ABI");
   expect_eq(info.width, 1920U, "7.1 width");

@@ -38,6 +38,7 @@ std::atomic<int> synchronize_count{0};
 std::atomic<int> pointer_attribute_count{0};
 std::atomic<int> memory_access_count{0};
 std::atomic<bool> fail_module_load{false};
+std::atomic<bool> fail_kernel_launch{false};
 std::atomic<int> sequence{0};
 std::atomic<int> last_launch_sequence{0};
 std::atomic<int> last_synchronize_sequence{0};
@@ -87,6 +88,7 @@ RECO_FAKE_CUDA_EXPORT void recoFakeCudaStitchReset() {
   pointer_attribute_count = 0;
   memory_access_count = 0;
   fail_module_load = false;
+  fail_kernel_launch = false;
   sequence = 0;
   last_launch_sequence = 0;
   last_synchronize_sequence = 0;
@@ -126,6 +128,7 @@ RECO_FAKE_CUDA_EXPORT std::uintptr_t recoFakeCudaStitchCurrentContext() {
 RECO_FAKE_CUDA_EXPORT void recoFakeCudaStitchFailModuleLoad(int fail) {
   fail_module_load = fail != 0;
 }
+RECO_FAKE_CUDA_EXPORT void recoFakeCudaStitchFailKernelLaunch() { fail_kernel_launch = true; }
 RECO_FAKE_CUDA_EXPORT std::uint64_t recoFakeCudaStitchCapturedU64(int index) {
   return index >= 0 && static_cast<std::size_t>(index) < captured_u64.size()
              ? captured_u64[static_cast<std::size_t>(index)]
@@ -329,6 +332,9 @@ RECO_FAKE_CUDA_EXPORT int cuLaunchKernel(void* function, unsigned int grid_x, un
   if (function != reinterpret_cast<void*>(0x5678U) || parameters == nullptr ||
       retain_count.load() <= 0 || current_context != reinterpret_cast<void*>(kContextIdentity)) {
     return 1;
+  }
+  if (fail_kernel_launch.exchange(false)) {
+    return 902;
   }
   const auto& left = *static_cast<const PlanePrefix*>(parameters[0]);
   const auto& right = *static_cast<const PlanePrefix*>(parameters[1]);
