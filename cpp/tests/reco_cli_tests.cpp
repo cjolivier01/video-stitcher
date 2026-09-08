@@ -898,6 +898,59 @@ void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
   expect_eq(std::filesystem::hard_link_count(destination), std::uintmax_t{1},
             "new stitch output has exactly one directory entry");
 
+#if defined(_WIN32)
+  const auto integrity_destination = root.path() / "write-locked-stitch.mp4";
+  bool publication_hook_ran = false;
+  bool publication_writer_denied = false;
+  {
+    detail::AtomicOutputFile output(
+        integrity_destination, [&](const std::filesystem::path& publication) {
+          publication_hook_ran = true;
+          SetLastError(ERROR_SUCCESS);
+          const HANDLE competing_writer =
+              CreateFileW(publication.c_str(), GENERIC_WRITE,
+                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+          const DWORD writer_error = GetLastError();
+          publication_writer_denied =
+              competing_writer == INVALID_HANDLE_VALUE && writer_error == ERROR_SHARING_VIOLATION;
+          if (competing_writer != INVALID_HANDLE_VALUE) {
+            constexpr char attacker_contents[] = "mutated after verification\n";
+            DWORD written = 0;
+            (void)WriteFile(competing_writer, attacker_contents,
+                            static_cast<DWORD>(sizeof(attacker_contents) - 1U), &written, nullptr);
+            (void)CloseHandle(competing_writer);
+          }
+        });
+    write_text_descriptor(output.descriptor(), "verified encoded output\n");
+    const auto verification = read_atomic_output(output.verification_path());
+    expect_true(verification.status == AtomicReadStatus::Success,
+                "Windows write-locked output remains readable for verification");
+    expect_eq(verification.contents, std::string("verified encoded output\n"),
+              "Windows verification observes the descriptor-bound bytes");
+
+    SetLastError(ERROR_SUCCESS);
+    const HANDLE competing_writer =
+        CreateFileW(output.verification_path().c_str(), GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL, nullptr);
+    const DWORD writer_error = GetLastError();
+    expect_true(competing_writer == INVALID_HANDLE_VALUE && writer_error == ERROR_SHARING_VIOLATION,
+                "Windows temporary rejects a second writer after verification");
+    if (competing_writer != INVALID_HANDLE_VALUE) {
+      (void)CloseHandle(competing_writer);
+    }
+    output.commit();
+  }
+  expect_true(publication_hook_ran,
+              "Windows write-lock fixture reaches the final publication window");
+  expect_true(publication_writer_denied,
+              "Windows temporary rejects mutation at the publication boundary");
+  expect_eq(read_text_file(integrity_destination), std::string("verified encoded output\n"),
+            "Windows publication preserves the bytes that were verified");
+  expect_no_stitch_output_artifacts(root.path(), "write-locked Windows stitch publication");
+#endif
+
   {
     detail::AtomicOutputFile output(destination);
     write_text_descriptor(output.descriptor(), "replacement encoded output\n");

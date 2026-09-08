@@ -4308,12 +4308,14 @@ AtomicOutputFile::AtomicOutputFile(
     auto filename = impl_->destination.filename();
     filename += ".tmp." + std::string(token.begin(), token.end());
     DWORD open_error = ERROR_SUCCESS;
-    handle = open_windows_file_relative(
-        impl_->output_directory.handle.get(), filename.wstring(),
-        GENERIC_WRITE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_CREATE,
-        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
-        open_error);
+    // Readers may verify the muxed stream and a DELETE-only handle may rename it, but the
+    // encoder's retained handle denies every competing writer through publication.
+    handle = open_windows_file_relative(impl_->output_directory.handle.get(), filename.wstring(),
+                                        GENERIC_WRITE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                                        FILE_SHARE_READ | FILE_SHARE_DELETE, FILE_CREATE,
+                                        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT |
+                                            FILE_OPEN_REPARSE_POINT,
+                                        open_error);
     if (handle != INVALID_HANDLE_VALUE) {
       impl_->descriptor =
           _open_osfhandle(reinterpret_cast<std::intptr_t>(handle), _O_BINARY | _O_WRONLY);
