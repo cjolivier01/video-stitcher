@@ -31,6 +31,8 @@ constexpr std::uint64_t kReadOnlyAllocation = 0xF0000U;
 constexpr std::uint64_t kContextIndependentMapping = 0x100000U;
 constexpr std::uint64_t kPhysicalAliasMapping = 0x110000U;
 constexpr std::uint64_t kUnknownPhysicalIdentityMapping = 0x120000U;
+constexpr std::uintptr_t kExecutionStream = 0xCAFE3901U;
+constexpr std::uintptr_t kCompletionEvent = 0xCAFE3902U;
 thread_local void* current_context = nullptr;
 std::atomic<int> retain_count{0};
 std::atomic<int> launch_count{0};
@@ -39,6 +41,13 @@ std::atomic<int> pointer_attribute_count{0};
 std::atomic<int> sequence{0};
 std::atomic<int> launch_sequence{0};
 std::atomic<int> synchronize_sequence{0};
+std::atomic<int> stream_create_count{0};
+std::atomic<int> stream_destroy_count{0};
+std::atomic<int> event_create_count{0};
+std::atomic<int> event_destroy_count{0};
+std::atomic<int> event_record_count{0};
+std::atomic<int> event_synchronize_count{0};
+std::atomic<int> surface_busy_count{0};
 std::array<std::uint64_t, 6> captured_u64{};
 std::array<std::uint32_t, 8> captured_u32{};
 std::array<float, 8> captured_color{};
@@ -64,6 +73,13 @@ RECO_FAKE_CUDA_EXPORT void recoFakeCudaRgbaToNv12Reset() {
   sequence = 0;
   launch_sequence = 0;
   synchronize_sequence = 0;
+  stream_create_count = 0;
+  stream_destroy_count = 0;
+  event_create_count = 0;
+  event_destroy_count = 0;
+  event_record_count = 0;
+  event_synchronize_count = 0;
+  surface_busy_count = 0;
   captured_u64.fill(0);
   captured_u32.fill(0);
   captured_color.fill(0.0F);
@@ -78,6 +94,27 @@ RECO_FAKE_CUDA_EXPORT int recoFakeCudaRgbaToNv12PointerAttributeCount() {
 RECO_FAKE_CUDA_EXPORT int recoFakeCudaRgbaToNv12LaunchSequence() { return launch_sequence.load(); }
 RECO_FAKE_CUDA_EXPORT int recoFakeCudaRgbaToNv12SynchronizeSequence() {
   return synchronize_sequence.load();
+}
+RECO_FAKE_CUDA_EXPORT int recoFakeCudaRgbaToNv12StreamCreateCount() {
+  return stream_create_count.load();
+}
+RECO_FAKE_CUDA_EXPORT int recoFakeCudaRgbaToNv12StreamDestroyCount() {
+  return stream_destroy_count.load();
+}
+RECO_FAKE_CUDA_EXPORT int recoFakeCudaRgbaToNv12EventCreateCount() {
+  return event_create_count.load();
+}
+RECO_FAKE_CUDA_EXPORT int recoFakeCudaRgbaToNv12EventDestroyCount() {
+  return event_destroy_count.load();
+}
+RECO_FAKE_CUDA_EXPORT int recoFakeCudaRgbaToNv12EventRecordCount() {
+  return event_record_count.load();
+}
+RECO_FAKE_CUDA_EXPORT int recoFakeCudaRgbaToNv12EventSynchronizeCount() {
+  return event_synchronize_count.load();
+}
+RECO_FAKE_CUDA_EXPORT int recoFakeCudaRgbaToNv12SurfaceBusyCount() {
+  return surface_busy_count.load();
 }
 RECO_FAKE_CUDA_EXPORT std::uint64_t recoFakeCudaRgbaToNv12CapturedU64(int index) {
   return index >= 0 && static_cast<std::size_t>(index) < captured_u64.size()
@@ -182,6 +219,65 @@ RECO_FAKE_CUDA_EXPORT int cuCtxSynchronize() {
   synchronize_sequence = ++sequence;
   return 0;
 }
+RECO_FAKE_CUDA_EXPORT int cuStreamCreate(void** stream, unsigned int flags) {
+  if (stream == nullptr || flags != 1U ||
+      current_context != reinterpret_cast<void*>(kContextIdentity)) {
+    return 1;
+  }
+  *stream = reinterpret_cast<void*>(kExecutionStream);
+  ++stream_create_count;
+  return 0;
+}
+RECO_FAKE_CUDA_EXPORT int cuStreamDestroy_v2(void* stream) {
+  if (stream != reinterpret_cast<void*>(kExecutionStream) || surface_busy_count.load() != 0) {
+    return 1;
+  }
+  ++stream_destroy_count;
+  return 0;
+}
+RECO_FAKE_CUDA_EXPORT int cuStreamSynchronize(void* stream) {
+  if (stream != reinterpret_cast<void*>(kExecutionStream) ||
+      current_context != reinterpret_cast<void*>(kContextIdentity)) {
+    return 1;
+  }
+  surface_busy_count = 0;
+  return 0;
+}
+RECO_FAKE_CUDA_EXPORT int cuEventCreate(void** event, unsigned int flags) {
+  if (event == nullptr || flags != 2U ||
+      current_context != reinterpret_cast<void*>(kContextIdentity)) {
+    return 1;
+  }
+  *event = reinterpret_cast<void*>(kCompletionEvent);
+  ++event_create_count;
+  return 0;
+}
+RECO_FAKE_CUDA_EXPORT int cuEventDestroy_v2(void* event) {
+  if (event != reinterpret_cast<void*>(kCompletionEvent) || surface_busy_count.load() != 0) {
+    return 1;
+  }
+  ++event_destroy_count;
+  return 0;
+}
+RECO_FAKE_CUDA_EXPORT int cuEventRecord(void* event, void* stream) {
+  if (event != reinterpret_cast<void*>(kCompletionEvent) ||
+      stream != reinterpret_cast<void*>(kExecutionStream) || surface_busy_count.load() <= 0 ||
+      current_context != reinterpret_cast<void*>(kContextIdentity)) {
+    return 1;
+  }
+  ++event_record_count;
+  return 0;
+}
+RECO_FAKE_CUDA_EXPORT int cuEventSynchronize(void* event) {
+  if (event != reinterpret_cast<void*>(kCompletionEvent) || surface_busy_count.load() <= 0 ||
+      current_context != reinterpret_cast<void*>(kContextIdentity)) {
+    return 1;
+  }
+  ++event_synchronize_count;
+  synchronize_sequence = ++sequence;
+  surface_busy_count = 0;
+  return 0;
+}
 RECO_FAKE_CUDA_EXPORT int cuPointerGetAttribute(void* data, int attribute, std::uint64_t pointer) {
   ++pointer_attribute_count;
   const auto base = allocation_base(pointer);
@@ -256,10 +352,11 @@ RECO_FAKE_CUDA_EXPORT int cuModuleGetFunction(void** function, void* module, con
 RECO_FAKE_CUDA_EXPORT int cuLaunchKernel(void* function, unsigned int grid_x, unsigned int grid_y,
                                          unsigned int grid_z, unsigned int block_x,
                                          unsigned int block_y, unsigned int block_z,
-                                         unsigned int shared_memory, void*, void** parameters,
-                                         void**) {
+                                         unsigned int shared_memory, void* stream,
+                                         void** parameters, void**) {
   if (function != reinterpret_cast<void*>(0x2903U) || parameters == nullptr ||
-      current_context != reinterpret_cast<void*>(kContextIdentity) || shared_memory != 0U) {
+      current_context != reinterpret_cast<void*>(kContextIdentity) || shared_memory != 0U ||
+      stream != reinterpret_cast<void*>(kExecutionStream)) {
     return 1;
   }
   for (std::size_t index = 0; index < captured_u64.size(); ++index) {
@@ -279,6 +376,7 @@ RECO_FAKE_CUDA_EXPORT int cuLaunchKernel(void* function, unsigned int grid_x, un
   std::copy(std::begin(color.values), std::end(color.values), captured_color.begin());
   ++launch_count;
   launch_sequence = ++sequence;
+  ++surface_busy_count;
   return 0;
 }
 
@@ -479,6 +577,14 @@ struct FakeCudaControl {
     launch_sequence_fn = library.symbol<int (*)()>("recoFakeCudaRgbaToNv12LaunchSequence");
     synchronize_sequence_fn =
         library.symbol<int (*)()>("recoFakeCudaRgbaToNv12SynchronizeSequence");
+    stream_create_count_fn = library.symbol<int (*)()>("recoFakeCudaRgbaToNv12StreamCreateCount");
+    stream_destroy_count_fn = library.symbol<int (*)()>("recoFakeCudaRgbaToNv12StreamDestroyCount");
+    event_create_count_fn = library.symbol<int (*)()>("recoFakeCudaRgbaToNv12EventCreateCount");
+    event_destroy_count_fn = library.symbol<int (*)()>("recoFakeCudaRgbaToNv12EventDestroyCount");
+    event_record_count_fn = library.symbol<int (*)()>("recoFakeCudaRgbaToNv12EventRecordCount");
+    event_synchronize_count_fn =
+        library.symbol<int (*)()>("recoFakeCudaRgbaToNv12EventSynchronizeCount");
+    surface_busy_count_fn = library.symbol<int (*)()>("recoFakeCudaRgbaToNv12SurfaceBusyCount");
     pointer_attribute_count_fn =
         library.symbol<int (*)()>("recoFakeCudaRgbaToNv12PointerAttributeCount");
     captured_u64_fn = library.symbol<std::uint64_t (*)(int)>("recoFakeCudaRgbaToNv12CapturedU64");
@@ -492,6 +598,13 @@ struct FakeCudaControl {
   int pointer_attribute_count() const { return pointer_attribute_count_fn(); }
   int launch_sequence() const { return launch_sequence_fn(); }
   int synchronize_sequence() const { return synchronize_sequence_fn(); }
+  int stream_create_count() const { return stream_create_count_fn(); }
+  int stream_destroy_count() const { return stream_destroy_count_fn(); }
+  int event_create_count() const { return event_create_count_fn(); }
+  int event_destroy_count() const { return event_destroy_count_fn(); }
+  int event_record_count() const { return event_record_count_fn(); }
+  int event_synchronize_count() const { return event_synchronize_count_fn(); }
+  int surface_busy_count() const { return surface_busy_count_fn(); }
   std::uint64_t captured_u64(int index) const { return captured_u64_fn(index); }
   std::uint32_t captured_u32(int index) const { return captured_u32_fn(index); }
   float captured_color(int index) const { return captured_color_fn(index); }
@@ -503,6 +616,13 @@ struct FakeCudaControl {
   int (*pointer_attribute_count_fn)() = nullptr;
   int (*launch_sequence_fn)() = nullptr;
   int (*synchronize_sequence_fn)() = nullptr;
+  int (*stream_create_count_fn)() = nullptr;
+  int (*stream_destroy_count_fn)() = nullptr;
+  int (*event_create_count_fn)() = nullptr;
+  int (*event_destroy_count_fn)() = nullptr;
+  int (*event_record_count_fn)() = nullptr;
+  int (*event_synchronize_count_fn)() = nullptr;
+  int (*surface_busy_count_fn)() = nullptr;
   std::uint64_t (*captured_u64_fn)(int) = nullptr;
   std::uint32_t (*captured_u32_fn)(int) = nullptr;
   float (*captured_color_fn)(int) = nullptr;
@@ -579,10 +699,10 @@ CudaRgbaToNv12Converter create_converter(const CudaRgbaToNv12Config& config,
                                          NvrtcCompiler::load(nvrtc_runtime.string()));
 }
 
-void compiles_once_and_synchronizes(const std::filesystem::path& cuda_runtime,
-                                    const std::filesystem::path& nvrtc_runtime,
-                                    const FakeCudaControl& cuda_control,
-                                    const FakeNvrtcControl& nvrtc_control) {
+void compiles_once_and_uses_event_scoped_completion(const std::filesystem::path& cuda_runtime,
+                                                    const std::filesystem::path& nvrtc_runtime,
+                                                    const FakeCudaControl& cuda_control,
+                                                    const FakeNvrtcControl& nvrtc_control) {
   cuda_control.reset();
   nvrtc_control.reset();
   auto converter = create_converter({.width = 34, .height = 18}, cuda_runtime, nvrtc_runtime);
@@ -612,7 +732,15 @@ void compiles_once_and_synchronizes(const std::filesystem::path& cuda_runtime,
   converter.convert(input, full);
   expect_eq(nvrtc_control.create_count(), 1, "conversion does not recompile");
   expect_eq(cuda_control.launch_count(), 2, "one kernel launch per conversion");
-  expect_eq(cuda_control.synchronize_count(), 2, "each conversion synchronizes before return");
+  expect_eq(cuda_control.synchronize_count(), 0,
+            "conversion does not synchronize unrelated CUDA context work");
+  expect_eq(cuda_control.stream_create_count(), 1, "converter retains one execution stream");
+  expect_eq(cuda_control.event_create_count(), 1, "converter retains one completion event");
+  expect_eq(cuda_control.event_record_count(), 2, "each conversion records completion");
+  expect_eq(cuda_control.event_synchronize_count(), 2,
+            "each conversion waits for its completion event");
+  expect_eq(cuda_control.surface_busy_count(), 0,
+            "NV12 output is complete before its surface can be reused");
   expect_eq(cuda_control.pointer_attribute_count(), 42,
             "each conversion validates all three pointers through seven CUDA attributes");
   expect_true(cuda_control.launch_sequence() < cuda_control.synchronize_sequence(),
@@ -1010,8 +1138,9 @@ int main() {
     FakeCudaControl cuda_control(cuda_runtime);
     FakeNvrtcControl nvrtc_control(nvrtc_runtime);
 
-    run_case("compile once and synchronize", [&] {
-      compiles_once_and_synchronizes(cuda_runtime, nvrtc_runtime, cuda_control, nvrtc_control);
+    run_case("compile once with event-scoped completion", [&] {
+      compiles_once_and_uses_event_scoped_completion(cuda_runtime, nvrtc_runtime, cuda_control,
+                                                     nvrtc_control);
     });
     run_case("configuration validation",
              [&] { rejects_invalid_configuration(cuda_runtime, nvrtc_runtime, nvrtc_control); });

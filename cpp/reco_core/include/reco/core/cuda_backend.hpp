@@ -122,6 +122,7 @@ class CudaSharedMemory;
 class CudaModule;
 class CudaKernel;
 class CudaValidatedSpan;
+class CudaExecutionStream;
 
 /// Optional non-throwing trace sink for explicit CUDA backend operations.
 class CudaBackendTraceSink {
@@ -194,6 +195,8 @@ public:
   [[nodiscard]] CudaKernel load_kernel_from_ptx(std::string_view ptx,
                                                 std::string_view function_name,
                                                 int device_ordinal = 0) const;
+  /// Returns the retained nonblocking stream and completion event shared by this device context.
+  [[nodiscard]] CudaExecutionStream execution_stream(int device_ordinal = 0) const;
   void synchronize() const;
 
 private:
@@ -202,6 +205,7 @@ private:
   friend class CudaModule;
   friend class CudaKernel;
   friend class CudaValidatedSpan;
+  friend class CudaExecutionStream;
 
   struct Impl;
 
@@ -277,6 +281,36 @@ private:
   bool owns_shareable_handle_ = false;
 };
 
+/// Retained nonblocking CUDA stream with an event-scoped completion boundary.
+///
+/// Backends that share one loaded CUDA driver also share one execution stream per retained
+/// primary context. Copies retain the stream and its completion event. Kernel submission through
+/// this object waits only for work recorded on this stream, never for unrelated context work.
+class CudaExecutionStream {
+public:
+  CudaExecutionStream() = default;
+  CudaExecutionStream(const CudaExecutionStream&) noexcept = default;
+  CudaExecutionStream& operator=(const CudaExecutionStream&) noexcept = default;
+  CudaExecutionStream(CudaExecutionStream&&) noexcept = default;
+  CudaExecutionStream& operator=(CudaExecutionStream&&) noexcept = default;
+  ~CudaExecutionStream() = default;
+
+  [[nodiscard]] explicit operator bool() const { return state_ != nullptr; }
+  /// Process-local CUDA context identity owning this stream.
+  [[nodiscard]] std::uintptr_t context_id() const;
+  /// CUDA device ordinal owning this stream.
+  [[nodiscard]] int device_ordinal() const;
+
+private:
+  friend class CudaBackend;
+  friend class CudaKernel;
+
+  struct State;
+  explicit CudaExecutionStream(std::shared_ptr<State> state);
+
+  std::shared_ptr<State> state_;
+};
+
 /// Shared owner for one loaded CUDA PTX module.
 ///
 /// Kernels resolved from a module keep its driver module alive after this handle is moved,
@@ -321,6 +355,10 @@ public:
   /// Launches and synchronizes in one CUDA context scope before restoring the caller context.
   /// Use this for kernels borrowing memory whose owners may be released when the call returns.
   void launch_and_synchronize(const CudaLaunchConfig& config, std::span<void*> args) const;
+  /// Launches on `stream` and waits for its completion event before restoring the caller context.
+  /// Unrelated work in the same CUDA context remains asynchronous.
+  void launch_and_synchronize(const CudaExecutionStream& stream, const CudaLaunchConfig& config,
+                              std::span<void*> args) const;
   void launch(const CudaLaunchConfig& config, std::span<void*> args) const;
   void synchronize() const;
   void reset();

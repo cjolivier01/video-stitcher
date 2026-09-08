@@ -510,14 +510,15 @@ CudaValidatedSpan validate_plane_allocation(const CudaBackend& backend,
 
 struct CudaStereoStitchRenderer::Impl {
   Impl(CudaStitchRendererConfig config_in, CudaContextId context_id_in, CudaBackend backend_in,
-       CudaKernel kernel_in)
+       CudaKernel kernel_in, CudaExecutionStream execution_stream_in)
       : config(std::move(config_in)),
         scene(SceneGeometry::from_layout_with_aspect(
             config.calibration.layout, static_cast<float>(config.calibration.left.width) /
                                            static_cast<float>(config.calibration.left.height))),
         left_basis(plane_basis(CameraId::Left, scene)),
         right_basis(plane_basis(CameraId::Right, scene)), context_id(context_id_in),
-        backend(std::move(backend_in)), kernel(std::move(kernel_in)) {}
+        backend(std::move(backend_in)), kernel(std::move(kernel_in)),
+        execution_stream(std::move(execution_stream_in)) {}
 
   CudaStitchRendererConfig config;
   SceneGeometry scene;
@@ -526,6 +527,7 @@ struct CudaStereoStitchRenderer::Impl {
   CudaContextId context_id = 0;
   CudaBackend backend;
   CudaKernel kernel;
+  CudaExecutionStream execution_stream;
   mutable std::mutex render_mutex;
 };
 
@@ -547,8 +549,10 @@ CudaStereoStitchRenderer CudaStereoStitchRenderer::create(CudaStitchRendererConf
   const auto compiled = compiler.compile(kCudaSource, "reco_cuda_stitch_renderer.cu", options);
   auto module = backend.load_module_from_ptx(compiled.ptx, config.device_ordinal);
   auto kernel = module.load_kernel(kKernelName);
-  return CudaStereoStitchRenderer(
-      std::make_unique<Impl>(std::move(config), context_id, std::move(backend), std::move(kernel)));
+  auto execution_stream = backend.execution_stream(config.device_ordinal);
+  return CudaStereoStitchRenderer(std::make_unique<Impl>(std::move(config), context_id,
+                                                         std::move(backend), std::move(kernel),
+                                                         std::move(execution_stream)));
 }
 
 CudaStereoStitchRenderer::CudaStereoStitchRenderer(std::unique_ptr<Impl> impl)
@@ -613,7 +617,8 @@ void CudaStereoStitchRenderer::render(const CudaNv12FrameView& left, const CudaN
                                  &output_pitch, &output_width, &output_height};
   const auto grid_x = (output_width + kBlockWidth - 1U) / kBlockWidth;
   const auto grid_y = (output_height + kBlockHeight - 1U) / kBlockHeight;
-  state.kernel.launch_and_synchronize({.grid = {grid_x, grid_y, 1},
+  state.kernel.launch_and_synchronize(state.execution_stream,
+                                      {.grid = {grid_x, grid_y, 1},
                                        .block = {kBlockWidth, kBlockHeight, 1},
                                        .shared_memory_bytes = 0},
                                       std::span<void*>(arguments));

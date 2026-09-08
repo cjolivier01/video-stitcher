@@ -254,14 +254,15 @@ std::uint64_t checked_pitch(std::size_t pitch) {
 
 struct CudaRgbaToNv12Converter::Impl {
   Impl(CudaRgbaToNv12Config config_in, CudaContextId context_id_in, CudaBackend backend_in,
-       CudaKernel kernel_in)
+       CudaKernel kernel_in, CudaExecutionStream execution_stream_in)
       : config(config_in), context_id(context_id_in), backend(std::move(backend_in)),
-        kernel(std::move(kernel_in)) {}
+        kernel(std::move(kernel_in)), execution_stream(std::move(execution_stream_in)) {}
 
   CudaRgbaToNv12Config config;
   CudaContextId context_id = 0;
   CudaBackend backend;
   CudaKernel kernel;
+  CudaExecutionStream execution_stream;
   mutable std::mutex convert_mutex;
 };
 
@@ -283,8 +284,9 @@ CudaRgbaToNv12Converter CudaRgbaToNv12Converter::create(CudaRgbaToNv12Config con
   const auto compiled = compiler.compile(kCudaSource, "reco_cuda_rgba_to_nv12.cu", options);
   auto module = backend.load_module_from_ptx(compiled.ptx, config.device_ordinal);
   auto kernel = module.load_kernel(kKernelName);
-  return CudaRgbaToNv12Converter(
-      std::make_unique<Impl>(config, context_id, std::move(backend), std::move(kernel)));
+  auto execution_stream = backend.execution_stream(config.device_ordinal);
+  return CudaRgbaToNv12Converter(std::make_unique<Impl>(
+      config, context_id, std::move(backend), std::move(kernel), std::move(execution_stream)));
 }
 
 CudaRgbaToNv12Converter::CudaRgbaToNv12Converter(std::unique_ptr<Impl> impl)
@@ -337,11 +339,11 @@ void CudaRgbaToNv12Converter::convert(const CudaRgbaFrameView& input,
                       static_cast<std::uint32_t>((chroma_columns % kBlockWidth) != 0U);
   const auto grid_y =
       chroma_rows / kBlockHeight + static_cast<std::uint32_t>((chroma_rows % kBlockHeight) != 0U);
-  state.kernel.launch({.grid = {grid_x, grid_y, 1},
-                       .block = {kBlockWidth, kBlockHeight, 1},
-                       .shared_memory_bytes = 0},
-                      std::span<void*>(arguments));
-  state.kernel.synchronize();
+  state.kernel.launch_and_synchronize(state.execution_stream,
+                                      {.grid = {grid_x, grid_y, 1},
+                                       .block = {kBlockWidth, kBlockHeight, 1},
+                                       .shared_memory_bytes = 0},
+                                      std::span<void*>(arguments));
 }
 
 CudaContextId CudaRgbaToNv12Converter::context_id() const {

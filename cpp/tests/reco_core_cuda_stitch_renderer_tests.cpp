@@ -1,3 +1,4 @@
+#include "reco/core/cuda_rgba_to_nv12.hpp"
 #include "reco/core/cuda_stitch_renderer.hpp"
 #include "reco/core/path.hpp"
 
@@ -32,6 +33,8 @@ static_assert(!std::is_copy_constructible_v<CudaStereoStitchRenderer>);
 static_assert(!std::is_copy_assignable_v<CudaStereoStitchRenderer>);
 static_assert(std::is_nothrow_move_constructible_v<CudaStereoStitchRenderer>);
 static_assert(std::is_nothrow_move_assignable_v<CudaStereoStitchRenderer>);
+static_assert(std::is_nothrow_copy_constructible_v<CudaExecutionStream>);
+static_assert(std::is_nothrow_copy_assignable_v<CudaExecutionStream>);
 
 int failures = 0;
 
@@ -113,6 +116,24 @@ void expect_logic_error(Function&& function, std::string_view fragment, std::str
     std::cerr << "FAIL: " << message << " did not throw\n";
     ++failures;
   } catch (const std::logic_error& error) {
+    if (std::string_view(error.what()).find(fragment) == std::string_view::npos) {
+      std::cerr << "FAIL: " << message << " missing fragment: " << error.what() << '\n';
+      ++failures;
+    }
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: " << message << " threw unexpected exception: " << error.what() << '\n';
+    ++failures;
+  }
+}
+
+template <typename Function>
+void expect_runtime_error(Function&& function, std::string_view fragment,
+                          std::string_view message) {
+  try {
+    function();
+    std::cerr << "FAIL: " << message << " did not throw\n";
+    ++failures;
+  } catch (const std::runtime_error& error) {
     if (std::string_view(error.what()).find(fragment) == std::string_view::npos) {
       std::cerr << "FAIL: " << message << " missing fragment: " << error.what() << '\n';
       ++failures;
@@ -220,6 +241,23 @@ struct FakeCudaControl {
     memory_access_count_fn = library.symbol<int (*)()>("recoFakeCudaStitchMemoryAccessCount");
     retain_count_fn = library.symbol<int (*)()>("recoFakeCudaStitchRetainCount");
     release_count_fn = library.symbol<int (*)()>("recoFakeCudaStitchReleaseCount");
+    stream_create_count_fn = library.symbol<int (*)()>("recoFakeCudaStitchStreamCreateCount");
+    stream_destroy_count_fn = library.symbol<int (*)()>("recoFakeCudaStitchStreamDestroyCount");
+    stream_synchronize_count_fn =
+        library.symbol<int (*)()>("recoFakeCudaStitchStreamSynchronizeCount");
+    event_create_count_fn = library.symbol<int (*)()>("recoFakeCudaStitchEventCreateCount");
+    event_destroy_count_fn = library.symbol<int (*)()>("recoFakeCudaStitchEventDestroyCount");
+    event_record_count_fn = library.symbol<int (*)()>("recoFakeCudaStitchEventRecordCount");
+    event_synchronize_count_fn =
+        library.symbol<int (*)()>("recoFakeCudaStitchEventSynchronizeCount");
+    surface_busy_count_fn = library.symbol<int (*)()>("recoFakeCudaStitchSurfaceBusyCount");
+    last_launch_stream_fn =
+        library.symbol<std::uintptr_t (*)()>("recoFakeCudaStitchLastLaunchStream");
+    launch_sequence_at_fn = library.symbol<int (*)(int)>("recoFakeCudaStitchLaunchSequenceAt");
+    event_record_sequence_at_fn =
+        library.symbol<int (*)(int)>("recoFakeCudaStitchEventRecordSequenceAt");
+    event_synchronize_sequence_at_fn =
+        library.symbol<int (*)(int)>("recoFakeCudaStitchEventSynchronizeSequenceAt");
     set_current_context_fn =
         library.symbol<void (*)(std::uintptr_t)>("recoFakeCudaStitchSetCurrentContext");
     fail_next_set_current_fn =
@@ -227,6 +265,9 @@ struct FakeCudaControl {
     current_context_fn = library.symbol<std::uintptr_t (*)()>("recoFakeCudaStitchCurrentContext");
     fail_module_load_fn = library.symbol<void (*)(int)>("recoFakeCudaStitchFailModuleLoad");
     fail_kernel_launch_fn = library.symbol<void (*)()>("recoFakeCudaStitchFailKernelLaunch");
+    fail_event_record_fn = library.symbol<void (*)()>("recoFakeCudaStitchFailEventRecord");
+    fail_event_synchronize_fn =
+        library.symbol<void (*)()>("recoFakeCudaStitchFailEventSynchronize");
     captured_u64_fn = library.symbol<std::uint64_t (*)(int)>("recoFakeCudaStitchCapturedU64");
     captured_u32_fn = library.symbol<std::uint32_t (*)(int)>("recoFakeCudaStitchCapturedU32");
     captured_float_fn = library.symbol<float (*)(int)>("recoFakeCudaStitchCapturedFloat");
@@ -242,11 +283,27 @@ struct FakeCudaControl {
   int memory_access_count() const { return memory_access_count_fn(); }
   int retain_count() const { return retain_count_fn(); }
   int release_count() const { return release_count_fn(); }
+  int stream_create_count() const { return stream_create_count_fn(); }
+  int stream_destroy_count() const { return stream_destroy_count_fn(); }
+  int stream_synchronize_count() const { return stream_synchronize_count_fn(); }
+  int event_create_count() const { return event_create_count_fn(); }
+  int event_destroy_count() const { return event_destroy_count_fn(); }
+  int event_record_count() const { return event_record_count_fn(); }
+  int event_synchronize_count() const { return event_synchronize_count_fn(); }
+  int surface_busy_count() const { return surface_busy_count_fn(); }
+  std::uintptr_t last_launch_stream() const { return last_launch_stream_fn(); }
+  int launch_sequence_at(int index) const { return launch_sequence_at_fn(index); }
+  int event_record_sequence_at(int index) const { return event_record_sequence_at_fn(index); }
+  int event_synchronize_sequence_at(int index) const {
+    return event_synchronize_sequence_at_fn(index);
+  }
   void set_current_context(std::uintptr_t context) const { set_current_context_fn(context); }
   void fail_next_set_current(std::uintptr_t context) const { fail_next_set_current_fn(context); }
   std::uintptr_t current_context() const { return current_context_fn(); }
   void fail_module_load(bool fail) const { fail_module_load_fn(fail ? 1 : 0); }
   void fail_kernel_launch() const { fail_kernel_launch_fn(); }
+  void fail_event_record() const { fail_event_record_fn(); }
+  void fail_event_synchronize() const { fail_event_synchronize_fn(); }
   std::uint64_t captured_u64(int index) const { return captured_u64_fn(index); }
   std::uint32_t captured_u32(int index) const { return captured_u32_fn(index); }
   float captured_float(int index) const { return captured_float_fn(index); }
@@ -262,11 +319,25 @@ struct FakeCudaControl {
   int (*memory_access_count_fn)() = nullptr;
   int (*retain_count_fn)() = nullptr;
   int (*release_count_fn)() = nullptr;
+  int (*stream_create_count_fn)() = nullptr;
+  int (*stream_destroy_count_fn)() = nullptr;
+  int (*stream_synchronize_count_fn)() = nullptr;
+  int (*event_create_count_fn)() = nullptr;
+  int (*event_destroy_count_fn)() = nullptr;
+  int (*event_record_count_fn)() = nullptr;
+  int (*event_synchronize_count_fn)() = nullptr;
+  int (*surface_busy_count_fn)() = nullptr;
+  std::uintptr_t (*last_launch_stream_fn)() = nullptr;
+  int (*launch_sequence_at_fn)(int) = nullptr;
+  int (*event_record_sequence_at_fn)(int) = nullptr;
+  int (*event_synchronize_sequence_at_fn)(int) = nullptr;
   void (*set_current_context_fn)(std::uintptr_t) = nullptr;
   void (*fail_next_set_current_fn)(std::uintptr_t) = nullptr;
   std::uintptr_t (*current_context_fn)() = nullptr;
   void (*fail_module_load_fn)(int) = nullptr;
   void (*fail_kernel_launch_fn)() = nullptr;
+  void (*fail_event_record_fn)() = nullptr;
+  void (*fail_event_synchronize_fn)() = nullptr;
   std::uint64_t (*captured_u64_fn)(int) = nullptr;
   std::uint32_t (*captured_u32_fn)(int) = nullptr;
   float (*captured_float_fn)(int) = nullptr;
@@ -371,10 +442,10 @@ void exact_cuda_runtime_path_preserves_windows_unicode(const std::filesystem::pa
 #endif
 }
 
-void compiles_once_and_synchronizes_each_render(const std::filesystem::path& cuda_runtime,
-                                                const std::filesystem::path& nvrtc_runtime,
-                                                const FakeCudaControl& cuda_control,
-                                                const FakeNvrtcControl& nvrtc_control) {
+void compiles_once_and_uses_event_scoped_completion(const std::filesystem::path& cuda_runtime,
+                                                    const std::filesystem::path& nvrtc_runtime,
+                                                    const FakeCudaControl& cuda_control,
+                                                    const FakeNvrtcControl& nvrtc_control) {
   cuda_control.reset();
   nvrtc_control.reset();
   auto renderer = create_renderer(config(), cuda_runtime, nvrtc_runtime);
@@ -402,7 +473,15 @@ void compiles_once_and_synchronizes_each_render(const std::filesystem::path& cud
 
   expect_eq(nvrtc_control.create_count(), 1, "render never recompiles the kernel");
   expect_eq(cuda_control.launch_count(), 2, "one fused launch per render");
-  expect_eq(cuda_control.synchronize_count(), 2, "each render synchronizes before return");
+  expect_eq(cuda_control.synchronize_count(), 0,
+            "render does not synchronize unrelated CUDA context work");
+  expect_eq(cuda_control.stream_create_count(), 1, "renderer retains one execution stream");
+  expect_eq(cuda_control.event_create_count(), 1, "renderer retains one completion event");
+  expect_eq(cuda_control.event_record_count(), 2, "each render records completion");
+  expect_eq(cuda_control.event_synchronize_count(), 2,
+            "each render waits for its completion event");
+  expect_eq(cuda_control.surface_busy_count(), 0,
+            "borrowed render surfaces are complete before return");
   expect_eq(cuda_control.pointer_attribute_count(), 70,
             "each render validates legacy pointers and the VMM output provenance");
   expect_eq(cuda_control.memory_access_count(), 2,
@@ -423,6 +502,101 @@ void compiles_once_and_synchronizes_each_render(const std::filesystem::path& cud
   expect_near(cuda_control.captured_float(1), 255.0F / 219.0F, 1.0e-6F, "limited-range luma scale");
   expect_near(cuda_control.captured_float(2), 128.0F, 1.0e-6F, "limited-range chroma center");
   expect_near(cuda_control.captured_float(13), 127.5F, 1.0e-6F, "full-range chroma center");
+}
+
+void renderer_and_converter_share_ordered_stream(const std::filesystem::path& cuda_runtime,
+                                                 const std::filesystem::path& nvrtc_runtime,
+                                                 const FakeCudaControl& cuda_control) {
+  cuda_control.reset();
+  auto backend = CudaBackend::load(cuda_runtime.string());
+  {
+    auto converter = CudaRgbaToNv12Converter::create({.width = 4, .height = 2}, backend,
+                                                     NvrtcCompiler::load(nvrtc_runtime.string()));
+    expect_eq(cuda_control.stream_create_count(), 1,
+              "converter creates one retained execution stream");
+    expect_eq(cuda_control.event_create_count(), 1,
+              "converter creates one retained completion event");
+    {
+      auto renderer = CudaStereoStitchRenderer::create(config(), backend,
+                                                       NvrtcCompiler::load(nvrtc_runtime.string()));
+      expect_eq(cuda_control.stream_create_count(), 1,
+                "renderer reuses the converter execution stream");
+      expect_eq(cuda_control.event_create_count(), 1,
+                "renderer reuses the converter completion event");
+
+      const auto context = renderer.context_id();
+      const auto left = nv12_frame(0x10000U, context);
+      const auto right = nv12_frame(0x30000U, context);
+      const auto rgba = rgba_frame(0x50000U, context);
+      const auto encoded = nv12_frame(0x70000U, context);
+      renderer.render(left, right, rgba);
+      converter.convert(rgba, encoded);
+
+      expect_eq(cuda_control.launch_count(), 2, "render and conversion each launch once");
+      expect_eq(cuda_control.synchronize_count(), 0,
+                "render-convert chain never synchronizes the CUDA context");
+      expect_eq(cuda_control.stream_synchronize_count(), 0,
+                "successful render-convert chain uses only event completion");
+      expect_eq(cuda_control.event_record_count(), 2,
+                "render and conversion each record stream completion");
+      expect_eq(cuda_control.event_synchronize_count(), 2,
+                "render and conversion each preserve borrowed-surface lifetime");
+      expect_true(cuda_control.last_launch_stream() != 0,
+                  "both kernels launch on an explicit CUDA stream");
+      expect_true(cuda_control.launch_sequence_at(0) < cuda_control.event_record_sequence_at(0) &&
+                      cuda_control.event_record_sequence_at(0) <
+                          cuda_control.event_synchronize_sequence_at(0),
+                  "render launch is recorded and completed in order");
+      expect_true(
+          cuda_control.event_synchronize_sequence_at(0) < cuda_control.launch_sequence_at(1) &&
+              cuda_control.launch_sequence_at(1) < cuda_control.event_record_sequence_at(1) &&
+              cuda_control.event_record_sequence_at(1) <
+                  cuda_control.event_synchronize_sequence_at(1),
+          "conversion follows completed render work on the shared stream");
+      expect_eq(cuda_control.surface_busy_count(), 0,
+                "NVMM handoff cannot observe an in-flight output surface");
+    }
+    expect_eq(cuda_control.stream_destroy_count(), 0,
+              "converter retains the stream after renderer destruction");
+    expect_eq(cuda_control.event_destroy_count(), 0,
+              "converter retains the event after renderer destruction");
+  }
+  expect_eq(cuda_control.event_destroy_count(), 1,
+            "final stream owner destroys the completion event");
+  expect_eq(cuda_control.stream_destroy_count(), 1,
+            "final stream owner destroys the execution stream");
+}
+
+void completion_failures_drain_before_surface_release(const std::filesystem::path& cuda_runtime,
+                                                      const std::filesystem::path& nvrtc_runtime,
+                                                      const FakeCudaControl& cuda_control) {
+  auto renderer = create_renderer(config(), cuda_runtime, nvrtc_runtime);
+  const auto context = renderer.context_id();
+  const auto left = nv12_frame(0x10000U, context);
+  const auto right = nv12_frame(0x30000U, context);
+  const auto output = rgba_frame(0x50000U, context);
+
+  cuda_control.reset();
+  cuda_control.fail_event_record();
+  expect_runtime_error([&] { renderer.render(left, right, output); }, "cuEventRecord",
+                       "event-record failure is reported");
+  expect_eq(cuda_control.synchronize_count(), 0,
+            "event-record recovery does not synchronize the CUDA context");
+  expect_eq(cuda_control.stream_synchronize_count(), 1,
+            "event-record recovery drains only the execution stream");
+  expect_eq(cuda_control.surface_busy_count(), 0,
+            "event-record recovery completes borrowed-surface work");
+
+  cuda_control.reset();
+  cuda_control.fail_event_synchronize();
+  expect_runtime_error([&] { renderer.render(left, right, output); }, "cuEventSynchronize",
+                       "event-wait failure is reported");
+  expect_eq(cuda_control.synchronize_count(), 0,
+            "event-wait recovery does not synchronize the CUDA context");
+  expect_eq(cuda_control.stream_synchronize_count(), 1,
+            "event-wait recovery drains only the execution stream");
+  expect_eq(cuda_control.surface_busy_count(), 0,
+            "event-wait recovery completes borrowed-surface work");
 }
 
 void render_synchronizes_before_restoring_the_caller_context(
@@ -818,9 +992,15 @@ int main() {
   });
   run_case("exact CUDA Windows Unicode path",
            [&] { exact_cuda_runtime_path_preserves_windows_unicode(cuda_runtime); });
-  run_case("compile once and synchronize", [&] {
-    compiles_once_and_synchronizes_each_render(cuda_runtime, nvrtc_runtime, cuda_control,
-                                               nvrtc_control);
+  run_case("compile once with event-scoped completion", [&] {
+    compiles_once_and_uses_event_scoped_completion(cuda_runtime, nvrtc_runtime, cuda_control,
+                                                   nvrtc_control);
+  });
+  run_case("shared render-convert stream ordering and lifetime", [&] {
+    renderer_and_converter_share_ordered_stream(cuda_runtime, nvrtc_runtime, cuda_control);
+  });
+  run_case("completion failures drain before surface release", [&] {
+    completion_failures_drain_before_surface_release(cuda_runtime, nvrtc_runtime, cuda_control);
   });
   run_case("configuration validation", [&] {
     rejects_invalid_configuration_before_compilation(cuda_runtime, nvrtc_runtime, nvrtc_control);

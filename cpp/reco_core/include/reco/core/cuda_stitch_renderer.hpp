@@ -42,9 +42,10 @@ struct CudaStitchRendererConfig {
 /// primary CUDA context. Every render reads borrowed pitched NV12 planes and
 /// writes borrowed pitched RGBA storage without CPU pixel processing. Each call
 /// requires retained whole-span driver validation or validates a structural-only
-/// borrowed span before launch, then synchronizes the CUDA context before
-/// returning so decoder owners may be released immediately; a future stream/fence
-/// API can relax this contract.
+/// borrowed span before launch, then waits for a retained stream completion event
+/// before returning so decoder owners may be released immediately. Renderers and
+/// converters created from the same backend share this ordered stream without
+/// synchronizing unrelated CUDA context work.
 class CudaStereoStitchRenderer {
 public:
   /// Creates a renderer using the process-default CUDA and NVRTC libraries.
@@ -59,7 +60,7 @@ public:
   CudaStereoStitchRenderer& operator=(CudaStereoStitchRenderer&&) noexcept;
   ~CudaStereoStitchRenderer();
 
-  /// Renders and synchronizes one stereo frame entirely in CUDA device memory.
+  /// Renders one stereo frame and waits for its stream event before returning.
   void render(const CudaNv12FrameView& left, const CudaNv12FrameView& right,
               const CudaRgbaFrameView& output, const CudaStitchViewport& viewport = {}) const;
 
