@@ -492,9 +492,11 @@ void validate_frame_provenance(const CudaNv12FrameView& frame, const CameraParam
 }
 
 void validate_plane_allocation(const CudaBackend& backend, const CudaPitchedPlaneView& plane,
-                               std::string_view label, int device_ordinal) {
+                               std::string_view label, CudaSpanAccess required_access,
+                               int device_ordinal) {
   try {
-    backend.validate_device_span(plane.ptr(), plane.accessible_bytes(), device_ordinal);
+    backend.validate_device_span(plane.ptr(), plane.accessible_bytes(), required_access,
+                                 device_ordinal);
   } catch (const std::invalid_argument& error) {
     throw std::invalid_argument("CUDA stitch " + std::string(label) +
                                 " plane is invalid: " + error.what());
@@ -576,12 +578,15 @@ void CudaStereoStitchRenderer::render(const CudaNv12FrameView& left, const CudaN
   if (output.device_ordinal() != state.config.device_ordinal) {
     throw std::invalid_argument("CUDA stitch RGBA output belongs to a different CUDA device");
   }
-  validate_plane_allocation(state.backend, left.y_plane(), "left Y", state.config.device_ordinal);
-  validate_plane_allocation(state.backend, left.uv_plane(), "left UV", state.config.device_ordinal);
-  validate_plane_allocation(state.backend, right.y_plane(), "right Y", state.config.device_ordinal);
-  validate_plane_allocation(state.backend, right.uv_plane(), "right UV",
+  validate_plane_allocation(state.backend, left.y_plane(), "left Y", CudaSpanAccess::Read,
                             state.config.device_ordinal);
-  validate_plane_allocation(state.backend, output.plane(), "RGBA output",
+  validate_plane_allocation(state.backend, left.uv_plane(), "left UV", CudaSpanAccess::Read,
+                            state.config.device_ordinal);
+  validate_plane_allocation(state.backend, right.y_plane(), "right Y", CudaSpanAccess::Read,
+                            state.config.device_ordinal);
+  validate_plane_allocation(state.backend, right.uv_plane(), "right UV", CudaSpanAccess::Read,
+                            state.config.device_ordinal);
+  validate_plane_allocation(state.backend, output.plane(), "RGBA output", CudaSpanAccess::ReadWrite,
                             state.config.device_ordinal);
   for (const auto* input_plane :
        {&left.y_plane(), &left.uv_plane(), &right.y_plane(), &right.uv_plane()}) {

@@ -426,6 +426,32 @@ void surface_array_mapping_retains_and_unmaps_owner() {
   }
 
   params = make_params();
+  params.buffer_desc = 14;
+  surface = make_surface(params);
+  auto context_independent =
+      map_nvmm_frame_to_cuda(extract_info(&surface), std::make_shared<int>(27));
+  expect_eq(context_independent.context_id, static_cast<std::uintptr_t>(0xC0DA),
+            "context-independent mapping uses retained primary-context identity");
+  context_independent.owner.reset();
+
+  params = make_params();
+  params.buffer_desc = 15;
+  surface = make_surface(params);
+  expect_nvmm_error_contains(
+      [&] { (void)map_nvmm_frame_to_cuda(extract_info(&surface), std::make_shared<int>(28)); },
+      "not readable", "PROT_NONE CUDA mapping is rejected");
+  expect_true(params.mapped_addr.cuda_ptr == nullptr,
+              "inaccessible CUDA mapping rolls back cleanly");
+
+  params = make_params();
+  params.buffer_desc = 16;
+  surface = make_surface(params);
+  auto read_only = map_nvmm_frame_to_cuda(extract_info(&surface), std::make_shared<int>(29));
+  expect_true(read_only.y_ptr != 0 && read_only.uv_ptr != 0,
+              "read-only decoded mapping is accepted as a stitch input");
+  read_only.owner.reset();
+
+  params = make_params();
   surface = make_surface(params);
   const auto valid = extract_info(&surface);
   expect_nvmm_error([&] { (void)map_nvmm_frame_to_cuda(valid, {}); },

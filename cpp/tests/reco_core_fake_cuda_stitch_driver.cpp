@@ -24,9 +24,12 @@ constexpr std::uint64_t kUndersizedAllocation = 0xA0000U;
 constexpr std::uint64_t kForeignContextAllocation = 0xB0000U;
 constexpr std::uint64_t kForeignDeviceAllocation = 0xC0000U;
 constexpr std::uint64_t kUnmappedAllocation = 0xD0000U;
+constexpr std::uint64_t kNoAccessAllocation = 0xE0000U;
+constexpr std::uint64_t kReadOnlyAllocation = 0xF0000U;
 constexpr std::uint64_t kContextIndependentMapping = 0x50000U;
 thread_local void* current_context = nullptr;
 std::atomic<int> retain_count{0};
+std::atomic<int> release_count{0};
 std::atomic<int> launch_count{0};
 std::atomic<int> synchronize_count{0};
 std::atomic<int> pointer_attribute_count{0};
@@ -91,6 +94,8 @@ RECO_FAKE_CUDA_EXPORT int recoFakeCudaStitchSynchronizeSequence() {
 RECO_FAKE_CUDA_EXPORT int recoFakeCudaStitchPointerAttributeCount() {
   return pointer_attribute_count.load();
 }
+RECO_FAKE_CUDA_EXPORT int recoFakeCudaStitchRetainCount() { return retain_count.load(); }
+RECO_FAKE_CUDA_EXPORT int recoFakeCudaStitchReleaseCount() { return release_count.load(); }
 RECO_FAKE_CUDA_EXPORT std::uint64_t recoFakeCudaStitchCapturedU64(int index) {
   return index >= 0 && static_cast<std::size_t>(index) < captured_u64.size()
              ? captured_u64[static_cast<std::size_t>(index)]
@@ -166,6 +171,10 @@ RECO_FAKE_CUDA_EXPORT int cuDevicePrimaryCtxRelease_v2(int device) {
     return 1;
   }
   --retain_count;
+  ++release_count;
+  if (retain_count.load() == 0 && current_context == reinterpret_cast<void*>(kContextIdentity)) {
+    current_context = nullptr;
+  }
   return 0;
 }
 RECO_FAKE_CUDA_EXPORT int cuCtxGetCurrent(void** context) {
@@ -176,18 +185,22 @@ RECO_FAKE_CUDA_EXPORT int cuCtxGetCurrent(void** context) {
   return 0;
 }
 RECO_FAKE_CUDA_EXPORT int cuCtxGetDevice(int* device) {
-  if (device == nullptr || current_context != reinterpret_cast<void*>(kContextIdentity)) {
+  if (device == nullptr || retain_count.load() <= 0 ||
+      current_context != reinterpret_cast<void*>(kContextIdentity)) {
     return 1;
   }
   *device = 0;
   return 0;
 }
 RECO_FAKE_CUDA_EXPORT int cuCtxSetCurrent(void* context) {
+  if (context == reinterpret_cast<void*>(kContextIdentity) && retain_count.load() <= 0) {
+    return 1;
+  }
   current_context = context;
   return 0;
 }
 RECO_FAKE_CUDA_EXPORT int cuCtxSynchronize() {
-  if (current_context != reinterpret_cast<void*>(kContextIdentity)) {
+  if (retain_count.load() <= 0 || current_context != reinterpret_cast<void*>(kContextIdentity)) {
     return 1;
   }
   ++synchronize_count;
@@ -198,8 +211,9 @@ RECO_FAKE_CUDA_EXPORT int cuCtxSynchronize() {
 RECO_FAKE_CUDA_EXPORT int cuPointerGetAttribute(void* data, int attribute, std::uint64_t pointer) {
   ++pointer_attribute_count;
   const auto base = allocation_base(pointer);
-  if (data == nullptr || current_context != reinterpret_cast<void*>(kContextIdentity) ||
-      pointer == 0 || base == kFreedAllocation) {
+  if (data == nullptr || retain_count.load() <= 0 ||
+      current_context != reinterpret_cast<void*>(kContextIdentity) || pointer == 0 ||
+      base == kFreedAllocation) {
     return 1;
   }
   switch (attribute) {
@@ -216,11 +230,21 @@ RECO_FAKE_CUDA_EXPORT int cuPointerGetAttribute(void* data, int attribute, std::
   case 9:
     *static_cast<int*>(data) = base == kForeignDeviceAllocation ? 1 : 0;
     return 0;
+  case 11:
+    *static_cast<std::uint64_t*>(data) = base;
+    return 0;
+  case 12:
+    *static_cast<std::size_t*>(data) = allocation_size(base);
+    return 0;
   case 13:
     *static_cast<unsigned int*>(data) = base == kUnmappedAllocation ? 0U : 1U;
     return 0;
+  case 16:
+    *static_cast<unsigned int*>(data) =
+        base == kNoAccessAllocation ? 0U : (base == kReadOnlyAllocation ? 1U : 3U);
+    return 0;
   case 18:
-    *static_cast<std::size_t*>(data) = allocation_size(base);
+    *static_cast<std::size_t*>(data) = kAllocationSize;
     return 0;
   case 19:
     *static_cast<std::uint64_t*>(data) = base;
@@ -231,7 +255,7 @@ RECO_FAKE_CUDA_EXPORT int cuPointerGetAttribute(void* data, int attribute, std::
 }
 
 RECO_FAKE_CUDA_EXPORT int cuModuleLoadData(void** module, const void* image) {
-  if (module == nullptr || image == nullptr ||
+  if (module == nullptr || image == nullptr || retain_count.load() <= 0 ||
       current_context != reinterpret_cast<void*>(kContextIdentity)) {
     return 1;
   }
@@ -255,7 +279,7 @@ RECO_FAKE_CUDA_EXPORT int cuLaunchKernel(void* function, unsigned int grid_x, un
                                          unsigned int shared_memory, void*, void** parameters,
                                          void**) {
   if (function != reinterpret_cast<void*>(0x5678U) || parameters == nullptr ||
-      current_context != reinterpret_cast<void*>(kContextIdentity)) {
+      retain_count.load() <= 0 || current_context != reinterpret_cast<void*>(kContextIdentity)) {
     return 1;
   }
   const auto& left = *static_cast<const PlanePrefix*>(parameters[0]);

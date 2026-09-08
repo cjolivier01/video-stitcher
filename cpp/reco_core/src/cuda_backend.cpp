@@ -36,7 +36,10 @@ constexpr unsigned int kMemoryTypeDevice = 2;
 constexpr int kPointerAttributeContext = 1;
 constexpr int kPointerAttributeMemoryType = 2;
 constexpr int kPointerAttributeDeviceOrdinal = 9;
+constexpr int kPointerAttributeRangeStartAddress = 11;
+constexpr int kPointerAttributeRangeSize = 12;
 constexpr int kPointerAttributeMapped = 13;
+constexpr int kPointerAttributeAccessFlags = 16;
 constexpr int kPointerAttributeMappingSize = 18;
 constexpr int kPointerAttributeMappingBaseAddress = 19;
 constexpr unsigned int kMemAllocationTypePinned = 1;
@@ -47,6 +50,7 @@ constexpr unsigned int kMemHandleType = 2;
 constexpr unsigned int kMemHandleType = 1;
 #endif
 constexpr unsigned int kMemAccessFlagsProtReadWrite = 3;
+constexpr unsigned int kMemAccessFlagsProtRead = 1;
 constexpr unsigned int kMemAllocGranularityMinimum = 0;
 constexpr int kDeviceAttributeComputeCapabilityMajor = 75;
 constexpr int kDeviceAttributeComputeCapabilityMinor = 76;
@@ -192,6 +196,14 @@ void validate_no_nul(std::string_view value, const char* name) {
   if (std::find(value.begin(), value.end(), '\0') != value.end()) {
     throw std::invalid_argument(std::string("CUDA ") + name + " must not contain NUL bytes");
   }
+}
+
+std::string validated_driver_library_path(std::string_view library_path) {
+  validate_no_nul(library_path, "driver library path");
+  if (library_path.size() > kMaximumDriverLibraryPathBytes) {
+    throw std::invalid_argument("CUDA driver library path exceeds 32768 bytes");
+  }
+  return std::string(library_path);
 }
 
 void validate_ptx(std::string_view ptx) {
@@ -642,7 +654,8 @@ std::string CudaBackend::availability_error() {
 
 std::string CudaBackend::availability_error(std::string_view library_path) {
   try {
-    const auto backend = load(library_path);
+    const auto backend =
+        CudaBackend(std::make_shared<Impl>(validated_driver_library_path(library_path)));
     if (backend.device_count() <= 0) {
       return "CUDA driver loaded but no CUDA devices were reported";
     }
@@ -658,11 +671,16 @@ CudaBackend CudaBackend::create() {
 }
 
 CudaBackend CudaBackend::load(std::string_view library_path) {
-  validate_no_nul(library_path, "driver library path");
-  if (library_path.size() > kMaximumDriverLibraryPathBytes) {
-    throw std::invalid_argument("CUDA driver library path exceeds 32768 bytes");
+  const auto path = validated_driver_library_path(library_path);
+  static std::mutex cache_mutex;
+  static std::unordered_map<std::string, std::shared_ptr<Impl>> cache;
+  std::lock_guard<std::mutex> lock(cache_mutex);
+  if (const auto it = cache.find(path); it != cache.end()) {
+    return CudaBackend(it->second);
   }
-  return CudaBackend(std::make_shared<Impl>(std::string(library_path)));
+  auto impl = std::make_shared<Impl>(path);
+  cache.emplace(path, impl);
+  return CudaBackend(std::move(impl));
 }
 
 CudaBackend::CudaBackend(std::shared_ptr<Impl> impl,
@@ -952,12 +970,15 @@ void CudaBackend::copy_device_to_host_2d(const CudaDeviceToHost2DCopy& copy) con
 }
 
 void CudaBackend::validate_device_span(CudaDevicePtr ptr, std::size_t accessible_bytes,
-                                       int device_ordinal) const {
+                                       CudaSpanAccess required_access, int device_ordinal) const {
   if (ptr == 0 || accessible_bytes == 0) {
     throw std::invalid_argument("CUDA device span requires a non-zero pointer and size");
   }
   if (device_ordinal < 0) {
     throw std::invalid_argument("CUDA device span ordinal must be non-negative");
+  }
+  if (required_access != CudaSpanAccess::Read && required_access != CudaSpanAccess::ReadWrite) {
+    throw std::invalid_argument("CUDA device span access requirement is invalid");
   }
 
   const CUcontext previous_context = impl_->current_context();
@@ -972,8 +993,7 @@ void CudaBackend::validate_device_span(CudaDevicePtr ptr, std::size_t accessible
     unsigned int memory_type = 0;
     int pointer_device = -1;
     unsigned int mapped = 0;
-    std::size_t mapping_size = 0;
-    CUdeviceptr mapping_base = 0;
+    unsigned int access_flags = 0;
     check_cuda_pointer(
         "cuPointerGetAttribute(CONTEXT)",
         impl_->cu_pointer_get_attribute(&pointer_context, kPointerAttributeContext, ptr));
@@ -986,11 +1006,8 @@ void CudaBackend::validate_device_span(CudaDevicePtr ptr, std::size_t accessible
     check_cuda_pointer("cuPointerGetAttribute(MAPPED)",
                        impl_->cu_pointer_get_attribute(&mapped, kPointerAttributeMapped, ptr));
     check_cuda_pointer(
-        "cuPointerGetAttribute(MAPPING_SIZE)",
-        impl_->cu_pointer_get_attribute(&mapping_size, kPointerAttributeMappingSize, ptr));
-    check_cuda_pointer(
-        "cuPointerGetAttribute(MAPPING_BASE_ADDR)",
-        impl_->cu_pointer_get_attribute(&mapping_base, kPointerAttributeMappingBaseAddress, ptr));
+        "cuPointerGetAttribute(ACCESS_FLAGS)",
+        impl_->cu_pointer_get_attribute(&access_flags, kPointerAttributeAccessFlags, ptr));
     // CUDA VMM mappings are context-independent and report a null owning context.
     if (pointer_context != nullptr && pointer_context != retained_context) {
       throw std::invalid_argument("CUDA device span belongs to a different CUDA context");
@@ -1004,14 +1021,38 @@ void CudaBackend::validate_device_span(CudaDevicePtr ptr, std::size_t accessible
     if (mapped == 0U) {
       throw std::invalid_argument("CUDA device span is not mapped to a live allocation");
     }
-
-    if (ptr < mapping_base) {
-      throw std::invalid_argument("CUDA device span precedes its mapping");
+    if ((access_flags & kMemAccessFlagsProtRead) == 0U) {
+      throw std::invalid_argument("CUDA device span does not permit device reads");
     }
-    const auto mapping_offset = ptr - mapping_base;
-    if (mapping_offset > mapping_size ||
-        accessible_bytes > mapping_size - static_cast<std::size_t>(mapping_offset)) {
-      throw std::invalid_argument("CUDA device span exceeds its mapping");
+    if (required_access == CudaSpanAccess::ReadWrite &&
+        (access_flags & kMemAccessFlagsProtReadWrite) != kMemAccessFlagsProtReadWrite) {
+      throw std::invalid_argument("CUDA device span does not permit device writes");
+    }
+    std::size_t allocation_size = 0;
+    CUdeviceptr allocation_base = 0;
+    if (pointer_context == nullptr) {
+      check_cuda_pointer(
+          "cuPointerGetAttribute(MAPPING_SIZE)",
+          impl_->cu_pointer_get_attribute(&allocation_size, kPointerAttributeMappingSize, ptr));
+      check_cuda_pointer("cuPointerGetAttribute(MAPPING_BASE_ADDR)",
+                         impl_->cu_pointer_get_attribute(&allocation_base,
+                                                         kPointerAttributeMappingBaseAddress, ptr));
+    } else {
+      check_cuda_pointer(
+          "cuPointerGetAttribute(RANGE_SIZE)",
+          impl_->cu_pointer_get_attribute(&allocation_size, kPointerAttributeRangeSize, ptr));
+      check_cuda_pointer("cuPointerGetAttribute(RANGE_START_ADDR)",
+                         impl_->cu_pointer_get_attribute(&allocation_base,
+                                                         kPointerAttributeRangeStartAddress, ptr));
+    }
+
+    if (ptr < allocation_base) {
+      throw std::invalid_argument("CUDA device span precedes its allocation");
+    }
+    const auto allocation_offset = ptr - allocation_base;
+    if (allocation_offset > allocation_size ||
+        accessible_bytes > allocation_size - static_cast<std::size_t>(allocation_offset)) {
+      throw std::invalid_argument("CUDA device span exceeds its allocation or mapping");
     }
   } catch (...) {
     try {

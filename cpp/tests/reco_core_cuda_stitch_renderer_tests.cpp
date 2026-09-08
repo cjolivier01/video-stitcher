@@ -181,6 +181,31 @@ private:
   void* handle_ = nullptr;
 };
 
+void set_hardware_vmm_access(const CudaBackend& backend, CudaDevicePtr pointer, std::size_t bytes,
+                             unsigned int flags) {
+  struct Location {
+    unsigned int type;
+    int id;
+  };
+  struct AccessDescription {
+    Location location;
+    unsigned int flags;
+  };
+#if defined(_WIN32)
+  DynamicControl driver("nvcuda.dll");
+#else
+  DynamicControl driver("libcuda.so.1");
+#endif
+  const auto set_access =
+      driver.symbol<int (*)(CudaDevicePtr, std::size_t, const AccessDescription*, std::size_t)>(
+          "cuMemSetAccess");
+  backend.ensure_primary_context(0);
+  const AccessDescription access{{1U, 0}, flags};
+  if (set_access(pointer, bytes, &access, 1) != 0) {
+    throw std::runtime_error("failed to set CUDA VMM access in hardware test");
+  }
+}
+
 struct FakeCudaControl {
   explicit FakeCudaControl(const std::filesystem::path& path) : library(path) {
     reset_fn = library.symbol<void (*)()>("recoFakeCudaStitchReset");
@@ -190,6 +215,8 @@ struct FakeCudaControl {
     synchronize_sequence_fn = library.symbol<int (*)()>("recoFakeCudaStitchSynchronizeSequence");
     pointer_attribute_count_fn =
         library.symbol<int (*)()>("recoFakeCudaStitchPointerAttributeCount");
+    retain_count_fn = library.symbol<int (*)()>("recoFakeCudaStitchRetainCount");
+    release_count_fn = library.symbol<int (*)()>("recoFakeCudaStitchReleaseCount");
     captured_u64_fn = library.symbol<std::uint64_t (*)(int)>("recoFakeCudaStitchCapturedU64");
     captured_u32_fn = library.symbol<std::uint32_t (*)(int)>("recoFakeCudaStitchCapturedU32");
     captured_float_fn = library.symbol<float (*)(int)>("recoFakeCudaStitchCapturedFloat");
@@ -201,6 +228,8 @@ struct FakeCudaControl {
   int launch_sequence() const { return launch_sequence_fn(); }
   int synchronize_sequence() const { return synchronize_sequence_fn(); }
   int pointer_attribute_count() const { return pointer_attribute_count_fn(); }
+  int retain_count() const { return retain_count_fn(); }
+  int release_count() const { return release_count_fn(); }
   std::uint64_t captured_u64(int index) const { return captured_u64_fn(index); }
   std::uint32_t captured_u32(int index) const { return captured_u32_fn(index); }
   float captured_float(int index) const { return captured_float_fn(index); }
@@ -212,6 +241,8 @@ struct FakeCudaControl {
   int (*launch_sequence_fn)() = nullptr;
   int (*synchronize_sequence_fn)() = nullptr;
   int (*pointer_attribute_count_fn)() = nullptr;
+  int (*retain_count_fn)() = nullptr;
+  int (*release_count_fn)() = nullptr;
   std::uint64_t (*captured_u64_fn)(int) = nullptr;
   std::uint32_t (*captured_u32_fn)(int) = nullptr;
   float (*captured_float_fn)(int) = nullptr;
@@ -281,6 +312,26 @@ CudaStereoStitchRenderer create_renderer(const CudaStitchRendererConfig& rendere
                                           NvrtcCompiler::load(nvrtc_runtime.string()));
 }
 
+void exact_path_backend_retains_primary_context_for_process_lifetime(
+    const std::filesystem::path& cuda_runtime, const FakeCudaControl& cuda_control) {
+  expect_eq(cuda_control.retain_count(), 0, "fake CUDA context starts unretained");
+  expect_eq(cuda_control.release_count(), 0, "fake CUDA context starts unreleased");
+  CudaContextId context = 0;
+  {
+    auto backend = CudaBackend::load(cuda_runtime.string());
+    context = backend.primary_context_id();
+    expect_true(context != 0, "exact-path backend establishes a primary context");
+  }
+  expect_eq(cuda_control.retain_count(), 1,
+            "exact-path backend cache keeps the primary context retained");
+  expect_eq(cuda_control.release_count(), 0,
+            "exact-path backend destruction does not invalidate a current context");
+  auto reused = CudaBackend::load(cuda_runtime.string());
+  expect_eq(reused.primary_context_id(), context,
+            "repeated exact-path load reuses the retained primary context");
+  expect_eq(cuda_control.retain_count(), 1, "repeated exact-path load does not retain again");
+}
+
 void compiles_once_and_synchronizes_each_render(const std::filesystem::path& cuda_runtime,
                                                 const std::filesystem::path& nvrtc_runtime,
                                                 const FakeCudaControl& cuda_control,
@@ -313,8 +364,8 @@ void compiles_once_and_synchronizes_each_render(const std::filesystem::path& cud
   expect_eq(nvrtc_control.create_count(), 1, "render never recompiles the kernel");
   expect_eq(cuda_control.launch_count(), 2, "one fused launch per render");
   expect_eq(cuda_control.synchronize_count(), 2, "each render synchronizes before return");
-  expect_eq(cuda_control.pointer_attribute_count(), 60,
-            "each render validates all five pointers through six CUDA attributes");
+  expect_eq(cuda_control.pointer_attribute_count(), 70,
+            "each render validates all five pointers through seven CUDA attributes");
   expect_true(cuda_control.launch_sequence() < cuda_control.synchronize_sequence(),
               "launch precedes synchronization");
   expect_eq(cuda_control.captured_u64(0), left.y_plane().ptr(), "left Y pointer propagated");
@@ -331,6 +382,25 @@ void compiles_once_and_synchronizes_each_render(const std::filesystem::path& cud
   expect_near(cuda_control.captured_float(1), 255.0F / 219.0F, 1.0e-6F, "limited-range luma scale");
   expect_near(cuda_control.captured_float(2), 128.0F, 1.0e-6F, "limited-range chroma center");
   expect_near(cuda_control.captured_float(13), 127.5F, 1.0e-6F, "full-range chroma center");
+}
+
+void enforces_device_access_permissions(const std::filesystem::path& cuda_runtime,
+                                        const std::filesystem::path& nvrtc_runtime,
+                                        const FakeCudaControl& cuda_control) {
+  auto renderer = create_renderer(config(), cuda_runtime, nvrtc_runtime);
+  const auto context = renderer.context_id();
+  const auto right = nv12_frame(0x30000U, context);
+  const auto output = rgba_frame(0x50000U, context);
+  cuda_control.reset();
+
+  renderer.render(nv12_frame(0xF0000U, context), right, output);
+  expect_eq(cuda_control.launch_count(), 1, "read-only input is accepted for device reads");
+  expect_invalid_argument([&] { renderer.render(nv12_frame(0xE0000U, context), right, output); },
+                          "reads", "inaccessible input is rejected");
+  expect_invalid_argument(
+      [&] { renderer.render(nv12_frame(0x10000U, context), right, rgba_frame(0xF0000U, context)); },
+      "writes", "read-only output is rejected");
+  expect_eq(cuda_control.launch_count(), 1, "denied access never launches the kernel");
 }
 
 void rejects_invalid_configuration_before_compilation(const std::filesystem::path& cuda_runtime,
@@ -461,6 +531,8 @@ void hardware_kernel_smoke_if_available() {
   auto right_y = backend.allocate_pitched(4, 2, 4);
   auto right_uv = backend.allocate_pitched(4, 1, 4);
   auto output_storage = backend.allocate_shared_memory(32);
+  auto inaccessible_storage = backend.allocate_shared_memory(32);
+  auto read_only_storage = backend.allocate_shared_memory(32);
   const std::vector<std::uint8_t> left_y_host(8, 82);
   const std::vector<std::uint8_t> left_uv_host{90, 240, 90, 240};
   const std::vector<std::uint8_t> right_y_host(8, 145);
@@ -510,6 +582,21 @@ void hardware_kernel_smoke_if_available() {
   const CudaRgbaFrameView output(
       CudaPitchedPlaneView(output_storage.ptr(), output_storage.size(), 16, 16, 2, context), 4, 2);
   auto renderer = CudaStereoStitchRenderer::create(config(), backend, NvrtcCompiler::create());
+  set_hardware_vmm_access(backend, inaccessible_storage.ptr(), inaccessible_storage.size(), 0U);
+  expect_invalid_argument(
+      [&] {
+        backend.validate_device_span(inaccessible_storage.ptr(), inaccessible_storage.size(),
+                                     CudaSpanAccess::Read);
+      },
+      "reads", "hardware PROT_NONE mapping is rejected");
+  set_hardware_vmm_access(backend, read_only_storage.ptr(), read_only_storage.size(), 1U);
+  backend.validate_device_span(read_only_storage.ptr(), read_only_storage.size(),
+                               CudaSpanAccess::Read);
+  const CudaRgbaFrameView read_only_output(
+      CudaPitchedPlaneView(read_only_storage.ptr(), read_only_storage.size(), 16, 16, 2, context),
+      4, 2);
+  expect_invalid_argument([&] { renderer.render(left, right, read_only_output); }, "writes",
+                          "hardware read-only output is rejected");
   renderer.render(left, right, output);
   std::vector<std::uint8_t> pixels(32, 0);
   backend.copy_device_to_host_2d({.dst = pixels.data(),
@@ -546,6 +633,9 @@ int main() {
     expect_invalid_argument([] { (void)CudaBackend::load(std::string(32769U, 'x')); }, "exceeds",
                             "oversized exact CUDA driver path");
   });
+  run_case("exact-path CUDA context lifetime", [&] {
+    exact_path_backend_retains_primary_context_for_process_lifetime(cuda_runtime, cuda_control);
+  });
   run_case("compile once and synchronize", [&] {
     compiles_once_and_synchronizes_each_render(cuda_runtime, nvrtc_runtime, cuda_control,
                                                nvrtc_control);
@@ -555,6 +645,8 @@ int main() {
   });
   run_case("frame contract validation",
            [&] { rejects_unsafe_frame_contracts(cuda_runtime, nvrtc_runtime, cuda_control); });
+  run_case("device access validation",
+           [&] { enforces_device_access_permissions(cuda_runtime, nvrtc_runtime, cuda_control); });
   run_case("moved-from renderer",
            [&] { moved_from_renderer_is_diagnosed(cuda_runtime, nvrtc_runtime); });
   run_case("hardware kernel smoke", hardware_kernel_smoke_if_available);

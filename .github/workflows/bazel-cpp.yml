@@ -181,12 +181,14 @@ jobs:
         env:
           RECO_REQUIRE_CUDA_TEST: "1"
           RECO_REQUIRE_NPP_TEST: "1"
+          RECO_EXPECT_NVMM_MEMORY_TYPE: "cuda-device"
         run: >-
           bazel --output_base="$RUNNER_TEMP/reco-bazel-output" test
           --jobs=2 --local_test_jobs=1
           --cache_test_results=no
           --test_env=RECO_REQUIRE_CUDA_TEST=1
           --test_env=RECO_REQUIRE_NPP_TEST=1
+          --test_env=RECO_EXPECT_NVMM_MEMORY_TYPE=cuda-device
           //cpp/tests:reco_core_nvrtc_tests
           //cpp/tests:reco_core_cuda_stitch_renderer_tests
           //cpp/tests:reco_core_cuda_stitch_parity_tests
@@ -247,3 +249,32 @@ jobs:
           jq -e \
             '.left_uniforms.width == 1280 and .right_uniforms.width == 1280 and (.params.cameraAxisOffset | type == "number")' \
             "$work_dir/match.json" >/dev/null
+
+  jetson-nvmm-hardware-conditional:
+    name: Bazel C++ Jetson NVMM stitch (hardware-conditional)
+    if: >-
+      vars.RECO_JETSON_RUNNER_ENABLED == 'true' &&
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ${{ fromJSON(vars.RECO_JETSON_RUNNER_LABELS || '["self-hosted","linux","ARM64","jetson","nvidia-gpu"]') }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: bazel-contrib/setup-bazel@4fd964a13a440a8aeb0be47350db2fc640f19ca8 # v0.15.0
+        with:
+          bazelisk-cache: true
+      - name: Require Jetson surface-array decode and CUDA stitch
+        env:
+          RECO_REQUIRE_CUDA_TEST: "1"
+          RECO_REQUIRE_NPP_TEST: "1"
+          RECO_EXPECT_NVMM_MEMORY_TYPE: "surface-array"
+          RECO_REQUIRE_JETSON_NVMM_TEST: "1"
+        run: >-
+          bazel --output_base="$RUNNER_TEMP/reco-bazel-output" test
+          --jobs=2 --local_test_jobs=1
+          --cache_test_results=no
+          --test_env=RECO_REQUIRE_CUDA_TEST=1
+          --test_env=RECO_REQUIRE_NPP_TEST=1
+          --test_env=RECO_EXPECT_NVMM_MEMORY_TYPE=surface-array
+          --test_env=RECO_REQUIRE_JETSON_NVMM_TEST=1
+          --test_output=errors
+          //cpp/tests:reco_calibrate_gpu_video_parity_tests

@@ -78,6 +78,14 @@ struct CudaDeviceToHost2DCopy {
   std::size_t height = 0;
 };
 
+/// Device permissions required from a borrowed CUDA memory span.
+enum class CudaSpanAccess {
+  /// The selected CUDA device must be able to read the entire span.
+  Read,
+  /// The selected CUDA device must be able to read and write the entire span.
+  ReadWrite,
+};
+
 class CudaDeviceBuffer {
 public:
   CudaDeviceBuffer() = default;
@@ -159,9 +167,9 @@ public:
   void copy_host_to_device_2d(const CudaHostToDevice2DCopy& copy) const;
   void copy_device_to_device_2d(const Cuda2DCopy& copy) const;
   void copy_device_to_host_2d(const CudaDeviceToHost2DCopy& copy) const;
-  /// Validates that a claimed span is live device memory accessible to the retained device.
+  /// Validates that a claimed span is live device memory with the required device access.
   void validate_device_span(CudaDevicePtr ptr, std::size_t accessible_bytes,
-                            int device_ordinal = 0) const;
+                            CudaSpanAccess required_access, int device_ordinal = 0) const;
   /// Loads one PTX module that can resolve and share ownership across multiple kernels.
   [[nodiscard]] CudaModule load_module_from_ptx(std::string_view ptx, int device_ordinal = 0) const;
   /// Compatibility helper that loads one PTX module and resolves one kernel from it.

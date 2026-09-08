@@ -101,8 +101,9 @@ extern "C" int cuPointerGetAttribute(void* data, int attribute, std::uint64_t po
   const auto base = allocation_base(static_cast<std::uintptr_t>(pointer));
   switch (attribute) {
   case 1:
-    *static_cast<void**>(data) =
-        base == 11 ? reinterpret_cast<void*>(0xBAD) : reinterpret_cast<void*>(0xC0DA);
+    *static_cast<void**>(data) = base == 11   ? reinterpret_cast<void*>(0xBAD)
+                                 : base == 14 ? nullptr
+                                              : reinterpret_cast<void*>(0xC0DA);
     return 0;
   case 2:
     *static_cast<int*>(data) = base == 9 ? 1 : 2;
@@ -114,13 +115,16 @@ extern "C" int cuPointerGetAttribute(void* data, int attribute, std::uint64_t po
     *static_cast<std::uint64_t*>(data) = base;
     return 0;
   case 12:
-    *static_cast<std::size_t*>(data) = kAllocationSize;
+    *static_cast<std::size_t*>(data) = base == 10 || base == 13 ? 1U : kAllocationSize;
     return 0;
   case 13:
     *static_cast<int*>(data) = 1;
     return 0;
+  case 16:
+    *static_cast<unsigned int*>(data) = base == 15 ? 0U : (base == 16 ? 1U : 3U);
+    return 0;
   case 18:
-    *static_cast<std::size_t*>(data) = base == 10 || base == 13 ? 1U : kAllocationSize;
+    *static_cast<std::size_t*>(data) = kAllocationSize;
     return 0;
   case 19:
     *static_cast<std::uint64_t*>(data) = base;

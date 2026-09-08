@@ -220,9 +220,13 @@ constexpr int kCudaMemoryTypeDevice = 2;
 constexpr int kCudaPointerAttributeContext = 1;
 constexpr int kCudaPointerAttributeMemoryType = 2;
 constexpr int kCudaPointerAttributeDeviceOrdinal = 9;
+constexpr int kCudaPointerAttributeRangeStartAddress = 11;
+constexpr int kCudaPointerAttributeRangeSize = 12;
 constexpr int kCudaPointerAttributeMapped = 13;
+constexpr int kCudaPointerAttributeAccessFlags = 16;
 constexpr int kCudaPointerAttributeMappingSize = 18;
 constexpr int kCudaPointerAttributeMappingBase = 19;
+constexpr unsigned int kCudaMemAccessProtRead = 1;
 constexpr std::uint32_t kCudaEglFrameTypePitch = 1;
 constexpr std::uint32_t kCudaArrayFormatUnsignedInt8 = 1;
 constexpr std::uint32_t kCudaEglColorYuv420Semiplanar = 0x01;
@@ -371,15 +375,29 @@ CudaPointerProvenance validate_cuda_plane_pointer(const std::shared_ptr<CudaFunc
                                                   "cuPointerGetAttribute(DEVICE_ORDINAL)");
   const auto mapped = cuda_pointer_attribute<int>(cuda, kCudaPointerAttributeMapped, pointer,
                                                   "cuPointerGetAttribute(MAPPED)");
-  const auto mapping_size = cuda_pointer_attribute<std::size_t>(
-      cuda, kCudaPointerAttributeMappingSize, pointer, "cuPointerGetAttribute(MAPPING_SIZE)");
-  const auto mapping_base = cuda_pointer_attribute<core::CudaDevicePtr>(
-      cuda, kCudaPointerAttributeMappingBase, pointer, "cuPointerGetAttribute(MAPPING_BASE_ADDR)");
-  if (context != cuda->primary_context || memory_type != kCudaMemoryTypeDevice ||
-      device != expected_device || mapped == 0) {
+  const auto access_flags = cuda_pointer_attribute<unsigned int>(
+      cuda, kCudaPointerAttributeAccessFlags, pointer, "cuPointerGetAttribute(ACCESS_FLAGS)");
+  if ((context != nullptr && context != cuda->primary_context) ||
+      memory_type != kCudaMemoryTypeDevice || device != expected_device || mapped == 0) {
     throw NvmmError(std::string("NvBufSurface ") + plane_name +
                     " plane is not memory on the expected device in the retained CUDA context");
   }
+  if ((access_flags & kCudaMemAccessProtRead) == 0U) {
+    throw NvmmError(std::string("NvBufSurface ") + plane_name +
+                    " plane is not readable from the expected CUDA device");
+  }
+  const auto mapping_size = cuda_pointer_attribute<std::size_t>(
+      cuda, context == nullptr ? kCudaPointerAttributeMappingSize : kCudaPointerAttributeRangeSize,
+      pointer,
+      context == nullptr ? "cuPointerGetAttribute(MAPPING_SIZE)"
+                         : "cuPointerGetAttribute(RANGE_SIZE)");
+  const auto mapping_base = cuda_pointer_attribute<core::CudaDevicePtr>(
+      cuda,
+      context == nullptr ? kCudaPointerAttributeMappingBase
+                         : kCudaPointerAttributeRangeStartAddress,
+      pointer,
+      context == nullptr ? "cuPointerGetAttribute(MAPPING_BASE_ADDR)"
+                         : "cuPointerGetAttribute(RANGE_START_ADDR)");
   if (pointer < mapping_base) {
     throw NvmmError(std::string("NvBufSurface ") + plane_name + " plane precedes its CUDA mapping");
   }
@@ -395,7 +413,8 @@ CudaPointerProvenance validate_cuda_plane_pointer(const std::shared_ptr<CudaFunc
                     " plane exceeds its CUDA mapping or plane allocation");
   }
   return {
-      .context_id = reinterpret_cast<std::uintptr_t>(context),
+      .context_id =
+          reinterpret_cast<std::uintptr_t>(context == nullptr ? cuda->primary_context : context),
       .device_ordinal = device,
       .mapping_base = mapping_base,
       .mapping_bytes = mapping_size,
