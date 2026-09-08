@@ -446,6 +446,81 @@ void lifecycle_callback_can_stop_without_deadlock() {
               "callback stop completes without lifecycle-lock deadlock");
 }
 
+void concurrent_stop_and_worker_notification_do_not_deadlock() {
+  struct CallbackCoordination {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool worker_callback_entered = false;
+    bool call_stop = false;
+    bool callback_stop_returned = false;
+  } coordination;
+
+  auto state = std::make_shared<FakeBackendState>();
+  GpuPreviewController* controller_ptr = nullptr;
+  GpuPreviewController controller(
+      valid_config(), std::make_unique<FakeBackend>(state),
+      [&](const GpuPreviewControllerSnapshot& snapshot) {
+        if (!snapshot.ready || snapshot.state != GpuPreviewControllerState::Paused) {
+          return;
+        }
+        {
+          std::unique_lock lock(coordination.mutex);
+          coordination.worker_callback_entered = true;
+          coordination.changed.notify_all();
+          coordination.changed.wait(lock, [&] { return coordination.call_stop; });
+        }
+        controller_ptr->stop();
+        {
+          std::lock_guard lock(coordination.mutex);
+          coordination.callback_stop_returned = true;
+          coordination.changed.notify_all();
+        }
+      });
+  controller_ptr = &controller;
+  controller.start();
+
+  {
+    std::unique_lock lock(coordination.mutex);
+    const bool entered = coordination.changed.wait_for(
+        lock, 2s, [&] { return coordination.worker_callback_entered; });
+    expect_true(entered, "worker notification is held before concurrent stop");
+    if (!entered) {
+      coordination.call_stop = true;
+      coordination.changed.notify_all();
+    }
+  }
+
+  std::thread external_stop([&] { controller.stop(); });
+  const bool shutdown_started =
+      wait_for_backend(state, [&] { return state->shutdown_count != 0U; });
+  expect_true(shutdown_started, "external stop owns the lifecycle path before callback stop");
+  {
+    std::lock_guard lock(coordination.mutex);
+    coordination.call_stop = true;
+    coordination.changed.notify_all();
+  }
+
+  bool callback_stop_returned = false;
+  {
+    std::unique_lock lock(coordination.mutex);
+    callback_stop_returned = coordination.changed.wait_for(
+        lock, 2s, [&] { return coordination.callback_stop_returned; });
+  }
+  if (!callback_stop_returned) {
+    std::cerr << "FAIL: worker notification stop deadlocked with external stop\n" << std::flush;
+    std::_Exit(EXIT_FAILURE);
+  }
+  external_stop.join();
+
+  expect_true(controller.snapshot().state == GpuPreviewControllerState::Stopped,
+              "concurrent notification and external stops reach stopped state");
+  {
+    std::lock_guard lock(state->mutex);
+    expect_true(state->release_count >= 1U,
+                "concurrent stop releases persistent GPU resources after joining");
+  }
+}
+
 } // namespace
 
 int main() {
@@ -456,5 +531,6 @@ int main() {
   stop_wakes_a_blocked_decode_and_joins();
   state_names_are_stable();
   lifecycle_callback_can_stop_without_deadlock();
+  concurrent_stop_and_worker_notification_do_not_deadlock();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

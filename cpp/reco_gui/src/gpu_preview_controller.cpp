@@ -30,6 +30,21 @@ constexpr float kMaximumPitchRadians = 89.0F * kPi / 180.0F;
 constexpr float kMinimumFovDegrees = 20.0F;
 constexpr float kMaximumFovDegrees = 150.0F;
 thread_local const void* g_active_preview_callback_slot = nullptr;
+thread_local const void* g_active_preview_worker = nullptr;
+
+class ActivePreviewWorkerScope {
+public:
+  explicit ActivePreviewWorkerScope(const void* worker) noexcept
+      : previous_(std::exchange(g_active_preview_worker, worker)) {}
+
+  ~ActivePreviewWorkerScope() { g_active_preview_worker = previous_; }
+
+  ActivePreviewWorkerScope(const ActivePreviewWorkerScope&) = delete;
+  ActivePreviewWorkerScope& operator=(const ActivePreviewWorkerScope&) = delete;
+
+private:
+  const void* previous_;
+};
 
 template <typename Path> bool path_has_embedded_null(const Path& path) {
   for (const auto value : path.native()) {
@@ -628,6 +643,19 @@ public:
 
   void stop() noexcept {
     try {
+      if (g_active_preview_worker == this) {
+        // A notification runs synchronously on its publishing thread. A worker
+        // callback cannot join itself, and waiting for lifecycle_mutex_ here
+        // would deadlock with an external stop that owns it while joining.
+        {
+          std::lock_guard lock(mutex_);
+          stopping_ = true;
+          desired_playing_ = false;
+        }
+        control_changed_.notify_all();
+        return;
+      }
+
       std::unique_lock lifecycle_lock(lifecycle_mutex_);
       {
         std::lock_guard lock(mutex_);
@@ -747,6 +775,7 @@ public:
 
 private:
   void run() noexcept {
+    const ActivePreviewWorkerScope active_worker(this);
     try {
       const auto info = backend_->initialize(config_);
       validate_backend_stream_info(info);

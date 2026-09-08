@@ -169,9 +169,9 @@ public:
 /// Thread-safe owner of the non-Qt GPU preview pipeline.
 class GpuPreviewController final {
 public:
-  /// Callback invoked outside controller locks; it may run on a control or worker thread.
-  /// Qt consumers should forward the copied snapshot with a queued connection. A callback must
-  /// not destroy its controller from the worker thread.
+  /// Callback invoked outside controller locks; it may run on a control or worker thread and may
+  /// request that the controller stop. Qt consumers should forward the copied snapshot with a
+  /// queued connection. A callback must not destroy its controller from the worker thread.
   using NotificationCallback = std::function<void(GpuPreviewControllerSnapshot)>;
 
   /// Creates a controller using the production NVDEC/CUDA/NVMM backend.
