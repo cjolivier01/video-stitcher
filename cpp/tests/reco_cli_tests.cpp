@@ -886,8 +886,10 @@ void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
     write_text_descriptor(output.descriptor(), "retained parent encoded output\n");
     std::filesystem::remove(active_parent);
     std::filesystem::create_directory_symlink(redirected_parent, active_parent);
-    expect_eq(read_text_file(output.verification_path()),
-              std::string("retained parent encoded output\n"),
+    const auto verification = read_atomic_output(output.verification_path());
+    expect_true(verification.status == AtomicReadStatus::Success,
+                "Windows verification path remains readable while output is retained");
+    expect_eq(verification.contents, std::string("retained parent encoded output\n"),
               "Windows verification follows the retained output directory");
     output.commit();
     expect_eq(read_text_file(retained_parent / "stitched.mp4"),

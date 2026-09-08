@@ -963,15 +963,9 @@ void hardware_parity_if_available() {
 
 int main() {
   try {
-#if defined(_WIN32)
-    constexpr std::string_view kFakeCudaRunfile =
-        "cpp/tests/reco_core_fake_cuda_rgba_to_nv12_driver.dll";
-    constexpr std::string_view kFakeNvrtcRunfile = "cpp/tests/reco_core_fake_nvrtc_runtime.dll";
-#else
     constexpr std::string_view kFakeCudaRunfile =
         "cpp/tests/libreco_core_fake_cuda_rgba_to_nv12_driver.so";
     constexpr std::string_view kFakeNvrtcRunfile = "cpp/tests/libreco_core_fake_nvrtc_runtime.so";
-#endif
     std::cerr << "RUN: fake runtime setup" << std::endl;
     const auto cuda_runtime = runtime_path("RECO_TEST_FAKE_CUDA_DRIVER", kFakeCudaRunfile);
     const auto nvrtc_runtime = runtime_path("RECO_TEST_FAKE_NVRTC_RUNTIME", kFakeNvrtcRunfile);
