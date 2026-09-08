@@ -3781,7 +3781,46 @@ struct AtomicOutputFile::Impl {
 #endif
   int descriptor = -1;
   bool committed = false;
+
+  ~Impl();
 };
+
+AtomicOutputFile::Impl::~Impl() {
+#if defined(_WIN32)
+  if (descriptor >= 0) {
+    const auto handle = reinterpret_cast<HANDLE>(_get_osfhandle(descriptor));
+    if (!committed && handle != INVALID_HANDLE_VALUE) {
+      (void)discard_open_file(handle);
+    }
+    (void)_close(descriptor);
+  }
+#else
+  if (!committed && descriptor >= 0 && directory_descriptor >= 0 && !temporary_name.empty()) {
+#if defined(__linux__)
+    (void)unlink_descriptor_entry_safely(directory_descriptor, temporary_name, descriptor,
+                                         destination);
+#elif defined(__APPLE__)
+    (void)unlink_posix_descriptor_entry_safely(directory_descriptor, temporary_name, descriptor,
+                                               destination);
+#else
+    struct stat descriptor_identity{};
+    struct stat path_identity{};
+    if (::fstat(descriptor, &descriptor_identity) == 0 &&
+        ::fstatat(directory_descriptor, temporary_name.c_str(), &path_identity,
+                  AT_SYMLINK_NOFOLLOW) == 0 &&
+        same_file_identity(descriptor_identity, path_identity)) {
+      (void)::unlinkat(directory_descriptor, temporary_name.c_str(), 0);
+    }
+#endif
+  }
+  if (descriptor >= 0) {
+    (void)::close(descriptor);
+  }
+  if (directory_descriptor >= 0) {
+    (void)::close(directory_descriptor);
+  }
+#endif
+}
 
 AtomicOutputFile::AtomicOutputFile(
     std::filesystem::path destination,
@@ -3818,6 +3857,15 @@ AtomicOutputFile::AtomicOutputFile(
         FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
         open_error);
     if (handle != INVALID_HANDLE_VALUE) {
+      impl_->descriptor =
+          _open_osfhandle(reinterpret_cast<std::intptr_t>(handle), _O_BINARY | _O_WRONLY);
+      if (impl_->descriptor < 0) {
+        const int descriptor_error = errno;
+        (void)discard_open_file(handle);
+        (void)CloseHandle(handle);
+        throw_file_error("cannot create stitch output descriptor", impl_->destination,
+                         descriptor_error);
+      }
       impl_->temporary_name = core::path_to_utf8(filename);
       impl_->temporary = impl_->parent / filename;
       break;
@@ -3830,23 +3878,15 @@ AtomicOutputFile::AtomicOutputFile(
   if (handle == INVALID_HANDLE_VALUE) {
     throw std::runtime_error("cannot create unique temporary stitch output");
   }
-  impl_->descriptor =
-      _open_osfhandle(reinterpret_cast<std::intptr_t>(handle), _O_BINARY | _O_WRONLY);
-  if (impl_->descriptor < 0) {
-    const int open_error = errno;
-    (void)discard_open_file(handle);
-    (void)CloseHandle(handle);
-    throw_file_error("cannot create stitch output descriptor", impl_->temporary, open_error);
-  }
 #else
   const int directory = ::open(impl_->parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   if (directory < 0) {
     throw_file_error("cannot retain stitch output directory", impl_->parent, errno);
   }
+  impl_->directory_descriptor = directory;
   struct stat directory_identity{};
   if (::fstat(directory, &directory_identity) != 0 || !S_ISDIR(directory_identity.st_mode)) {
     const int inspect_error = errno == 0 ? ENOTDIR : errno;
-    (void)::close(directory);
     throw_file_error("cannot inspect stitch output directory", impl_->parent, inspect_error);
   }
   std::random_device random;
@@ -3863,68 +3903,23 @@ AtomicOutputFile::AtomicOutputFile(
     descriptor = ::openat(directory, temporary_name.c_str(),
                           O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (descriptor >= 0) {
+      impl_->descriptor = descriptor;
+      impl_->temporary_name = std::move(temporary_name);
+      impl_->temporary = impl_->parent / impl_->temporary_name;
       break;
     }
     if (errno != EEXIST) {
       const int open_error = errno;
-      (void)::close(directory);
       throw_file_error("cannot create temporary stitch output", impl_->destination, open_error);
     }
   }
   if (descriptor < 0) {
-    (void)::close(directory);
     throw std::runtime_error("cannot create unique temporary stitch output");
   }
-  impl_->directory_descriptor = directory;
-  impl_->descriptor = descriptor;
-  impl_->temporary_name = std::move(temporary_name);
-  impl_->temporary = impl_->parent / impl_->temporary_name;
 #endif
 }
 
-AtomicOutputFile::~AtomicOutputFile() {
-  if (!impl_) {
-    return;
-  }
-#if defined(_WIN32)
-  if (impl_->descriptor >= 0) {
-    const auto handle = reinterpret_cast<HANDLE>(_get_osfhandle(impl_->descriptor));
-    if (!impl_->committed && handle != INVALID_HANDLE_VALUE) {
-      (void)discard_open_file(handle);
-    }
-    (void)_close(impl_->descriptor);
-    impl_->descriptor = -1;
-  }
-#else
-  if (!impl_->committed && impl_->descriptor >= 0 && impl_->directory_descriptor >= 0 &&
-      !impl_->temporary_name.empty()) {
-#if defined(__linux__)
-    (void)unlink_descriptor_entry_safely(impl_->directory_descriptor, impl_->temporary_name,
-                                         impl_->descriptor, impl_->destination);
-#elif defined(__APPLE__)
-    (void)unlink_posix_descriptor_entry_safely(impl_->directory_descriptor, impl_->temporary_name,
-                                               impl_->descriptor, impl_->destination);
-#else
-    struct stat descriptor_identity{};
-    struct stat path_identity{};
-    if (::fstat(impl_->descriptor, &descriptor_identity) == 0 &&
-        ::fstatat(impl_->directory_descriptor, impl_->temporary_name.c_str(), &path_identity,
-                  AT_SYMLINK_NOFOLLOW) == 0 &&
-        same_file_identity(descriptor_identity, path_identity)) {
-      (void)::unlinkat(impl_->directory_descriptor, impl_->temporary_name.c_str(), 0);
-    }
-#endif
-  }
-  if (impl_->descriptor >= 0) {
-    (void)::close(impl_->descriptor);
-    impl_->descriptor = -1;
-  }
-  if (impl_->directory_descriptor >= 0) {
-    (void)::close(impl_->directory_descriptor);
-    impl_->directory_descriptor = -1;
-  }
-#endif
-}
+AtomicOutputFile::~AtomicOutputFile() = default;
 
 int AtomicOutputFile::descriptor() const {
   if (!impl_ || impl_->descriptor < 0) {
