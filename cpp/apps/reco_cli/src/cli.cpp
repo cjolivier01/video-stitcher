@@ -613,36 +613,40 @@ public:
   return relative_path_identifies_windows_handle(directory, destination_name, source, false);
 }
 
-[[nodiscard]] DWORD link_open_file(HANDLE handle, HANDLE directory, std::wstring_view link_name) {
+[[nodiscard]] DWORD link_open_file(HANDLE handle, HANDLE directory, std::wstring_view link_name,
+                                   bool replace_existing = false) {
   const auto filename_bytes = link_name.size() * sizeof(wchar_t);
-  // winternl.h does not expose FILE_LINK_INFORMATION. Keep this definition
-  // local to the native FileLinkInformation (class 11) call.
+  // winternl.h does not expose FILE_LINK_INFORMATION. FileLinkInformation
+  // reads the first byte as ReplaceIfExists; FileLinkInformationEx reads the
+  // same storage as a flags word.
   struct NativeLinkInfo {
-    BOOLEAN replace_if_exists;
+    ULONG flags;
     HANDLE root_directory;
     ULONG filename_length;
     wchar_t filename[1];
   };
   static_assert(std::is_standard_layout_v<NativeLinkInfo>);
-  static_assert(sizeof(BOOLEAN) == 1U);
   static_assert(sizeof(ULONG) == 4U);
   const auto info_bytes = offsetof(NativeLinkInfo, filename) + filename_bytes;
   std::vector<std::max_align_t> storage(
       (info_bytes + sizeof(std::max_align_t) - 1U) / sizeof(std::max_align_t), std::max_align_t{});
   auto* raw = reinterpret_cast<std::byte*>(storage.data());
-  const BOOLEAN replace_if_exists = FALSE;
+  constexpr ULONG kReplaceIfExists = 0x00000001;
+  constexpr ULONG kPosixSemantics = 0x00000002;
+  const ULONG flags = replace_existing ? kReplaceIfExists | kPosixSemantics : 0U;
   const HANDLE root_directory = directory;
   const auto filename_length = static_cast<ULONG>(filename_bytes);
-  std::memcpy(raw + offsetof(NativeLinkInfo, replace_if_exists), &replace_if_exists,
-              sizeof(replace_if_exists));
+  std::memcpy(raw + offsetof(NativeLinkInfo, flags), &flags, sizeof(flags));
   std::memcpy(raw + offsetof(NativeLinkInfo, root_directory), &root_directory,
               sizeof(root_directory));
   std::memcpy(raw + offsetof(NativeLinkInfo, filename_length), &filename_length,
               sizeof(filename_length));
   std::memcpy(raw + offsetof(NativeLinkInfo, filename), link_name.data(), filename_bytes);
   constexpr ULONG kFileLinkInformation = 11;
+  constexpr ULONG kFileLinkInformationEx = 72;
   return set_windows_file_information(handle, storage.data(), static_cast<ULONG>(info_bytes),
-                                      kFileLinkInformation);
+                                      replace_existing ? kFileLinkInformationEx
+                                                       : kFileLinkInformation);
 }
 
 void rename_open_file(HANDLE handle, HANDLE directory, std::wstring_view destination_name,
@@ -2258,71 +2262,25 @@ void write_calibration_json_atomically_impl(
                                                                      destination_name, handle);
             return false;
           }
-          BY_HANDLE_FILE_INFORMATION published_identity{};
-          if (GetFileInformationByHandle(handle, &published_identity) == 0) {
-            throw_file_error("cannot inspect published calibration output before rollback",
-                             destination, static_cast<int>(GetLastError()));
+          const auto restore_error =
+              link_open_file(displaced_output->handle.get(), output_directory.handle.get(),
+                             destination_name, true);
+          if (restore_error != ERROR_SUCCESS) {
+            throw_file_error("cannot relink displaced calibration output for rollback", destination,
+                             static_cast<int>(restore_error));
           }
-          const auto retain_published_error =
-              link_open_file(handle, output_directory.handle.get(), temporary_name);
-          if (retain_published_error != ERROR_SUCCESS) {
-            throw_file_error("cannot retain published calibration output for rollback", temporary,
-                             static_cast<int>(retain_published_error));
-          }
-          temporary_exists = true;
-          if (!relative_path_identifies_windows_handle(output_directory.handle.get(),
-                                                       temporary_name, handle, false)) {
-            throw WindowsPublicationIdentityError(
-                "retained published calibration output changed before rollback");
-          }
-          rename_open_file(displaced_output->handle.get(), output_directory.handle.get(),
-                           destination_name, destination, true, true);
           destination_published = false;
           if (!relative_path_identifies_windows_handle(output_directory.handle.get(),
                                                        destination_name,
-                                                       displaced_output->handle.get(), true) ||
-              !relative_path_identifies_windows_handle(output_directory.handle.get(),
-                                                       temporary_name, handle, false)) {
+                                                       displaced_output->handle.get(), true)) {
             return false;
           }
+          if (!discard_open_file(displaced_output->handle.get())) {
+            throw_file_error("cannot remove displaced calibration output rollback link",
+                             output_directory.resolved_path / displaced_output->name,
+                             static_cast<int>(GetLastError()));
+          }
           displaced_output.reset();
-
-          if (CloseHandle(handle) == 0) {
-            throw_file_error("cannot release retained published calibration output", temporary,
-                             static_cast<int>(GetLastError()));
-          }
-          handle = INVALID_HANDLE_VALUE;
-          DWORD cleanup_error = ERROR_SUCCESS;
-          const HANDLE cleanup_handle = open_windows_file_relative(
-              output_directory.handle.get(), temporary_name,
-              DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE, FILE_SHARE_READ, FILE_OPEN,
-              FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
-              cleanup_error);
-          if (cleanup_handle == INVALID_HANDLE_VALUE) {
-            throw_file_error("cannot reopen retained published calibration output", temporary,
-                             static_cast<int>(cleanup_error));
-          }
-          UniqueWindowsHandle retained_cleanup(cleanup_handle);
-          FILE_ATTRIBUTE_TAG_INFO cleanup_attributes{};
-          BY_HANDLE_FILE_INFORMATION cleanup_identity{};
-          if (GetFileInformationByHandleEx(cleanup_handle, FileAttributeTagInfo,
-                                           &cleanup_attributes, sizeof(cleanup_attributes)) == 0 ||
-              (cleanup_attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
-              GetFileInformationByHandle(cleanup_handle, &cleanup_identity) == 0 ||
-              !same_windows_file_identity(published_identity, cleanup_identity)) {
-            throw WindowsPublicationIdentityError(
-                "retained published calibration output changed before cleanup");
-          }
-          if (!discard_open_file(cleanup_handle)) {
-            throw_file_error("cannot remove retained published calibration output", temporary,
-                             static_cast<int>(GetLastError()));
-          }
-          if (CloseHandle(retained_cleanup.get()) == 0) {
-            throw_file_error("cannot close retained published calibration output", temporary,
-                             static_cast<int>(GetLastError()));
-          }
-          (void)retained_cleanup.release();
-          temporary_exists = false;
         } else {
           rename_open_file(handle, output_directory.handle.get(), temporary_name, temporary, false,
                            false);
