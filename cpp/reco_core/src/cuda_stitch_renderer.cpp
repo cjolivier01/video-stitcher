@@ -291,7 +291,7 @@ extern "C" __global__ void reco_stitch_nv12_rgba(
                  mul(make_vec3(view.right), ndc_x * view.projection[0] * view.projection[1]));
   ray = normalize(add(ray, mul(make_vec3(view.up), ndc_y * view.projection[0])));
 
-  Pixel destination{0.0f, 0.0f, 0.0f, 0.0f};
+  Pixel destination{0.0f, 0.0f, 0.0f, 1.0f};
   Pixel source{};
   if (shade_plane(left, view, ray, false, &source)) {
     composite(source, &destination);
@@ -491,23 +491,35 @@ void validate_frame_provenance(const CudaNv12FrameView& frame, const CameraParam
   }
 }
 
+void validate_plane_allocation(const CudaBackend& backend, const CudaPitchedPlaneView& plane,
+                               std::string_view label, int device_ordinal) {
+  try {
+    backend.validate_device_span(plane.ptr(), plane.accessible_bytes(), device_ordinal);
+  } catch (const std::invalid_argument& error) {
+    throw std::invalid_argument("CUDA stitch " + std::string(label) +
+                                " plane is invalid: " + error.what());
+  }
+}
+
 } // namespace
 
 struct CudaStereoStitchRenderer::Impl {
-  Impl(CudaStitchRendererConfig config_in, CudaContextId context_id_in, CudaKernel kernel_in)
+  Impl(CudaStitchRendererConfig config_in, CudaContextId context_id_in, CudaBackend backend_in,
+       CudaKernel kernel_in)
       : config(std::move(config_in)),
         scene(SceneGeometry::from_layout_with_aspect(
             config.calibration.layout, static_cast<float>(config.calibration.left.width) /
                                            static_cast<float>(config.calibration.left.height))),
         left_basis(plane_basis(CameraId::Left, scene)),
         right_basis(plane_basis(CameraId::Right, scene)), context_id(context_id_in),
-        kernel(std::move(kernel_in)) {}
+        backend(std::move(backend_in)), kernel(std::move(kernel_in)) {}
 
   CudaStitchRendererConfig config;
   SceneGeometry scene;
   PlaneBasis left_basis;
   PlaneBasis right_basis;
   CudaContextId context_id = 0;
+  CudaBackend backend;
   CudaKernel kernel;
   mutable std::mutex render_mutex;
 };
@@ -531,7 +543,7 @@ CudaStereoStitchRenderer CudaStereoStitchRenderer::create(CudaStitchRendererConf
   auto module = backend.load_module_from_ptx(compiled.ptx, config.device_ordinal);
   auto kernel = module.load_kernel(kKernelName);
   return CudaStereoStitchRenderer(
-      std::make_unique<Impl>(std::move(config), context_id, std::move(kernel)));
+      std::make_unique<Impl>(std::move(config), context_id, std::move(backend), std::move(kernel)));
 }
 
 CudaStereoStitchRenderer::CudaStereoStitchRenderer(std::unique_ptr<Impl> impl)
@@ -564,6 +576,13 @@ void CudaStereoStitchRenderer::render(const CudaNv12FrameView& left, const CudaN
   if (output.device_ordinal() != state.config.device_ordinal) {
     throw std::invalid_argument("CUDA stitch RGBA output belongs to a different CUDA device");
   }
+  validate_plane_allocation(state.backend, left.y_plane(), "left Y", state.config.device_ordinal);
+  validate_plane_allocation(state.backend, left.uv_plane(), "left UV", state.config.device_ordinal);
+  validate_plane_allocation(state.backend, right.y_plane(), "right Y", state.config.device_ordinal);
+  validate_plane_allocation(state.backend, right.uv_plane(), "right UV",
+                            state.config.device_ordinal);
+  validate_plane_allocation(state.backend, output.plane(), "RGBA output",
+                            state.config.device_ordinal);
   for (const auto* input_plane :
        {&left.y_plane(), &left.uv_plane(), &right.y_plane(), &right.uv_plane()}) {
     if (spans_overlap(*input_plane, output.plane())) {

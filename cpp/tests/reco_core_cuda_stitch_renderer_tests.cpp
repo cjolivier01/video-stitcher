@@ -188,6 +188,9 @@ struct FakeCudaControl {
     synchronize_count_fn = library.symbol<int (*)()>("recoFakeCudaStitchSynchronizeCount");
     launch_sequence_fn = library.symbol<int (*)()>("recoFakeCudaStitchLaunchSequence");
     synchronize_sequence_fn = library.symbol<int (*)()>("recoFakeCudaStitchSynchronizeSequence");
+    pointer_attribute_count_fn =
+        library.symbol<int (*)()>("recoFakeCudaStitchPointerAttributeCount");
+    address_range_count_fn = library.symbol<int (*)()>("recoFakeCudaStitchAddressRangeCount");
     captured_u64_fn = library.symbol<std::uint64_t (*)(int)>("recoFakeCudaStitchCapturedU64");
     captured_u32_fn = library.symbol<std::uint32_t (*)(int)>("recoFakeCudaStitchCapturedU32");
     captured_float_fn = library.symbol<float (*)(int)>("recoFakeCudaStitchCapturedFloat");
@@ -198,6 +201,8 @@ struct FakeCudaControl {
   int synchronize_count() const { return synchronize_count_fn(); }
   int launch_sequence() const { return launch_sequence_fn(); }
   int synchronize_sequence() const { return synchronize_sequence_fn(); }
+  int pointer_attribute_count() const { return pointer_attribute_count_fn(); }
+  int address_range_count() const { return address_range_count_fn(); }
   std::uint64_t captured_u64(int index) const { return captured_u64_fn(index); }
   std::uint32_t captured_u32(int index) const { return captured_u32_fn(index); }
   float captured_float(int index) const { return captured_float_fn(index); }
@@ -208,6 +213,8 @@ struct FakeCudaControl {
   int (*synchronize_count_fn)() = nullptr;
   int (*launch_sequence_fn)() = nullptr;
   int (*synchronize_sequence_fn)() = nullptr;
+  int (*pointer_attribute_count_fn)() = nullptr;
+  int (*address_range_count_fn)() = nullptr;
   std::uint64_t (*captured_u64_fn)(int) = nullptr;
   std::uint32_t (*captured_u32_fn)(int) = nullptr;
   float (*captured_float_fn)(int) = nullptr;
@@ -309,6 +316,10 @@ void compiles_once_and_synchronizes_each_render(const std::filesystem::path& cud
   expect_eq(nvrtc_control.create_count(), 1, "render never recompiles the kernel");
   expect_eq(cuda_control.launch_count(), 2, "one fused launch per render");
   expect_eq(cuda_control.synchronize_count(), 2, "each render synchronizes before return");
+  expect_eq(cuda_control.pointer_attribute_count(), 40,
+            "each render validates all five pointers through four CUDA attributes");
+  expect_eq(cuda_control.address_range_count(), 10,
+            "each render validates all five pointer allocation bounds");
   expect_true(cuda_control.launch_sequence() < cuda_control.synchronize_sequence(),
               "launch precedes synchronization");
   expect_eq(cuda_control.captured_u64(0), left.y_plane().ptr(), "left Y pointer propagated");
@@ -399,6 +410,18 @@ void rejects_unsafe_frame_contracts(const std::filesystem::path& cuda_runtime,
         renderer.render(left, right, output, {.yaw = std::numeric_limits<float>::quiet_NaN()});
       },
       "finite", "non-finite yaw is rejected");
+  expect_invalid_argument([&] { renderer.render(nv12_frame(0x80000U, context), right, output); },
+                          "device memory", "host pointer is rejected");
+  expect_invalid_argument([&] { renderer.render(nv12_frame(0x8F000U, context), right, output); },
+                          "rejected", "freed UV pointer is rejected");
+  expect_invalid_argument([&] { renderer.render(left, nv12_frame(0xA0000U, context), output); },
+                          "exceeds", "undersized allocation is rejected");
+  expect_invalid_argument([&] { renderer.render(left, right, rgba_frame(0xB0000U, context)); },
+                          "different CUDA context", "foreign-context output is rejected");
+  expect_invalid_argument([&] { renderer.render(left, nv12_frame(0xBF000U, context), output); },
+                          "different CUDA device", "foreign-device UV pointer is rejected");
+  expect_invalid_argument([&] { renderer.render(left, right, rgba_frame(0xD0000U, context)); },
+                          "not mapped", "unmapped output pointer is rejected");
   expect_eq(cuda_control.launch_count(), 0, "invalid render requests do not launch");
   expect_eq(cuda_control.synchronize_count(), 0, "invalid render requests do not synchronize");
 }

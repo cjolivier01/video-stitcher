@@ -14,10 +14,13 @@ using CudaContextId = std::uintptr_t;
 /// Borrowed view of pitched CUDA device memory.
 ///
 /// The view does not own or retain the allocation. Its caller must keep the
-/// allocation and CUDA context alive for the complete use of the view.
+/// allocation and CUDA context alive for the complete use of the view. The
+/// constructor validates the claimed shape and provenance metadata only;
+/// consumers must validate the pointer and capacity with the CUDA driver before
+/// submitting GPU work.
 struct CudaPitchedPlaneView {
 public:
-  /// Creates a view after validating its address, capacity, shape, pitch, and provenance.
+  /// Creates a view after structurally validating its claimed metadata.
   CudaPitchedPlaneView(CudaDevicePtr ptr, std::size_t accessible_bytes, std::size_t pitch_bytes,
                        std::size_t row_bytes, std::uint32_t rows, CudaContextId context_id,
                        int device_ordinal = 0);

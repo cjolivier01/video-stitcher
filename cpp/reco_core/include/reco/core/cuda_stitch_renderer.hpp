@@ -40,9 +40,11 @@ struct CudaStitchRendererConfig {
 ///
 /// Construction compiles exactly one NVRTC kernel and loads it into the selected
 /// primary CUDA context. Every render reads borrowed pitched NV12 planes and
-/// writes borrowed pitched RGBA storage without CPU pixel processing. The call
-/// synchronizes the CUDA context before returning so decoder owners may be
-/// released immediately; a future stream/fence API can relax this contract.
+/// writes borrowed pitched RGBA storage without CPU pixel processing. Each call
+/// validates every borrowed span against the CUDA driver's pointer provenance
+/// and allocation bounds before launch, then synchronizes the CUDA context
+/// before returning so decoder owners may be released immediately; a future
+/// stream/fence API can relax this contract.
 class CudaStereoStitchRenderer {
 public:
   /// Creates a renderer using the process-default CUDA and NVRTC libraries.

@@ -312,7 +312,7 @@ std::vector<std::uint8_t> reference_render(const CudaStitchRendererConfig& confi
       Float3 ray =
           add(view.forward, multiply(view.right, ndc_x * view.tan_half_fov * view.output_aspect));
       ray = normalize(add(ray, multiply(view.up, ndc_y * view.tan_half_fov)));
-      ReferencePixel destination;
+      ReferencePixel destination{.a = 1.0F};
       ReferencePixel source;
       const bool left_hit = shade_reference(left, config.calibration.left, left_basis, view, ray,
                                             plane_aspect, config.calibration.lens_correction_amount,
@@ -345,6 +345,7 @@ std::vector<std::uint8_t> reference_render(const CudaStitchRendererConfig& confi
 }
 
 MatchCalibration parity_calibration();
+HostNv12 patterned_frame(std::uint32_t seed, YuvColorMatrix matrix, YuvColorRange range, bool flip);
 
 std::optional<std::pair<float, float>> reference_project_ray(Float3 ray, const CameraParams& camera,
                                                              const ReferenceBasis& basis,
@@ -449,6 +450,24 @@ MatchCalibration parity_calibration() {
   calibration.blend_width = 0.18F;
   calibration.lens_correction_amount = 0.8F;
   return calibration;
+}
+
+void reference_alpha_matches_wgpu_compositing() {
+  CudaStitchRendererConfig config{
+      .calibration = parity_calibration(), .output_width = 48, .output_height = 28};
+  const CudaStitchViewport viewport{.yaw = 0.07F, .pitch = -0.04F, .fov_degrees = 82.0F};
+  ReferenceCoverage coverage;
+  const auto output = reference_render(
+      config, viewport, patterned_frame(7, YuvColorMatrix::Bt601, YuvColorRange::Limited, false),
+      patterned_frame(19, YuvColorMatrix::Bt2020, YuvColorRange::Full, false), &coverage);
+  expect_true(coverage.uncovered != 0, "alpha fixture exercises uncovered output pixels");
+  expect_true(coverage.fractional_blends != 0,
+              "alpha fixture exercises fractional feather blending");
+  bool all_opaque = true;
+  for (std::size_t index = 3; index < output.size(); index += 4U) {
+    all_opaque = all_opaque && output[index] == 255U;
+  }
+  expect_true(all_opaque, "wgpu clear and OVER behavior keeps every output pixel opaque");
 }
 
 HostNv12 patterned_frame(std::uint32_t seed, YuvColorMatrix matrix, YuvColorRange range,
@@ -580,7 +599,12 @@ void run_hardware_parity_case(const CudaBackend& backend, const CudaStereoStitch
   const auto center = (static_cast<std::size_t>(config.output_height / 2U) * config.output_width +
                        config.output_width / 2U) *
                       4U;
-  expect_true(expected[center + 3U] != 0U, "parity fixture center ray intersects the scene");
+  expect_true(expected[center + 3U] == 255U, "parity fixture center ray is opaque");
+  bool all_alpha_opaque = true;
+  for (std::size_t index = 3; index < actual.size(); index += 4U) {
+    all_alpha_opaque = all_alpha_opaque && actual[index] == 255U;
+  }
+  expect_true(all_alpha_opaque, "CUDA uncovered and feathered output pixels are opaque");
   compare_pixels(actual, expected, "CUDA stitch");
 }
 
@@ -626,6 +650,7 @@ void hardware_parity_if_available() {
 
 int main() {
   run_case("representative projection rays", representative_rays_match_projection_api);
+  run_case("opaque alpha reference", reference_alpha_matches_wgpu_compositing);
   run_case("hardware CUDA stitch parity", hardware_parity_if_available);
   if (failures != 0) {
     std::cerr << failures << " test(s) failed\n";

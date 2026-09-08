@@ -15,10 +15,21 @@
 namespace {
 
 constexpr std::uintptr_t kContextIdentity = 0xCAFE0001U;
+constexpr std::uintptr_t kForeignContextIdentity = 0xCAFE0002U;
+constexpr std::uint64_t kAllocationAlignment = 0x1000U;
+constexpr std::size_t kAllocationSize = 0x1000U;
+constexpr std::uint64_t kHostAllocation = 0x80000U;
+constexpr std::uint64_t kFreedAllocation = 0x90000U;
+constexpr std::uint64_t kUndersizedAllocation = 0xA0000U;
+constexpr std::uint64_t kForeignContextAllocation = 0xB0000U;
+constexpr std::uint64_t kForeignDeviceAllocation = 0xC0000U;
+constexpr std::uint64_t kUnmappedAllocation = 0xD0000U;
 thread_local void* current_context = nullptr;
 std::atomic<int> retain_count{0};
 std::atomic<int> launch_count{0};
 std::atomic<int> synchronize_count{0};
+std::atomic<int> pointer_attribute_count{0};
+std::atomic<int> address_range_count{0};
 std::atomic<int> sequence{0};
 std::atomic<int> last_launch_sequence{0};
 std::atomic<int> last_synchronize_sequence{0};
@@ -49,11 +60,21 @@ struct ViewPrefix {
   float blend_clip[4];
 };
 
+std::uint64_t allocation_base(std::uint64_t pointer) {
+  return pointer - pointer % kAllocationAlignment;
+}
+
+std::size_t allocation_size(std::uint64_t base) {
+  return base == kUndersizedAllocation ? 8U : kAllocationSize;
+}
+
 } // namespace
 
 RECO_FAKE_CUDA_EXPORT void recoFakeCudaStitchReset() {
   launch_count = 0;
   synchronize_count = 0;
+  pointer_attribute_count = 0;
+  address_range_count = 0;
   sequence = 0;
   last_launch_sequence = 0;
   last_synchronize_sequence = 0;
@@ -67,6 +88,12 @@ RECO_FAKE_CUDA_EXPORT int recoFakeCudaStitchSynchronizeCount() { return synchron
 RECO_FAKE_CUDA_EXPORT int recoFakeCudaStitchLaunchSequence() { return last_launch_sequence.load(); }
 RECO_FAKE_CUDA_EXPORT int recoFakeCudaStitchSynchronizeSequence() {
   return last_synchronize_sequence.load();
+}
+RECO_FAKE_CUDA_EXPORT int recoFakeCudaStitchPointerAttributeCount() {
+  return pointer_attribute_count.load();
+}
+RECO_FAKE_CUDA_EXPORT int recoFakeCudaStitchAddressRangeCount() {
+  return address_range_count.load();
 }
 RECO_FAKE_CUDA_EXPORT std::uint64_t recoFakeCudaStitchCapturedU64(int index) {
   return index >= 0 && static_cast<std::size_t>(index) < captured_u64.size()
@@ -169,6 +196,47 @@ RECO_FAKE_CUDA_EXPORT int cuCtxSynchronize() {
   }
   ++synchronize_count;
   last_synchronize_sequence = ++sequence;
+  return 0;
+}
+
+RECO_FAKE_CUDA_EXPORT int cuPointerGetAttribute(void* data, int attribute, std::uint64_t pointer) {
+  ++pointer_attribute_count;
+  const auto base = allocation_base(pointer);
+  if (data == nullptr || current_context != reinterpret_cast<void*>(kContextIdentity) ||
+      pointer == 0 || base == kFreedAllocation) {
+    return 1;
+  }
+  switch (attribute) {
+  case 1:
+    *static_cast<void**>(data) = base == kForeignContextAllocation
+                                     ? reinterpret_cast<void*>(kForeignContextIdentity)
+                                     : reinterpret_cast<void*>(kContextIdentity);
+    return 0;
+  case 2:
+    *static_cast<unsigned int*>(data) = base == kHostAllocation ? 1U : 2U;
+    return 0;
+  case 9:
+    *static_cast<int*>(data) = base == kForeignDeviceAllocation ? 1 : 0;
+    return 0;
+  case 13:
+    *static_cast<unsigned int*>(data) = base == kUnmappedAllocation ? 0U : 1U;
+    return 0;
+  default:
+    return 1;
+  }
+}
+
+RECO_FAKE_CUDA_EXPORT int cuMemGetAddressRange_v2(std::uint64_t* base, std::size_t* size,
+                                                  std::uint64_t pointer) {
+  ++address_range_count;
+  const auto pointer_base = allocation_base(pointer);
+  if (base == nullptr || size == nullptr ||
+      current_context != reinterpret_cast<void*>(kContextIdentity) || pointer == 0 ||
+      pointer_base == kFreedAllocation) {
+    return 1;
+  }
+  *base = pointer_base;
+  *size = allocation_size(pointer_base);
   return 0;
 }
 

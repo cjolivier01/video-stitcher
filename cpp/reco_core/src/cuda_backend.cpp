@@ -33,6 +33,10 @@ using CUmemGenericAllocationHandle = std::uint64_t;
 constexpr CUresult kCudaSuccess = 0;
 constexpr unsigned int kMemoryTypeHost = 1;
 constexpr unsigned int kMemoryTypeDevice = 2;
+constexpr int kPointerAttributeContext = 1;
+constexpr int kPointerAttributeMemoryType = 2;
+constexpr int kPointerAttributeDeviceOrdinal = 9;
+constexpr int kPointerAttributeMapped = 13;
 constexpr unsigned int kMemAllocationTypePinned = 1;
 constexpr unsigned int kMemLocationTypeDevice = 1;
 #if defined(_WIN32)
@@ -151,6 +155,14 @@ void check_cuda(const char* function, CUresult result) {
   }
 }
 
+void check_cuda_pointer(const char* function, CUresult result) {
+  if (result != kCudaSuccess) {
+    throw std::invalid_argument(std::string(function) +
+                                " rejected the CUDA device pointer (error " +
+                                std::to_string(result) + ")");
+  }
+}
+
 void validate_2d_shape(std::size_t src_pitch, std::size_t dst_pitch, std::size_t width_bytes,
                        std::size_t height) {
   if (width_bytes == 0 || height == 0) {
@@ -258,6 +270,10 @@ struct CudaBackend::Impl {
     cu_memcpy_2d = driver.symbol<decltype(cu_memcpy_2d)>("cuMemcpy2D_v2");
     cu_memcpy_dtoh = driver.symbol<decltype(cu_memcpy_dtoh)>("cuMemcpyDtoH_v2");
     cu_mem_get_info = driver.symbol<decltype(cu_mem_get_info)>("cuMemGetInfo_v2");
+    cu_mem_get_address_range =
+        driver.symbol<decltype(cu_mem_get_address_range)>("cuMemGetAddressRange_v2");
+    cu_pointer_get_attribute =
+        driver.symbol<decltype(cu_pointer_get_attribute)>("cuPointerGetAttribute");
     cu_mem_get_allocation_granularity =
         driver.symbol<decltype(cu_mem_get_allocation_granularity)>("cuMemGetAllocationGranularity");
     cu_mem_address_reserve = driver.symbol<decltype(cu_mem_address_reserve)>("cuMemAddressReserve");
@@ -349,6 +365,8 @@ struct CudaBackend::Impl {
   CUresult (*cu_memcpy_2d)(const CudaMemcpy2D*) = nullptr;
   CUresult (*cu_memcpy_dtoh)(void*, CUdeviceptr, std::size_t) = nullptr;
   CUresult (*cu_mem_get_info)(std::size_t*, std::size_t*) = nullptr;
+  CUresult (*cu_mem_get_address_range)(CUdeviceptr*, std::size_t*, CUdeviceptr) = nullptr;
+  CUresult (*cu_pointer_get_attribute)(void*, int, CUdeviceptr) = nullptr;
   CUresult (*cu_mem_get_allocation_granularity)(std::size_t*, const CudaMemAllocationProp*,
                                                 unsigned int) = nullptr;
   CUresult (*cu_mem_address_reserve)(CUdeviceptr*, std::size_t, std::size_t, CUdeviceptr,
@@ -932,6 +950,73 @@ void CudaBackend::copy_device_to_host_2d(const CudaDeviceToHost2DCopy& copy) con
   if (trace_sink_) {
     trace_sink_->device_to_host_copy_submitted(copy.width_bytes, copy.height);
   }
+}
+
+void CudaBackend::validate_device_span(CudaDevicePtr ptr, std::size_t accessible_bytes,
+                                       int device_ordinal) const {
+  if (ptr == 0 || accessible_bytes == 0) {
+    throw std::invalid_argument("CUDA device span requires a non-zero pointer and size");
+  }
+  if (device_ordinal < 0) {
+    throw std::invalid_argument("CUDA device span ordinal must be non-negative");
+  }
+
+  const CUcontext previous_context = impl_->current_context();
+  impl_->ensure_primary_context(device_ordinal);
+  try {
+    const CUcontext retained_context = impl_->current_context();
+    if (retained_context == nullptr) {
+      throw std::runtime_error("CUDA device span validation did not establish a context");
+    }
+
+    CUcontext pointer_context = nullptr;
+    unsigned int memory_type = 0;
+    int pointer_device = -1;
+    unsigned int mapped = 0;
+    check_cuda_pointer(
+        "cuPointerGetAttribute(CONTEXT)",
+        impl_->cu_pointer_get_attribute(&pointer_context, kPointerAttributeContext, ptr));
+    check_cuda_pointer(
+        "cuPointerGetAttribute(MEMORY_TYPE)",
+        impl_->cu_pointer_get_attribute(&memory_type, kPointerAttributeMemoryType, ptr));
+    check_cuda_pointer(
+        "cuPointerGetAttribute(DEVICE_ORDINAL)",
+        impl_->cu_pointer_get_attribute(&pointer_device, kPointerAttributeDeviceOrdinal, ptr));
+    check_cuda_pointer("cuPointerGetAttribute(MAPPED)",
+                       impl_->cu_pointer_get_attribute(&mapped, kPointerAttributeMapped, ptr));
+    if (pointer_context != retained_context) {
+      throw std::invalid_argument("CUDA device span belongs to a different CUDA context");
+    }
+    if (memory_type != kMemoryTypeDevice) {
+      throw std::invalid_argument("CUDA device span does not reference device memory");
+    }
+    if (pointer_device != device_ordinal) {
+      throw std::invalid_argument("CUDA device span belongs to a different CUDA device");
+    }
+    if (mapped == 0U) {
+      throw std::invalid_argument("CUDA device span is not mapped to a live allocation");
+    }
+
+    CUdeviceptr allocation_base = 0;
+    std::size_t allocation_size = 0;
+    check_cuda_pointer("cuMemGetAddressRange_v2",
+                       impl_->cu_mem_get_address_range(&allocation_base, &allocation_size, ptr));
+    if (ptr < allocation_base) {
+      throw std::invalid_argument("CUDA device span precedes its allocation");
+    }
+    const auto allocation_offset = ptr - allocation_base;
+    if (allocation_offset > allocation_size ||
+        accessible_bytes > allocation_size - static_cast<std::size_t>(allocation_offset)) {
+      throw std::invalid_argument("CUDA device span exceeds its allocation");
+    }
+  } catch (...) {
+    try {
+      impl_->set_current_context(previous_context);
+    } catch (...) {
+    }
+    throw;
+  }
+  impl_->set_current_context(previous_context);
 }
 
 CudaModule CudaBackend::load_module_from_ptx(std::string_view ptx, int device_ordinal) const {
