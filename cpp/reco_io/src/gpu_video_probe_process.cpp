@@ -154,6 +154,7 @@ struct ProbeLaunchOptions {
   bool force_worker_memory_limit_for_test = false;
 #if defined(_WIN32)
   bool pad_request_to_maximum_size = false;
+  std::chrono::nanoseconds pre_request_write_delay{};
 #endif
   int pre_owner_fork_ready_descriptor = -1;
   int pre_owner_fork_release_descriptor = -1;
@@ -472,7 +473,8 @@ std::string read_response(HANDLE input, std::chrono::steady_clock::time_point de
   return response;
 }
 
-std::string run_probe_worker(const std::filesystem::path& worker_path, std::string_view request,
+std::string run_probe_worker(const std::filesystem::path& worker_path,
+                             std::shared_ptr<const std::string> request,
                              std::chrono::steady_clock::time_point deadline,
                              std::chrono::steady_clock::time_point cleanup_deadline,
                              const ProbeLaunchOptions& options,
@@ -654,19 +656,47 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
     terminate_worker();
     throw_worker_timeout();
   }
-  std::exception_ptr write_error;
+  struct RequestWriterState {
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool stop_requested = false;
+    bool write_committed = false;
+    bool completed = false;
+    std::exception_ptr error;
+  };
+  auto writer_state = std::make_shared<RequestWriterState>();
   std::thread writer;
   try {
     if (options.fail_request_writer_start) {
       throw GpuVideoProbeError("forced video probe request-writer construction failure");
     }
-    writer = std::thread([input = std::move(parent_stdin), request, &write_error]() {
-      try {
-        write_request(input.get(), request);
-      } catch (...) {
-        write_error = std::current_exception();
-      }
-    });
+    writer =
+        std::thread([input = std::move(parent_stdin), request = std::move(request),
+                     state = writer_state, pre_write_delay = options.pre_request_write_delay]() {
+          try {
+            {
+              std::unique_lock lock(state->mutex);
+              if (pre_write_delay.count() > 0) {
+                (void)state->condition.wait_for(lock, pre_write_delay,
+                                                [&] { return state->stop_requested; });
+              }
+              if (state->stop_requested) {
+                throw GpuVideoProbeError(
+                    "failed to write video probe worker request (request writer cancelled)");
+              }
+              state->write_committed = true;
+            }
+            write_request(input.get(), *request);
+          } catch (...) {
+            std::lock_guard lock(state->mutex);
+            state->error = std::current_exception();
+          }
+          {
+            std::lock_guard lock(state->mutex);
+            state->completed = true;
+          }
+          state->condition.notify_all();
+        });
   } catch (...) {
     terminate_worker();
     throw;
@@ -674,19 +704,46 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
 
   const auto terminate_cancel_and_join = [&](std::chrono::steady_clock::time_point deadline =
                                                  std::chrono::steady_clock::time_point::max()) {
-    terminate_worker(deadline);
+    deadline = std::min(deadline, cleanup_deadline);
+    {
+      std::lock_guard lock(writer_state->mutex);
+      writer_state->stop_requested = true;
+    }
+    writer_state->condition.notify_all();
     (void)CancelSynchronousIo(writer.native_handle());
-    writer.join();
+    terminate_worker(deadline);
+    std::unique_lock lock(writer_state->mutex);
+    while (!writer_state->completed && std::chrono::steady_clock::now() < deadline) {
+      const auto writer_committed = writer_state->write_committed;
+      lock.unlock();
+      if (writer_committed) {
+        (void)CancelSynchronousIo(writer.native_handle());
+      }
+      lock.lock();
+      const auto poll_deadline =
+          std::min(deadline, std::chrono::steady_clock::now() + kProcessPollInterval);
+      (void)writer_state->condition.wait_until(lock, poll_deadline,
+                                               [&] { return writer_state->completed; });
+    }
+    const auto completed = writer_state->completed;
+    lock.unlock();
+    if (completed) {
+      writer.join();
+    } else {
+      writer.detach();
+    }
+    return completed;
   };
 
   while (true) {
     if (cancellation_is_requested(cancellation_requested)) {
-      terminate_cancel_and_join(std::chrono::steady_clock::now() + kMaximumTerminationReserve);
+      (void)terminate_cancel_and_join(std::chrono::steady_clock::now() +
+                                      kMaximumTerminationReserve);
       throw GpuVideoProbeCancelled();
     }
     const auto now = std::chrono::steady_clock::now();
     if (now >= deadline) {
-      terminate_cancel_and_join();
+      (void)terminate_cancel_and_join();
       throw_worker_timeout();
     }
     const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
@@ -701,13 +758,15 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
       break;
     }
     if (wait_result != WAIT_TIMEOUT) {
-      terminate_cancel_and_join();
+      (void)terminate_cancel_and_join();
       throw GpuVideoProbeError("failed while waiting for video probe worker");
     }
   }
-  terminate_cancel_and_join();
-  if (write_error != nullptr) {
-    std::rethrow_exception(write_error);
+  if (!terminate_cancel_and_join()) {
+    throw GpuVideoProbeError("video probe request writer did not stop before the cleanup deadline");
+  }
+  if (writer_state->error != nullptr) {
+    std::rethrow_exception(writer_state->error);
   }
   DWORD exit_code = 0;
   if (GetExitCodeProcess(process.get(), &exit_code) == 0 || exit_code != 0) {
@@ -1409,11 +1468,16 @@ ForkProtectedFd duplicate_fork_protected_for_supervisor(int descriptor) {
 }
 
 #if defined(__linux__)
-ForkProtectedFd snapshot_linux_probe_executable(int source) {
+ForkProtectedFd
+snapshot_linux_probe_executable(int source, std::chrono::steady_clock::time_point deadline,
+                                const GpuVideoProbeCancellationRequested& cancellation_requested) {
 #if !defined(SYS_memfd_create)
   (void)source;
+  (void)deadline;
+  (void)cancellation_requested;
   throw GpuVideoProbeError("sealed Linux video probe snapshots require memfd_create");
 #else
+  require_worker_launch_active(deadline, cancellation_requested);
   struct stat before{};
   if (::fstat(source, &before) != 0 || before.st_size <= 0 ||
       static_cast<std::uint64_t>(before.st_size) > kMaximumProbeExecutableSnapshotBytes) {
@@ -1436,26 +1500,35 @@ ForkProtectedFd snapshot_linux_probe_executable(int source) {
     throw GpuVideoProbeError("failed to create sealed Linux video probe snapshot: " +
                              std::string(std::strerror(errno)));
   }
+  require_worker_launch_active(deadline, cancellation_requested);
 
   std::array<char, 64U * 1024U> buffer{};
   off_t offset = 0;
   while (offset < before.st_size) {
+    require_worker_launch_active(deadline, cancellation_requested);
     const auto remaining = static_cast<std::uint64_t>(before.st_size - offset);
     const auto requested = static_cast<std::size_t>(
         std::min<std::uint64_t>(remaining, static_cast<std::uint64_t>(buffer.size())));
     ssize_t received = -1;
     do {
       received = ::pread(source, buffer.data(), requested, offset);
+      if (received < 0 && errno == EINTR) {
+        require_worker_launch_active(deadline, cancellation_requested);
+      }
     } while (received < 0 && errno == EINTR);
     if (received <= 0) {
       throw GpuVideoProbeError("failed to read Linux video probe executable snapshot");
     }
     std::size_t written = 0;
     while (written < static_cast<std::size_t>(received)) {
+      require_worker_launch_active(deadline, cancellation_requested);
       ssize_t count = -1;
       do {
         count = ::write(snapshot.get(), buffer.data() + written,
                         static_cast<std::size_t>(received) - written);
+        if (count < 0 && errno == EINTR) {
+          require_worker_launch_active(deadline, cancellation_requested);
+        }
       } while (count < 0 && errno == EINTR);
       if (count <= 0) {
         throw GpuVideoProbeError("failed to write Linux video probe executable snapshot");
@@ -1464,6 +1537,7 @@ ForkProtectedFd snapshot_linux_probe_executable(int source) {
     }
     offset += received;
   }
+  require_worker_launch_active(deadline, cancellation_requested);
 
   struct stat after{};
   struct stat snapshot_status{};
@@ -1485,6 +1559,7 @@ ForkProtectedFd snapshot_linux_probe_executable(int source) {
     throw GpuVideoProbeError("failed to seal Linux video probe executable snapshot: " +
                              std::string(std::strerror(errno)));
   }
+  require_worker_launch_active(deadline, cancellation_requested);
   return snapshot;
 #endif
 }
@@ -1493,8 +1568,10 @@ ForkProtectedFd snapshot_linux_probe_executable(int source) {
 #if defined(__APPLE__)
 class MacProbeExecutableSnapshot final {
 public:
-  MacProbeExecutableSnapshot(int source, std::chrono::steady_clock::time_point deadline) {
+  MacProbeExecutableSnapshot(int source, std::chrono::steady_clock::time_point deadline,
+                             const GpuVideoProbeCancellationRequested& cancellation_requested) {
     try {
+      require_worker_launch_active(deadline, cancellation_requested);
       struct stat before{};
       if (::fstat(source, &before) != 0 || before.st_size <= 0 ||
           static_cast<std::uint64_t>(before.st_size) > kMaximumProbeExecutableSnapshotBytes) {
@@ -1507,13 +1584,14 @@ public:
       constexpr char hexadecimal[] = "0123456789abcdef";
       int setup_error = EEXIST;
       for (int attempt = 0; attempt < 128 && setup_error == EEXIST; ++attempt) {
+        require_worker_launch_active(deadline, cancellation_requested);
         std::string token(32U, '0');
         for (auto& digit : token) {
           digit = hexadecimal[random() & 0x0fU];
         }
         root_ = temporary_directory / ("reco-video-probe-" + token);
         executable_ = root_ / "probe-worker";
-        setup_error = start_cleanup_helper(deadline);
+        setup_error = start_cleanup_helper(deadline, cancellation_requested);
         if (setup_error == EEXIST) {
           root_.clear();
           executable_.clear();
@@ -1531,6 +1609,7 @@ public:
         throw GpuVideoProbeError("failed to create macOS video probe snapshot: " +
                                  std::string(std::strerror(errno)));
       }
+      require_worker_launch_active(deadline, cancellation_requested);
 
       constexpr std::size_t maximum_xattr_names_bytes = 1024U * 1024U;
       constexpr std::uint64_t maximum_xattr_value_bytes = 16ULL * 1024ULL * 1024ULL;
@@ -1547,6 +1626,7 @@ public:
       std::uint64_t xattr_value_bytes = 0;
       std::size_t name_offset = 0;
       while (name_offset < xattr_names.size()) {
+        require_worker_launch_active(deadline, cancellation_requested);
         const auto remaining = xattr_names.size() - name_offset;
         const auto name_size = ::strnlen(xattr_names.data() + name_offset, remaining);
         if (name_size == 0 || name_size == remaining) {
@@ -1561,10 +1641,86 @@ public:
         xattr_value_bytes += static_cast<std::uint64_t>(value_size);
         name_offset += name_size + 1U;
       }
-      if (::fcopyfile(source, output.get(), nullptr, COPYFILE_DATA | COPYFILE_XATTR) != 0) {
-        throw GpuVideoProbeError("failed to copy macOS video probe executable snapshot: " +
-                                 std::string(std::strerror(errno)));
+
+      std::array<char, 64U * 1024U> buffer{};
+      off_t offset = 0;
+      while (offset < before.st_size) {
+        require_worker_launch_active(deadline, cancellation_requested);
+        const auto remaining = static_cast<std::uint64_t>(before.st_size - offset);
+        const auto requested = static_cast<std::size_t>(
+            std::min<std::uint64_t>(remaining, static_cast<std::uint64_t>(buffer.size())));
+        ssize_t received = -1;
+        do {
+          received = ::pread(source, buffer.data(), requested, offset);
+          if (received < 0 && errno == EINTR) {
+            require_worker_launch_active(deadline, cancellation_requested);
+          }
+        } while (received < 0 && errno == EINTR);
+        if (received <= 0) {
+          throw GpuVideoProbeError("failed to read macOS video probe executable snapshot");
+        }
+        std::size_t written = 0;
+        while (written < static_cast<std::size_t>(received)) {
+          require_worker_launch_active(deadline, cancellation_requested);
+          ssize_t count = -1;
+          do {
+            count = ::write(output.get(), buffer.data() + written,
+                            static_cast<std::size_t>(received) - written);
+            if (count < 0 && errno == EINTR) {
+              require_worker_launch_active(deadline, cancellation_requested);
+            }
+          } while (count < 0 && errno == EINTR);
+          if (count <= 0) {
+            throw GpuVideoProbeError("failed to write macOS video probe executable snapshot");
+          }
+          written += static_cast<std::size_t>(count);
+        }
+        offset += received;
       }
+      require_worker_launch_active(deadline, cancellation_requested);
+      struct MetadataCopyContext {
+        std::chrono::steady_clock::time_point deadline;
+        const GpuVideoProbeCancellationRequested* cancellation_requested;
+        bool cancelled = false;
+        bool timed_out = false;
+      } copy_context{deadline, &cancellation_requested};
+      const copyfile_callback_t copy_status = [](int, int, copyfile_state_t, const char*,
+                                                 const char*, void* opaque) {
+        auto& context = *static_cast<MetadataCopyContext*>(opaque);
+        if (cancellation_is_requested(*context.cancellation_requested)) {
+          context.cancelled = true;
+          return COPYFILE_QUIT;
+        }
+        if (std::chrono::steady_clock::now() >= context.deadline) {
+          context.timed_out = true;
+          return COPYFILE_QUIT;
+        }
+        return COPYFILE_CONTINUE;
+      };
+      auto* copy_state = ::copyfile_state_alloc();
+      if (copy_state == nullptr ||
+          ::copyfile_state_set(copy_state, COPYFILE_STATE_STATUS_CB,
+                               reinterpret_cast<const void*>(copy_status)) != 0 ||
+          ::copyfile_state_set(copy_state, COPYFILE_STATE_STATUS_CTX, &copy_context) != 0) {
+        if (copy_state != nullptr) {
+          (void)::copyfile_state_free(copy_state);
+        }
+        throw GpuVideoProbeError("failed to configure macOS video probe metadata copy");
+      }
+      const auto copy_result = ::fcopyfile(source, output.get(), copy_state, COPYFILE_XATTR);
+      const auto copy_error = errno;
+      (void)::copyfile_state_free(copy_state);
+      if (copy_context.cancelled) {
+        throw GpuVideoProbeCancelled();
+      }
+      if (copy_context.timed_out) {
+        throw_worker_timeout();
+      }
+      if (copy_result != 0) {
+        throw GpuVideoProbeError("failed to copy macOS video probe executable metadata: " +
+                                 std::string(std::strerror(copy_error)));
+      }
+      require_worker_launch_active(deadline, cancellation_requested);
 
       struct stat after{};
       struct stat snapshot_status{};
@@ -1583,6 +1739,7 @@ public:
         throw GpuVideoProbeError("failed to seal macOS video probe executable snapshot: " +
                                  std::string(std::strerror(errno)));
       }
+      require_worker_launch_active(deadline, cancellation_requested);
     } catch (...) {
       cleanup();
       throw;
@@ -1596,7 +1753,9 @@ public:
   [[nodiscard]] const std::filesystem::path& executable() const { return executable_; }
 
 private:
-  [[nodiscard]] int start_cleanup_helper(std::chrono::steady_clock::time_point deadline) {
+  [[nodiscard]] int
+  start_cleanup_helper(std::chrono::steady_clock::time_point deadline,
+                       const GpuVideoProbeCancellationRequested& cancellation_requested) {
     auto lifetime_descriptors = ForkProtectedFd::create_socket_pair("macOS snapshot cleanup");
     auto helper_lifetime = std::move(lifetime_descriptors[0]);
     auto owner_lifetime = std::move(lifetime_descriptors[1]);
@@ -1732,7 +1891,7 @@ private:
     int setup_error = 0;
     try {
       read_exact(cleanup_lifetime_.get(), reinterpret_cast<char*>(&setup_error),
-                 sizeof(setup_error), deadline);
+                 sizeof(setup_error), deadline, cancellation_requested);
     } catch (...) {
       stop_cleanup_helper();
       throw;
@@ -4260,7 +4419,10 @@ public:
   GuardianProcess(const GuardianProcess&) = delete;
   GuardianProcess& operator=(const GuardianProcess&) = delete;
   ~GuardianProcess() {
-    if (cancellation_is_requested(cancellation_requested_)) {
+    if (!cancellation_latched_ && cancellation_is_requested(cancellation_requested_)) {
+      cancellation_latched_ = true;
+    }
+    if (cancellation_latched_) {
       deadline_ =
           std::min(deadline_, std::chrono::steady_clock::now() + kMaximumTerminationReserve);
     }
@@ -4270,6 +4432,7 @@ public:
   [[nodiscard]] int control() const { return control_.get(); }
 
   void cancel() {
+    cancellation_latched_ = true;
     deadline_ = std::min(deadline_, std::chrono::steady_clock::now() + kMaximumTerminationReserve);
     terminate();
   }
@@ -4403,6 +4566,7 @@ private:
   std::shared_ptr<SupervisorSlot> reservation_;
   int owner_wait_release_descriptor_ = -1;
   GpuVideoProbeCancellationRequested cancellation_requested_;
+  bool cancellation_latched_ = false;
 };
 
 std::string run_probe_worker(const std::filesystem::path& worker_path, std::string_view request,
@@ -4416,10 +4580,12 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
   (void)deferred_process_reaper();
   auto source_executable = open_probe_executable(worker_path);
 #if defined(__linux__)
-  auto pinned_executable = snapshot_linux_probe_executable(source_executable.get());
+  auto pinned_executable =
+      snapshot_linux_probe_executable(source_executable.get(), deadline, cancellation_requested);
   const auto executable = worker_path.string();
 #elif defined(__APPLE__)
-  MacProbeExecutableSnapshot executable_snapshot(source_executable.get(), deadline);
+  MacProbeExecutableSnapshot executable_snapshot(source_executable.get(), deadline,
+                                                 cancellation_requested);
   auto pinned_executable = open_fork_protected_probe_executable(executable_snapshot.executable());
   const auto executable = executable_snapshot.executable().string();
 #else
@@ -4493,68 +4659,73 @@ std::string run_probe_worker(const std::filesystem::path& worker_path, std::stri
                            std::move(parent_control), std::move(guardian_launch.caller_lifetime),
                            cleanup_deadline, std::move(reservation),
                            options.owner_wait_release_descriptor, cancellation_requested);
-  child_input.reset();
-  child_output.reset();
-  child_control.reset();
-  guard_control.reset();
-  guard_input.reset();
-  guard_output.reset();
-  char lifecycle = '\0';
-  const auto throw_guardian_startup_error = [&] {
-    int launch_error = 0;
-    read_exact(guardian.control(), reinterpret_cast<char*>(&launch_error), sizeof(launch_error),
-               deadline, cancellation_requested);
-    throw GpuVideoProbeError("failed to start video probe worker guardian: " +
-                             std::string(std::strerror(launch_error)));
-  };
-  read_exact(guardian.control(), &lifecycle, 1, deadline, cancellation_requested);
-  if (lifecycle == kGuardianLaunchFailed) {
-    throw_guardian_startup_error();
-  }
-  if (lifecycle != kGuardianReady) {
-    throw GpuVideoProbeError("video probe guardian failed its readiness handshake");
-  }
-  write_all(guardian.control(), std::string_view(&kGuardianLaunch, 1), deadline,
-            cancellation_requested);
-  read_exact(guardian.control(), &lifecycle, 1, deadline, cancellation_requested);
-  if (lifecycle == kGuardianLaunchFailed) {
-    throw_guardian_startup_error();
-  }
-  if (lifecycle != kGuardianStarted) {
-    throw GpuVideoProbeError("video probe guardian failed its worker launch handshake");
-  }
-  std::uint64_t encoded_worker_pid = 0;
-  read_exact(guardian.control(), reinterpret_cast<char*>(&encoded_worker_pid),
-             sizeof(encoded_worker_pid), deadline, cancellation_requested);
-  if (encoded_worker_pid == 0 ||
-      encoded_worker_pid > static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max())) {
-    throw GpuVideoProbeError("video probe guardian returned an invalid worker process ID");
-  }
-  require_worker_launch_active(deadline, cancellation_requested);
-  write_all(guardian.control(), std::string_view(&kGuardianRelease, 1), deadline,
-            cancellation_requested);
-  write_request(parent_input.get(), request, deadline, stable_source, cancellation_requested);
-  parent_input.reset();
+  try {
+    child_input.reset();
+    child_output.reset();
+    child_control.reset();
+    guard_control.reset();
+    guard_input.reset();
+    guard_output.reset();
+    char lifecycle = '\0';
+    const auto throw_guardian_startup_error = [&] {
+      int launch_error = 0;
+      read_exact(guardian.control(), reinterpret_cast<char*>(&launch_error), sizeof(launch_error),
+                 deadline, cancellation_requested);
+      throw GpuVideoProbeError("failed to start video probe worker guardian: " +
+                               std::string(std::strerror(launch_error)));
+    };
+    read_exact(guardian.control(), &lifecycle, 1, deadline, cancellation_requested);
+    if (lifecycle == kGuardianLaunchFailed) {
+      throw_guardian_startup_error();
+    }
+    if (lifecycle != kGuardianReady) {
+      throw GpuVideoProbeError("video probe guardian failed its readiness handshake");
+    }
+    write_all(guardian.control(), std::string_view(&kGuardianLaunch, 1), deadline,
+              cancellation_requested);
+    read_exact(guardian.control(), &lifecycle, 1, deadline, cancellation_requested);
+    if (lifecycle == kGuardianLaunchFailed) {
+      throw_guardian_startup_error();
+    }
+    if (lifecycle != kGuardianStarted) {
+      throw GpuVideoProbeError("video probe guardian failed its worker launch handshake");
+    }
+    std::uint64_t encoded_worker_pid = 0;
+    read_exact(guardian.control(), reinterpret_cast<char*>(&encoded_worker_pid),
+               sizeof(encoded_worker_pid), deadline, cancellation_requested);
+    if (encoded_worker_pid == 0 ||
+        encoded_worker_pid > static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max())) {
+      throw GpuVideoProbeError("video probe guardian returned an invalid worker process ID");
+    }
+    require_worker_launch_active(deadline, cancellation_requested);
+    write_all(guardian.control(), std::string_view(&kGuardianRelease, 1), deadline,
+              cancellation_requested);
+    write_request(parent_input.get(), request, deadline, stable_source, cancellation_requested);
+    parent_input.reset();
 
-  read_exact(guardian.control(), &lifecycle, 1, deadline, cancellation_requested);
-  if (lifecycle != kGuardianExited) {
-    throw GpuVideoProbeError("video probe guardian failed its worker exit handshake");
+    read_exact(guardian.control(), &lifecycle, 1, deadline, cancellation_requested);
+    if (lifecycle != kGuardianExited) {
+      throw GpuVideoProbeError("video probe guardian failed its worker exit handshake");
+    }
+    int status = 0;
+    read_exact(guardian.control(), reinterpret_cast<char*>(&status), sizeof(status), deadline,
+               cancellation_requested);
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
+      throw GpuVideoProbeError("failed to start video probe worker");
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+      throw GpuVideoProbeError("video probe worker exited abnormally");
+    }
+    auto response = read_response(parent_output.get(), deadline, cancellation_requested);
+    throw_if_cancelled(cancellation_requested);
+    if (!guardian.finish()) {
+      throw GpuVideoProbeError("failed to reap video probe guardian before the configured timeout");
+    }
+    return response;
+  } catch (const GpuVideoProbeCancelled&) {
+    guardian.cancel();
+    throw;
   }
-  int status = 0;
-  read_exact(guardian.control(), reinterpret_cast<char*>(&status), sizeof(status), deadline,
-             cancellation_requested);
-  if (WIFEXITED(status) && WEXITSTATUS(status) == 127) {
-    throw GpuVideoProbeError("failed to start video probe worker");
-  }
-  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-    throw GpuVideoProbeError("video probe worker exited abnormally");
-  }
-  auto response = read_response(parent_output.get(), deadline, cancellation_requested);
-  throw_if_cancelled(cancellation_requested);
-  if (!guardian.finish()) {
-    throw GpuVideoProbeError("failed to reap video probe guardian before the configured timeout");
-  }
-  return response;
 }
 
 #endif
@@ -4577,8 +4748,9 @@ run_probe_worker_bounded(std::filesystem::path worker_path, std::string request,
   wait_for_worker_launch_delay(options.supervisor_start_delay, public_deadline,
                                cancellation_requested);
 #if defined(_WIN32)
-  return run_probe_worker(worker_path, request, worker_deadline, public_deadline, options,
-                          std::move(reservation), stable_source, cancellation_requested);
+  auto shared_request = std::make_shared<const std::string>(std::move(request));
+  return run_probe_worker(worker_path, std::move(shared_request), worker_deadline, public_deadline,
+                          options, std::move(reservation), stable_source, cancellation_requested);
 #else
   return run_probe_worker(worker_path, request, worker_deadline, public_deadline, options,
                           std::move(reservation), stable_source, cancellation_requested);
@@ -4803,8 +4975,10 @@ GpuVideoProbe
 detail::probe_gpu_video_with_maximum_request_for_test(const GpuFileDecodeConfig& config,
                                                       const std::filesystem::path& worker_path,
                                                       std::uint64_t timeout_ns) {
-  return probe_gpu_video_with_delays(config, worker_path, timeout_ns,
-                                     ProbeLaunchOptions{.pad_request_to_maximum_size = true});
+  return probe_gpu_video_with_delays(
+      config, worker_path, timeout_ns,
+      ProbeLaunchOptions{.pad_request_to_maximum_size = true,
+                         .pre_request_write_delay = std::chrono::seconds(5)});
 }
 #endif
 
@@ -4882,7 +5056,8 @@ void detail::hold_linux_probe_executable_snapshot_for_test(const std::filesystem
                                                            int release_descriptor) {
   SupervisorSlot slot;
   auto source = open_probe_executable(worker_path);
-  auto snapshot = snapshot_linux_probe_executable(source.get());
+  auto snapshot = snapshot_linux_probe_executable(source.get(),
+                                                  std::chrono::steady_clock::time_point::max(), {});
   const char ready = 'R';
   ssize_t written = -1;
   do {

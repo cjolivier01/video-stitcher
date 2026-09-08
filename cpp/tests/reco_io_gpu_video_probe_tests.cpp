@@ -1791,6 +1791,7 @@ void cancellation_terminates_an_active_probe_worker(const std::filesystem::path&
   set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "block-input");
 
   std::atomic<bool> cancel{false};
+  std::atomic<bool> cancellation_delivered{false};
   std::optional<std::uint64_t> worker;
   std::thread requester([&] {
     worker =
@@ -1802,8 +1803,14 @@ void cancellation_terminates_an_active_probe_worker(const std::filesystem::path&
   bool cancelled = false;
   try {
     (void)reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
-                                    30'000'000'000ULL,
-                                    [&] { return cancel.load(std::memory_order_acquire); });
+                                    30'000'000'000ULL, [&] {
+                                      if (!cancel.load(std::memory_order_acquire)) {
+                                        return false;
+                                      }
+                                      bool expected = false;
+                                      return cancellation_delivered.compare_exchange_strong(
+                                          expected, true, std::memory_order_acq_rel);
+                                    });
   } catch (const GpuVideoProbeCancelled&) {
     cancelled = true;
   } catch (const std::exception& error) {
@@ -1814,6 +1821,8 @@ void cancellation_terminates_an_active_probe_worker(const std::filesystem::path&
   requester.join();
 
   expect_true(worker.has_value(), "active probe worker reports its process ID before cancellation");
+  expect_true(cancellation_delivered.load(std::memory_order_acquire),
+              "active probe observes its one-shot cancellation request");
   expect_true(cancelled, "active probe reports explicit cancellation");
   expect_true(std::chrono::steady_clock::now() - started < std::chrono::seconds(3),
               "active probe cancellation returns within the cleanup bound");
@@ -1830,6 +1839,52 @@ void cancellation_terminates_an_active_probe_worker(const std::filesystem::path&
   set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", "");
   set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
   std::filesystem::remove(marker);
+}
+
+void cancellation_interrupts_linux_executable_snapshot(const std::filesystem::path& video_path) {
+#if defined(__linux__)
+  const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("reco_probe_snapshot_cancel_" + std::to_string(unique));
+  const auto worker = root / "padded-probe-worker";
+  std::error_code cleanup_error;
+  try {
+    std::filesystem::create_directories(root);
+    std::filesystem::copy_file(fake_probe_worker_path, worker);
+    std::filesystem::permissions(worker, std::filesystem::perms::owner_write,
+                                 std::filesystem::perm_options::add);
+    std::filesystem::resize_file(worker, 64ULL * 1024ULL * 1024ULL);
+
+    std::atomic<unsigned int> cancellation_checks{0};
+    const auto started = std::chrono::steady_clock::now();
+    bool cancelled = false;
+    try {
+      (void)reco::io::probe_gpu_video(container_config(video_path), worker, 30'000'000'000ULL, [&] {
+        return cancellation_checks.fetch_add(1, std::memory_order_acq_rel) + 1U == 7U;
+      });
+    } catch (const GpuVideoProbeCancelled&) {
+      cancelled = true;
+    } catch (const std::exception& error) {
+      std::cerr << "FAIL: executable snapshot cancellation returned the wrong error: "
+                << error.what() << '\n';
+      ++failures;
+    }
+    expect_true(cancelled, "Linux executable snapshot reports explicit cancellation");
+    expect_true(cancellation_checks.load(std::memory_order_acquire) >= 7U,
+                "Linux executable snapshot checks cancellation at a copy boundary");
+    expect_true(std::chrono::steady_clock::now() - started < std::chrono::seconds(2),
+                "Linux executable snapshot cancellation is prompt");
+    expect_eq(reco::io::detail::reserved_probe_memory_bytes_for_test(), 0ULL,
+              "Linux executable snapshot cancellation releases its memory reservation");
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: Linux executable snapshot cancellation fixture failed: " << error.what()
+              << '\n';
+    ++failures;
+  }
+  std::filesystem::remove_all(root, cleanup_error);
+#else
+  (void)video_path;
+#endif
 }
 
 void rapid_posix_probe_launches_establish_process_groups(const std::filesystem::path& video_path) {
@@ -3160,7 +3215,7 @@ void windows_normal_exit_cancels_blocked_request_writer(const std::filesystem::p
     WindowsHandle caller_thread(caller_info.hThread);
     const auto caller_exit = WaitForSingleObject(caller_process.get(), 3'000);
     expect_true(caller_exit == WAIT_OBJECT_0,
-                "Windows normal worker exit cannot leave its maximum request writer blocked");
+                "Windows pre-write cancellation race cannot leave its request writer blocked");
     DWORD exit_code = EXIT_FAILURE;
     expect_true(caller_exit == WAIT_OBJECT_0 &&
                     GetExitCodeProcess(caller_process.get(), &exit_code) != 0 &&
@@ -4867,6 +4922,7 @@ int main(int argc, char** argv) {
             "path tests leave no aggregate admission behind");
   worker_ipc_failures_are_bounded(video_path);
   cancellation_terminates_an_active_probe_worker(video_path);
+  cancellation_interrupts_linux_executable_snapshot(video_path);
   rapid_posix_probe_launches_establish_process_groups(video_path);
   aggregate_worker_memory_budget_is_enforced();
   maximum_linux_snapshots_are_aggregate_bounded();
