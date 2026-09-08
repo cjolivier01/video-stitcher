@@ -106,8 +106,8 @@ std::optional<std::string> validate_gpu_encode_config(const GpuEncodeConfig& con
       static_cast<std::uint64_t>(config.fps_denominator) * 1'000U) {
     return "GPU encode frame rate exceeds 1000 fps";
   }
-  if (config.device_ordinal > static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
-    return "GPU encode device ordinal is out of range";
+  if (config.device_ordinal != 0U) {
+    return "GPU encode currently requires CUDA device ordinal zero";
   }
   if (config.pool_capacity < kMinimumGpuEncodePoolCapacity ||
       config.pool_capacity > kMaximumGpuEncodePoolCapacity) {

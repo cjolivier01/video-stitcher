@@ -1,5 +1,10 @@
 #include "reco/io/gpu_encode.hpp"
 
+#include "reco/core/path.hpp"
+#if defined(_WIN32)
+#include "reco/core/windows_runtime_library.hpp"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -7,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -77,15 +83,15 @@ static_assert(offsetof(GstMessageAbi, type) == (sizeof(void*) == 8 ? 64 : 36));
 
 class DynamicLibrary {
 public:
-  explicit DynamicLibrary(std::string path) : path_(std::move(path)) {
+  explicit DynamicLibrary(const std::filesystem::path& path) : path_(core::path_to_utf8(path)) {
 #if defined(_WIN32)
-    handle_ = LoadLibraryA(path_.c_str());
+    handle_ = static_cast<HMODULE>(core::detail::load_windows_runtime_library(path));
     if (handle_ == nullptr) {
       throw GpuEncodeError("failed to load " + path_ + " (Windows error " +
                            std::to_string(GetLastError()) + ")");
     }
 #else
-    handle_ = dlopen(path_.c_str(), RTLD_NOW | RTLD_LOCAL);
+    handle_ = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (handle_ == nullptr) {
       const char* error = dlerror();
       throw GpuEncodeError("failed to load " + path_ +
@@ -134,14 +140,14 @@ private:
 std::shared_ptr<DynamicLibrary> load_runtime_library(const char* environment_variable,
                                                      std::initializer_list<const char*> names,
                                                      std::string_view component) {
-  if (const char* override_path = std::getenv(environment_variable);
-      override_path != nullptr && override_path[0] != '\0') {
-    return std::make_shared<DynamicLibrary>(override_path);
+  if (const auto override_path = core::path_from_environment(environment_variable);
+      override_path.has_value()) {
+    return std::make_shared<DynamicLibrary>(*override_path);
   }
   std::string errors;
   for (const char* name : names) {
     try {
-      return std::make_shared<DynamicLibrary>(name);
+      return std::make_shared<DynamicLibrary>(std::filesystem::path(name));
     } catch (const GpuEncodeError& error) {
       if (!errors.empty()) {
         errors += "; ";
@@ -236,7 +242,83 @@ public:
   Free free = nullptr;
 };
 
-std::string take_error(const std::shared_ptr<GstreamerEncodeApi>& api, GErrorAbi*& error,
+class GstreamerDiscoverApi {
+public:
+  using InitCheck = int (*)(int*, char***, GErrorAbi**);
+  using FilenameToUri = char* (*)(const char*, GErrorAbi**);
+  using DiscovererNew = void* (*)(std::uint64_t, GErrorAbi**);
+  using DiscovererDiscoverUri = void* (*)(void*, const char*, GErrorAbi**);
+  using DiscovererInfoGetResult = int (*)(const void*);
+  using DiscovererInfoGetVideoStreams = void* (*)(void*);
+  using DiscovererStreamInfoListFree = void (*)(void*);
+  using ErrorFree = void (*)(GErrorAbi*);
+  using Free = void (*)(void*);
+  using GObjectUnref = void (*)(void*);
+
+  GstreamerDiscoverApi() {
+#if defined(_WIN32)
+    core = load_runtime_library("RECO_GSTREAMER_DYLIB_PATH", {"gstreamer-1.0-0.dll"}, "GStreamer");
+    glib = load_runtime_library("RECO_GLIB_DYLIB_PATH", {"libglib-2.0-0.dll", "glib-2.0-0.dll"},
+                                "GLib");
+    pbutils = load_runtime_library("RECO_GSTPBUTILS_DYLIB_PATH", {"gstpbutils-1.0-0.dll"},
+                                   "GStreamer PbUtils");
+    gobject = load_runtime_library("RECO_GOBJECT_DYLIB_PATH",
+                                   {"libgobject-2.0-0.dll", "gobject-2.0-0.dll"}, "GObject");
+#elif defined(__APPLE__)
+    core =
+        load_runtime_library("RECO_GSTREAMER_DYLIB_PATH",
+                             {"libgstreamer-1.0.0.dylib", "libgstreamer-1.0.dylib"}, "GStreamer");
+    glib = load_runtime_library("RECO_GLIB_DYLIB_PATH",
+                                {"libglib-2.0.0.dylib", "libglib-2.0.dylib"}, "GLib");
+    pbutils = load_runtime_library("RECO_GSTPBUTILS_DYLIB_PATH",
+                                   {"libgstpbutils-1.0.0.dylib", "libgstpbutils-1.0.dylib"},
+                                   "GStreamer PbUtils");
+    gobject = load_runtime_library("RECO_GOBJECT_DYLIB_PATH",
+                                   {"libgobject-2.0.0.dylib", "libgobject-2.0.dylib"}, "GObject");
+#else
+    core = load_runtime_library("RECO_GSTREAMER_DYLIB_PATH",
+                                {"libgstreamer-1.0.so.0", "libgstreamer-1.0.so"}, "GStreamer");
+    glib = load_runtime_library("RECO_GLIB_DYLIB_PATH", {"libglib-2.0.so.0", "libglib-2.0.so"},
+                                "GLib");
+    pbutils = load_runtime_library("RECO_GSTPBUTILS_DYLIB_PATH",
+                                   {"libgstpbutils-1.0.so.0", "libgstpbutils-1.0.so"},
+                                   "GStreamer PbUtils");
+    gobject = load_runtime_library("RECO_GOBJECT_DYLIB_PATH",
+                                   {"libgobject-2.0.so.0", "libgobject-2.0.so"}, "GObject");
+#endif
+    init_check = core->symbol<InitCheck>("gst_init_check");
+    filename_to_uri = core->symbol<FilenameToUri>("gst_filename_to_uri");
+    discoverer_new = pbutils->symbol<DiscovererNew>("gst_discoverer_new");
+    discoverer_discover_uri = pbutils->symbol<DiscovererDiscoverUri>("gst_discoverer_discover_uri");
+    discoverer_info_get_result =
+        pbutils->symbol<DiscovererInfoGetResult>("gst_discoverer_info_get_result");
+    discoverer_info_get_video_streams =
+        pbutils->symbol<DiscovererInfoGetVideoStreams>("gst_discoverer_info_get_video_streams");
+    discoverer_stream_info_list_free =
+        pbutils->symbol<DiscovererStreamInfoListFree>("gst_discoverer_stream_info_list_free");
+    error_free = glib->symbol<ErrorFree>("g_error_free");
+    free = glib->symbol<Free>("g_free");
+    g_object_unref = gobject->symbol<GObjectUnref>("g_object_unref");
+  }
+
+  std::shared_ptr<DynamicLibrary> core;
+  std::shared_ptr<DynamicLibrary> glib;
+  std::shared_ptr<DynamicLibrary> pbutils;
+  std::shared_ptr<DynamicLibrary> gobject;
+  InitCheck init_check = nullptr;
+  FilenameToUri filename_to_uri = nullptr;
+  DiscovererNew discoverer_new = nullptr;
+  DiscovererDiscoverUri discoverer_discover_uri = nullptr;
+  DiscovererInfoGetResult discoverer_info_get_result = nullptr;
+  DiscovererInfoGetVideoStreams discoverer_info_get_video_streams = nullptr;
+  DiscovererStreamInfoListFree discoverer_stream_info_list_free = nullptr;
+  ErrorFree error_free = nullptr;
+  Free free = nullptr;
+  GObjectUnref g_object_unref = nullptr;
+};
+
+template <typename Api>
+std::string take_error(const std::shared_ptr<Api>& api, GErrorAbi*& error,
                        std::string_view fallback) {
   std::string message(fallback);
   if (error != nullptr) {
@@ -618,6 +700,7 @@ struct GpuVideoEncodeSession::Impl {
       throw GpuEncodeError("compressed audio packet timestamps must be finite");
     }
 
+    const auto admitted_bytes = packet.bytes.size();
     const auto deadline = std::chrono::steady_clock::now() + config.acquire_timeout;
     for (;;) {
       if (const auto bus_result = poll_bus(0, false);
@@ -679,8 +762,14 @@ struct GpuVideoEncodeSession::Impl {
       if (buffer == nullptr) {
         {
           std::lock_guard lock(audio_pool->mutex);
-          --audio_pool->in_flight;
-          audio_pool->bytes_in_flight -= wrapped_owner->bytes.size();
+          if (audio_pool->in_flight > 0U) {
+            --audio_pool->in_flight;
+          }
+          if (admitted_bytes <= audio_pool->bytes_in_flight) {
+            audio_pool->bytes_in_flight -= admitted_bytes;
+          } else {
+            audio_pool->bytes_in_flight = 0U;
+          }
         }
         audio_pool->available.notify_all();
       }
@@ -709,11 +798,11 @@ struct GpuVideoEncodeSession::Impl {
       pool->accepting = false;
     }
     if (audio_source != nullptr && api->app_src_end_of_stream(audio_source) != kGstFlowOk) {
-      abort_locked();
+      abort_session();
       throw GpuEncodeError("GStreamer audio appsrc rejected end-of-stream");
     }
     if (api->app_src_end_of_stream(source) != kGstFlowOk) {
-      abort_locked();
+      abort_session();
       throw GpuEncodeError("GStreamer appsrc rejected end-of-stream");
     }
 
@@ -721,17 +810,25 @@ struct GpuVideoEncodeSession::Impl {
     while (true) {
       const auto now = std::chrono::steady_clock::now();
       if (now >= deadline) {
-        abort_locked();
+        abort_session();
         throw GpuEncodeError("timed out while finalizing the GPU encoder and muxer");
       }
-      const auto remaining =
-          std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now).count();
-      const auto result = poll_bus(static_cast<std::uint64_t>(remaining), true);
+      {
+        std::lock_guard lock(pool->mutex);
+        if (aborted) {
+          throw GpuEncodeError("GPU encode session was aborted");
+        }
+      }
+      const auto remaining = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - now);
+      const auto poll_slice = std::min(
+          remaining,
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::milliseconds(100)));
+      const auto result = poll_bus(static_cast<std::uint64_t>(poll_slice.count()), true);
       if (!result.has_value()) {
         continue;
       }
       if (!result->empty()) {
-        abort_locked();
+        abort_session();
         throw GpuEncodeError(*result);
       }
       break;
@@ -741,18 +838,19 @@ struct GpuVideoEncodeSession::Impl {
     }
     {
       std::lock_guard lock(pool->mutex);
+      if (aborted) {
+        throw GpuEncodeError("GPU encode session was aborted");
+      }
       finished = true;
     }
     pool->available.notify_all();
     audio_pool->available.notify_all();
   }
 
-  void abort() noexcept {
-    std::lock_guard submission_lock(submission_mutex);
-    abort_locked();
-  }
+  void abort() noexcept { abort_session(); }
 
-  void abort_locked() noexcept {
+  void abort_session() noexcept {
+    bool should_stop_pipeline = false;
     {
       std::lock_guard lock(pool->mutex);
       if (aborted || finished) {
@@ -760,10 +858,11 @@ struct GpuVideoEncodeSession::Impl {
       }
       aborted = true;
       pool->accepting = false;
+      should_stop_pipeline = true;
     }
     pool->available.notify_all();
     audio_pool->available.notify_all();
-    if (pipeline != nullptr) {
+    if (should_stop_pipeline && pipeline != nullptr) {
       (void)api->element_set_state(pipeline, kGstStateNull);
     }
   }
@@ -870,6 +969,55 @@ std::string_view GpuVideoEncodeSession::pipeline() const {
     return {};
   }
   return impl_->pipeline_text;
+}
+
+void verify_muxed_gpu_video_output(std::string_view path, std::chrono::milliseconds timeout) {
+  if (path.empty() || path.find('\0') != std::string_view::npos) {
+    throw std::invalid_argument("GPU output verification requires a non-empty path without NUL");
+  }
+  if (timeout < std::chrono::milliseconds(1) || timeout > std::chrono::hours(1)) {
+    throw std::invalid_argument("GPU output verification timeout is outside the supported bound");
+  }
+
+  auto api = std::make_shared<GstreamerDiscoverApi>();
+  GErrorAbi* error = nullptr;
+  if (api->init_check(nullptr, nullptr, &error) == 0) {
+    throw GpuEncodeError(take_error(api, error, "GStreamer initialization failed"));
+  }
+  const std::string owned_path(path);
+  char* uri = api->filename_to_uri(owned_path.c_str(), &error);
+  if (uri == nullptr) {
+    throw GpuEncodeError(take_error(api, error, "failed to create encoded output URI"));
+  }
+  const std::unique_ptr<void, GstreamerDiscoverApi::Free> uri_owner(uri, api->free);
+  const auto timeout_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(timeout).count();
+  void* discoverer = api->discoverer_new(static_cast<std::uint64_t>(timeout_ns), &error);
+  if (discoverer == nullptr) {
+    throw GpuEncodeError(take_error(api, error, "failed to create encoded output discoverer"));
+  }
+  const std::unique_ptr<void, GstreamerDiscoverApi::GObjectUnref> discoverer_owner(
+      discoverer, api->g_object_unref);
+  void* info = api->discoverer_discover_uri(discoverer, static_cast<const char*>(uri), &error);
+  if (info == nullptr) {
+    throw GpuEncodeError(take_error(api, error, "failed to inspect encoded output streams"));
+  }
+  const std::unique_ptr<void, GstreamerDiscoverApi::GObjectUnref> info_owner(info,
+                                                                             api->g_object_unref);
+  constexpr int kDiscovererOk = 0;
+  constexpr int kDiscovererMissingPlugins = 5;
+  const int result = api->discoverer_info_get_result(info);
+  if (result != kDiscovererOk && result != kDiscovererMissingPlugins) {
+    throw GpuEncodeError(take_error(api, error, "encoded output stream discovery failed"));
+  }
+  if (error != nullptr) {
+    api->error_free(error);
+    error = nullptr;
+  }
+  void* streams = api->discoverer_info_get_video_streams(info);
+  if (streams == nullptr) {
+    throw GpuEncodeError("completed GPU output contains no video stream");
+  }
+  api->discoverer_stream_info_list_free(streams);
 }
 
 } // namespace reco::io

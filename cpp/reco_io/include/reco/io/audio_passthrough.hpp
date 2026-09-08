@@ -12,10 +12,18 @@
 
 namespace reco::io {
 
+/// One video segment whose compressed audio may be passed through.
+struct AudioPassthroughSegment {
+  /// Input video path. Elementary video streams are retained as silent timeline gaps.
+  std::string path;
+  /// Probed video duration used to preserve the joined video timeline when audio is absent.
+  std::uint64_t video_duration_ns = 0;
+};
+
 /// Bounded configuration for compressed audio demuxed without decoding or re-encoding.
 struct AudioPassthroughConfig {
-  /// Ordered recording segments. Empty segments and elementary video streams are rejected.
-  std::vector<std::string> paths;
+  /// Ordered recording segments and their authoritative video durations.
+  std::vector<AudioPassthroughSegment> segments;
   /// Source timestamp trimmed from the first segment and rebased to output timestamp zero.
   std::uint64_t start_time_ns = 0;
   /// Maximum wait for one compressed packet or terminal pipeline state.

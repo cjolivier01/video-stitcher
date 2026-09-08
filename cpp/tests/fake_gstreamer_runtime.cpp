@@ -182,9 +182,11 @@ struct FakeDiscoverer : FakeObject {
 };
 
 struct FakeDiscovererInfo : FakeObject {
-  explicit FakeDiscovererInfo(bool has_audio_value)
-      : FakeObject(ObjectKind::DiscovererInfo), has_audio(has_audio_value) {}
+  explicit FakeDiscovererInfo(bool has_audio_value, bool has_video_value = true)
+      : FakeObject(ObjectKind::DiscovererInfo), has_audio(has_audio_value),
+        has_video(has_video_value) {}
   bool has_audio = false;
+  bool has_video = true;
 };
 
 struct FakePipeline : FakeObject {
@@ -988,6 +990,13 @@ RECO_FAKE_EXPORT int gst_element_set_state(void* pipeline_pointer, int state) {
     std::this_thread::sleep_for(std::chrono::seconds(30));
   }
   auto* pipeline = static_cast<FakePipeline*>(pipeline_pointer);
+  if (state == 1 && scenario() == "audio-stop-blocked-read") {
+    {
+      std::lock_guard lock(pipeline->flush_mutex);
+      pipeline->flush_started = true;
+    }
+    pipeline->flush_changed.notify_all();
+  }
   if (state == 4 && ((!pipeline->parser_probe && scenario() == "state-error") ||
                      (pipeline->encoder && scenario() == "encode-state-error") ||
                      (pipeline->parser_probe &&
@@ -1418,9 +1427,12 @@ RECO_FAKE_EXPORT char* gst_filename_to_uri(const char* path, GErrorAbi**) {
 
 RECO_FAKE_EXPORT void* gst_discoverer_new(std::uint64_t, GErrorAbi**) { return new FakeDiscoverer; }
 
-RECO_FAKE_EXPORT void* gst_discoverer_discover_uri(void*, const char*, GErrorAbi**) {
+RECO_FAKE_EXPORT void* gst_discoverer_discover_uri(void*, const char* uri, GErrorAbi**) {
   record("discover-audio");
-  return new FakeDiscovererInfo(scenario() != "audio-no-stream");
+  const bool silent_middle = scenario() == "audio-silent-middle" && uri != nullptr &&
+                             std::string_view(uri).find("silent") != std::string_view::npos;
+  return new FakeDiscovererInfo(scenario() != "audio-no-stream" && !silent_middle,
+                                scenario() != "encoded-output-no-video");
 }
 
 RECO_FAKE_EXPORT int gst_discoverer_info_get_result(const void*) { return 0; }
@@ -1428,6 +1440,11 @@ RECO_FAKE_EXPORT int gst_discoverer_info_get_result(const void*) { return 0; }
 RECO_FAKE_EXPORT void* gst_discoverer_info_get_audio_streams(void* info_pointer) {
   const auto* info = static_cast<FakeDiscovererInfo*>(info_pointer);
   return info != nullptr && info->has_audio ? static_cast<void*>(new int(1)) : nullptr;
+}
+
+RECO_FAKE_EXPORT void* gst_discoverer_info_get_video_streams(void* info_pointer) {
+  const auto* info = static_cast<FakeDiscovererInfo*>(info_pointer);
+  return info != nullptr && info->has_video ? static_cast<void*>(new int(1)) : nullptr;
 }
 
 RECO_FAKE_EXPORT void gst_discoverer_stream_info_list_free(void* streams) {
@@ -1964,6 +1981,13 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
   record("pull");
   const auto current_scenario = scenario();
   if (sink->pipeline->audio_demux) {
+    if (current_scenario == "audio-stop-blocked-read" && sink->pull_count > 0U) {
+      std::unique_lock lock(sink->pipeline->flush_mutex);
+      record("audio-pull-blocked");
+      sink->pipeline->flush_changed.wait(lock, [&] { return sink->pipeline->flush_started; });
+      record("audio-pull-unblocked");
+      return nullptr;
+    }
     if (current_scenario == "audio-no-stream") {
       ++sink->pull_count;
       return nullptr;
@@ -2218,7 +2242,9 @@ RECO_FAKE_EXPORT int gst_app_sink_is_eos(void* sink_pointer) {
                   (static_cast<std::uint64_t>(sink->pipeline->seek_target_ns) + 19'999'999ULL) /
                   20'000'000ULL)
             : 0U;
-    return current_scenario == "audio-no-stream" || first_packet + sink->pull_count >= 4U;
+    return current_scenario == "audio-no-stream" ||
+           (current_scenario == "audio-stop-blocked-read" && sink->pipeline->flush_started) ||
+           first_packet + sink->pull_count >= 4U;
   }
   return (current_scenario == "frame-eos" || current_scenario == "retained-frame-running" ||
           current_scenario == "unknown-time" || current_scenario == "visible-crop" ||

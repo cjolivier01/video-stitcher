@@ -49,13 +49,15 @@ void run_real_runtime_checks() {
                                           audio_only);
 
   auto absent = AudioPassthroughSource::open(
-      {.paths = {video_only.string()}, .read_timeout = std::chrono::seconds(2)});
+      {.segments = {{.path = video_only.string(), .video_duration_ns = 1'000'000'000ULL}},
+       .read_timeout = std::chrono::seconds(2)});
   if (absent.caps().has_value() || absent.read().status != AudioPassthroughStatus::EndOfStream) {
     throw std::runtime_error("video-only MP4 did not report clean audio EOS");
   }
 
   auto audio = AudioPassthroughSource::open(
-      {.paths = {audio_only.string()}, .read_timeout = std::chrono::seconds(2)});
+      {.segments = {{.path = audio_only.string(), .video_duration_ns = 1'000'000'000ULL}},
+       .read_timeout = std::chrono::seconds(2)});
   if (!audio.caps().has_value() || audio.caps()->find("audio/mpeg") == std::string::npos) {
     throw std::runtime_error("AAC MP4 did not retain parser-negotiated compressed caps");
   }

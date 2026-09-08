@@ -752,6 +752,123 @@ void stitch_parse_matches_rust_defaults() {
   expect_true(stitch->no_zero_copy, "stitch no zero copy");
 }
 
+void stitch_frame_timing_preserves_source_gaps_and_rejects_overflow() {
+  const auto first = detail::derive_stitch_frame_timing(100, 100, 30, 1);
+  const auto after_gap = detail::derive_stitch_frame_timing(102, 100, 30, 1);
+  expect_eq(first.pts_ns, 0ULL, "first aligned source frame starts at output zero");
+  expect_eq(first.duration_ns, 33'333'333ULL, "frame duration uses exact rational cadence");
+  expect_eq(after_gap.pts_ns, 66'666'666ULL,
+            "missing aligned source frame remains a timestamp gap");
+  expect_true(after_gap.pts_ns > first.pts_ns + first.duration_ns,
+              "source gap is not compressed to emitted-frame count");
+
+  bool backwards_rejected = false;
+  try {
+    (void)detail::derive_stitch_frame_timing(99, 100, 30, 1);
+  } catch (const std::runtime_error&) {
+    backwards_rejected = true;
+  }
+  expect_true(backwards_rejected, "backwards source frame index is rejected");
+
+  bool overflow_rejected = false;
+  try {
+    (void)detail::derive_stitch_frame_timing(std::numeric_limits<std::uint64_t>::max(), 0, 30, 1);
+  } catch (const std::overflow_error&) {
+    overflow_rejected = true;
+  }
+  expect_true(overflow_rejected, "terminal source frame index overflow is rejected");
+}
+
+void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
+  TemporaryDirectory root;
+  const auto destination = root.path() / "stitched.mp4";
+  {
+    detail::AtomicOutputFile output(destination);
+    write_text_file(output.temporary_path(), "first encoded output\n");
+    expect_true(output.descriptor() >= 0, "stitch output exposes a retained descriptor");
+    output.commit();
+    output.commit();
+  }
+  expect_eq(read_text_file(destination), std::string("first encoded output\n"),
+            "stitch output transaction publishes a new file and repeated commit is a no-op");
+
+  {
+    detail::AtomicOutputFile output(destination);
+    write_text_file(output.temporary_path(), "replacement encoded output\n");
+    output.commit();
+  }
+  expect_eq(read_text_file(destination), std::string("replacement encoded output\n"),
+            "stitch output transaction atomically replaces an existing file");
+
+#if defined(__linux__)
+  std::filesystem::path attacker_entry;
+  bool substitution_rejected = false;
+  {
+    detail::AtomicOutputFile output(destination, [&](const std::filesystem::path& publication) {
+      attacker_entry = publication;
+      std::filesystem::remove(publication);
+      write_text_file(publication, "attacker replacement\n");
+    });
+    write_text_file(output.temporary_path(), "descriptor-bound encoded output\n");
+    try {
+      output.commit();
+    } catch (const std::runtime_error& error) {
+      substitution_rejected =
+          std::string_view(error.what()).find("publication boundary") != std::string_view::npos;
+    }
+  }
+  expect_true(substitution_rejected,
+              "stitch publication rejects a substituted temporary directory entry");
+  expect_eq(read_text_file(destination), std::string("replacement encoded output\n"),
+            "rejected stitch publication preserves the existing destination");
+  expect_eq(read_text_file(attacker_entry), std::string("attacker replacement\n"),
+            "stitch cleanup does not unlink an attacker replacement");
+  std::filesystem::remove(attacker_entry);
+
+  const auto descriptor_count = [] {
+    return static_cast<std::size_t>(
+        std::distance(std::filesystem::directory_iterator("/proc/self/fd"),
+                      std::filesystem::directory_iterator{}));
+  };
+  const auto before = descriptor_count();
+  const std::string oversized_name(8'192, 'x');
+  for (int attempt = 0; attempt < 32; ++attempt) {
+    try {
+      detail::AtomicOutputFile output(root.path() / oversized_name);
+      expect_true(false, "oversized stitch temporary unexpectedly opened");
+    } catch (const std::system_error&) {
+    }
+  }
+  const auto after = descriptor_count();
+  expect_true(after <= before + 1U,
+              "failed stitch output construction does not leak its directory descriptor");
+#elif defined(_WIN32)
+  const auto retained_parent = root.path() / "retained-output-parent";
+  const auto redirected_parent = root.path() / "redirected-output-parent";
+  const auto active_parent = root.path() / "active-output-parent";
+  std::filesystem::create_directory(retained_parent);
+  std::filesystem::create_directory(redirected_parent);
+  std::error_code parent_symlink_error;
+  std::filesystem::create_directory_symlink(retained_parent, active_parent, parent_symlink_error);
+  expect_true(!parent_symlink_error, "Windows stitch output parent symlink fixture is available");
+  if (!parent_symlink_error) {
+    detail::AtomicOutputFile output(active_parent / "stitched.mp4");
+    write_text_file(output.temporary_path(), "retained parent encoded output\n");
+    std::filesystem::remove(active_parent);
+    std::filesystem::create_directory_symlink(redirected_parent, active_parent);
+    expect_eq(read_text_file(output.verification_path()),
+              std::string("retained parent encoded output\n"),
+              "Windows verification follows the retained output directory");
+    output.commit();
+    expect_eq(read_text_file(retained_parent / "stitched.mp4"),
+              std::string("retained parent encoded output\n"),
+              "Windows stitch publication stays in the retained output directory");
+    expect_true(!std::filesystem::exists(redirected_parent / "stitched.mp4"),
+                "Windows redirected output parent receives no publication");
+  }
+#endif
+}
+
 void preview_and_calibrate_parse_matches_rust_defaults() {
   const auto preview_command =
       expect_command(parse_args({"preview", "l.mp4", "r.mp4", "--calibration", "match.json",
@@ -2684,6 +2801,10 @@ int main(int argc, char** argv) {
 #endif
   run_test_case("validators_match_rust", validators_match_rust);
   run_test_case("stitch_parse_matches_rust_defaults", stitch_parse_matches_rust_defaults);
+  run_test_case("stitch_frame_timing_preserves_source_gaps_and_rejects_overflow",
+                stitch_frame_timing_preserves_source_gaps_and_rejects_overflow);
+  run_test_case("stitch_output_transaction_is_descriptor_pinned_and_atomic",
+                stitch_output_transaction_is_descriptor_pinned_and_atomic);
   run_test_case("preview_and_calibrate_parse_matches_rust_defaults",
                 preview_and_calibrate_parse_matches_rust_defaults);
   run_test_case("live_command_parse_matches_rust_defaults",

@@ -42,6 +42,8 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <fcntl.h>
+#include <io.h>
 #include <windows.h>
 #include <winternl.h>
 #elif defined(__linux__)
@@ -3764,6 +3766,525 @@ std::variant<CalibrateCommand, ParseError> parse_calibrate(Cursor& cursor) {
 } // namespace
 
 namespace detail {
+
+struct AtomicOutputFile::Impl {
+  std::filesystem::path destination;
+  std::filesystem::path parent;
+  std::filesystem::path temporary;
+  std::string temporary_name;
+  std::function<void(const std::filesystem::path&)> after_temporary_validation;
+  std::function<void()> publication_fault_hook;
+#if defined(_WIN32)
+  PinnedWindowsDirectory output_directory;
+#else
+  int directory_descriptor = -1;
+#endif
+  int descriptor = -1;
+  bool committed = false;
+};
+
+AtomicOutputFile::AtomicOutputFile(
+    std::filesystem::path destination,
+    std::function<void(const std::filesystem::path&)> after_temporary_validation,
+    std::function<void()> publication_fault_hook)
+    : impl_(std::make_unique<Impl>()) {
+  if (destination.filename().empty() || destination.filename() == "." ||
+      destination.filename() == "..") {
+    throw std::runtime_error("stitch output path must name a file");
+  }
+  impl_->destination = std::move(destination);
+  impl_->parent = impl_->destination.has_parent_path() ? impl_->destination.parent_path()
+                                                       : std::filesystem::path(".");
+  impl_->after_temporary_validation = std::move(after_temporary_validation);
+  impl_->publication_fault_hook = std::move(publication_fault_hook);
+
+#if defined(_WIN32)
+  impl_->output_directory = pin_windows_output_directory(impl_->destination);
+  std::random_device random;
+  constexpr char hex[] = "0123456789abcdef";
+  HANDLE handle = INVALID_HANDLE_VALUE;
+  for (int attempt = 0; attempt < 128; ++attempt) {
+    std::array<char, 32> token{};
+    for (auto& digit : token) {
+      digit = hex[random() & 0x0fU];
+    }
+    auto filename = impl_->destination.filename();
+    filename += ".tmp." + std::string(token.begin(), token.end());
+    DWORD open_error = ERROR_SUCCESS;
+    handle = open_windows_file_relative(
+        impl_->output_directory.handle.get(), filename.wstring(),
+        GENERIC_WRITE | DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_CREATE,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+        open_error);
+    if (handle != INVALID_HANDLE_VALUE) {
+      impl_->temporary_name = core::path_to_utf8(filename);
+      impl_->temporary = impl_->parent / filename;
+      break;
+    }
+    if (open_error != ERROR_FILE_EXISTS && open_error != ERROR_ALREADY_EXISTS) {
+      throw_file_error("cannot create temporary stitch output", impl_->destination,
+                       static_cast<int>(open_error));
+    }
+  }
+  if (handle == INVALID_HANDLE_VALUE) {
+    throw std::runtime_error("cannot create unique temporary stitch output");
+  }
+  impl_->descriptor =
+      _open_osfhandle(reinterpret_cast<std::intptr_t>(handle), _O_BINARY | _O_WRONLY);
+  if (impl_->descriptor < 0) {
+    const int open_error = errno;
+    (void)discard_open_file(handle);
+    (void)CloseHandle(handle);
+    throw_file_error("cannot create stitch output descriptor", impl_->temporary, open_error);
+  }
+#else
+  const int directory = ::open(impl_->parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (directory < 0) {
+    throw_file_error("cannot retain stitch output directory", impl_->parent, errno);
+  }
+  struct stat directory_identity{};
+  if (::fstat(directory, &directory_identity) != 0 || !S_ISDIR(directory_identity.st_mode)) {
+    const int inspect_error = errno == 0 ? ENOTDIR : errno;
+    (void)::close(directory);
+    throw_file_error("cannot inspect stitch output directory", impl_->parent, inspect_error);
+  }
+  std::random_device random;
+  constexpr char hex[] = "0123456789abcdef";
+  int descriptor = -1;
+  std::string temporary_name;
+  for (int attempt = 0; attempt < 128; ++attempt) {
+    std::array<char, 32> token{};
+    for (auto& digit : token) {
+      digit = hex[random() & 0x0fU];
+    }
+    temporary_name =
+        impl_->destination.filename().string() + ".tmp." + std::string(token.begin(), token.end());
+    descriptor = ::openat(directory, temporary_name.c_str(),
+                          O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (descriptor >= 0) {
+      break;
+    }
+    if (errno != EEXIST) {
+      const int open_error = errno;
+      (void)::close(directory);
+      throw_file_error("cannot create temporary stitch output", impl_->destination, open_error);
+    }
+  }
+  if (descriptor < 0) {
+    (void)::close(directory);
+    throw std::runtime_error("cannot create unique temporary stitch output");
+  }
+  impl_->directory_descriptor = directory;
+  impl_->descriptor = descriptor;
+  impl_->temporary_name = std::move(temporary_name);
+  impl_->temporary = impl_->parent / impl_->temporary_name;
+#endif
+}
+
+AtomicOutputFile::~AtomicOutputFile() {
+  if (!impl_) {
+    return;
+  }
+#if defined(_WIN32)
+  if (impl_->descriptor >= 0) {
+    const auto handle = reinterpret_cast<HANDLE>(_get_osfhandle(impl_->descriptor));
+    if (!impl_->committed && handle != INVALID_HANDLE_VALUE) {
+      (void)discard_open_file(handle);
+    }
+    (void)_close(impl_->descriptor);
+    impl_->descriptor = -1;
+  }
+#else
+  if (!impl_->committed && impl_->descriptor >= 0 && impl_->directory_descriptor >= 0 &&
+      !impl_->temporary_name.empty()) {
+#if defined(__linux__)
+    (void)unlink_descriptor_entry_safely(impl_->directory_descriptor, impl_->temporary_name,
+                                         impl_->descriptor, impl_->destination);
+#elif defined(__APPLE__)
+    (void)unlink_posix_descriptor_entry_safely(impl_->directory_descriptor, impl_->temporary_name,
+                                               impl_->descriptor, impl_->destination);
+#else
+    struct stat descriptor_identity{};
+    struct stat path_identity{};
+    if (::fstat(impl_->descriptor, &descriptor_identity) == 0 &&
+        ::fstatat(impl_->directory_descriptor, impl_->temporary_name.c_str(), &path_identity,
+                  AT_SYMLINK_NOFOLLOW) == 0 &&
+        same_file_identity(descriptor_identity, path_identity)) {
+      (void)::unlinkat(impl_->directory_descriptor, impl_->temporary_name.c_str(), 0);
+    }
+#endif
+  }
+  if (impl_->descriptor >= 0) {
+    (void)::close(impl_->descriptor);
+    impl_->descriptor = -1;
+  }
+  if (impl_->directory_descriptor >= 0) {
+    (void)::close(impl_->directory_descriptor);
+    impl_->directory_descriptor = -1;
+  }
+#endif
+}
+
+int AtomicOutputFile::descriptor() const {
+  if (!impl_ || impl_->descriptor < 0) {
+    throw std::runtime_error("stitch output descriptor is closed");
+  }
+  return impl_->descriptor;
+}
+
+std::filesystem::path AtomicOutputFile::verification_path() const {
+  const int retained_descriptor = descriptor();
+#if defined(__linux__)
+  return std::filesystem::path("/proc") / std::to_string(::getpid()) / "fd" /
+         std::to_string(retained_descriptor);
+#elif defined(__APPLE__)
+  return std::filesystem::path("/dev/fd") / std::to_string(retained_descriptor);
+#elif defined(_WIN32)
+  return impl_->output_directory.resolved_path / impl_->temporary.filename();
+#else
+  return impl_->temporary;
+#endif
+}
+
+const std::filesystem::path& AtomicOutputFile::temporary_path() const {
+  if (!impl_) {
+    throw std::runtime_error("stitch output transaction is empty");
+  }
+  return impl_->temporary;
+}
+
+void AtomicOutputFile::commit() {
+  if (!impl_) {
+    throw std::runtime_error("stitch output transaction is empty");
+  }
+  if (impl_->committed) {
+    return;
+  }
+  if (impl_->descriptor < 0) {
+    throw std::runtime_error("stitch output transaction is closed");
+  }
+
+#if defined(_WIN32)
+  const auto handle = reinterpret_cast<HANDLE>(_get_osfhandle(impl_->descriptor));
+  if (handle == INVALID_HANDLE_VALUE) {
+    throw_file_error("cannot access completed stitch output", impl_->temporary, EBADF);
+  }
+  if (_commit(impl_->descriptor) != 0) {
+    const int commit_error = errno;
+    throw_file_error("cannot commit completed stitch output", impl_->temporary, commit_error);
+  }
+  if (FlushFileBuffers(handle) == 0) {
+    const int flush_error = static_cast<int>(GetLastError());
+    throw_file_error("cannot flush completed stitch output", impl_->temporary, flush_error);
+  }
+  BY_HANDLE_FILE_INFORMATION identity{};
+  if (GetFileInformationByHandle(handle, &identity) == 0 ||
+      (identity.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ||
+      (identity.nFileSizeHigh == 0 && identity.nFileSizeLow == 0)) {
+    throw std::runtime_error("GPU encoder did not produce a regular non-empty output");
+  }
+  [[maybe_unused]] auto publication_lock =
+      lock_windows_output_directory(impl_->output_directory.handle.get(),
+                                    impl_->output_directory.path, {}, std::chrono::seconds(2));
+  HANDLE publication_handle = handle;
+  bool destination_published = false;
+  publish_windows_output(
+      impl_->output_directory.handle.get(), impl_->output_directory.resolved_path,
+      impl_->destination.filename().wstring(), impl_->temporary.filename().wstring(),
+      publication_handle, impl_->destination, destination_published,
+      impl_->after_temporary_validation, impl_->publication_fault_hook, false);
+  impl_->committed = destination_published;
+  if (_close(impl_->descriptor) != 0) {
+    impl_->descriptor = -1;
+    throw_file_error("cannot close completed stitch output", impl_->destination, errno);
+  }
+  impl_->descriptor = -1;
+#elif defined(__linux__)
+  struct stat descriptor_identity{};
+  if (::fstat(impl_->descriptor, &descriptor_identity) != 0 ||
+      !S_ISREG(descriptor_identity.st_mode) || descriptor_identity.st_size <= 0 ||
+      ::fsync(impl_->descriptor) != 0) {
+    throw_file_error("cannot validate completed stitch output", impl_->temporary,
+                     errno == 0 ? EIO : errno);
+  }
+  auto publication_lock = lock_output_directory(impl_->directory_descriptor, impl_->parent, {},
+                                                std::chrono::seconds(2));
+  std::string publication_name;
+  bool publication_exists = false;
+  bool temporary_exists = true;
+  try {
+    const auto linked = create_descriptor_publication_link_at(
+        impl_->directory_descriptor, impl_->destination, impl_->descriptor, false);
+    const bool descriptor_linked = linked.has_value();
+    publication_name = descriptor_linked ? *linked : impl_->temporary_name;
+    publication_exists = descriptor_linked;
+    if (!temporary_name_identifies_descriptor(impl_->directory_descriptor, publication_name,
+                                              impl_->descriptor)) {
+      throw std::runtime_error("temporary stitch output identity changed before publication");
+    }
+    if (impl_->after_temporary_validation) {
+      impl_->after_temporary_validation(impl_->parent / publication_name);
+    }
+    if (!temporary_name_identifies_descriptor(impl_->directory_descriptor, publication_name,
+                                              impl_->descriptor)) {
+      throw std::runtime_error("temporary stitch output changed at the publication boundary");
+    }
+
+    const auto destination_name = impl_->destination.filename().string();
+    bool published = false;
+    bool destination_exists =
+        directory_entry_exists_at(impl_->directory_descriptor, destination_name);
+    if (!destination_exists) {
+      if (descriptor_linked) {
+        const auto status = link_descriptor_at(impl_->directory_descriptor, destination_name,
+                                               impl_->descriptor, false);
+        published = status == DescriptorLinkStatus::Linked;
+        destination_exists = status == DescriptorLinkStatus::AlreadyExists;
+      } else {
+        published = rename_directory_entry_noreplace_at(
+            impl_->directory_descriptor, publication_name, destination_name, impl_->destination);
+        destination_exists = !published;
+        temporary_exists = !published;
+      }
+      if (published) {
+        const auto rollback_new = [&] {
+          if (descriptor_linked) {
+            return unlink_descriptor_entry_safely(impl_->directory_descriptor, destination_name,
+                                                  impl_->descriptor, impl_->destination);
+          }
+          const bool rolled_back = rollback_new_directory_entry_safely(
+              impl_->directory_descriptor, destination_name, impl_->temporary_name,
+              impl_->descriptor, impl_->destination);
+          temporary_exists = rolled_back;
+          return rolled_back;
+        };
+        try {
+          if (impl_->publication_fault_hook) {
+            impl_->publication_fault_hook();
+          }
+          if (!temporary_name_identifies_descriptor(impl_->directory_descriptor, destination_name,
+                                                    impl_->descriptor)) {
+            throw std::runtime_error("published stitch output identity changed");
+          }
+        } catch (...) {
+          if (!rollback_new()) {
+            throw std::runtime_error("stitch output publication failed and rollback was refused");
+          }
+          throw;
+        }
+      }
+    }
+
+    if (!published && destination_exists) {
+      if (!temporary_name_identifies_descriptor(impl_->directory_descriptor, publication_name,
+                                                impl_->descriptor)) {
+        throw std::runtime_error("temporary stitch output changed before atomic exchange");
+      }
+      auto displaced =
+          capture_directory_entry_snapshot(impl_->directory_descriptor, destination_name);
+      if (S_ISDIR(displaced.identity.st_mode)) {
+        throw std::runtime_error("stitch output destination identifies a directory");
+      }
+      exchange_directory_entries_at(impl_->directory_descriptor, publication_name, destination_name,
+                                    impl_->destination);
+      const auto rollback_exchange = [&] {
+        const bool rolled_back = rollback_exchanged_directory_entries_safely(
+            impl_->directory_descriptor, destination_name, impl_->descriptor, publication_name,
+            displaced, impl_->destination);
+        publication_exists = descriptor_linked && rolled_back;
+        temporary_exists = !descriptor_linked && rolled_back;
+        return rolled_back;
+      };
+      try {
+        if (impl_->publication_fault_hook) {
+          impl_->publication_fault_hook();
+        }
+        if (!temporary_name_identifies_descriptor(impl_->directory_descriptor, destination_name,
+                                                  impl_->descriptor) ||
+            !directory_entry_matches_snapshot(impl_->directory_descriptor, publication_name,
+                                              displaced)) {
+          throw std::runtime_error("exchanged stitch output identity changed");
+        }
+      } catch (...) {
+        if (!rollback_exchange()) {
+          throw std::runtime_error("stitch output exchange failed and rollback was refused");
+        }
+        throw;
+      }
+      if (!unlink_directory_entry_if_unchanged(impl_->directory_descriptor, publication_name,
+                                               displaced, impl_->destination)) {
+        if (!rollback_exchange()) {
+          throw std::runtime_error("displaced stitch output changed and rollback was refused");
+        }
+        throw std::runtime_error("cannot remove displaced stitch output");
+      }
+      publication_exists = false;
+      temporary_exists = false;
+      published = true;
+    }
+
+    if (!published) {
+      throw std::runtime_error("stitch output was not published");
+    }
+    if (publication_exists) {
+      (void)unlink_descriptor_entry_safely(impl_->directory_descriptor, publication_name,
+                                           impl_->descriptor, impl_->destination);
+      publication_exists = false;
+    }
+    if (temporary_exists) {
+      (void)unlink_descriptor_entry_safely(impl_->directory_descriptor, impl_->temporary_name,
+                                           impl_->descriptor, impl_->destination);
+      temporary_exists = false;
+    }
+    impl_->committed = true;
+    if (::fsync(impl_->directory_descriptor) != 0) {
+      throw_file_error("cannot flush stitch output directory", impl_->parent, errno);
+    }
+    if (::close(impl_->descriptor) != 0) {
+      impl_->descriptor = -1;
+      throw_file_error("cannot close completed stitch output", impl_->destination, errno);
+    }
+    impl_->descriptor = -1;
+  } catch (...) {
+    if (publication_exists) {
+      (void)unlink_descriptor_entry_safely(impl_->directory_descriptor, publication_name,
+                                           impl_->descriptor, impl_->destination);
+    }
+    throw;
+  }
+#elif defined(__APPLE__)
+  struct stat descriptor_identity{};
+  if (::fstat(impl_->descriptor, &descriptor_identity) != 0 ||
+      !S_ISREG(descriptor_identity.st_mode) || descriptor_identity.st_size <= 0 ||
+      ::fsync(impl_->descriptor) != 0) {
+    throw_file_error("cannot validate completed stitch output", impl_->temporary,
+                     errno == 0 ? EIO : errno);
+  }
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (::flock(impl_->directory_descriptor, LOCK_EX | LOCK_NB) != 0) {
+    if (errno != EINTR && errno != EWOULDBLOCK && errno != EAGAIN) {
+      throw_file_error("cannot lock stitch output directory", impl_->parent, errno);
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      throw_file_error("timed out locking stitch output directory", impl_->parent, ETIMEDOUT);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  bool temporary_exists = true;
+  bool exchanged = false;
+  std::optional<PosixDirectoryEntrySnapshot> displaced;
+  try {
+    if (!path_identifies_descriptor_at(impl_->directory_descriptor, impl_->temporary_name,
+                                       impl_->descriptor)) {
+      throw std::runtime_error("temporary stitch output identity changed before publication");
+    }
+    if (impl_->after_temporary_validation) {
+      impl_->after_temporary_validation(impl_->parent / impl_->temporary_name);
+    }
+    if (!path_identifies_descriptor_at(impl_->directory_descriptor, impl_->temporary_name,
+                                       impl_->descriptor)) {
+      throw std::runtime_error("temporary stitch output changed at the publication boundary");
+    }
+    const auto destination_name = impl_->destination.filename().string();
+    if (::renameatx_np(impl_->directory_descriptor, impl_->temporary_name.c_str(),
+                       impl_->directory_descriptor, destination_name.c_str(), RENAME_EXCL) == 0) {
+      temporary_exists = false;
+      try {
+        if (impl_->publication_fault_hook) {
+          impl_->publication_fault_hook();
+        }
+        if (!path_identifies_descriptor_at(impl_->directory_descriptor, destination_name,
+                                           impl_->descriptor)) {
+          throw std::runtime_error("published stitch output identity changed");
+        }
+      } catch (...) {
+        if (!rollback_new_posix_directory_entry_safely(impl_->directory_descriptor,
+                                                       destination_name, impl_->temporary_name,
+                                                       impl_->descriptor, impl_->destination)) {
+          throw std::runtime_error("stitch output publication failed and rollback was refused");
+        }
+        temporary_exists = true;
+        throw;
+      }
+    } else if (errno == EEXIST) {
+      displaced =
+          capture_posix_directory_entry_snapshot(impl_->directory_descriptor, destination_name);
+      if (S_ISDIR(displaced->identity.st_mode)) {
+        throw std::runtime_error("stitch output destination identifies a directory");
+      }
+      if (::renameatx_np(impl_->directory_descriptor, impl_->temporary_name.c_str(),
+                         impl_->directory_descriptor, destination_name.c_str(), RENAME_SWAP) != 0) {
+        throw_file_error("cannot exchange stitch output", impl_->destination, errno);
+      }
+      exchanged = true;
+      const auto rollback_exchange = [&] {
+        const bool rolled_back = rollback_exchanged_posix_directory_entries_safely(
+            impl_->directory_descriptor, destination_name, impl_->descriptor, impl_->temporary_name,
+            *displaced, impl_->destination);
+        temporary_exists = rolled_back;
+        exchanged = !rolled_back;
+        return rolled_back;
+      };
+      try {
+        if (impl_->publication_fault_hook) {
+          impl_->publication_fault_hook();
+        }
+        if (!path_identifies_descriptor_at(impl_->directory_descriptor, destination_name,
+                                           impl_->descriptor) ||
+            !posix_directory_entry_matches_snapshot(impl_->directory_descriptor,
+                                                    impl_->temporary_name, *displaced)) {
+          throw std::runtime_error("exchanged stitch output identity changed");
+        }
+      } catch (...) {
+        if (!rollback_exchange()) {
+          throw std::runtime_error("stitch output exchange failed and rollback was refused");
+        }
+        throw;
+      }
+      if (!unlink_posix_directory_entry_if_unchanged(
+              impl_->directory_descriptor, impl_->temporary_name, *displaced, impl_->destination)) {
+        if (!rollback_exchange()) {
+          throw std::runtime_error("displaced stitch output changed and rollback was refused");
+        }
+        throw std::runtime_error("cannot remove displaced stitch output");
+      }
+      temporary_exists = false;
+      exchanged = false;
+    } else {
+      throw_file_error("cannot publish stitch output", impl_->destination, errno);
+    }
+    impl_->committed = true;
+    (void)::flock(impl_->directory_descriptor, LOCK_UN);
+    if (::close(impl_->descriptor) != 0) {
+      impl_->descriptor = -1;
+      throw_file_error("cannot close completed stitch output", impl_->destination, errno);
+    }
+    impl_->descriptor = -1;
+  } catch (...) {
+    if (exchanged && displaced.has_value()) {
+      (void)rollback_exchanged_posix_directory_entries_safely(
+          impl_->directory_descriptor, impl_->destination.filename().string(), impl_->descriptor,
+          impl_->temporary_name, *displaced, impl_->destination);
+    }
+    if (temporary_exists) {
+      (void)unlink_posix_descriptor_entry_safely(impl_->directory_descriptor, impl_->temporary_name,
+                                                 impl_->descriptor, impl_->destination);
+    }
+    (void)::flock(impl_->directory_descriptor, LOCK_UN);
+    throw;
+  }
+#else
+  if (::fsync(impl_->descriptor) != 0) {
+    throw_file_error("cannot flush completed stitch output", impl_->temporary, errno);
+  }
+  if (::linkat(impl_->directory_descriptor, impl_->temporary_name.c_str(),
+               impl_->directory_descriptor, impl_->destination.filename().c_str(), 0) != 0) {
+    throw_file_error("cannot publish completed stitch output", impl_->destination, errno);
+  }
+  impl_->committed = true;
+#endif
+}
 
 std::optional<std::filesystem::path>
 resolve_video_probe_worker(const std::filesystem::path& executable_path) {

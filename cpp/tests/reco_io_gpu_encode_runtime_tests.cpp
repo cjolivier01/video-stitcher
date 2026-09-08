@@ -101,7 +101,8 @@ void run_round_trip() {
   const auto audio_input = temporary.path() / "audio-only.mp4";
   reco::tests::materialize_base64_fixture(reco::tests::find_runfile("audio_only_mp4.b64"),
                                           audio_input);
-  auto audio = AudioPassthroughSource::open({.paths = {audio_input.string()}});
+  auto audio = AudioPassthroughSource::open(
+      {.segments = {{.path = audio_input.string(), .video_duration_ns = 10'000'000'000ULL}}});
   if (!audio.caps().has_value()) {
     throw std::runtime_error("real AAC fixture did not expose compressed audio caps");
   }
@@ -166,6 +167,7 @@ void run_round_trip() {
     encoder.submit_frame(std::move(output_frame), frame_index * duration_ns, duration_ns);
   }
   encoder.finish();
+  verify_muxed_gpu_video_output(output.string(), std::chrono::seconds(5));
 
   if (!std::filesystem::is_regular_file(output) || std::filesystem::file_size(output) < 1024U) {
     throw std::runtime_error("GPU encoder did not produce a usable output file");
@@ -193,7 +195,8 @@ void run_round_trip() {
   }
   decoder->request_stop();
 
-  auto remuxed_audio = AudioPassthroughSource::open({.paths = {output.string()}});
+  auto remuxed_audio = AudioPassthroughSource::open(
+      {.segments = {{.path = output.string(), .video_duration_ns = 10'000'000'000ULL}}});
   if (!remuxed_audio.caps().has_value() ||
       remuxed_audio.read().status != AudioPassthroughStatus::Packet) {
     throw std::runtime_error("GPU encoder output did not retain passthrough audio");

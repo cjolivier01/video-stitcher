@@ -61,6 +61,10 @@ void validation_rejects_unsafe_contracts() {
   config.fps_denominator = 1;
   expect_true(validate_gpu_encode_config(config).has_value(), "excessive frame rate is rejected");
   config = valid_config();
+  config.device_ordinal = 1;
+  expect_true(validate_gpu_encode_config(config).has_value(),
+              "nonzero device is rejected before NVMM allocation");
+  config = valid_config();
   config.pool_capacity = 7;
   expect_true(validate_gpu_encode_config(config).has_value(), "undersized pool is rejected");
   config = valid_config();
@@ -153,13 +157,15 @@ void compressed_audio_is_stream_copied_through_a_bounded_mux_branch() {
   expect_true(source.find("decodebin") == std::string::npos,
               "audio source never decodes compressed packets");
 
-  AudioPassthroughConfig passthrough{.paths = {"left.mp4", "left-2.mp4"},
-                                     .start_time_ns = 2'000'000'000ULL};
+  AudioPassthroughConfig passthrough{
+      .segments = {{.path = "left.mp4", .video_duration_ns = 10'000'000'000ULL},
+                   {.path = "left-2.mp4", .video_duration_ns = 10'000'000'000ULL}},
+      .start_time_ns = 2'000'000'000ULL};
   expect_true(!validate_audio_passthrough_config(passthrough).has_value(),
               "chained container audio is accepted");
-  passthrough.paths = {"left.h264"};
-  expect_true(validate_audio_passthrough_config(passthrough).has_value(),
-              "elementary video cannot be used as an audio source");
+  passthrough.segments = {{.path = "left.h264", .video_duration_ns = 10'000'000'000ULL}};
+  expect_true(!validate_audio_passthrough_config(passthrough).has_value(),
+              "elementary video is retained as a silent timeline segment");
 }
 
 } // namespace

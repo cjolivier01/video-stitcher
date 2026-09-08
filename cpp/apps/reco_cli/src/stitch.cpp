@@ -14,7 +14,6 @@
 #include "reco/io/output.hpp"
 
 #include <algorithm>
-#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -23,24 +22,11 @@
 #include <iostream>
 #include <limits>
 #include <optional>
-#include <random>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <system_error>
 #include <utility>
 #include <vector>
-
-#if defined(_WIN32)
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#else
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
 
 namespace reco::cli::detail {
 namespace {
@@ -56,7 +42,7 @@ struct ProbedInput {
 };
 
 struct AudioSelection {
-  std::vector<std::string> paths;
+  std::vector<AudioPassthroughSegment> segments;
   std::uint64_t local_start_time_ns = 0;
 };
 
@@ -84,150 +70,6 @@ std::vector<std::string> split_input_segments(std::string_view input, std::strin
   }
   return paths;
 }
-
-class OutputTransaction {
-public:
-  explicit OutputTransaction(std::filesystem::path destination)
-      : destination_(std::move(destination)) {
-    if (destination_.filename().empty()) {
-      throw std::runtime_error("stitch output must name a file");
-    }
-    auto parent = destination_.parent_path();
-    if (parent.empty()) {
-      parent = ".";
-    }
-    std::error_code error;
-    if (!std::filesystem::is_directory(parent, error) || error) {
-      throw std::runtime_error("stitch output parent is not an accessible directory");
-    }
-#if !defined(_WIN32)
-    directory_descriptor_ = ::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-    if (directory_descriptor_ < 0) {
-      throw std::system_error(errno, std::system_category(),
-                              "cannot retain stitch output directory");
-    }
-#endif
-    std::random_device random;
-    constexpr char hex[] = "0123456789abcdef";
-    for (int attempt = 0; attempt < 128; ++attempt) {
-      std::string token(32, '0');
-      for (auto& digit : token) {
-        digit = hex[random() & 0x0fU];
-      }
-      auto filename = destination_.filename();
-      filename += ".tmp." + token;
-      temporary_ = parent / filename;
-#if defined(_WIN32)
-      const HANDLE handle =
-          CreateFileW(temporary_.c_str(), GENERIC_WRITE | FILE_READ_ATTRIBUTES,
-                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, CREATE_NEW,
-                      FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-      if (handle != INVALID_HANDLE_VALUE) {
-        (void)CloseHandle(handle);
-        return;
-      }
-      if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) {
-        throw std::system_error(static_cast<int>(GetLastError()), std::system_category(),
-                                "cannot reserve stitch output temporary");
-      }
-#else
-      temporary_name_ = filename.string();
-      descriptor_ = ::openat(directory_descriptor_, temporary_name_.c_str(),
-                             O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-      if (descriptor_ >= 0) {
-        return;
-      }
-      if (errno != EEXIST) {
-        throw std::system_error(errno, std::system_category(),
-                                "cannot reserve stitch output temporary");
-      }
-#endif
-    }
-    throw std::runtime_error("cannot reserve a unique stitch output temporary");
-  }
-
-  OutputTransaction(const OutputTransaction&) = delete;
-  OutputTransaction& operator=(const OutputTransaction&) = delete;
-
-  ~OutputTransaction() {
-#if defined(_WIN32)
-    if (!committed_) {
-      std::error_code error;
-      std::filesystem::remove(temporary_, error);
-    }
-#else
-    if (!committed_ && directory_descriptor_ >= 0 && !temporary_name_.empty()) {
-      (void)::unlinkat(directory_descriptor_, temporary_name_.c_str(), 0);
-    }
-    if (descriptor_ >= 0) {
-      (void)::close(descriptor_);
-    }
-    if (directory_descriptor_ >= 0) {
-      (void)::close(directory_descriptor_);
-    }
-#endif
-  }
-
-  [[nodiscard]] const std::filesystem::path& temporary() const { return temporary_; }
-#if !defined(_WIN32)
-  [[nodiscard]] int descriptor() const { return descriptor_; }
-#endif
-
-  void commit() {
-#if defined(_WIN32)
-    std::error_code error;
-    const auto status = std::filesystem::symlink_status(temporary_, error);
-    if (error || !std::filesystem::is_regular_file(status) ||
-        std::filesystem::file_size(temporary_, error) == 0 || error) {
-      throw std::runtime_error("GPU encoder did not produce a regular non-empty output");
-    }
-    if (MoveFileExW(temporary_.c_str(), destination_.c_str(),
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0) {
-      throw std::system_error(static_cast<int>(GetLastError()), std::system_category(),
-                              "cannot publish completed stitch output");
-    }
-#else
-    errno = 0;
-    struct stat descriptor_identity{};
-    struct stat path_identity{};
-    if (descriptor_ < 0 || directory_descriptor_ < 0 ||
-        ::fstat(descriptor_, &descriptor_identity) != 0 ||
-        ::fstatat(directory_descriptor_, temporary_name_.c_str(), &path_identity,
-                  AT_SYMLINK_NOFOLLOW) != 0 ||
-        !S_ISREG(descriptor_identity.st_mode) || !S_ISREG(path_identity.st_mode) ||
-        descriptor_identity.st_size <= 0 || descriptor_identity.st_dev != path_identity.st_dev ||
-        descriptor_identity.st_ino != path_identity.st_ino || ::fsync(descriptor_) != 0) {
-      throw std::system_error(errno == 0 ? EIO : errno, std::system_category(),
-                              "cannot validate completed stitch output");
-    }
-    const auto destination_name = destination_.filename().string();
-    if (::renameat(directory_descriptor_, temporary_name_.c_str(), directory_descriptor_,
-                   destination_name.c_str()) != 0) {
-      throw std::system_error(errno, std::system_category(),
-                              "cannot publish completed stitch output");
-    }
-    struct stat published_identity{};
-    if (::fstatat(directory_descriptor_, destination_name.c_str(), &published_identity,
-                  AT_SYMLINK_NOFOLLOW) != 0 ||
-        published_identity.st_dev != descriptor_identity.st_dev ||
-        published_identity.st_ino != descriptor_identity.st_ino ||
-        ::fsync(directory_descriptor_) != 0) {
-      throw std::runtime_error("published stitch output identity changed during publication");
-    }
-#endif
-    committed_ = true;
-  }
-
-private:
-  std::filesystem::path destination_;
-  std::filesystem::path temporary_;
-#if !defined(_WIN32)
-  std::string temporary_name_;
-  int directory_descriptor_ = -1;
-  int descriptor_ = -1;
-#endif
-  bool committed_ = false;
-};
 
 void reject_output_alias(const std::filesystem::path& output, const std::filesystem::path& input,
                          std::string_view label) {
@@ -307,6 +149,19 @@ std::optional<std::uint64_t> exact_total_frames(const ProbedInput& input) {
   return total;
 }
 
+void require_exact_indexed_timeline(const ProbedInput& input, std::string_view label) {
+  if (!exact_total_frames(input).has_value()) {
+    throw std::runtime_error(std::string(label) +
+                             " input requires exact verified constant-cadence metadata");
+  }
+  for (const auto& probe : input.probes) {
+    if (!probe.first_stream_time_ns.has_value()) {
+      throw std::runtime_error(std::string(label) +
+                               " input is missing an indexed stream-time origin");
+    }
+  }
+}
+
 std::unique_ptr<GpuFileDecodeSource>
 open_decode_source(const ProbedInput& input, std::optional<std::uint64_t> start_frame,
                    const std::shared_ptr<const NvbufSurfaceRuntime>& runtime) {
@@ -333,12 +188,21 @@ std::uint64_t timestamp_for_frame(std::uint64_t frame_index, std::uint32_t fps_n
   const auto whole_seconds = frame_index / fps_numerator;
   const auto remainder = frame_index % fps_numerator;
   constexpr std::uint64_t billion = 1'000'000'000ULL;
-  if (whole_seconds > std::numeric_limits<std::uint64_t>::max() / billion / fps_denominator) {
+  const auto scale = billion * static_cast<std::uint64_t>(fps_denominator);
+  if (whole_seconds > std::numeric_limits<std::uint64_t>::max() / scale) {
     throw std::overflow_error("stitch output timestamp exceeds the GStreamer time range");
   }
-  const auto whole = whole_seconds * billion * fps_denominator;
-  const auto fractional_scale = billion * static_cast<std::uint64_t>(fps_denominator);
-  return whole + (remainder * fractional_scale) / fps_numerator;
+  const auto whole = whole_seconds * scale;
+  const auto fractional_whole = remainder * (scale / fps_numerator);
+  const auto fractional_remainder = (remainder * (scale % fps_numerator)) / fps_numerator;
+  if (fractional_whole > std::numeric_limits<std::uint64_t>::max() - fractional_remainder) {
+    throw std::overflow_error("stitch output timestamp exceeds the GStreamer time range");
+  }
+  const auto fractional = fractional_whole + fractional_remainder;
+  if (whole > std::numeric_limits<std::uint64_t>::max() - fractional) {
+    throw std::overflow_error("stitch output timestamp exceeds the GStreamer time range");
+  }
+  return whole + fractional;
 }
 
 std::uint64_t nanoseconds_from_seconds(double seconds, std::string_view label) {
@@ -365,17 +229,11 @@ AudioSelection select_audio_segments(const ProbedInput& input, std::uint64_t sta
   }
 
   AudioSelection selection;
-  bool selected_segment_has_audio_container = false;
   for (std::size_t index = first_segment; index < input.paths.size(); ++index) {
-    const auto& path = input.paths[index];
-    if (!gpu_decode_path_is_elementary_stream(path) && gpu_decode_container_for_path(path)) {
-      if (selection.paths.empty()) {
-        selected_segment_has_audio_container = index == first_segment;
-      }
-      selection.paths.push_back(path);
-    }
+    selection.segments.push_back(
+        {.path = input.paths[index], .video_duration_ns = input.probes[index].duration_ns});
   }
-  selection.local_start_time_ns = selected_segment_has_audio_container ? local_start : 0U;
+  selection.local_start_time_ns = local_start;
   return selection;
 }
 
@@ -428,6 +286,10 @@ std::optional<std::uint64_t> output_frame_limit(const StitchCommand& command,
     }
     const long double frames = static_cast<long double>(*command.end_time - start) *
                                probe.fps_numerator / probe.fps_denominator;
+    if (!std::isfinite(frames) ||
+        std::ceil(frames) > static_cast<long double>(std::numeric_limits<std::uint64_t>::max())) {
+      throw std::runtime_error("--end-time exceeds the supported output frame range");
+    }
     const auto time_limit = static_cast<std::uint64_t>(std::ceil(frames));
     limit = limit.has_value() ? std::min(*limit, time_limit) : time_limit;
   }
@@ -450,6 +312,25 @@ void reject_unported_stitch_options(const StitchCommand& command) {
 }
 
 } // namespace
+
+StitchFrameTiming derive_stitch_frame_timing(std::uint64_t source_frame_index,
+                                             std::uint64_t first_source_frame_index,
+                                             std::uint32_t fps_numerator,
+                                             std::uint32_t fps_denominator) {
+  if (fps_numerator == 0 || fps_denominator == 0) {
+    throw std::invalid_argument("stitch output frame rate must be non-zero");
+  }
+  if (source_frame_index < first_source_frame_index) {
+    throw std::runtime_error("stitch source frame index moved backwards");
+  }
+  const auto relative_index = source_frame_index - first_source_frame_index;
+  if (relative_index == std::numeric_limits<std::uint64_t>::max()) {
+    throw std::overflow_error("stitch output frame index overflows");
+  }
+  const auto pts = timestamp_for_frame(relative_index, fps_numerator, fps_denominator);
+  const auto next_pts = timestamp_for_frame(relative_index + 1U, fps_numerator, fps_denominator);
+  return {.pts_ns = pts, .duration_ns = next_pts - pts};
+}
 
 int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& executable_path,
                    std::ostream& out, std::ostream& err) {
@@ -481,6 +362,8 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
     }
     auto left_input = probe_input(std::move(left_paths), *worker, "left");
     auto right_input = probe_input(std::move(right_paths), *worker, "right");
+    require_exact_indexed_timeline(left_input, "left");
+    require_exact_indexed_timeline(right_input, "right");
     const auto& left_probe = left_input.probes.front();
     const auto& right_probe = right_input.probes.front();
     if (left_probe.fps_numerator != right_probe.fps_numerator ||
@@ -552,17 +435,19 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
     const auto audio_selection = select_audio_segments(
         left_input, audio_start_time_ns(command, sync_offset, left_probe.fps_numerator,
                                         left_probe.fps_denominator));
-    if (!audio_selection.paths.empty()) {
-      audio.emplace(AudioPassthroughSource::open(
-          {.paths = audio_selection.paths, .start_time_ns = audio_selection.local_start_time_ns}));
+    if (!audio_selection.segments.empty()) {
+      audio.emplace(
+          AudioPassthroughSource::open({.segments = audio_selection.segments,
+                                        .start_time_ns = audio_selection.local_start_time_ns}));
       if (!audio->caps().has_value()) {
         audio.reset();
       }
     }
 
-    OutputTransaction output(output_path);
+    AtomicOutputFile output(output_path);
     GpuEncodeConfig encode_config{
-        .output_path = core::path_to_utf8(output.temporary()),
+        .output_path = {},
+        .output_descriptor = output.descriptor(),
         .width = command.width,
         .height = command.height,
         .fps_numerator = left_probe.fps_numerator,
@@ -576,10 +461,6 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
         .device_ordinal = 0,
         .pool_capacity = 8,
     };
-#if !defined(_WIN32)
-    encode_config.output_path.clear();
-    encode_config.output_descriptor = output.descriptor();
-#endif
     auto encoder = GpuVideoEncodeSession::open(std::move(encode_config), runtime);
     auto left = open_decode_source(left_input, start_frame, runtime);
     auto right = open_decode_source(right_input, start_frame, runtime);
@@ -615,6 +496,8 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
 
     const auto started = std::chrono::steady_clock::now();
     std::uint64_t frames = 0;
+    std::optional<std::uint64_t> first_source_frame_index;
+    std::optional<std::uint64_t> previous_source_frame_index;
     while (!limit.has_value() || frames < *limit) {
       auto decoded = decoder.read();
       if (decoded.status == GpuStereoDecodeStatus::EndOfStream) {
@@ -636,19 +519,32 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
                        .flip_right_180 = decoded.frames->right.rotation_degrees == 180});
       auto encoded = encoder.acquire_frame();
       converter.convert(rgba, encoded.view());
-      const auto pts =
-          timestamp_for_frame(frames, left_probe.fps_numerator, left_probe.fps_denominator);
-      const auto next_pts =
-          timestamp_for_frame(frames + 1U, left_probe.fps_numerator, left_probe.fps_denominator);
-      encoder.submit_frame(std::move(encoded), pts, next_pts - pts);
-      forward_audio_before(next_pts);
+      const auto source_frame_index = decoded.frames->left.frame_index;
+      if (previous_source_frame_index.has_value() &&
+          source_frame_index <= *previous_source_frame_index) {
+        throw std::runtime_error("stereo decoder returned a non-increasing source frame index");
+      }
+      if (!first_source_frame_index.has_value()) {
+        first_source_frame_index = source_frame_index;
+      }
+      const auto timing =
+          derive_stitch_frame_timing(source_frame_index, *first_source_frame_index,
+                                     left_probe.fps_numerator, left_probe.fps_denominator);
+      encoder.submit_frame(std::move(encoded), timing.pts_ns, timing.duration_ns);
+      forward_audio_before(timing.pts_ns + timing.duration_ns);
+      previous_source_frame_index = source_frame_index;
       ++frames;
     }
     decoder.request_stop();
     if (audio.has_value()) {
       audio->request_stop();
     }
+    if (frames == 0) {
+      encoder.abort();
+      throw std::runtime_error("stereo inputs produced no aligned video frames");
+    }
     encoder.finish();
+    verify_muxed_gpu_video_output(core::path_to_utf8(output.verification_path()));
     output.commit();
     const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started);
     const auto rate = elapsed.count() > 0.0 ? static_cast<double>(frames) / elapsed.count() : 0.0;

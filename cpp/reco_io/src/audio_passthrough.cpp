@@ -1,14 +1,21 @@
 #include "reco/io/audio_passthrough.hpp"
 
+#include "reco/core/path.hpp"
+#if defined(_WIN32)
+#include "reco/core/windows_runtime_library.hpp"
+#endif
 #include "reco/io/gpu_decode.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <initializer_list>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -67,15 +74,15 @@ static_assert(sizeof(GstBufferAbi) == (sizeof(void*) == 8 ? 112 : 80));
 
 class DynamicLibrary {
 public:
-  explicit DynamicLibrary(std::string path) : path_(std::move(path)) {
+  explicit DynamicLibrary(const std::filesystem::path& path) : path_(core::path_to_utf8(path)) {
 #if defined(_WIN32)
-    handle_ = LoadLibraryA(path_.c_str());
+    handle_ = static_cast<HMODULE>(core::detail::load_windows_runtime_library(path));
     if (handle_ == nullptr) {
       throw AudioPassthroughError("failed to load " + path_ + " (Windows error " +
                                   std::to_string(GetLastError()) + ")");
     }
 #else
-    handle_ = dlopen(path_.c_str(), RTLD_NOW | RTLD_LOCAL);
+    handle_ = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (handle_ == nullptr) {
       const char* error = dlerror();
       throw AudioPassthroughError("failed to load " + path_ +
@@ -124,14 +131,14 @@ private:
 std::shared_ptr<DynamicLibrary> load_library(const char* environment_variable,
                                              std::initializer_list<const char*> names,
                                              std::string_view component) {
-  if (const char* override_path = std::getenv(environment_variable);
-      override_path != nullptr && override_path[0] != '\0') {
-    return std::make_shared<DynamicLibrary>(override_path);
+  if (const auto override_path = core::path_from_environment(environment_variable);
+      override_path.has_value()) {
+    return std::make_shared<DynamicLibrary>(*override_path);
   }
   std::string errors;
   for (const char* name : names) {
     try {
-      return std::make_shared<DynamicLibrary>(name);
+      return std::make_shared<DynamicLibrary>(std::filesystem::path(name));
     } catch (const AudioPassthroughError& error) {
       if (!errors.empty()) {
         errors += "; ";
@@ -317,19 +324,26 @@ std::optional<std::uint64_t> CompressedAudioPacket::timestamp_ns() const noexcep
 }
 
 std::optional<std::string> validate_audio_passthrough_config(const AudioPassthroughConfig& config) {
-  if (config.paths.empty()) {
+  if (config.segments.empty()) {
     return "audio passthrough requires at least one input segment";
   }
-  for (const auto& path : config.paths) {
-    if (path.empty()) {
+  for (const auto& segment : config.segments) {
+    if (segment.path.empty()) {
       return "audio passthrough input paths must not be empty";
     }
-    if (path.find('\0') != std::string::npos) {
+    if (segment.path.find('\0') != std::string::npos) {
       return "audio passthrough input path contains an embedded NUL";
     }
-    if (gpu_decode_path_is_elementary_stream(path) || !gpu_decode_container_for_path(path)) {
-      return "audio passthrough requires a supported container input";
+    if (!gpu_decode_path_is_elementary_stream(segment.path) &&
+        !gpu_decode_container_for_path(segment.path)) {
+      return "audio passthrough requires a supported video input";
     }
+    if (segment.video_duration_ns == 0 || segment.video_duration_ns == kGstClockTimeNone) {
+      return "audio passthrough video segment duration must be finite and non-zero";
+    }
+  }
+  if (config.start_time_ns >= config.segments.front().video_duration_ns) {
+    return "audio passthrough start time must fall within the first selected segment";
   }
   if (config.read_timeout < std::chrono::milliseconds(1) ||
       config.read_timeout > std::chrono::hours(1)) {
@@ -372,7 +386,7 @@ struct AudioPassthroughSource::Impl {
 
   ~Impl() { stop(); }
 
-  void close_segment() noexcept {
+  void close_segment_locked() noexcept {
     if (pipeline != nullptr) {
       (void)api->element_set_state(pipeline, kGstStateNull);
     }
@@ -390,8 +404,20 @@ struct AudioPassthroughSource::Impl {
     }
   }
 
+  void close_segment() noexcept {
+    std::lock_guard lock(resources_mutex);
+    close_segment_locked();
+  }
+
   void stop() noexcept {
-    stopped = true;
+    stopped.store(true, std::memory_order_release);
+    {
+      std::lock_guard lock(resources_mutex);
+      if (pipeline != nullptr) {
+        (void)api->element_set_state(pipeline, kGstStateNull);
+      }
+    }
+    std::lock_guard operation_lock(operation_mutex);
     pending.reset();
     close_segment();
   }
@@ -468,21 +494,45 @@ struct AudioPassthroughSource::Impl {
   }
 
   bool open_next_segment() {
+    if (segment_output_end.has_value()) {
+      next_output_ns = std::max(next_output_ns, *segment_output_end);
+      segment_output_end.reset();
+    }
     close_segment();
-    if (stopped) {
+    if (stopped.load(std::memory_order_acquire)) {
       return false;
     }
-    while (next_path < config.paths.size() && !segment_has_audio(config.paths[next_path])) {
-      ++next_path;
+    const AudioPassthroughSegment* segment = nullptr;
+    for (;;) {
+      if (next_segment >= config.segments.size()) {
+        return false;
+      }
+      const auto segment_index = next_segment++;
+      segment = &config.segments[segment_index];
+      const auto trim = segment_index == 0 ? config.start_time_ns : 0U;
+      const auto selected_duration = segment->video_duration_ns - trim;
+      if (next_output_ns > std::numeric_limits<std::uint64_t>::max() - selected_duration) {
+        throw AudioPassthroughError("audio passthrough video timeline overflows");
+      }
+      segment_output_anchor = next_output_ns;
+      segment_output_end = next_output_ns + selected_duration;
+      trim_before_ns = trim;
+      segment_source_anchor.reset();
+      const bool supported_container = !gpu_decode_path_is_elementary_stream(segment->path) &&
+                                       gpu_decode_container_for_path(segment->path).has_value();
+      if (supported_container && segment_has_audio(segment->path)) {
+        break;
+      }
+      next_output_ns = *segment_output_end;
+      segment_output_end.reset();
+      if (stopped.load(std::memory_order_acquire)) {
+        return false;
+      }
     }
-    if (next_path >= config.paths.size()) {
-      return false;
-    }
-    const bool first_supplied_segment = next_path == 0;
-    const auto description = build_gstreamer_audio_passthrough_pipeline(config.paths[next_path++]);
+    const auto description = build_gstreamer_audio_passthrough_pipeline(segment->path);
     GErrorAbi* error = nullptr;
-    pipeline = api->parse_launch(description.c_str(), &error);
-    if (pipeline == nullptr || error != nullptr) {
+    void* candidate_pipeline = api->parse_launch(description.c_str(), &error);
+    if (candidate_pipeline == nullptr || error != nullptr) {
       std::string detail = "failed to construct compressed audio pipeline";
       if (error != nullptr) {
         if (error->message != nullptr) {
@@ -490,31 +540,54 @@ struct AudioPassthroughSource::Impl {
         }
         api->error_free(error);
       }
-      close_segment();
+      if (candidate_pipeline != nullptr) {
+        api->object_unref(candidate_pipeline);
+      }
       throw AudioPassthroughError(detail);
     }
-    sink = api->bin_get_by_name(pipeline, "audio_sink");
-    bus = api->element_get_bus(pipeline);
-    if (sink == nullptr || bus == nullptr) {
-      close_segment();
+    void* candidate_sink = api->bin_get_by_name(candidate_pipeline, "audio_sink");
+    void* candidate_bus = api->element_get_bus(candidate_pipeline);
+    const auto close_candidate = [&]() noexcept {
+      (void)api->element_set_state(candidate_pipeline, kGstStateNull);
+      if (candidate_sink != nullptr) {
+        api->object_unref(candidate_sink);
+      }
+      if (candidate_bus != nullptr) {
+        api->object_unref(candidate_bus);
+      }
+      api->object_unref(candidate_pipeline);
+    };
+    if (candidate_sink == nullptr || candidate_bus == nullptr) {
+      close_candidate();
       throw AudioPassthroughError("compressed audio pipeline is missing appsink or bus resources");
     }
-    if (api->element_set_state(pipeline, kGstStatePlaying) == kGstStateChangeFailure) {
-      close_segment();
-      throw AudioPassthroughError("compressed audio pipeline failed to enter PLAYING");
+    {
+      std::lock_guard lock(resources_mutex);
+      if (stopped.load(std::memory_order_acquire)) {
+        close_candidate();
+        return false;
+      }
+      pipeline = candidate_pipeline;
+      sink = candidate_sink;
+      bus = candidate_bus;
+      if (api->element_set_state(pipeline, kGstStatePlaying) == kGstStateChangeFailure) {
+        close_segment_locked();
+        throw AudioPassthroughError("compressed audio pipeline failed to enter PLAYING");
+      }
     }
     int current = 0;
     int pending_state = 0;
     if (api->element_get_state(pipeline, &current, &pending_state,
                                timeout_ns(config.read_timeout)) == kGstStateChangeFailure) {
+      if (stopped.load(std::memory_order_acquire)) {
+        close_segment();
+        return false;
+      }
       const auto detail =
           take_bus_error().value_or("compressed audio pipeline failed during startup");
       close_segment();
       throw AudioPassthroughError(detail);
     }
-    segment_output_anchor = next_output_ns;
-    segment_source_anchor.reset();
-    trim_before_ns = first_supplied_segment ? config.start_time_ns : 0;
     if (trim_before_ns > 0) {
       (void)api->element_seek_simple(
           pipeline, kGstFormatTime, kGstSeekFlush | kGstSeekKeyUnit,
@@ -528,6 +601,12 @@ struct AudioPassthroughSource::Impl {
   std::optional<CompressedAudioPacket> pull_current() {
     for (;;) {
       void* sample = api->app_sink_try_pull_sample(sink, timeout_ns(config.read_timeout));
+      if (stopped.load(std::memory_order_acquire)) {
+        if (sample != nullptr) {
+          api->sample_unref(sample);
+        }
+        return std::nullopt;
+      }
       if (sample == nullptr) {
         if (const auto error = take_bus_error(); error.has_value()) {
           throw AudioPassthroughError(*error);
@@ -608,6 +687,9 @@ struct AudioPassthroughSource::Impl {
       api->sample_unref(sample);
 
       const auto output_timestamp = packet.pts_ns.value_or(packet.dts_ns.value_or(0));
+      if (!segment_output_end.has_value() || output_timestamp >= *segment_output_end) {
+        return std::nullopt;
+      }
       const auto duration = packet.duration_ns;
       next_output_ns = output_timestamp > std::numeric_limits<std::uint64_t>::max() - duration
                            ? std::numeric_limits<std::uint64_t>::max()
@@ -627,7 +709,8 @@ struct AudioPassthroughSource::Impl {
   }
 
   AudioPassthroughReadResult read() {
-    if (stopped) {
+    std::lock_guard operation_lock(operation_mutex);
+    if (stopped.load(std::memory_order_acquire)) {
       return {};
     }
     if (pending.has_value()) {
@@ -643,6 +726,9 @@ struct AudioPassthroughSource::Impl {
       if (packet.has_value()) {
         return {.status = AudioPassthroughStatus::Packet, .packet = std::move(packet)};
       }
+      if (stopped.load(std::memory_order_acquire)) {
+        return {};
+      }
       close_segment();
       if (!open_next_segment()) {
         return {};
@@ -652,17 +738,20 @@ struct AudioPassthroughSource::Impl {
 
   AudioPassthroughConfig config;
   std::shared_ptr<GstreamerAudioApi> api;
-  std::size_t next_path = 0;
+  std::size_t next_segment = 0;
   void* pipeline = nullptr;
   void* sink = nullptr;
   void* bus = nullptr;
   std::optional<std::string> caps_value;
   std::optional<CompressedAudioPacket> pending;
   std::optional<std::uint64_t> segment_source_anchor;
+  std::optional<std::uint64_t> segment_output_end;
   std::uint64_t segment_output_anchor = 0;
   std::uint64_t trim_before_ns = 0;
   std::uint64_t next_output_ns = 0;
-  bool stopped = false;
+  std::mutex operation_mutex;
+  std::mutex resources_mutex;
+  std::atomic<bool> stopped{false};
 };
 
 AudioPassthroughSource AudioPassthroughSource::open(AudioPassthroughConfig config) {

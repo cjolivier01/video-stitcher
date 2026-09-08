@@ -225,6 +225,8 @@ jobs:
           //cpp/tests:reco_core_nvrtc_tests
           //cpp/tests:reco_core_cuda_stitch_renderer_tests
           //cpp/tests:reco_core_cuda_stitch_parity_tests
+          //cpp/tests:reco_core_cuda_rgba_to_nv12_tests
+          //cpp/tests:reco_io_gpu_encode_runtime_tests
           //cpp/tests:reco_calibrate_gpu_undistort_tests
           //cpp/tests:reco_calibrate_gpu_sampling_tests
           //cpp/tests:reco_calibrate_gpu_features_tests
@@ -283,6 +285,16 @@ jobs:
             '.left_uniforms.width == 1280 and .right_uniforms.width == 1280 and (.params.cameraAxisOffset | type == "number")' \
             "$work_dir/match.json" >/dev/null
 
+          bazel --output_base="$RUNNER_TEMP/reco-bazel-output" run \
+            --jobs=2 --local_test_jobs=1 //cpp/apps/reco_cli:reco -- stitch \
+            "$work_dir/left.mp4" "$work_dir/right.mp4" \
+            --calibration "$work_dir/match.json" \
+            --max-frames 3 \
+            --output "$work_dir/stitched.mp4"
+          test "$(ffprobe -v error -select_streams v:0 \
+            -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1 \
+            "$work_dir/stitched.mp4")" = "video"
+
   jetson-nvmm-hardware-conditional:
     name: Bazel C++ Jetson NVMM stitch (hardware-conditional)
     if: >-
@@ -310,4 +322,6 @@ jobs:
           --test_env=RECO_EXPECT_NVMM_MEMORY_TYPE=surface-array
           --test_env=RECO_REQUIRE_JETSON_NVMM_TEST=1
           --test_output=errors
+          //cpp/tests:reco_core_cuda_rgba_to_nv12_tests
+          //cpp/tests:reco_io_gpu_encode_runtime_tests
           //cpp/tests:reco_calibrate_gpu_video_parity_tests

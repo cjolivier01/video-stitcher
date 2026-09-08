@@ -258,6 +258,18 @@ void wrapping_and_push_failures_preserve_pool_ownership(
     expect_encode_error([&] { (void)session.acquire_frame(); }, "flow status",
                         "appsrc rejection remains sticky");
   }
+  {
+    set_scenario("encode-wrap-error");
+    auto session = GpuVideoEncodeSession::open(audio_config(), runtime);
+    expect_encode_error([&] { session.submit_audio_packet(audio_packet(16U * 1024U * 1024U)); },
+                        "failed to wrap", "compressed-audio owner allocation failure");
+    set_scenario("encode-audio-backpressure");
+    session.submit_audio_packet(audio_packet(16U * 1024U * 1024U));
+    session.submit_audio_packet(audio_packet(16U * 1024U * 1024U));
+    expect_encode_error([&] { session.submit_audio_packet(audio_packet(1)); }, "timed out waiting",
+                        "audio allocation failure rolls back aggregate accounting");
+    session.abort();
+  }
 }
 
 void bus_errors_and_early_eos_are_sticky(
@@ -379,6 +391,15 @@ void compressed_audio_packets_use_the_bounded_audio_appsrc(
             "audio appsrc receives terminal EOS before mux finalization");
 }
 
+void finalized_output_requires_a_discoverable_video_stream() {
+  set_scenario("encode-success");
+  verify_muxed_gpu_video_output("fake-output.mp4", std::chrono::milliseconds(5));
+  set_scenario("encoded-output-no-video");
+  expect_encode_error(
+      [&] { verify_muxed_gpu_video_output("fake-output.mp4", std::chrono::milliseconds(5)); },
+      "contains no video stream", "audio-only muxed output is rejected before publication");
+}
+
 void compressed_audio_backpressure_bounds_packets_and_bytes(
     const std::shared_ptr<const NvbufSurfaceRuntime>& runtime,
     const std::filesystem::path& event_path) {
@@ -427,7 +448,7 @@ void compressed_audio_preserves_only_buffer_semantic_flags(
             "audio mux retains semantic flags and filters mini-object and memory-tag flags");
 }
 
-void submission_is_serialized_with_finish_and_abort(
+void finish_is_serialized_and_abort_interrupts_waits(
     const std::shared_ptr<const NvbufSurfaceRuntime>& runtime,
     const std::filesystem::path& event_path) {
   using namespace std::chrono_literals;
@@ -455,10 +476,53 @@ void submission_is_serialized_with_finish_and_abort(
     expect_true(wait_for_event(event_path, "audio-push-enter"),
                 "second blocking audio submission entered the runtime");
     auto abort = std::async(std::launch::async, [&] { session.abort(); });
-    expect_true(abort.wait_for(10ms) == std::future_status::timeout,
-                "abort waits until the active audio submission returns");
-    submit.get();
+    expect_true(abort.wait_for(50ms) == std::future_status::ready,
+                "abort does not wait for an active audio submission");
     abort.get();
+    submit.get();
+  }
+
+  std::filesystem::remove(event_path);
+  set_scenario("encode-audio-backpressure");
+  {
+    auto backpressure_config = audio_config();
+    backpressure_config.acquire_timeout = std::chrono::seconds(30);
+    auto session = GpuVideoEncodeSession::open(std::move(backpressure_config), runtime);
+    for (std::size_t index = 0; index < 32; ++index) {
+      session.submit_audio_packet(audio_packet(1));
+    }
+    auto blocked_submit =
+        std::async(std::launch::async, [&] { session.submit_audio_packet(audio_packet(1)); });
+    expect_true(blocked_submit.wait_for(10ms) == std::future_status::timeout,
+                "audio submission blocks at the bounded mux capacity");
+    const auto abort_started = std::chrono::steady_clock::now();
+    session.abort();
+    expect_true(std::chrono::steady_clock::now() - abort_started < 500ms,
+                "abort returns promptly during audio backpressure");
+    expect_true(blocked_submit.wait_for(500ms) == std::future_status::ready,
+                "abort wakes audio backpressure immediately");
+    expect_encode_error([&] { blocked_submit.get(); }, "no longer accepting",
+                        "aborted audio backpressure reports terminal state");
+  }
+
+  std::filesystem::remove(event_path);
+  set_scenario("encode-finalize-timeout");
+  {
+    auto finalize_config = config();
+    finalize_config.finalize_timeout = std::chrono::seconds(30);
+    auto session = GpuVideoEncodeSession::open(std::move(finalize_config), runtime);
+    auto frame = session.acquire_frame();
+    session.submit_frame(std::move(frame), 0, 1);
+    auto finish = std::async(std::launch::async, [&] { session.finish(); });
+    expect_true(wait_for_event(event_path, "appsrc-eos"),
+                "encoder entered mux finalization before abort");
+    const auto abort_started = std::chrono::steady_clock::now();
+    session.abort();
+    expect_true(std::chrono::steady_clock::now() - abort_started < 500ms,
+                "abort returns promptly during mux finalization");
+    expect_true(finish.wait_for(500ms) == std::future_status::ready,
+                "abort interrupts mux finalization polling");
+    expect_encode_error([&] { finish.get(); }, "aborted", "interrupted finalization reports abort");
   }
 }
 
@@ -467,7 +531,9 @@ void compressed_audio_source_trims_and_rebases_chained_segments(
   std::filesystem::remove(event_path);
   set_scenario("audio-packets");
   auto source = AudioPassthroughSource::open(
-      {.paths = {"first.mp4", "second.mp4"}, .start_time_ns = 20'000'000ULL});
+      {.segments = {{.path = "first.mp4", .video_duration_ns = 80'000'000ULL},
+                    {.path = "second.mp4", .video_duration_ns = 80'000'000ULL}},
+       .start_time_ns = 20'000'000ULL});
   expect_true(source.caps() == "audio/mpeg, mpegversion=(int)4, rate=(int)48000, channels=(int)2",
               "audio source exposes parser-negotiated compressed caps");
 
@@ -501,13 +567,43 @@ void compressed_audio_source_trims_and_rebases_chained_segments(
             "audio start trim seeks only the first selected segment");
   expect_eq(count_event(events, "decoder-element"), 0U,
             "compressed audio passthrough never creates a decoder");
+
+  std::filesystem::remove(event_path);
+  set_scenario("audio-silent-middle");
+  auto with_silent_segment = AudioPassthroughSource::open(
+      {.segments = {{.path = "first.mp4", .video_duration_ns = 80'000'000ULL},
+                    {.path = "silent.mp4", .video_duration_ns = 100'000'000ULL},
+                    {.path = "second.mp4", .video_duration_ns = 80'000'000ULL}}});
+  timestamps.clear();
+  for (;;) {
+    auto result = with_silent_segment.read();
+    if (result.status == AudioPassthroughStatus::EndOfStream) {
+      break;
+    }
+    expect_true(result.packet.has_value(), "silent-gap audio result contains a packet");
+    if (result.packet.has_value()) {
+      timestamps.push_back(
+          result.packet->pts_ns.value_or(std::numeric_limits<std::uint64_t>::max()));
+    }
+  }
+  expect_true(timestamps ==
+                  std::vector<std::uint64_t>({0, 20'000'000, 40'000'000, 60'000'000, 180'000'000,
+                                              200'000'000, 220'000'000, 240'000'000}),
+              "audio-free segment preserves its video-duration gap");
+  const auto silent_events = read_events(event_path);
+  expect_eq(count_event(silent_events, "discover-audio"), 3U,
+            "every container segment is inspected for audio");
+  expect_eq(count_event(silent_events, "parse-audio"), 2U,
+            "audio-free segment does not construct a demux pipeline");
 }
 
 void compressed_audio_source_handles_absence_and_incompatible_caps(
     const std::filesystem::path& event_path) {
   std::filesystem::remove(event_path);
   set_scenario("audio-no-stream");
-  auto absent = AudioPassthroughSource::open({.paths = {"first.mp4", "second.mp4"}});
+  auto absent = AudioPassthroughSource::open(
+      {.segments = {{.path = "first.mp4", .video_duration_ns = 80'000'000ULL},
+                    {.path = "second.mp4", .video_duration_ns = 80'000'000ULL}}});
   expect_true(!absent.caps().has_value(), "audio-free segments expose no mux caps");
   expect_true(absent.read().status == AudioPassthroughStatus::EndOfStream,
               "audio-free segment chain ends cleanly");
@@ -519,13 +615,38 @@ void compressed_audio_source_handles_absence_and_incompatible_caps(
 
   std::filesystem::remove(event_path);
   set_scenario("audio-incompatible-segments");
-  auto incompatible = AudioPassthroughSource::open({.paths = {"first.mp4", "second.mp4"}});
+  auto incompatible = AudioPassthroughSource::open(
+      {.segments = {{.path = "first.mp4", .video_duration_ns = 80'000'000ULL},
+                    {.path = "second.mp4", .video_duration_ns = 80'000'000ULL}}});
   for (int index = 0; index < 4; ++index) {
     expect_true(incompatible.read().status == AudioPassthroughStatus::Packet,
                 "first compatible audio segment is readable");
   }
   expect_audio_error([&] { (void)incompatible.read(); }, "incompatible caps",
                      "incompatible chained compressed audio fails closed");
+}
+
+void compressed_audio_stop_interrupts_concurrent_read(const std::filesystem::path& event_path) {
+  using namespace std::chrono_literals;
+  std::filesystem::remove(event_path);
+  set_scenario("audio-stop-blocked-read");
+  auto source = AudioPassthroughSource::open(
+      {.segments = {{.path = "first.mp4", .video_duration_ns = 80'000'000ULL}},
+       .read_timeout = std::chrono::seconds(30)});
+  expect_true(source.read().status == AudioPassthroughStatus::Packet,
+              "primed compressed audio packet is returned before blocked read");
+  auto read = std::async(std::launch::async, [&] { return source.read(); });
+  expect_true(wait_for_event(event_path, "audio-pull-blocked"),
+              "compressed audio read entered the blocking runtime call");
+  auto stop = std::async(std::launch::async, [&] { source.request_stop(); });
+  expect_true(stop.wait_for(500ms) == std::future_status::ready,
+              "audio request_stop interrupts and joins a concurrent read");
+  stop.get();
+  expect_true(read.wait_for(500ms) == std::future_status::ready,
+              "interrupted compressed audio read returns promptly");
+  expect_true(read.get().status == AudioPassthroughStatus::EndOfStream,
+              "interrupted compressed audio read reports terminal status");
+  source.request_stop();
 }
 
 } // namespace
@@ -560,11 +681,13 @@ int main() {
     successful_finish_waits_for_downstream_release(runtime);
     outstanding_leases_survive_session_destruction(runtime);
     compressed_audio_packets_use_the_bounded_audio_appsrc(runtime, event_path);
+    finalized_output_requires_a_discoverable_video_stream();
     compressed_audio_backpressure_bounds_packets_and_bytes(runtime, event_path);
     compressed_audio_preserves_only_buffer_semantic_flags(runtime, event_path);
-    submission_is_serialized_with_finish_and_abort(runtime, event_path);
+    finish_is_serialized_and_abort_interrupts_waits(runtime, event_path);
     compressed_audio_source_trims_and_rebases_chained_segments(event_path);
     compressed_audio_source_handles_absence_and_incompatible_caps(event_path);
+    compressed_audio_stop_interrupts_concurrent_read(event_path);
   } catch (const std::exception& error) {
     std::cerr << "FAIL: unexpected top-level error: " << error.what() << '\n';
     ++failures;

@@ -126,5 +126,8 @@ private:
 [[nodiscard]] std::optional<std::string> validate_gpu_encode_config(const GpuEncodeConfig& config);
 [[nodiscard]] std::string_view gstreamer_hardware_encoder_factory(Codec codec);
 [[nodiscard]] std::string build_gstreamer_gpu_encode_pipeline(const GpuEncodeConfig& config);
+/// Verifies that a finalized muxed file exposes at least one video stream without decoding it.
+void verify_muxed_gpu_video_output(std::string_view path,
+                                   std::chrono::milliseconds timeout = std::chrono::seconds(10));
 
 } // namespace reco::io
