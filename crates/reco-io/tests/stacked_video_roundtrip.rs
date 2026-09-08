@@ -173,18 +173,32 @@ fn matroska_reader_sees_partial_writes() {
     let path = dir.path().join("stacked.mkv");
     let layout = GridLayout::vstack(TILE_W, TILE_H, 2).expect("even dims");
 
-    let mut enc =
-        StackedEncoder::new(layout, &path, encoder_config(Container::Matroska)).expect("open");
+    // Force a deterministic encoder and a single GOP longer than the
+    // fixture. This prevents a keyframe from closing the Matroska
+    // cluster automatically, so only flush() can make it readable.
+    let mut config = encoder_config(Container::Matroska);
+    config.inner.encoder_name = Some("libx264".to_owned());
+    config.inner.gop_size = Some(N_FRAMES as u32 + 1);
+    let mut enc = StackedEncoder::new(layout, &path, config).expect("open");
 
-    // Push half the frames and flush so the AVIO layer writes to
-    // disk. Without flush(), ffmpeg buffers several clusters-worth
-    // of packets in memory before a single write.
-    for i in 0..(N_FRAMES / 2) {
+    // Push two batches with a flush between them. This exercises continued
+    // packet writes after a null direct flush, then flushes those later packets
+    // for the concurrent reader. Without flush(), the muxer retains the whole
+    // cluster in a dynamic buffer.
+    for i in 0..(N_FRAMES / 3) {
         let l = synthetic_tile(i, 0);
         let r = synthetic_tile(i, 1);
         enc.push(&[Some(&l), Some(&r)]).expect("push");
     }
     enc.flush().expect("flush");
+
+    for i in (N_FRAMES / 3)..(N_FRAMES * 2 / 3) {
+        let l = synthetic_tile(i, 0);
+        let r = synthetic_tile(i, 1);
+        enc.push(&[Some(&l), Some(&r)]).expect("push after flush");
+    }
+    enc.flush().expect("flush after more packets");
+    enc.flush().expect("repeated flush");
 
     // Reader opens with a separate file handle while the writer
     // holds its own. No file locks, no mmap; the OS lets both
@@ -209,7 +223,7 @@ fn matroska_reader_sees_partial_writes() {
     drop(src);
 
     // Writer keeps pushing and finalizes cleanly afterwards.
-    for i in (N_FRAMES / 2)..N_FRAMES {
+    for i in (N_FRAMES * 2 / 3)..N_FRAMES {
         let l = synthetic_tile(i, 0);
         let r = synthetic_tile(i, 1);
         enc.push(&[Some(&l), Some(&r)]).expect("push");

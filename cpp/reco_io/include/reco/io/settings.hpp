@@ -117,7 +117,8 @@ template <typename T>
     return *error;
   }
   const auto& path = std::get<std::filesystem::path>(path_result);
-  const auto tmp = path.parent_path() / (path.filename().string() + ".tmp");
+  auto tmp = path;
+  tmp += ".tmp";
   try {
     errno = 0;
     std::ofstream output(tmp, std::ios::binary | std::ios::trunc);

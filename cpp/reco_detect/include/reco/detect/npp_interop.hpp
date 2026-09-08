@@ -41,6 +41,10 @@ void npp_resize_c3(core::CudaDevicePtr src, std::uint32_t src_w, std::uint32_t s
                    core::CudaDevicePtr dst, std::uint32_t dst_w, std::uint32_t dst_h,
                    NppiRect dst_roi);
 
+void npp_resize_c1(core::CudaDevicePtr src, std::size_t src_pitch, std::uint32_t src_w,
+                   std::uint32_t src_h, core::CudaDevicePtr dst, std::size_t dst_pitch,
+                   std::uint32_t dst_w, std::uint32_t dst_h);
+
 void npp_resize_c4(core::CudaDevicePtr src, std::uint32_t src_w, std::uint32_t src_h,
                    core::CudaDevicePtr dst, std::uint32_t dst_w, std::uint32_t dst_h,
                    NppiRect dst_roi);

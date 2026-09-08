@@ -1,6 +1,8 @@
 #include "reco/io/gpu_video_probe.hpp"
 
 #include "gpu_video_probe_internal.hpp"
+#include "reco/core/path.hpp"
+#include "reco/core/windows_runtime_library.hpp"
 
 #include <algorithm>
 #include <array>
@@ -146,86 +148,17 @@ static_assert(sizeof(GstBufferAbi) == (sizeof(void*) == 8 ? 112 : 80));
 static_assert(offsetof(GstPadProbeInfoAbi, data) ==
               (sizeof(void*) == 8 && sizeof(unsigned long) == 8 ? 16 : 8));
 
-#if defined(_WIN32)
-std::wstring utf8_to_wide(std::string_view value) {
-  if (value.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-    throw GpuVideoProbeError("video-probe runtime path is too long");
-  }
-  const auto size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
-                                        static_cast<int>(value.size()), nullptr, 0);
-  if (size <= 0) {
-    throw GpuVideoProbeError("video-probe runtime path is not valid UTF-8");
-  }
-  std::wstring result(static_cast<std::size_t>(size), L'\0');
-  if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
-                          static_cast<int>(value.size()), result.data(), size) != size) {
-    throw GpuVideoProbeError("failed to convert video-probe runtime path");
-  }
-  return result;
-}
-
-std::wstring resolve_windows_library_path(const std::wstring& requested) {
-  const std::filesystem::path requested_path(requested);
-  if (requested_path.is_absolute()) {
-    return requested_path.lexically_normal().native();
-  }
-  if (requested_path.has_parent_path()) {
-    std::error_code error;
-    const auto absolute = std::filesystem::absolute(requested_path, error);
-    return error ? requested : absolute.lexically_normal().native();
-  }
-
-  const auto required = GetEnvironmentVariableW(L"PATH", nullptr, 0);
-  if (required == 0) {
-    return requested;
-  }
-  std::wstring path_value(static_cast<std::size_t>(required), L'\0');
-  const auto written = GetEnvironmentVariableW(L"PATH", path_value.data(), required);
-  if (written == 0 || written >= required) {
-    return requested;
-  }
-  path_value.resize(written);
-  std::size_t offset = 0;
-  while (offset <= path_value.size()) {
-    const auto separator = path_value.find(L';', offset);
-    auto directory = path_value.substr(
-        offset, separator == std::wstring::npos ? std::wstring::npos : separator - offset);
-    if (directory.size() >= 2 && directory.front() == L'"' && directory.back() == L'"') {
-      directory = directory.substr(1, directory.size() - 2);
-    }
-    const std::filesystem::path directory_path(directory);
-    if (!directory.empty() && directory_path.is_absolute()) {
-      const auto candidate = (directory_path / requested_path).lexically_normal();
-      std::error_code error;
-      if (std::filesystem::is_regular_file(candidate, error) && !error) {
-        return candidate.native();
-      }
-    }
-    if (separator == std::wstring::npos) {
-      break;
-    }
-    offset = separator + 1;
-  }
-  return requested;
-}
-#endif
-
 class DynamicLibrary {
 public:
-  explicit DynamicLibrary(std::string path) : path_(std::move(path)) {
+  explicit DynamicLibrary(const std::filesystem::path& path) : path_(core::path_to_utf8(path)) {
 #if defined(_WIN32)
-    const auto wide_path = resolve_windows_library_path(utf8_to_wide(path_));
-    auto flags = LOAD_LIBRARY_SEARCH_DEFAULT_DIRS;
-    if (std::filesystem::path(wide_path).is_absolute()) {
-      flags |= LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR;
-    }
-    handle_ = LoadLibraryExW(wide_path.c_str(), nullptr, flags);
+    handle_ = static_cast<HMODULE>(core::detail::load_windows_runtime_library(path));
     if (handle_ == nullptr) {
       throw GpuVideoProbeError("failed to load " + path_ + " (Windows error " +
                                std::to_string(GetLastError()) + ")");
     }
 #else
-    handle_ = dlopen(path_.c_str(), RTLD_NOW | RTLD_LOCAL);
+    handle_ = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (handle_ == nullptr) {
       const char* error = dlerror();
       throw GpuVideoProbeError("failed to load " + path_ +
@@ -274,15 +207,15 @@ private:
 std::shared_ptr<DynamicLibrary> load_library(const char* environment_variable,
                                              std::initializer_list<const char*> names,
                                              std::string_view component) {
-  if (const char* override_path = std::getenv(environment_variable);
-      override_path != nullptr && override_path[0] != '\0') {
-    return std::make_shared<DynamicLibrary>(override_path);
+  if (const auto override_path = core::path_from_environment(environment_variable);
+      override_path.has_value()) {
+    return std::make_shared<DynamicLibrary>(*override_path);
   }
 
   std::string errors;
   for (const char* name : names) {
     try {
-      return std::make_shared<DynamicLibrary>(name);
+      return std::make_shared<DynamicLibrary>(std::filesystem::path(name));
     } catch (const GpuVideoProbeError& error) {
       if (!errors.empty()) {
         errors += "; ";
@@ -647,6 +580,8 @@ std::string pop_pipeline_error(const std::shared_ptr<ProbeApi>& api, void* bus) 
 
 class CompressedSampleBudget {
 public:
+  explicit CompressedSampleBudget(bool exhaustive) : exhaustive_(exhaustive) {}
+
   [[nodiscard]] bool admit_input(std::uint64_t bytes) noexcept {
     if (input_limit_exceeded_.load(std::memory_order_acquire)) {
       return false;
@@ -687,9 +622,12 @@ public:
 
   void consume() {
     require_input_within_limit();
-    if (consumed_ == kMaximumCompressedSamplePulls) {
+    if (!exhaustive_ && consumed_ == kMaximumCompressedSamplePulls) {
       throw GpuVideoProbeError(
           "video parser exceeded the compressed access-unit metadata work limit");
+    }
+    if (consumed_ == std::numeric_limits<std::uint64_t>::max()) {
+      throw GpuVideoProbeError("video parser compressed access-unit count overflowed");
     }
     if (consumed_ >= checkpointed_.load(std::memory_order_acquire)) {
       throw GpuVideoProbeError(
@@ -703,6 +641,7 @@ private:
   std::atomic<bool> input_limit_exceeded_{false};
   std::atomic<std::uint64_t> checkpointed_{0};
   std::uint64_t consumed_ = 0;
+  bool exhaustive_ = false;
 };
 
 struct InputBudgetCallbackData {
@@ -1436,6 +1375,7 @@ bool frame_rates_are_identical(std::uint32_t first_numerator, std::uint32_t firs
 struct UntimedPresentationPrefix {
   std::uint64_t frame_count = 0;
   std::uint64_t duration_ns = 0;
+  std::optional<std::uint64_t> stream_time_origin;
 };
 
 UntimedPresentationPrefix infer_untimed_presentation_prefix(const TimingScan& scan,
@@ -1471,11 +1411,15 @@ UntimedPresentationPrefix infer_untimed_presentation_prefix(const TimingScan& sc
       frame_count_for_duration(add_saturating(available_prefix_duration, half_frame_duration),
                                fps_numerator, fps_denominator);
   const auto frame_count = std::min(scan.timed_sample_indices[0], available_prefix_frames);
+  if (frame_count == 0) {
+    return {};
+  }
   return {.frame_count = frame_count,
           .duration_ns =
               frame_count == available_prefix_frames
                   ? available_prefix_duration
-                  : minimum_duration_for_frame_count(frame_count, fps_numerator, fps_denominator)};
+                  : minimum_duration_for_frame_count(frame_count, fps_numerator, fps_denominator),
+          .stream_time_origin = estimated_origin};
 }
 
 bool frame_rates_are_close(std::uint32_t first_numerator, std::uint32_t first_denominator,
@@ -1806,7 +1750,8 @@ std::optional<SelectedStreamProbe> selected_stream_duration(
 } // namespace
 
 GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& config,
-                                                 std::uint64_t timeout_ns) {
+                                                 std::uint64_t timeout_ns,
+                                                 GpuVideoProbePolicy policy) {
   if (const auto error = validate_gpu_file_decode_config(config); error.has_value()) {
     throw std::invalid_argument(*error);
   }
@@ -1814,7 +1759,8 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
     throw std::invalid_argument("video probe timeout must be between one second and one hour");
   }
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(timeout_ns);
-  CompressedSampleBudget sample_budget;
+  const bool exhaustive = policy == GpuVideoProbePolicy::ExhaustiveIndexedCadence;
+  CompressedSampleBudget sample_budget(exhaustive);
 
   std::error_code path_error;
   const auto absolute_path = std::filesystem::absolute(path_from_utf8(config.path), path_error);
@@ -2075,6 +2021,12 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
                      kTimingReorderLookahead) < timing_scan.sample_count;
   const auto preliminary_frame_rate = infer_constant_frame_rate(
       timing_scan, timing_scan.reached_eos, timing_scan.reached_eos, !timing_scan.reached_eos);
+  if (preliminary_frame_rate.has_value() &&
+      static_cast<long double>(preliminary_frame_rate->numerator) /
+              preliminary_frame_rate->denominator >
+          kMaximumSaneFps) {
+    throw GpuVideoProbeError("video parser returned an implausible frame rate");
+  }
   const bool caps_rate_conflict_needs_more_evidence =
       preliminary_frame_rate.has_value() && caps_frame_rate_is_plausible &&
       !frame_rates_are_identical(
@@ -2146,7 +2098,7 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
   std::vector<std::pair<std::uint32_t, std::uint32_t>> cadence_verified_rates;
   std::optional<std::uint64_t> full_cadence_sample_count;
   const bool eager_cadence_validation_is_bounded =
-      timing_scan.reached_eos || !queried_container_duration.has_value() ||
+      exhaustive || timing_scan.reached_eos || !queried_container_duration.has_value() ||
       std::any_of(cadence_candidates.begin(), cadence_candidates.end(), [&](const auto& candidate) {
         return frame_count_ceiling_for_duration(*queried_container_duration, candidate.rate.first,
                                                 candidate.rate.second) <=
@@ -2179,7 +2131,7 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
     }
     auto validation_sample_count = timing_scan.sample_count;
     if (!timing_scan.reached_eos) {
-      while (validation_sample_count < kMaximumEagerCadenceValidationSamples) {
+      while (exhaustive || validation_sample_count < kMaximumEagerCadenceValidationSamples) {
         void* sample = pull_compressed_sample(
             api, probe_sink, bus, sample_budget, deadline,
             "GStreamer parser-only probe timed out while verifying full-stream frame cadence");
@@ -2403,11 +2355,16 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
                                     inferred_frame_rate->denominator, kFrameRatePreferenceTolerance)
           ? inferred_frame_rate->timestamp_multiplicity
           : 1U;
+  if (timestamp_multiplicity == 0U ||
+      timestamp_multiplicity > reco::io::kMaximumIndexedTimestampMultiplicity) {
+    throw GpuVideoProbeError("video parser timestamp multiplicity exceeds the indexed limit");
+  }
   std::uint64_t duration_ns = 0;
   std::uint64_t total_frames = 0;
   std::optional<std::uint64_t> correlated_frame_count;
   bool duration_is_estimated = false;
   bool total_frames_is_estimated = false;
+  auto indexed_stream_time_origin = timing_scan.first_stream_time;
   if (timing_scan.reached_eos) {
     total_frames = timing_scan.sample_count;
     const bool complete_timestamps = timing_scan.timed_sample_count == timing_scan.sample_count &&
@@ -2464,6 +2421,9 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
       if (selected_duration.has_value()) {
         const auto untimed_prefix =
             infer_untimed_presentation_prefix(timing_scan, fps_num, fps_den);
+        if (untimed_prefix.stream_time_origin.has_value()) {
+          indexed_stream_time_origin = untimed_prefix.stream_time_origin;
+        }
         duration_ns = add_saturating(selected_duration->duration_ns, untimed_prefix.duration_ns);
         correlated_frame_count =
             add_saturating(selected_duration->frame_count, untimed_prefix.frame_count);
@@ -2490,6 +2450,10 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
     duration_ns =
         std::max(duration_ns, minimum_duration_for_frame_count(total_frames, fps_num, fps_den));
   }
+  if (exhaustive && (!timing_scan.reached_eos || !indexed_sampling_cadence_verified)) {
+    throw GpuVideoProbeError(
+        "video parser could not verify exact full-stream cadence for indexed calibration");
+  }
   return {.width = static_cast<std::uint32_t>(width),
           .height = static_cast<std::uint32_t>(height),
           .fps_numerator = fps_num,
@@ -2497,10 +2461,25 @@ GpuVideoProbe detail::probe_gpu_video_in_process(const GpuFileDecodeConfig& conf
           .fps = fps,
           .duration_ns = duration_ns,
           .total_frames = total_frames,
+          .first_stream_time_ns = indexed_stream_time_origin,
+          .timestamp_multiplicity = static_cast<std::uint32_t>(timestamp_multiplicity),
           .duration_is_estimated = duration_is_estimated,
           .total_frames_is_estimated = total_frames_is_estimated,
           .selected_stream_caps_verified = selected_stream_caps_verified,
           .indexed_sampling_cadence_verified = indexed_sampling_cadence_verified};
 }
+
+namespace detail {
+GpuVideoProbe probe_gpu_video_exhaustive_for_test(const GpuFileDecodeConfig& config,
+                                                  std::uint64_t timeout_ns) {
+  return probe_gpu_video_in_process(config, timeout_ns,
+                                    GpuVideoProbePolicy::ExhaustiveIndexedCadence);
+}
+
+GpuVideoProbe probe_gpu_video_bounded_in_process_for_test(const GpuFileDecodeConfig& config,
+                                                          std::uint64_t timeout_ns) {
+  return probe_gpu_video_in_process(config, timeout_ns, GpuVideoProbePolicy::Bounded);
+}
+} // namespace detail
 
 } // namespace reco::io

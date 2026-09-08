@@ -16,6 +16,8 @@ struct GpuGrayFrame {
   std::uint32_t width = 0;
   std::uint32_t height = 0;
   reco::core::YuvColorRange color_range = reco::core::YuvColorRange::Full;
+  // Clockwise source rotation already applied to this frame's pixels.
+  std::uint16_t applied_rotation_degrees = 0;
 };
 
 struct GpuUndistortConfig {
@@ -35,7 +37,7 @@ public:
   GpuCalibrationUndistorter& operator=(GpuCalibrationUndistorter&&) noexcept;
 
   [[nodiscard]] const GpuUndistortConfig& config() const;
-  // Source and destination device ranges must not overlap and must carry the same color range.
+  /// Source and destination device ranges must not overlap. Output is full-range luma.
   void undistort_y(const GpuGrayFrame& src, const GpuGrayFrame& dst) const;
 
 private:

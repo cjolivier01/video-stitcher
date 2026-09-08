@@ -2,6 +2,16 @@
 #include <cstddef>
 #include <cstdint>
 
+#ifndef RECO_FAKE_CUDA_DRIVER_MARKER
+#define RECO_FAKE_CUDA_DRIVER_MARKER 1
+#endif
+
+#if defined(_WIN32)
+#define RECO_TEST_EXPORT __declspec(dllexport)
+#else
+#define RECO_TEST_EXPORT __attribute__((visibility("default")))
+#endif
+
 namespace {
 
 struct CudaEglFrame {
@@ -41,6 +51,8 @@ std::uintptr_t allocation_base(std::uintptr_t pointer) {
 }
 
 } // namespace
+
+extern "C" RECO_TEST_EXPORT int recoFakeRuntimeMarker() { return RECO_FAKE_CUDA_DRIVER_MARKER; }
 
 extern "C" int cuInit(unsigned int) { return 0; }
 

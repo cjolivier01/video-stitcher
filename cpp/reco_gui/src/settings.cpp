@@ -1,5 +1,7 @@
 #include "reco/gui/settings.hpp"
 
+#include "reco/core/path.hpp"
+
 #include <array>
 
 namespace reco::gui {
@@ -9,11 +11,11 @@ std::optional<std::filesystem::path> optional_path(const nlohmann::json& json, c
   if (!json.contains(key) || json.at(key).is_null()) {
     return std::nullopt;
   }
-  return std::filesystem::path(json.at(key).get<std::string>());
+  return reco::core::path_from_utf8(json.at(key).get<std::string>());
 }
 
-std::optional<std::pair<std::uint32_t, std::uint32_t>> optional_window_size(
-    const nlohmann::json& json, const char* key) {
+std::optional<std::pair<std::uint32_t, std::uint32_t>>
+optional_window_size(const nlohmann::json& json, const char* key) {
   if (!json.contains(key) || json.at(key).is_null()) {
     return std::nullopt;
   }
@@ -24,7 +26,7 @@ std::optional<std::pair<std::uint32_t, std::uint32_t>> optional_window_size(
 void put_optional_path(nlohmann::json& json, const char* key,
                        const std::optional<std::filesystem::path>& value) {
   if (value.has_value()) {
-    json[key] = value->string();
+    json[key] = reco::core::path_to_utf8(*value);
   } else {
     json[key] = nullptr;
   }
@@ -69,8 +71,8 @@ void to_json(nlohmann::json& json, const GuiSettings& settings) {
   put_optional_path(json, "ai_model_path", settings.ai_model_path);
   put_optional_path(json, "recording_folder", settings.recording_folder);
   if (settings.window_size.has_value()) {
-    json["window_size"] = nlohmann::json::array({settings.window_size->first,
-                                                 settings.window_size->second});
+    json["window_size"] =
+        nlohmann::json::array({settings.window_size->first, settings.window_size->second});
   } else {
     json["window_size"] = nullptr;
   }

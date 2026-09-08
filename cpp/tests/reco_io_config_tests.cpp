@@ -1,3 +1,4 @@
+#include "reco/core/path.hpp"
 #include "reco/core/source.hpp"
 #include "reco/io/jsonl_sink.hpp"
 #include "reco/io/output.hpp"
@@ -6,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -26,6 +28,18 @@ int failures = 0;
 void expect_true(bool condition, std::string_view message) {
   if (!condition) {
     std::cerr << "FAIL: " << message << '\n';
+    ++failures;
+  }
+}
+
+void run_test(std::string_view name, void (*test)()) {
+  try {
+    test();
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: " << name << " threw: " << error.what() << '\n';
+    ++failures;
+  } catch (...) {
+    std::cerr << "FAIL: " << name << " threw an unknown exception\n";
     ++failures;
   }
 }
@@ -72,13 +86,14 @@ void from_json(const nlohmann::json& json, DummySettings& settings) {
 class ScopedConfigDir {
 public:
   ScopedConfigDir() {
-    path_ = std::filesystem::temp_directory_path() / "reco_io_cpp_settings_tests";
+    path_ = std::filesystem::temp_directory_path() /
+            reco::core::path_from_utf8("reco_io_cpp_settings_tests-\xCE\xA9-\xE4\xBE\x8B");
     std::filesystem::remove_all(path_);
     std::filesystem::create_directories(path_);
 #if defined(_WIN32)
-    _putenv_s("RECO_CONFIG_DIR", path_.string().c_str());
+    _wputenv_s(L"RECO_CONFIG_DIR", path_.c_str());
 #else
-    setenv("RECO_CONFIG_DIR", path_.string().c_str(), 1);
+    setenv("RECO_CONFIG_DIR", reco::core::path_to_utf8(path_).c_str(), 1);
 #endif
   }
 
@@ -355,6 +370,16 @@ void recent_files_match_rust_mru_policy() {
   const auto roundtrip = json.get<RecentFiles>();
   expect_eq(roundtrip.size(), 3U, "recent json roundtrip size");
   expect_true(roundtrip.entries()[0] == std::filesystem::path("/b"), "recent json order");
+
+  const auto unicode_path = reco::core::path_from_utf8("/video/\xCE\xA9-\xE4\xBE\x8B.mp4");
+  recent.push(unicode_path);
+  const nlohmann::json unicode_json = recent;
+  expect_true(unicode_json["entries"][0].get<std::string>() ==
+                  reco::core::path_to_utf8(unicode_path),
+              "recent file serializes as UTF-8");
+  const auto unicode_roundtrip = unicode_json.get<RecentFiles>();
+  expect_true(unicode_roundtrip.entries()[0] == unicode_path,
+              "recent file preserves a Unicode native path");
 }
 
 void jsonl_sink_writes_one_pipeline_event_per_line() {
@@ -371,11 +396,13 @@ void jsonl_sink_writes_one_pipeline_event_per_line() {
     expect_eq(sink.write_failures(), 0ULL, "jsonl sink no write failures");
   }
 
-  std::ifstream input(path);
-  std::string line;
   std::vector<std::string> lines;
-  while (std::getline(input, line)) {
-    lines.push_back(line);
+  {
+    std::ifstream input(path);
+    std::string line;
+    while (std::getline(input, line)) {
+      lines.push_back(line);
+    }
   }
   expect_eq(lines.size(), 5U, "jsonl line count");
   for (std::size_t i = 0; i < lines.size(); ++i) {
@@ -474,17 +501,17 @@ void pipeline_event_json_serializes_core_event_vocabulary() {
 
 int main() {
   static_assert(std::is_copy_constructible_v<StackError>, "StackError is copyable");
-  output_parsing_matches_rust_aliases();
-  format_detection_matches_rust_policy();
-  layout_validation_matches_rust_guards();
-  pack_unpack_round_trips_identity();
-  empty_tiles_get_grey_fill();
-  stack_errors_match_rust_cases();
-  grid_3x3_round_trips_nine_tiles();
-  timestamp_follows_first_nonempty_tile();
-  settings_round_trip_and_namespace_guards_match_rust();
-  recent_files_match_rust_mru_policy();
-  jsonl_sink_writes_one_pipeline_event_per_line();
-  pipeline_event_json_serializes_core_event_vocabulary();
+  run_test("output parsing", output_parsing_matches_rust_aliases);
+  run_test("format detection", format_detection_matches_rust_policy);
+  run_test("layout validation", layout_validation_matches_rust_guards);
+  run_test("pack/unpack identity", pack_unpack_round_trips_identity);
+  run_test("empty tile fill", empty_tiles_get_grey_fill);
+  run_test("stack errors", stack_errors_match_rust_cases);
+  run_test("3x3 grid roundtrip", grid_3x3_round_trips_nine_tiles);
+  run_test("timestamp selection", timestamp_follows_first_nonempty_tile);
+  run_test("settings roundtrip", settings_round_trip_and_namespace_guards_match_rust);
+  run_test("recent files", recent_files_match_rust_mru_policy);
+  run_test("JSONL sink", jsonl_sink_writes_one_pipeline_event_per_line);
+  run_test("pipeline event JSON", pipeline_event_json_serializes_core_event_vocabulary);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -2,6 +2,8 @@
 #include "reco/io/detail/nvbufsurface_9_1.hpp"
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -17,11 +19,39 @@ void* mapped_device_pointer(std::uint64_t descriptor) {
                           : reinterpret_cast<void*>(descriptor);
 }
 
+#if !defined(RECO_FAKE_NVBUFSURFACE_7_1)
 std::mutex cuda_buffers_mutex;
 std::unordered_map<void*, std::unique_ptr<abi::CudaBuffer>> cuda_buffers;
+#endif
 
 } // namespace
 
+extern "C" void nvds_version(unsigned int* major, unsigned int* minor) {
+  if (major == nullptr || minor == nullptr) {
+    return;
+  }
+#if defined(RECO_FAKE_NVBUFSURFACE_7_1)
+  *major = 7;
+  *minor = 1;
+#else
+  const char* version = std::getenv("RECO_FAKE_DEEPSTREAM_VERSION");
+  if (version != nullptr && std::strcmp(version, "7.1") == 0) {
+    *major = 7;
+    *minor = 1;
+  } else if (version != nullptr && std::strcmp(version, "8.0") == 0) {
+    *major = 8;
+    *minor = 0;
+  } else if (version != nullptr && std::strcmp(version, "0.0") == 0) {
+    *major = 0;
+    *minor = 0;
+  } else {
+    *major = 9;
+    *minor = 1;
+  }
+#endif
+}
+
+#if !defined(RECO_FAKE_NVBUFSURFACE_7_1)
 extern "C" int NvBufSurfaceMapCudaBuffer(void* raw_surface, int index) {
   if (raw_surface == nullptr || index != 0) {
     return -1;
@@ -68,6 +98,7 @@ extern "C" int NvBufSurfaceUnMapCudaBuffer(void* raw_surface, int index) {
   surface->surface_list[0].mapped_addr.cuda_ptr = nullptr;
   return 0;
 }
+#endif
 
 extern "C" int NvBufSurfaceMapEglImage(void* raw_surface, int index) {
   if (raw_surface == nullptr || index != 0) {
@@ -80,8 +111,7 @@ extern "C" int NvBufSurfaceMapEglImage(void* raw_surface, int index) {
   }
   surface->surface_list[0].mapped_addr.egl_image =
       mapped_device_pointer(static_cast<std::uint64_t>(surface->surface_list[0].buffer_desc));
-  return surface->surface_list[0].buffer_desc == 95 ||
-                 surface->surface_list[0].buffer_desc == 97
+  return surface->surface_list[0].buffer_desc == 95 || surface->surface_list[0].buffer_desc == 97
              ? -1
              : 0;
 }

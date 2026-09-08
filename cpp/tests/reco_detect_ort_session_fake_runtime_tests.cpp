@@ -1,14 +1,25 @@
+#include "reco/core/cuda_backend.hpp"
+#include "reco/core/path.hpp"
 #include "reco/detect/detectors.hpp"
 #include "reco/detect/ort_session.hpp"
-#include "reco/core/cuda_backend.hpp"
+
+#include "rules_cc/cc/runfiles/runfiles.h"
 
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 using namespace reco::detect;
 
@@ -42,25 +53,23 @@ template <typename Fn> void expect_runtime_error(Fn&& fn, std::string_view messa
   }
 }
 
-bool ends_with(std::string_view value, std::string_view suffix) {
-  return value.size() >= suffix.size() &&
-         value.substr(value.size() - suffix.size()) == suffix;
-}
-
 std::filesystem::path find_fake_runtime_runfile() {
-  const char* runfiles = std::getenv("TEST_SRCDIR");
-  if (runfiles == nullptr || *runfiles == '\0') {
-    throw std::runtime_error("TEST_SRCDIR is not set");
+  const char* workspace = std::getenv("TEST_WORKSPACE");
+  if (workspace == nullptr || workspace[0] == '\0') {
+    throw std::runtime_error("TEST_WORKSPACE is not set");
   }
-  for (const auto& entry : std::filesystem::recursive_directory_iterator(runfiles)) {
-    const auto filename = entry.path().filename().string();
-    if (filename.find("fake_onnxruntime") != std::string::npos &&
-        (ends_with(filename, ".so") || ends_with(filename, ".dylib") ||
-         ends_with(filename, ".dll"))) {
-      return entry.path();
-    }
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(&error));
+  if (!runfiles) {
+    throw std::runtime_error("failed to initialize Bazel runfiles: " + error);
   }
-  throw std::runtime_error("fake ONNX Runtime runfile not found");
+  const auto logical_path = std::string(workspace) + "/cpp/tests/libfake_onnxruntime.so";
+  const auto resolved = std::filesystem::path(runfiles->Rlocation(logical_path));
+  if (resolved.empty() || !std::filesystem::is_regular_file(resolved)) {
+    throw std::runtime_error("fake ONNX Runtime runfile not found");
+  }
+  return resolved;
 }
 
 std::filesystem::path write_marker_model() {
@@ -72,9 +81,31 @@ std::filesystem::path write_marker_model() {
 
 void set_env(const char* name, const std::filesystem::path& value) {
 #if defined(_WIN32)
-  _putenv_s(name, value.string().c_str());
+  std::wstring wide_name;
+  for (const unsigned char character : std::string_view(name)) {
+    wide_name.push_back(static_cast<wchar_t>(character));
+  }
+  if (SetEnvironmentVariableW(wide_name.c_str(), value.c_str()) == 0) {
+    throw std::runtime_error("failed to set native ORT runtime path");
+  }
 #else
-  setenv(name, value.string().c_str(), 1);
+  setenv(name, value.c_str(), 1);
+#endif
+}
+
+std::filesystem::path native_fake_runtime_path() {
+  const auto source = find_fake_runtime_runfile();
+#if defined(_WIN32)
+  const auto directory = std::filesystem::temp_directory_path() /
+                         std::filesystem::path(std::u8string(u8"reco-ort-\u5f55\u50cf")) /
+                         std::to_string(GetCurrentProcessId());
+  std::filesystem::create_directories(directory);
+  const auto destination = directory / source.filename();
+  std::filesystem::copy_file(source, destination,
+                             std::filesystem::copy_options::overwrite_existing);
+  return destination;
+#else
+  return source;
 #endif
 }
 
@@ -94,20 +125,60 @@ void unset_env(const char* name) {
 #endif
 }
 
-void fake_runtime_session_contract() {
-  const auto fake_runtime = find_fake_runtime_runfile();
+void fake_runtime_invalid_api_contract(std::string_view mode) {
+  const auto fake_runtime = native_fake_runtime_path();
   set_env("ORT_DYLIB_PATH", fake_runtime);
+
+  std::string_view expected_error;
+  if (mode == "null-get-api") {
+    set_env("RECO_FAKE_ORT_NULL_GET_API", "1");
+    expected_error = "OrtGetApiBase returned an invalid API base";
+  } else if (mode == "unsupported-api-version") {
+    set_env("RECO_FAKE_ORT_UNSUPPORTED_API_VERSION", "1");
+    expected_error = "does not support ORT C API version 23";
+  } else {
+    throw std::invalid_argument("unknown fake ORT test mode");
+  }
+
+  const auto probe = probe_ort_runtime();
+  expect_true(!probe.available, "unusable fake ORT runtime is unavailable");
+  expect_eq(probe.path, reco::core::path_to_utf8(fake_runtime),
+            "unusable fake ORT runtime reports its UTF-8 path");
+  expect_eq(probe.version, std::string("1.23.2"), "unusable fake ORT runtime version");
+  expect_true(!probe.error.empty(), "unusable fake ORT runtime reports an error");
+  expect_true(probe.error.find(expected_error) != std::string::npos,
+              "unusable fake ORT runtime reports the API failure");
+  expect_true(!ort_runtime_available(), "unusable fake ORT runtime availability helper");
+}
+
+void fake_runtime_session_contract() {
+  const auto fake_runtime = native_fake_runtime_path();
+  set_env("ORT_DYLIB_PATH", fake_runtime);
+  unset_env("RECO_FAKE_ORT_NULL_GET_API");
+  unset_env("RECO_FAKE_ORT_UNSUPPORTED_API_VERSION");
 
   const auto probe = probe_ort_runtime();
   expect_true(probe.available, "fake ORT runtime available");
+  expect_eq(probe.path, reco::core::path_to_utf8(fake_runtime),
+            "fake ORT runtime reports its UTF-8 path");
   expect_eq(probe.version, std::string("1.23.2"), "fake ORT runtime version");
 
   const auto model = write_marker_model();
+  auto missing_runtime = model;
+  missing_runtime += ".missing-runtime";
+  std::error_code remove_error;
+  std::filesystem::remove(missing_runtime, remove_error);
+  if (remove_error) {
+    throw std::runtime_error("failed to prepare missing ORT runtime path: " +
+                             remove_error.message());
+  }
+  set_env("ORT_DYLIB_PATH", missing_runtime);
   OrtSession session(OrtSessionConfig{
       .model_path = model,
       .fallback_labels = {},
       .providers = {OrtExecutionProvider::Cpu},
   });
+  set_env("ORT_DYLIB_PATH", fake_runtime);
   expect_eq(session.metadata().input_size, 8U, "metadata input size");
   expect_eq(session.metadata().input_names[0], std::string("images"), "metadata input name");
   expect_eq(session.metadata().output_names[0], std::string("detections"), "metadata output name");
@@ -226,15 +297,14 @@ void fake_runtime_cpu_detector_contract() {
   unset_env("RECO_FAKE_ORT_EMPTY_OUTPUT");
 
   try {
-    (void)detector.detect(CameraId::Left,
-                          DetectorFrame(GpuNv12Frame{
-                              .y_ptr = 1,
-                              .uv_ptr = 2,
-                              .y_pitch = 2,
-                              .uv_pitch = 2,
-                              .width = 2,
-                              .height = 2,
-                          }));
+    (void)detector.detect(CameraId::Left, DetectorFrame(GpuNv12Frame{
+                                              .y_ptr = 1,
+                                              .uv_ptr = 2,
+                                              .y_pitch = 2,
+                                              .uv_pitch = 2,
+                                              .width = 2,
+                                              .height = 2,
+                                          }));
     std::cerr << "FAIL: cpu detector accepted CUDA frame\n";
     ++failures;
   } catch (const DetectorError& error) {
@@ -281,43 +351,42 @@ void fake_runtime_cuda_detector_contract() {
   });
 
   set_env("RECO_FAKE_ORT_VALIDATE_CUDA_INPUT_ANY", "1");
-  const auto detections = detector.detect(
-      CameraId::Left, DetectorFrame(GpuNv12Frame{
-                          .y_ptr = y_device.ptr(),
-                          .uv_ptr = uv_device.ptr(),
-                          .y_pitch = 2,
-                          .uv_pitch = 2,
-                          .width = 2,
-                          .height = 2,
-                      }));
+  const auto detections = detector.detect(CameraId::Left, DetectorFrame(GpuNv12Frame{
+                                                              .y_ptr = y_device.ptr(),
+                                                              .uv_ptr = uv_device.ptr(),
+                                                              .y_pitch = 2,
+                                                              .uv_pitch = 2,
+                                                              .width = 2,
+                                                              .height = 2,
+                                                          }));
   unset_env("RECO_FAKE_ORT_VALIDATE_CUDA_INPUT_ANY");
   expect_eq(detections.size(), 2U, "cuda detector detections");
 
   set_env("RECO_FAKE_ORT_VALIDATE_CUDA_INPUT_ANY", "1");
-  const auto colorimetry_detections = detector.detect(
-      CameraId::Left, DetectorFrame(GpuNv12Frame{
-                          .y_ptr = y_device.ptr(),
-                          .uv_ptr = uv_device.ptr(),
-                          .y_pitch = 2,
-                          .uv_pitch = 2,
-                          .width = 2,
-                          .height = 2,
-                          .color_matrix = reco::core::YuvColorMatrix::Bt709,
-                          .color_range = reco::core::YuvColorRange::Limited,
-                      }));
+  const auto colorimetry_detections =
+      detector.detect(CameraId::Left, DetectorFrame(GpuNv12Frame{
+                                          .y_ptr = y_device.ptr(),
+                                          .uv_ptr = uv_device.ptr(),
+                                          .y_pitch = 2,
+                                          .uv_pitch = 2,
+                                          .width = 2,
+                                          .height = 2,
+                                          .color_matrix = reco::core::YuvColorMatrix::Bt709,
+                                          .color_range = reco::core::YuvColorRange::Limited,
+                                      }));
   unset_env("RECO_FAKE_ORT_VALIDATE_CUDA_INPUT_ANY");
   expect_eq(colorimetry_detections.size(), 2U, "cuda detector accepts colorimetry");
 
   try {
     (void)detector.detect(CameraId::Left, DetectorFrame(GpuNv12Frame{
-                                            .y_ptr = y_device.ptr(),
-                                            .uv_ptr = uv_device.ptr(),
-                                            .y_pitch = 2,
-                                            .uv_pitch = 2,
-                                            .width = 2,
-                                            .height = 2,
-                                            .color_matrix = reco::core::YuvColorMatrix::Bt709,
-                                        }));
+                                              .y_ptr = y_device.ptr(),
+                                              .uv_ptr = uv_device.ptr(),
+                                              .y_pitch = 2,
+                                              .uv_pitch = 2,
+                                              .width = 2,
+                                              .height = 2,
+                                              .color_matrix = reco::core::YuvColorMatrix::Bt709,
+                                          }));
     std::cerr << "FAIL: CUDA detector accepted partial colorimetry\n";
     ++failures;
   } catch (const DetectorError& error) {
@@ -328,11 +397,11 @@ void fake_runtime_cuda_detector_contract() {
   try {
     const std::vector<float> chw(1 * 3 * 8 * 8, 0.5F);
     (void)detector.detect(CameraId::Left, DetectorFrame(PreprocessedChwFrame{
-                                            .data = chw,
-                                            .input_size = 8,
-                                            .src_width = 2,
-                                            .src_height = 2,
-                                        }));
+                                              .data = chw,
+                                              .input_size = 8,
+                                              .src_width = 2,
+                                              .src_height = 2,
+                                          }));
     std::cerr << "FAIL: cuda detector accepted CPU frame\n";
     ++failures;
   } catch (const DetectorError& error) {
@@ -343,9 +412,27 @@ void fake_runtime_cuda_detector_contract() {
 
 } // namespace
 
-int main() {
+int run_tests(std::string_view mode) {
+  if (!mode.empty()) {
+    fake_runtime_invalid_api_contract(mode);
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+  }
   fake_runtime_session_contract();
   fake_runtime_cpu_detector_contract();
   fake_runtime_cuda_detector_contract();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+int main(int argc, char** argv) {
+  try {
+    if (argc > 2) {
+      throw std::invalid_argument("expected at most one fake ORT test mode");
+    }
+    return run_tests(argc == 2 ? std::string_view(argv[1]) : std::string_view{});
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: uncaught ORT runtime test exception: " << error.what() << '\n';
+  } catch (...) {
+    std::cerr << "FAIL: uncaught non-standard ORT runtime test exception\n";
+  }
+  return EXIT_FAILURE;
 }

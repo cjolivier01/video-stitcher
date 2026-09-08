@@ -24,14 +24,26 @@
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
 namespace reco::io::detail {
 #if !defined(_WIN32)
-int run_gpu_video_probe_guardian(const char* executable, std::uint64_t pre_worker_report_delay_ns);
+int run_gpu_video_probe_owner(const char* executable, std::uint64_t pre_worker_report_delay_ns,
+                              std::uint64_t pre_guardian_exec_delay_ns, bool has_marker,
+                              bool stop_supervisor_after_guardian_launch,
+                              bool force_worker_memory_limit_for_test);
+int run_gpu_video_probe_supervisor(const char* executable, std::uint64_t pre_worker_report_delay_ns,
+                                   std::uint64_t pre_guardian_exec_delay_ns,
+                                   std::uint64_t caller_pid, bool has_marker,
+                                   bool stop_after_guardian_launch,
+                                   bool force_worker_memory_limit_for_test);
+int run_gpu_video_probe_guardian(const char* executable, std::uint64_t pre_worker_report_delay_ns,
+                                 bool force_worker_memory_limit_for_test);
 #endif
 } // namespace reco::io::detail
 
@@ -67,9 +79,23 @@ public:
 #if defined(_WIN32)
     const char* guardian_process = std::getenv("RECO_VIDEO_PROBE_GUARDIAN_PROCESS");
 #endif
-    if (scenario == nullptr || std::strcmp(scenario, "pre-main-block") != 0 ||
-        marker_path == nullptr || marker_path[0] == '\0' ||
-        (guardian_process != nullptr && std::strcmp(guardian_process, "1") == 0)) {
+    const bool worker_block =
+        scenario != nullptr && std::strcmp(scenario, "pre-main-block") == 0 &&
+        (guardian_process == nullptr || std::strcmp(guardian_process, "1") != 0);
+#if !defined(_WIN32)
+    const char* process_role = std::getenv("RECO_VIDEO_PROBE_PROCESS_ROLE");
+    const bool supervisor_block =
+        scenario != nullptr && std::strcmp(scenario, "supervisor-pre-main-block") == 0 &&
+        process_role != nullptr && std::strcmp(process_role, "supervisor") == 0;
+    const bool owner_delay = scenario != nullptr &&
+                             std::strcmp(scenario, "owner-pre-main-delay") == 0 &&
+                             process_role != nullptr && std::strcmp(process_role, "owner") == 0;
+#else
+    constexpr bool supervisor_block = false;
+    constexpr bool owner_delay = false;
+#endif
+    if ((!worker_block && !supervisor_block && !owner_delay) || marker_path == nullptr ||
+        marker_path[0] == '\0') {
       return;
     }
 #if defined(_WIN32)
@@ -107,7 +133,14 @@ public:
     }
     (void)::close(marker);
 #endif
-    std::this_thread::sleep_for(std::chrono::seconds(30));
+    if (owner_delay) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+#if !defined(_WIN32)
+      (void)::setenv("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata", 1);
+#endif
+    } else {
+      std::this_thread::sleep_for(std::chrono::seconds(30));
+    }
   }
 };
 
@@ -149,6 +182,10 @@ void write_frame(std::string_view payload) {
   const auto header = frame_header(payload.size());
   std::cout.write(header.data(), static_cast<std::streamsize>(header.size()));
   std::cout.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+  std::cout.flush();
+  if (!std::cout) {
+    throw std::runtime_error("failed to write video probe worker response");
+  }
 }
 
 bool write_process_marker(const char* environment_name, std::uint64_t process_id) {
@@ -171,7 +208,7 @@ bool write_lifecycle_event(std::string_view event) {
   return static_cast<bool>(output);
 }
 
-std::uint64_t spawn_sleeping_descendant() {
+std::uint64_t spawn_sleeping_descendant(bool inherit_standard_handles = false) {
 #if defined(_WIN32)
   std::vector<wchar_t> executable(32'768);
   const auto length =
@@ -183,9 +220,16 @@ std::uint64_t spawn_sleeping_descendant() {
   auto command_line = L"\"" + application + L"\" --reco-fake-probe-sleeper";
   STARTUPINFOW startup{};
   startup.cb = sizeof(startup);
+  if (inherit_standard_handles) {
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    startup.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
+  }
   PROCESS_INFORMATION process{};
-  if (CreateProcessW(application.c_str(), command_line.data(), nullptr, nullptr, FALSE,
-                     CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process) == 0) {
+  if (CreateProcessW(application.c_str(), command_line.data(), nullptr, nullptr,
+                     inherit_standard_handles ? TRUE : FALSE, CREATE_NO_WINDOW, nullptr, nullptr,
+                     &startup, &process) == 0) {
     return 0;
   }
   const auto process_id = static_cast<std::uint64_t>(process.dwProcessId);
@@ -193,6 +237,7 @@ std::uint64_t spawn_sleeping_descendant() {
   CloseHandle(process.hProcess);
   return process_id;
 #else
+  (void)inherit_standard_handles;
   const auto process_id = ::fork();
   if (process_id == 0) {
     std::this_thread::sleep_for(std::chrono::seconds(30));
@@ -203,6 +248,106 @@ std::uint64_t spawn_sleeping_descendant() {
 }
 
 #if !defined(_WIN32)
+void terminate_and_reap(pid_t process_id) {
+  if (process_id <= 0) {
+    return;
+  }
+  (void)::kill(process_id, SIGKILL);
+  int status = 0;
+  while (::waitpid(process_id, &status, 0) < 0 && errno == EINTR) {
+  }
+}
+
+bool write_pipe_byte(int descriptor, char value) {
+  ssize_t written = -1;
+  do {
+    written = ::write(descriptor, &value, 1);
+  } while (written < 0 && errno == EINTR);
+  return written == 1;
+}
+
+bool read_pipe_byte(int descriptor, char* value) {
+  ssize_t received = -1;
+  do {
+    received = ::read(descriptor, value, 1);
+  } while (received < 0 && errno == EINTR);
+  return received == 1;
+}
+
+int run_aggregate_memory_with_descendant() {
+  constexpr std::size_t kAllocationBytes = 280ULL * 1024ULL * 1024ULL;
+  int readiness[2] = {-1, -1};
+  if (::pipe(readiness) != 0) {
+    return EXIT_FAILURE;
+  }
+
+  const auto descendant = ::fork();
+  if (descendant == 0) {
+    (void)::close(readiness[0]);
+    try {
+      std::vector<std::uint8_t> allocation(kAllocationBytes);
+      volatile auto* bytes = allocation.data();
+      for (std::size_t offset = 0; offset < allocation.size(); offset += 4'096U) {
+        bytes[offset] = static_cast<std::uint8_t>(offset);
+      }
+      if (!write_lifecycle_event("descendant-memory-ready") ||
+          !write_pipe_byte(readiness[1], 'R')) {
+        (void)::close(readiness[1]);
+        std::_Exit(EXIT_FAILURE);
+      }
+      (void)::close(readiness[1]);
+      std::this_thread::sleep_for(std::chrono::seconds(30));
+    } catch (...) {
+      (void)::close(readiness[1]);
+      std::_Exit(EXIT_FAILURE);
+    }
+    std::_Exit(EXIT_SUCCESS);
+  }
+
+  (void)::close(readiness[1]);
+  if (descendant < 0) {
+    (void)::close(readiness[0]);
+    return EXIT_FAILURE;
+  }
+  if (!write_process_marker("RECO_FAKE_PROBE_DESCENDANT_PATH",
+                            static_cast<std::uint64_t>(descendant))) {
+    (void)::close(readiness[0]);
+    terminate_and_reap(descendant);
+    return EXIT_FAILURE;
+  }
+
+  char ready = '\0';
+  if (!read_pipe_byte(readiness[0], &ready) || ready != 'R') {
+    (void)::close(readiness[0]);
+    terminate_and_reap(descendant);
+    return EXIT_FAILURE;
+  }
+  (void)::close(readiness[0]);
+  if (!write_lifecycle_event("worker-memory-allocation-started")) {
+    terminate_and_reap(descendant);
+    return EXIT_FAILURE;
+  }
+
+  try {
+    std::vector<std::uint8_t> allocation(kAllocationBytes);
+    volatile auto* bytes = allocation.data();
+    for (std::size_t offset = 0; offset < allocation.size(); offset += 4'096U) {
+      bytes[offset] = static_cast<std::uint8_t>(offset);
+    }
+    if (!write_lifecycle_event("worker-memory-ready")) {
+      terminate_and_reap(descendant);
+      return EXIT_FAILURE;
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(30));
+  } catch (...) {
+    (void)write_lifecycle_event("worker-memory-allocation-failed");
+    terminate_and_reap(descendant);
+    return EXIT_FAILURE;
+  }
+  terminate_and_reap(descendant);
+  return EXIT_FAILURE;
+}
+
 bool close_unrelated_descriptors() {
 #if defined(__linux__)
   std::error_code directory_error;
@@ -330,17 +475,92 @@ int main(int argc, char** argv) {
     return EXIT_SUCCESS;
   }
 #if !defined(_WIN32)
-  if (argc == 3 && std::strcmp(argv[1], "--reco-video-probe-guardian") == 0) {
+  if (argc == 7 && std::strcmp(argv[1], "--reco-video-probe-owner") == 0) {
+    std::array<std::uint64_t, 2> values{};
+    for (std::size_t index = 0; index < values.size(); ++index) {
+      const std::string_view value(argv[index + 2U]);
+      const auto [end, error] =
+          std::from_chars(value.data(), value.data() + value.size(), values[index]);
+      if (error != std::errc{} || end != value.data() + value.size()) {
+        return 2;
+      }
+    }
+    if (argv[4][0] == '\0' || argv[4][1] != '\0' || (argv[4][0] != '0' && argv[4][0] != '1') ||
+        argv[5][0] == '\0' || argv[5][1] != '\0' || (argv[5][0] != '0' && argv[5][0] != '1') ||
+        argv[6][0] == '\0' || argv[6][1] != '\0' || (argv[6][0] != '0' && argv[6][0] != '1')) {
+      return 2;
+    }
+    const char* scenario = std::getenv("RECO_FAKE_PROBE_WORKER_SCENARIO");
+    if (scenario != nullptr && std::strcmp(scenario, "partial-owner-launch-report") == 0) {
+      constexpr char kPartialReport = 'P';
+      constexpr char kCleanupCertified = 'C';
+      if (::send(3, &kPartialReport, 1,
+#if defined(MSG_NOSIGNAL)
+                 MSG_NOSIGNAL
+#else
+                 0
+#endif
+                 ) != 1) {
+        return EXIT_FAILURE;
+      }
+      pollfd lifetime{.fd = STDIN_FILENO, .events = POLLIN, .revents = 0};
+      int lifetime_ready = -1;
+      do {
+        lifetime_ready = ::poll(&lifetime, 1, -1);
+      } while (lifetime_ready < 0 && errno == EINTR);
+      char command = '\0';
+      ssize_t received = -1;
+      if (lifetime_ready > 0) {
+        do {
+          received = ::recv(STDIN_FILENO, &command, 1, 0);
+        } while (received < 0 && errno == EINTR);
+      }
+      if (received != 1 || command != 'T' ||
+          ::send(STDIN_FILENO, &kCleanupCertified, 1,
+#if defined(MSG_NOSIGNAL)
+                 MSG_NOSIGNAL
+#else
+                 0
+#endif
+                 ) != 1) {
+        return EXIT_FAILURE;
+      }
+      return EXIT_SUCCESS;
+    }
+    return reco::io::detail::run_gpu_video_probe_owner(
+        argv[0], values[0], values[1], argv[4][0] == '1', argv[5][0] == '1', argv[6][0] == '1');
+  }
+  if (argc == 8 && std::strcmp(argv[1], "--reco-video-probe-supervisor") == 0) {
+    std::array<std::uint64_t, 3> values{};
+    for (std::size_t index = 0; index < values.size(); ++index) {
+      const std::string_view value(argv[index + 2U]);
+      const auto [end, error] =
+          std::from_chars(value.data(), value.data() + value.size(), values[index]);
+      if (error != std::errc{} || end != value.data() + value.size()) {
+        return 2;
+      }
+    }
+    if (argv[5][0] == '\0' || argv[5][1] != '\0' || (argv[5][0] != '0' && argv[5][0] != '1') ||
+        argv[6][0] == '\0' || argv[6][1] != '\0' || (argv[6][0] != '0' && argv[6][0] != '1') ||
+        argv[7][0] == '\0' || argv[7][1] != '\0' || (argv[7][0] != '0' && argv[7][0] != '1')) {
+      return 2;
+    }
+    return reco::io::detail::run_gpu_video_probe_supervisor(argv[0], values[0], values[1],
+                                                            values[2], argv[5][0] == '1',
+                                                            argv[6][0] == '1', argv[7][0] == '1');
+  }
+  if (argc == 4 && std::strcmp(argv[1], "--reco-video-probe-guardian") == 0) {
     const std::string_view delay_value(argv[2]);
     std::uint64_t delay_ns = 0;
     const auto [end, error] =
         std::from_chars(delay_value.data(), delay_value.data() + delay_value.size(), delay_ns);
     if (error != std::errc{} || end != delay_value.data() + delay_value.size() ||
+        argv[3][0] == '\0' || argv[3][1] != '\0' || (argv[3][0] != '0' && argv[3][0] != '1') ||
         !write_process_marker("RECO_FAKE_PROBE_GUARDIAN_PID_PATH",
                               static_cast<std::uint64_t>(::getpid()))) {
       return EXIT_FAILURE;
     }
-    return reco::io::detail::run_gpu_video_probe_guardian(argv[0], delay_ns);
+    return reco::io::detail::run_gpu_video_probe_guardian(argv[0], delay_ns, argv[3][0] == '1');
   }
   if (argc == 2 && std::strcmp(argv[1], "--reco-video-probe-guard") == 0) {
     return run_process_group_guard();
@@ -369,11 +589,15 @@ int main(int argc, char** argv) {
                       expected_parent);
   const bool valid_parent =
       separator != std::string_view::npos && separator + 2 == parent_argument.size() &&
-      (parent_argument[separator + 1] == '0' || parent_argument[separator + 1] == '1') &&
+      (parent_argument[separator + 1] == '0' || parent_argument[separator + 1] == '1' ||
+       parent_argument[separator + 1] == '2') &&
       parent_error == std::errc{} && parent_end == parent_argument.data() + separator &&
       expected_parent == static_cast<std::uint64_t>(::getppid());
   if (!valid_parent || (parent_argument[separator + 1] == '0' && !close_unrelated_descriptors())) {
     return EXIT_FAILURE;
+  }
+  if (parent_argument[separator + 1] == '2') {
+    (void)::close(3);
   }
 #endif
 #if defined(_WIN32)
@@ -398,17 +622,6 @@ int main(int argc, char** argv) {
     if (::setrlimit(RLIMIT_AS, &raised) == 0 || errno != EPERM) {
       return 6;
     }
-  }
-#else
-  if (scenario != nullptr && std::strcmp(scenario, "memory-over-limit") == 0) {
-    constexpr std::size_t kAllocationBytes = 640ULL * 1024ULL * 1024ULL;
-    std::vector<std::uint8_t> allocation(kAllocationBytes);
-    volatile auto* bytes = allocation.data();
-    for (std::size_t offset = 0; offset < allocation.size(); offset += 4'096U) {
-      bytes[offset] = static_cast<std::uint8_t>(offset);
-    }
-    std::this_thread::sleep_for(std::chrono::seconds(30));
-    return 6;
   }
 #endif
   if (scenario != nullptr && std::strcmp(scenario, "descriptor-isolation") == 0) {
@@ -440,6 +653,34 @@ int main(int argc, char** argv) {
   if (!write_process_marker("RECO_FAKE_PROBE_WORKER_PID_PATH", current_process_id)) {
     return EXIT_FAILURE;
   }
+#if !defined(_WIN32)
+  if (scenario != nullptr && std::strcmp(scenario, "process-spawn-denied") == 0) {
+    const auto descendant = ::fork();
+    if (descendant == 0) {
+      std::_Exit(EXIT_SUCCESS);
+    }
+    if (descendant > 0) {
+      terminate_and_reap(descendant);
+      return 8;
+    }
+#if defined(__APPLE__)
+    if (errno != EAGAIN) {
+#else
+    if (errno != EPERM) {
+#endif
+      return 9;
+    }
+    bool thread_ran = false;
+    std::thread thread([&thread_ran] { thread_ran = true; });
+    thread.join();
+    if (!thread_ran) {
+      return 10;
+    }
+  }
+  if (scenario != nullptr && std::strcmp(scenario, "aggregate-memory-with-descendant") == 0) {
+    return run_aggregate_memory_with_descendant();
+  }
+#endif
   if (scenario != nullptr && std::strcmp(scenario, "startup-marker") == 0) {
     const char* marker_path = std::getenv("RECO_FAKE_PROBE_STARTUP_MARKER_PATH");
     if (marker_path == nullptr || marker_path[0] == '\0') {
@@ -476,13 +717,16 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     return EXIT_SUCCESS;
   }
-  if (scenario != nullptr && (std::strcmp(scenario, "valid-metadata-with-descendant") == 0 ||
-                              std::strcmp(scenario, "block-input-with-descendant") == 0)) {
+  if (scenario != nullptr &&
+      (std::strcmp(scenario, "valid-metadata-with-descendant") == 0 ||
+       std::strcmp(scenario, "block-input-with-descendant") == 0 ||
+       std::strcmp(scenario, "exit-before-request-with-inherited-descendant") == 0)) {
     const char* descendant_path = std::getenv("RECO_FAKE_PROBE_DESCENDANT_PATH");
     if (descendant_path == nullptr || descendant_path[0] == '\0') {
       return EXIT_FAILURE;
     }
-    const auto descendant = spawn_sleeping_descendant();
+    const auto descendant = spawn_sleeping_descendant(
+        std::strcmp(scenario, "exit-before-request-with-inherited-descendant") == 0);
     if (descendant == 0) {
       return EXIT_FAILURE;
     }
@@ -492,7 +736,9 @@ int main(int argc, char** argv) {
   }
   if (scenario != nullptr && std::strcmp(scenario, "block-input") != 0 &&
       std::strcmp(scenario, "block-input-with-descendant") != 0) {
-    if (!read_request()) {
+    const bool exit_before_request =
+        std::strcmp(scenario, "exit-before-request-with-inherited-descendant") == 0;
+    if (!exit_before_request && !read_request()) {
       return EXIT_FAILURE;
     }
     if (!write_lifecycle_event("request")) {
@@ -529,8 +775,10 @@ int main(int argc, char** argv) {
       response = {{"protocol_version", std::numeric_limits<std::uint64_t>::max()}, {"ok", false}};
     } else if (std::strcmp(scenario, "valid-metadata") == 0 ||
                std::strcmp(scenario, "valid-metadata-with-descendant") == 0 ||
+               std::strcmp(scenario, "exit-before-request-with-inherited-descendant") == 0 ||
 #if !defined(_WIN32)
                std::strcmp(scenario, "descriptor-isolation") == 0 ||
+               std::strcmp(scenario, "process-spawn-denied") == 0 ||
 #if !defined(__APPLE__)
                std::strcmp(scenario, "memory-limit") == 0 ||
 #endif
@@ -540,34 +788,40 @@ int main(int argc, char** argv) {
                std::strcmp(scenario, "oversized-metadata") == 0) {
       const bool negative = std::strcmp(scenario, "negative-metadata") == 0;
       const bool oversized = std::strcmp(scenario, "oversized-metadata") == 0;
-      response = {{"protocol_version", 3},
-                  {"ok", true},
-                  {"width",
-                   negative ? nlohmann::json(-2)
-                   : oversized
-                       ? nlohmann::json(std::numeric_limits<std::uint64_t>::max())
-                       : nlohmann::json(
-                             std::strcmp(scenario, "valid-metadata") == 0 ||
-                                     std::strcmp(scenario, "valid-metadata-with-descendant") == 0 ||
+      response = {
+          {"protocol_version", 5},
+          {"ok", true},
+          {"width",
+           negative ? nlohmann::json(-2)
+           : oversized
+               ? nlohmann::json(std::numeric_limits<std::uint64_t>::max())
+               : nlohmann::json(
+                     std::strcmp(scenario, "valid-metadata") == 0 ||
+                             std::strcmp(scenario, "valid-metadata-with-descendant") == 0 ||
+                             std::strcmp(scenario,
+                                         "exit-before-request-with-inherited-descendant") == 0 ||
 #if !defined(_WIN32)
-                                     std::strcmp(scenario, "descriptor-isolation") == 0 ||
+                             std::strcmp(scenario, "descriptor-isolation") == 0 ||
+                             std::strcmp(scenario, "process-spawn-denied") == 0 ||
 #endif
 #if !defined(_WIN32) && !defined(__APPLE__)
-                                     std::strcmp(scenario, "memory-limit") == 0 || false
+                             std::strcmp(scenario, "memory-limit") == 0 || false
 #else
-                                     false
+                             false
 #endif
-                                 ? 854
-                                 : 853)},
-                  {"height", 480},
-                  {"fps_numerator", 30},
-                  {"fps_denominator", 1},
-                  {"duration_ns", negative ? nlohmann::json(-1) : nlohmann::json(1'000'000'000)},
-                  {"total_frames", negative ? nlohmann::json(-1) : nlohmann::json(30)},
-                  {"duration_is_estimated", false},
-                  {"total_frames_is_estimated", false},
-                  {"selected_stream_caps_verified", true},
-                  {"indexed_sampling_cadence_verified", true}};
+                         ? 854
+                         : 853)},
+          {"height", 480},
+          {"fps_numerator", 30},
+          {"fps_denominator", 1},
+          {"duration_ns", negative ? nlohmann::json(-1) : nlohmann::json(1'000'000'000)},
+          {"total_frames", negative ? nlohmann::json(-1) : nlohmann::json(30)},
+          {"first_stream_time_ns", 0},
+          {"timestamp_multiplicity", 1},
+          {"duration_is_estimated", false},
+          {"total_frames_is_estimated", false},
+          {"selected_stream_caps_verified", true},
+          {"indexed_sampling_cadence_verified", true}};
     }
     const auto encoded = nlohmann::json::to_cbor(response);
     write_frame({reinterpret_cast<const char*>(encoded.data()), encoded.size()});

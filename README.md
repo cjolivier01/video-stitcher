@@ -107,7 +107,9 @@ sudo apt install libavcodec-dev libavformat-dev libavutil-dev \
     pkg-config clang
 
 # macOS (Homebrew)
-brew install ffmpeg pkg-config
+brew install ffmpeg@7 pkg-config
+export PKG_CONFIG_PATH="$(brew --prefix ffmpeg@7)/lib/pkgconfig"
+export PATH="$(brew --prefix ffmpeg@7)/bin:$PATH"
 
 # Windows: FFmpeg 7.x binaries + LLVM/Clang, set FFMPEG_DIR env var
 

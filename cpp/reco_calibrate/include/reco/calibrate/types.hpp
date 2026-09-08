@@ -12,6 +12,20 @@
 
 namespace reco::calibrate {
 
+/// Stable regular-file metadata captured before isolated calibration begins.
+struct CalibrationFileIdentity {
+  std::uint64_t device = 0;
+  std::uint64_t inode = 0;
+  std::uint64_t size = 0;
+  std::uint32_t mode = 0;
+  std::int64_t modified_seconds = 0;
+  std::int64_t modified_nanoseconds = 0;
+  std::int64_t changed_seconds = 0;
+  std::int64_t changed_nanoseconds = 0;
+
+  bool operator==(const CalibrationFileIdentity&) const = default;
+};
+
 struct GrayFrame {
   std::vector<std::uint8_t> data;
   std::uint32_t width = 0;

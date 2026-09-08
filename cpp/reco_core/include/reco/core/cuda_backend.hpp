@@ -110,8 +110,14 @@ class CudaKernel;
 class CudaBackendTraceSink {
 public:
   virtual ~CudaBackendTraceSink() = default;
+  /// Called after a `CudaDeviceBuffer` allocation has completed successfully.
+  virtual void device_allocation_created(std::size_t) noexcept {}
+  /// Called after a traced `CudaDeviceBuffer` allocation has been released successfully.
+  virtual void device_allocation_released(std::size_t) noexcept {}
   /// Called after a device-to-device copy has been accepted by the CUDA driver.
   virtual void device_to_device_copy_submitted() noexcept {}
+  /// Called after a device-to-host copy has completed successfully.
+  virtual void device_to_host_copy_submitted(std::size_t, std::size_t) noexcept {}
   /// Called after an explicit CUDA context synchronization succeeds.
   virtual void context_synchronized() noexcept {}
 };

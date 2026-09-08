@@ -1,4 +1,5 @@
 #include "reco/core/calibration.hpp"
+#include "reco/core/path.hpp"
 
 #include <cmath>
 #include <filesystem>
@@ -450,7 +451,8 @@ std::optional<MatchCalibration> parse_match_calibration_json(std::string_view js
 
 std::optional<MatchCalibration> load_match_calibration_file(const std::string& path,
                                                             std::string* error) {
-  std::ifstream input(path, std::ios::binary);
+  const auto native_path = path_from_utf8(path);
+  std::ifstream input(native_path, std::ios::binary);
   if (!input.good()) {
     if (error != nullptr) {
       *error = "cannot read calibration file";
@@ -458,7 +460,7 @@ std::optional<MatchCalibration> load_match_calibration_file(const std::string& p
     return std::nullopt;
   }
   std::error_code status_error;
-  const auto file_size = std::filesystem::file_size(path, status_error);
+  const auto file_size = std::filesystem::file_size(native_path, status_error);
   if (status_error || file_size > kMaxCalibrationFileSize) {
     if (error != nullptr) {
       *error = status_error ? "cannot stat calibration file" : "calibration file too large";

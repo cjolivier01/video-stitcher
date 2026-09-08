@@ -1,5 +1,8 @@
 #include "reco/detect/trt_engine.hpp"
 
+#include "reco/core/path.hpp"
+#include "reco/core/windows_runtime_library.hpp"
+
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -40,9 +43,9 @@ using TrtDestroy = void(RECO_TRT_CALL*)(void*);
 
 class DynamicLibrary {
 public:
-  explicit DynamicLibrary(const std::filesystem::path& path) : path_(path.string()) {
+  explicit DynamicLibrary(const std::filesystem::path& path) : path_(core::path_to_utf8(path)) {
 #if defined(_WIN32)
-    handle_ = LoadLibraryA(path_.c_str());
+    handle_ = static_cast<HMODULE>(core::detail::load_windows_runtime_library(path));
 #else
     handle_ = dlopen(path_.c_str(), RTLD_NOW | RTLD_LOCAL);
 #endif
@@ -100,10 +103,7 @@ struct TrtApi {
 };
 
 std::filesystem::path getenv_path(const char* name) {
-  if (const char* value = std::getenv(name); value != nullptr && value[0] != '\0') {
-    return std::filesystem::path(value);
-  }
-  return {};
+  return core::path_from_environment(name).value_or(std::filesystem::path{});
 }
 
 std::vector<std::uint8_t> read_engine_file(const std::filesystem::path& path) {
@@ -276,8 +276,7 @@ TrtEngine::TrtEngine(const std::filesystem::path& engine_path) {
 
 TrtEngine::~TrtEngine() = default;
 
-TrtEngine::TrtEngine(TrtEngine&& other) noexcept
-    : state_(std::move(other.state_)) {}
+TrtEngine::TrtEngine(TrtEngine&& other) noexcept : state_(std::move(other.state_)) {}
 
 TrtEngine& TrtEngine::operator=(TrtEngine&& other) noexcept {
   if (this != &other) {

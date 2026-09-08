@@ -6,6 +6,7 @@
 
 extern crate ffmpeg_next as ffmpeg;
 
+use ffmpeg::codec::packet::Ref as _;
 use ffmpeg::format::Pixel;
 use ffmpeg::software::scaling::{context::Context as ScalingContext, flag::Flags as ScalingFlags};
 use ffmpeg::util::frame::video::Video as VideoFrame;
@@ -485,6 +486,8 @@ type OpenedVideoEncoder = (
 /// ```
 pub struct VideoEncoder {
     octx: format::context::Output,
+    container: Container,
+    mux_packet_write_model: MuxPacketWriteModel,
     encoder: ffmpeg::encoder::video::Encoder,
     scaler: ScalingContext,
     stream_index: usize,
@@ -568,6 +571,68 @@ unsafe impl Send for VideoEncoder {}
 // SAFETY: Same single-thread usage as VideoEncoder.
 unsafe impl Send for StreamOutput {}
 unsafe impl Send for SilentAudio {}
+
+type MuxPacketWriteFn = unsafe extern "C" fn(
+    *mut ffmpeg::sys::AVFormatContext,
+    *mut ffmpeg::sys::AVPacket,
+) -> std::ffi::c_int;
+
+/// FFmpeg forbids mixing its direct and interleaved packet-writing APIs on
+/// one output context. Bind the choice to the context for its whole lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MuxPacketWriteModel {
+    Direct,
+    Interleaved,
+}
+
+impl MuxPacketWriteModel {
+    fn for_primary_output(container: Container, has_audio: bool) -> Self {
+        // A video-only Matroska stream is already ordered, and direct writes
+        // let a null flush close its active cluster for write-while-read.
+        // Multi-stream output needs FFmpeg's interleaver to order A/V packets.
+        if container == Container::Matroska && !has_audio {
+            Self::Direct
+        } else {
+            Self::Interleaved
+        }
+    }
+
+    fn writer(self) -> MuxPacketWriteFn {
+        match self {
+            Self::Direct => ffmpeg::sys::av_write_frame,
+            Self::Interleaved => ffmpeg::sys::av_interleaved_write_frame,
+        }
+    }
+}
+
+fn mux_packet_ptr(
+    packet: Option<&ffmpeg::Packet>,
+) -> Result<*mut ffmpeg::sys::AVPacket, EncodeError> {
+    match packet {
+        Some(packet) if packet.size() == 0 => Err(ffmpeg::Error::InvalidData.into()),
+        Some(packet) => Ok(packet.as_ptr().cast_mut()),
+        None => Ok(std::ptr::null_mut()),
+    }
+}
+
+fn write_mux_packet(
+    output: &mut format::context::Output,
+    model: MuxPacketWriteModel,
+    packet: Option<&ffmpeg::Packet>,
+) -> Result<(), EncodeError> {
+    let packet_ptr = mux_packet_ptr(packet)?;
+
+    // SAFETY: `output` owns a live AVFormatContext and a non-null packet
+    // pointer remains valid for the call. Each FFmpeg API applies its own
+    // documented packet ownership semantics. A null packet is that same
+    // writer's flush request. `model` is fixed for each output context.
+    let result = unsafe { model.writer()(output.as_mut_ptr(), packet_ptr) };
+    if result < 0 {
+        Err(ffmpeg::Error::from(result).into())
+    } else {
+        Ok(())
+    }
+}
 
 impl Drop for VideoEncoder {
     fn drop(&mut self) {
@@ -718,6 +783,8 @@ impl VideoEncoder {
                         }
                         a
                     });
+                    let mux_packet_write_model =
+                        MuxPacketWriteModel::for_primary_output(config.container, audio.is_some());
 
                     let stream = if let Some(ref url) = config.stream_url {
                         match Self::open_stream_output(url, &octx, stream_index, fps) {
@@ -738,6 +805,8 @@ impl VideoEncoder {
 
                     return Ok(Self {
                         octx,
+                        container: config.container,
+                        mux_packet_write_model,
                         encoder: enc_opened,
                         scaler,
                         stream_index,
@@ -1159,7 +1228,7 @@ impl VideoEncoder {
                         break;
                     }
 
-                    packet.write_interleaved(&mut self.octx)?;
+                    write_mux_packet(&mut self.octx, self.mux_packet_write_model, Some(&packet))?;
                 }
                 Err(ffmpeg::Error::Eof) => {
                     // Current segment done; continue with the next chained one.
@@ -1409,20 +1478,26 @@ impl VideoEncoder {
     /// they've actually hit disk. Call periodically (e.g. every
     /// keyframe) from the stacked-video replay path.
     ///
-    /// `av_write_frame(ctx, NULL)` prompts the muxer to emit any
-    /// queued packets; `avio_flush` then forces the AVIO layer to
-    /// write its buffer to the OS. Both are safe to call multiple
-    /// times and at any point after `write_header`.
+    /// For video-only Matroska, a null packet sent through its direct
+    /// packet-writing API closes the active cluster. Matroska with audio uses
+    /// the interleaved API, where a null packet drains the interleaver; normal
+    /// keyframe cluster boundaries make completed data visible. `avio_flush`
+    /// then forces the AVIO layer to write its buffer to the OS.
     pub fn flush_to_disk(&mut self) -> Result<(), EncodeError> {
-        // SAFETY: `octx` is a live output context (created in
-        // `new`, never dropped until `Drop` runs). `avio_flush` is
-        // safe on any live AVIO and doesn't alter muxer state -
-        // just forces the output-layer buffer to the file
-        // descriptor. We intentionally avoid
-        // `av_write_frame(ctx, NULL)` because fMP4's
-        // `frag_keyframe` mode treats that as "close current
-        // fragment" which clashes with the subsequent
-        // `write_trailer` on finish (observed as AVERROR -105).
+        // Matroska assembles each cluster in a dynamic buffer and
+        // copies it to the output only when the cluster closes. An
+        // AVIO flush alone therefore exposes just the file header to
+        // a concurrent reader. The Matroska muxer explicitly supports
+        // a null packet for closing the active cluster. Keep fMP4 on
+        // the AVIO-only path: closing an fMP4 fragment this way clashes
+        // with its later write_trailer call (observed as AVERROR -105).
+        if self.container == Container::Matroska {
+            write_mux_packet(&mut self.octx, self.mux_packet_write_model, None)?;
+        }
+
+        // SAFETY: `octx` remains live until `Drop`. `avio_flush` does
+        // not alter muxer state; it only pushes the AVIO buffer to the
+        // underlying file descriptor.
         unsafe {
             let pb = (*self.octx.as_mut_ptr()).pb;
             if !pb.is_null() {
@@ -1516,7 +1591,11 @@ impl VideoEncoder {
                 // Save PTS before write_interleaved blanks the packet
                 // (av_interleaved_write_frame resets all fields to defaults).
                 let video_pts = clone.pts().unwrap_or(0);
-                if let Err(e) = clone.write_interleaved(&mut stream.octx) {
+                if let Err(e) = write_mux_packet(
+                    &mut stream.octx,
+                    MuxPacketWriteModel::Interleaved,
+                    Some(&clone),
+                ) {
                     log::warn!("RTMP stream write failed ({e}), disabling stream");
                     self.stream = None;
                 } else if let Some(ref mut sa) = stream.audio {
@@ -1530,7 +1609,7 @@ impl VideoEncoder {
                 }
             }
 
-            packet.write_interleaved(&mut self.octx)?;
+            write_mux_packet(&mut self.octx, self.mux_packet_write_model, Some(&packet))?;
         }
         Ok(())
     }
@@ -1645,7 +1724,7 @@ impl SilentAudio {
             while self.encoder.receive_packet(&mut packet).is_ok() {
                 packet.set_stream(self.stream_index);
                 packet.rescale_ts(Rational(1, self.sample_rate as i32), self.output_time_base);
-                packet.write_interleaved(octx)?;
+                write_mux_packet(octx, MuxPacketWriteModel::Interleaved, Some(&packet))?;
             }
         }
         Ok(())
@@ -1927,6 +2006,52 @@ fn build_encoder_opts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The packet model is selected once from stream topology, and each model
+    /// maps to exactly one FFmpeg API for both data and null flush markers.
+    /// This checks that invariant without relying on an installed muxer.
+    #[test]
+    fn mux_packet_and_flush_submissions_share_one_writer_model() {
+        assert_eq!(
+            MuxPacketWriteModel::for_primary_output(Container::Matroska, false),
+            MuxPacketWriteModel::Direct
+        );
+        assert_eq!(
+            MuxPacketWriteModel::for_primary_output(Container::Matroska, true),
+            MuxPacketWriteModel::Interleaved
+        );
+        for container in [Container::Mp4, Container::Mp4Fragmented, Container::Flv] {
+            assert_eq!(
+                MuxPacketWriteModel::for_primary_output(container, false),
+                MuxPacketWriteModel::Interleaved
+            );
+        }
+
+        let direct: MuxPacketWriteFn = ffmpeg::sys::av_write_frame;
+        assert!(std::ptr::fn_addr_eq(
+            MuxPacketWriteModel::Direct.writer(),
+            direct
+        ));
+        let interleaved: MuxPacketWriteFn = ffmpeg::sys::av_interleaved_write_frame;
+        assert!(std::ptr::fn_addr_eq(
+            MuxPacketWriteModel::Interleaved.writer(),
+            interleaved
+        ));
+
+        let packet = ffmpeg::Packet::copy(&[1]);
+        assert!(
+            !mux_packet_ptr(Some(&packet))
+                .expect("data packet")
+                .is_null()
+        );
+        assert!(mux_packet_ptr(None).expect("flush marker").is_null());
+
+        let empty = ffmpeg::Packet::empty();
+        assert!(matches!(
+            mux_packet_ptr(Some(&empty)),
+            Err(EncodeError::Ffmpeg(ffmpeg::Error::InvalidData))
+        ));
+    }
 
     /// Only a positive, finite start time should shift audio; anything else
     /// (default exports, garbage values) must leave the soundtrack untouched.

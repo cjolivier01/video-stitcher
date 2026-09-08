@@ -1,4 +1,5 @@
 #include "reco/core/calibration.hpp"
+#include "reco/core/path.hpp"
 #include "reco/core/source.hpp"
 
 #include <cstdlib>
@@ -81,6 +82,15 @@ void source_path_validation_matches_rust_reasons() {
   expect_true(!empty.ok, "empty rejected");
   expect_true(empty.reason == InvalidPathReason::Empty, "empty reason");
   expect_eq(invalid_path_reason_name(InvalidPathReason::Empty), "file is empty", "empty label");
+
+  const auto unicode = dir / path_from_utf8("video-\xCE\xA9-\xE4\xBE\x8B.mp4");
+  {
+    std::ofstream output(unicode, std::ios::binary);
+    output << "native path probe";
+  }
+  const auto unicode_result = validate_input_path(unicode);
+  expect_true(unicode_result.ok, "Unicode input path accepted");
+  expect_eq(unicode_result.path, path_to_utf8(unicode), "input path diagnostic is UTF-8");
 }
 
 void frame_plane_validation_matches_rust_messages() {
@@ -656,6 +666,20 @@ void calibration_file_size_cap_is_enforced() {
   expect_true(!parse_match_calibration_json(too_large).has_value(), "large calibration rejected");
 }
 
+void utf8_native_paths_round_trip_and_load_calibration() {
+  constexpr std::string_view filename = "calibration-\xCE\xA9-\xE4\xBE\x8B.json";
+  const auto path = scratch_dir() / path_from_utf8(filename);
+  {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output << calibration_to_json(valid_calibration());
+  }
+  expect_true(path_to_utf8(path).find(filename) != std::string::npos,
+              "native path round-trips through UTF-8");
+  std::string error;
+  expect_true(load_match_calibration_file(path_to_utf8(path), &error).has_value(),
+              "calibration loader opens a UTF-8 path through native filesystem semantics");
+}
+
 } // namespace
 
 int main() {
@@ -669,5 +693,6 @@ int main() {
   calibration_json_parses_top_level_non_defaults();
   calibration_json_rejects_schema_that_rust_rejects();
   calibration_file_size_cap_is_enforced();
+  utf8_native_paths_round_trip_and_load_calibration();
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

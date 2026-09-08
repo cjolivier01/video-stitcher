@@ -1,5 +1,7 @@
 #include "reco/detect/npp_interop.hpp"
 
+#include "reco/core/windows_runtime_library.hpp"
+
 #include <array>
 #include <initializer_list>
 #include <limits>
@@ -18,7 +20,8 @@
 namespace reco::detect {
 namespace {
 
-constexpr int kNppiInterLinear = 1;
+constexpr int kNppiInterLinear = 2;
+constexpr int kNppiInterSuper = 8;
 constexpr int kNppiAxisBoth = 2;
 constexpr std::uint32_t kCudaStreamNonBlocking = 1;
 
@@ -91,7 +94,7 @@ public:
 private:
   void open(const char* name) {
 #if defined(_WIN32)
-    handle_ = LoadLibraryA(name);
+    handle_ = core::detail::load_windows_runtime_library(name);
 #else
     handle_ = dlopen(name, RTLD_NOW | RTLD_LOCAL);
 #endif
@@ -164,6 +167,7 @@ struct NppFunctions {
   std::optional<CudaStreamDestroy> stream_destroy;
   NppiNv12ToRgb nv12_to_rgb = nullptr;
   NppiNv12ToRgbColorTwist nv12_to_rgb_color_twist = nullptr;
+  NppiResize resize_c1 = nullptr;
   NppiResize resize_c3 = nullptr;
   NppiResize resize_c4 = nullptr;
   NppiMirror mirror_c3 = nullptr;
@@ -269,6 +273,7 @@ std::unique_ptr<NppFunctions> load_npp() {
   functions->nv12_to_rgb = functions->nppicc.symbol<NppiNv12ToRgb>("nppiNV12ToRGB_8u_P2C3R_Ctx");
   functions->nv12_to_rgb_color_twist =
       functions->nppicc.symbol<NppiNv12ToRgbColorTwist>("nppiNV12ToRGB_8u_ColorTwist32f_P2C3R_Ctx");
+  functions->resize_c1 = functions->nppig.symbol<NppiResize>("nppiResize_8u_C1R_Ctx");
   functions->resize_c3 = functions->nppig.symbol<NppiResize>("nppiResize_8u_C3R_Ctx");
   functions->resize_c4 = functions->nppig.symbol<NppiResize>("nppiResize_8u_C4R_Ctx");
   functions->mirror_c3 = functions->nppig.symbol<NppiMirror>("nppiMirror_8u_C3R_Ctx");
@@ -447,6 +452,30 @@ void npp_resize_c3(core::CudaDevicePtr src, std::uint32_t src_w, std::uint32_t s
                 reinterpret_cast<std::uint8_t*>(dst), checked_step(dst_w, 3, "C3 destination"),
                 NppiSize{static_cast<int>(dst_w), static_cast<int>(dst_h)}, dst_roi,
                 kNppiInterLinear, functions.stream_ctx));
+}
+
+void npp_resize_c1(core::CudaDevicePtr src, std::size_t src_pitch, std::uint32_t src_w,
+                   std::uint32_t src_h, core::CudaDevicePtr dst, std::size_t dst_pitch,
+                   std::uint32_t dst_w, std::uint32_t dst_h) {
+  require_ptr(src, "C1 resize source");
+  require_ptr(dst, "C1 resize destination");
+  require_dims(src_w, src_h, "C1 source");
+  require_dims(dst_w, dst_h, "C1 destination");
+  if (src_pitch < src_w || dst_pitch < dst_w) {
+    throw std::invalid_argument("NPP C1 resize pitch is smaller than width");
+  }
+
+  const auto& functions = npp();
+  check_npp("nppiResize_8u_C1R_Ctx",
+            functions.resize_c1(
+                reinterpret_cast<const std::uint8_t*>(src), checked_pitch(src_pitch, "C1 source"),
+                NppiSize{static_cast<int>(src_w), static_cast<int>(src_h)},
+                NppiRect{0, 0, static_cast<int>(src_w), static_cast<int>(src_h)},
+                reinterpret_cast<std::uint8_t*>(dst), checked_pitch(dst_pitch, "C1 destination"),
+                NppiSize{static_cast<int>(dst_w), static_cast<int>(dst_h)},
+                NppiRect{0, 0, static_cast<int>(dst_w), static_cast<int>(dst_h)},
+                dst_w < src_w && dst_h < src_h ? kNppiInterSuper : kNppiInterLinear,
+                functions.stream_ctx));
 }
 
 void npp_resize_c4(core::CudaDevicePtr src, std::uint32_t src_w, std::uint32_t src_h,

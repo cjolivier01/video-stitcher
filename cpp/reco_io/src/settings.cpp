@@ -1,5 +1,7 @@
 #include "reco/io/settings.hpp"
 
+#include "reco/core/path.hpp"
+
 #include <algorithm>
 
 namespace reco::io {
@@ -10,19 +12,11 @@ make_error(SettingsErrorKind kind, std::string message, std::string ns = {}) {
   return SettingsError{kind, std::errc{}, std::move(message), std::move(ns)};
 }
 
-std::optional<std::filesystem::path> getenv_path(const char* key) {
-  const char* value = std::getenv(key);
-  if (value == nullptr || *value == '\0') {
-    return std::nullopt;
-  }
-  return std::filesystem::path(value);
-}
-
 std::filesystem::path home_config_dir() {
-  if (auto xdg = getenv_path("XDG_CONFIG_HOME")) {
+  if (auto xdg = core::path_from_environment("XDG_CONFIG_HOME")) {
     return *xdg / "reco";
   }
-  if (auto home = getenv_path("HOME")) {
+  if (auto home = core::path_from_environment("HOME")) {
     return *home / ".config" / "reco";
   }
   return {};
@@ -51,16 +45,16 @@ bool validate_settings_namespace(std::string_view ns) {
 }
 
 std::variant<std::filesystem::path, SettingsError> config_dir() {
-  if (auto override_path = getenv_path("RECO_CONFIG_DIR")) {
+  if (auto override_path = core::path_from_environment("RECO_CONFIG_DIR")) {
     return *override_path;
   }
 
 #if defined(_WIN32)
-  if (auto appdata = getenv_path("APPDATA")) {
+  if (auto appdata = core::path_from_environment("APPDATA")) {
     return *appdata / "reco";
   }
 #elif defined(__APPLE__)
-  if (auto home = getenv_path("HOME")) {
+  if (auto home = core::path_from_environment("HOME")) {
     return *home / "Library" / "Application Support" / "reco";
   }
 #else
@@ -156,7 +150,7 @@ void RecentFiles::clear() { entries_.clear(); }
 void to_json(nlohmann::json& json, const RecentFiles& recent) {
   json = nlohmann::json{{"entries", nlohmann::json::array()}, {"max", recent.max_}};
   for (const auto& entry : recent.entries_) {
-    json["entries"].push_back(entry.string());
+    json["entries"].push_back(core::path_to_utf8(entry));
   }
 }
 
@@ -167,7 +161,7 @@ void from_json(const nlohmann::json& json, RecentFiles& recent) {
     recent.max_ = 1;
   }
   for (const auto& entry : json.value("entries", std::vector<std::string>{})) {
-    recent.entries_.push_back(std::filesystem::path(entry));
+    recent.entries_.push_back(core::path_from_utf8(entry));
   }
 }
 
