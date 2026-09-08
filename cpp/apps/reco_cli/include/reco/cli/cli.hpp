@@ -171,6 +171,9 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err,
 
 namespace detail {
 
+/// Rounds non-negative seconds to the full unsigned GStreamer nanosecond range.
+[[nodiscard]] std::uint64_t nanoseconds_from_seconds(double seconds, std::string_view label);
+
 /// Descriptor-pinned temporary output with identity-checked atomic publication.
 class AtomicOutputFile final {
 public:

@@ -1,5 +1,7 @@
 #include "reco/io/gpu_decode.hpp"
 
+#include "gstreamer_gpu_decode_internal.hpp"
+
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -16,7 +18,8 @@ namespace {
 
 constexpr std::size_t kMaximumGpuDecodeSegments = 4096;
 
-using SourceOpener = std::function<std::unique_ptr<GpuFileDecodeSource>(GpuFileDecodeConfig)>;
+using SourceOpener = std::function<std::unique_ptr<GpuFileDecodeSource>(
+    GpuFileDecodeConfig, const detail::GpuDecodeOpeningSourceObserver&)>;
 
 std::uint64_t add_frame_counts(std::uint64_t left, std::uint64_t right) {
   if (right > std::numeric_limits<std::uint64_t>::max() - left) {
@@ -83,7 +86,14 @@ public:
 
   void request_stop() noexcept override {
     stopped_.store(true, std::memory_order_release);
-    const auto source = current_source();
+    std::shared_ptr<GpuFileDecodeSource> source;
+    {
+      std::lock_guard state_lock(state_mutex_);
+      if (opening_source_ != nullptr) {
+        opening_source_->request_stop();
+      }
+      source = source_;
+    }
     if (source) {
       source->request_stop();
     }
@@ -153,13 +163,33 @@ private:
     }
     auto segment_config = config_.segments[segment_index_].config;
     segment_config.start_frame_index = local_start_frame_;
-    auto opened = std::shared_ptr<GpuFileDecodeSource>(opener_(std::move(segment_config)));
+    const auto observe_opening_source = [this](GpuFileDecodeSource* source) {
+      std::lock_guard state_lock(state_mutex_);
+      opening_source_ = source;
+      return !stopped_.load(std::memory_order_acquire);
+    };
+    std::unique_ptr<GpuFileDecodeSource> opened_unique;
+    try {
+      opened_unique = opener_(std::move(segment_config), observe_opening_source);
+    } catch (...) {
+      {
+        std::lock_guard state_lock(state_mutex_);
+        opening_source_ = nullptr;
+      }
+      if (stopped_.load(std::memory_order_acquire)) {
+        ended_ = true;
+        return;
+      }
+      throw;
+    }
+    auto opened = std::shared_ptr<GpuFileDecodeSource>(std::move(opened_unique));
     if (!opened || !opened->gpu_resident()) {
       throw GpuDecodeError("chained GPU decode opener returned a non-GPU source");
     }
     bool reject_open = false;
     {
       std::lock_guard state_lock(state_mutex_);
+      opening_source_ = nullptr;
       reject_open = stopped_.load(std::memory_order_acquire);
       if (!reject_open) {
         source_ = opened;
@@ -196,6 +226,7 @@ private:
   mutable std::mutex state_mutex_;
   std::mutex operation_mutex_;
   std::shared_ptr<GpuFileDecodeSource> source_;
+  GpuFileDecodeSource* opening_source_ = nullptr;
   std::atomic<bool> stopped_{false};
   std::size_t segment_index_ = 0;
   std::uint64_t segment_base_index_ = 0;
@@ -253,8 +284,10 @@ open_gstreamer_gpu_chained_file_decode_source(GpuChainedFileDecodeConfig config,
     throw std::invalid_argument(*error);
   }
   return std::make_unique<ChainedGpuFileDecodeSource>(
-      std::move(config), [abi](GpuFileDecodeConfig segment) {
-        return open_gstreamer_gpu_file_decode_source(std::move(segment), abi);
+      std::move(config),
+      [abi](GpuFileDecodeConfig segment, const detail::GpuDecodeOpeningSourceObserver& observer) {
+        return detail::open_gstreamer_gpu_file_decode_source_interruptibly(std::move(segment), abi,
+                                                                           observer);
       });
 }
 
@@ -268,8 +301,11 @@ open_gstreamer_gpu_chained_file_decode_source(GpuChainedFileDecodeConfig config,
     throw std::invalid_argument("chained GPU decode requires a retained NvBufSurface runtime");
   }
   return std::make_unique<ChainedGpuFileDecodeSource>(
-      std::move(config), [runtime = std::move(runtime)](GpuFileDecodeConfig segment) {
-        return open_gstreamer_gpu_file_decode_source(std::move(segment), runtime);
+      std::move(config),
+      [runtime = std::move(runtime)](GpuFileDecodeConfig segment,
+                                     const detail::GpuDecodeOpeningSourceObserver& observer) {
+        return detail::open_gstreamer_gpu_file_decode_source_interruptibly(std::move(segment),
+                                                                           runtime, observer);
       });
 }
 

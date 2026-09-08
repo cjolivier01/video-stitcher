@@ -984,12 +984,17 @@ RECO_FAKE_EXPORT int gst_element_set_state(void* pipeline_pointer, int state) {
          : state == 3 ? "state-paused"
          : state == 2 ? "state-ready"
                       : "state-null");
+  auto* pipeline = static_cast<FakePipeline*>(pipeline_pointer);
   if (state == 1 && scenario() == "probe-blocking-null-state") {
     std::this_thread::sleep_for(std::chrono::seconds(30));
   } else if (state == 4 && scenario() == "probe-blocking-playing") {
     std::this_thread::sleep_for(std::chrono::seconds(30));
+  } else if (state == 4 && scenario() == "stop-blocked-open") {
+    std::unique_lock lock(pipeline->flush_mutex);
+    record("state-playing-blocked");
+    pipeline->flush_changed.wait(lock, [&] { return pipeline->flush_started; });
+    record("state-playing-unblocked");
   }
-  auto* pipeline = static_cast<FakePipeline*>(pipeline_pointer);
   if (state == 1 && scenario() == "audio-stop-blocked-read") {
     {
       std::lock_guard lock(pipeline->flush_mutex);

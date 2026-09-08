@@ -29,6 +29,20 @@
 #include <vector>
 
 namespace reco::cli::detail {
+
+std::uint64_t nanoseconds_from_seconds(double seconds, std::string_view label) {
+  if (!std::isfinite(seconds) || seconds < 0.0) {
+    throw std::runtime_error(std::string(label) + " must be finite and non-negative");
+  }
+  const long double nanoseconds = static_cast<long double>(seconds) * 1'000'000'000.0L;
+  const long double rounded = std::round(nanoseconds);
+  constexpr long double kExclusiveUint64Limit = 18'446'744'073'709'551'616.0L;
+  if (!std::isfinite(rounded) || rounded >= kExclusiveUint64Limit) {
+    throw std::runtime_error(std::string(label) + " exceeds the GStreamer time range");
+  }
+  return static_cast<std::uint64_t>(rounded);
+}
+
 namespace {
 
 using namespace reco::io;
@@ -203,17 +217,6 @@ std::uint64_t timestamp_for_frame(std::uint64_t frame_index, std::uint32_t fps_n
     throw std::overflow_error("stitch output timestamp exceeds the GStreamer time range");
   }
   return whole + fractional;
-}
-
-std::uint64_t nanoseconds_from_seconds(double seconds, std::string_view label) {
-  if (!std::isfinite(seconds) || seconds < 0.0) {
-    throw std::runtime_error(std::string(label) + " must be finite and non-negative");
-  }
-  const long double nanoseconds = static_cast<long double>(seconds) * 1'000'000'000.0L;
-  if (nanoseconds > static_cast<long double>(std::numeric_limits<std::uint64_t>::max())) {
-    throw std::runtime_error(std::string(label) + " exceeds the GStreamer time range");
-  }
-  return static_cast<std::uint64_t>(std::llround(nanoseconds));
 }
 
 AudioSelection select_audio_segments(const ProbedInput& input, std::uint64_t start_time_ns) {

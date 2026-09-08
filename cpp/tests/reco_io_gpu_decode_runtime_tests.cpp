@@ -351,6 +351,34 @@ void chained_source_stop_interrupts_the_active_segment() {
             "chained stop flushes only the active segment");
 }
 
+void chained_source_stop_interrupts_a_lazy_segment_open() {
+  set_scenario("stop-blocked-open");
+  const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
+  std::filesystem::remove(event_path);
+  auto source = open_gstreamer_gpu_chained_file_decode_source(
+      {.segments = {{.config = valid_config(), .exact_frame_count = std::nullopt}}},
+      NvbufSurfaceAbi::DeepStream9_1);
+
+  std::atomic<bool> returned_eos{false};
+  std::thread reader([&] {
+    try {
+      returned_eos = source->read().status == GpuDecodeFrameStatus::EndOfStream;
+    } catch (...) {
+    }
+  });
+  expect_true(wait_for_event(event_path, "state-playing-blocked", std::chrono::seconds(2)),
+              "lazy chained source blocks while opening its first segment");
+  source->request_stop();
+  reader.join();
+
+  const auto events = read_events(event_path);
+  expect_true(returned_eos.load(), "chained stop cancels a segment blocked during lazy open");
+  expect_eq(count_event(events, "send-flush-start"), 1U,
+            "chained stop flushes the partially opened GPU pipeline once");
+  expect_eq(count_event(events, "state-playing-unblocked"), 1U,
+            "startup returns after the stop flush reaches GStreamer");
+}
+
 void persistent_stereo_session_pairs_gstreamer_sources() {
   set_scenario("frame-eos");
   const auto event_path = std::filesystem::path(std::getenv("RECO_FAKE_GST_EVENT_PATH"));
@@ -1115,6 +1143,7 @@ int run_tests() {
   source_destruction_stops_decode_with_a_retained_frame();
   chained_sources_open_lazily_and_preserve_global_indices();
   chained_source_stop_interrupts_the_active_segment();
+  chained_source_stop_interrupts_a_lazy_segment_open();
   persistent_stereo_session_pairs_gstreamer_sources();
   early_stereo_stop_flushes_both_pipelines_before_teardown();
   stop_flushes_a_blocked_appsink_read_before_teardown();

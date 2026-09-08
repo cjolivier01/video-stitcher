@@ -1256,6 +1256,17 @@ void exchange_directory_entries_at(int directory_descriptor, std::string_view le
   }
 }
 
+void exchange_directory_entries_between_at(int left_directory, std::string_view left,
+                                           int right_directory, std::string_view right,
+                                           const std::filesystem::path& destination) {
+  const std::string left_name(left);
+  const std::string right_name(right);
+  if (::syscall(SYS_renameat2, left_directory, left_name.c_str(), right_directory,
+                right_name.c_str(), RENAME_EXCHANGE) != 0) {
+    throw_file_error("failed to exchange stitch output", destination, errno);
+  }
+}
+
 [[nodiscard]] bool rename_directory_entry_noreplace_at(int directory_descriptor,
                                                        std::string_view source,
                                                        std::string_view destination_name,
@@ -1270,6 +1281,21 @@ void exchange_directory_entries_at(int directory_descriptor, std::string_view le
     return false;
   }
   throw_file_error("failed to publish calibration output", destination, errno);
+}
+
+[[nodiscard]] bool rename_directory_entry_noreplace_between_at(
+    int source_directory, std::string_view source, int destination_directory,
+    std::string_view destination_name, const std::filesystem::path& destination) {
+  const std::string source_name(source);
+  const std::string target_name(destination_name);
+  if (::syscall(SYS_renameat2, source_directory, source_name.c_str(), destination_directory,
+                target_name.c_str(), RENAME_NOREPLACE) == 0) {
+    return true;
+  }
+  if (errno == EEXIST) {
+    return false;
+  }
+  throw_file_error("failed to publish stitch output", destination, errno);
 }
 
 [[nodiscard]] bool
@@ -1381,6 +1407,30 @@ rollback_new_directory_entry_safely(int directory_descriptor, std::string_view p
   }
 }
 
+[[nodiscard]] bool rollback_new_directory_entry_between_safely(
+    int published_directory, std::string_view published_name, int retained_directory,
+    std::string_view retained_name, int published_descriptor,
+    const std::filesystem::path& destination) noexcept {
+  try {
+    ProtectedPosixQuarantine quarantine(retained_directory, destination);
+    constexpr std::string_view quarantined_name = "published";
+    if (!move_directory_entry_noreplace_noexcept(published_directory, published_name,
+                                                 quarantine.get(), quarantined_name)) {
+      return false;
+    }
+    if (!temporary_name_identifies_descriptor(quarantine.get(), quarantined_name,
+                                              published_descriptor)) {
+      (void)move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_name,
+                                                    published_directory, published_name);
+      return false;
+    }
+    return move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_name,
+                                                   retained_directory, retained_name);
+  } catch (...) {
+    return false;
+  }
+}
+
 [[nodiscard]] bool rollback_exchanged_directory_entries_safely(
     int directory_descriptor, std::string_view published_name, int published_descriptor,
     std::string_view displaced_name, const DirectoryEntrySnapshot& displaced_snapshot,
@@ -1420,6 +1470,48 @@ rollback_new_directory_entry_safely(int directory_descriptor, std::string_view p
       return false;
     }
     return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+[[nodiscard]] bool rollback_exchanged_directory_entries_between_safely(
+    int published_directory, std::string_view published_name, int published_descriptor,
+    int displaced_directory, std::string_view displaced_name,
+    const DirectoryEntrySnapshot& displaced_snapshot,
+    const std::filesystem::path& destination) noexcept {
+  try {
+    ProtectedPosixQuarantine quarantine(displaced_directory, destination);
+    constexpr std::string_view quarantined_published = "published";
+    constexpr std::string_view quarantined_displaced = "displaced";
+    if (!move_directory_entry_noreplace_noexcept(published_directory, published_name,
+                                                 quarantine.get(), quarantined_published)) {
+      return false;
+    }
+    if (!move_directory_entry_noreplace_noexcept(displaced_directory, displaced_name,
+                                                 quarantine.get(), quarantined_displaced)) {
+      (void)move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_published,
+                                                    published_directory, published_name);
+      return false;
+    }
+    const bool identities_match =
+        temporary_name_identifies_descriptor(quarantine.get(), quarantined_published,
+                                             published_descriptor) &&
+        directory_entry_matches_snapshot(quarantine.get(), quarantined_displaced,
+                                         displaced_snapshot);
+    if (!identities_match) {
+      (void)move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_displaced,
+                                                    displaced_directory, displaced_name);
+      (void)move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_published,
+                                                    published_directory, published_name);
+      return false;
+    }
+    if (!move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_displaced,
+                                                 published_directory, published_name)) {
+      return false;
+    }
+    return move_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_published,
+                                                   displaced_directory, displaced_name);
   } catch (...) {
     return false;
   }
@@ -1812,6 +1904,32 @@ move_posix_directory_entry_noreplace_noexcept(int source_directory, std::string_
                         target_name.c_str(), RENAME_EXCL) == 0;
 }
 
+[[nodiscard]] bool rename_posix_directory_entry_noreplace_between_at(
+    int source_directory, std::string_view source, int destination_directory,
+    std::string_view destination_name, const std::filesystem::path& destination) {
+  const std::string source_name(source);
+  const std::string target_name(destination_name);
+  if (::renameatx_np(source_directory, source_name.c_str(), destination_directory,
+                     target_name.c_str(), RENAME_EXCL) == 0) {
+    return true;
+  }
+  if (errno == EEXIST) {
+    return false;
+  }
+  throw_file_error("cannot publish stitch output", destination, errno);
+}
+
+void exchange_posix_directory_entries_between_at(int left_directory, std::string_view left,
+                                                 int right_directory, std::string_view right,
+                                                 const std::filesystem::path& destination) {
+  const std::string left_name(left);
+  const std::string right_name(right);
+  if (::renameatx_np(left_directory, left_name.c_str(), right_directory, right_name.c_str(),
+                     RENAME_SWAP) != 0) {
+    throw_file_error("cannot exchange stitch output", destination, errno);
+  }
+}
+
 class ProtectedDarwinQuarantine {
 public:
   ProtectedDarwinQuarantine(int parent, const std::filesystem::path& destination)
@@ -1913,6 +2031,29 @@ rollback_new_posix_directory_entry_safely(int directory_descriptor, std::string_
   }
 }
 
+[[nodiscard]] bool rollback_new_posix_directory_entry_between_safely(
+    int published_directory, std::string_view published_name, int retained_directory,
+    std::string_view retained_name, int published_descriptor,
+    const std::filesystem::path& destination) noexcept {
+  try {
+    ProtectedDarwinQuarantine quarantine(retained_directory, destination);
+    constexpr std::string_view quarantined_name = "published";
+    if (!move_posix_directory_entry_noreplace_noexcept(published_directory, published_name,
+                                                       quarantine.get(), quarantined_name)) {
+      return false;
+    }
+    if (!path_identifies_descriptor_at(quarantine.get(), quarantined_name, published_descriptor)) {
+      (void)move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_name,
+                                                          published_directory, published_name);
+      return false;
+    }
+    return move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_name,
+                                                         retained_directory, retained_name);
+  } catch (...) {
+    return false;
+  }
+}
+
 [[nodiscard]] bool rollback_exchanged_posix_directory_entries_safely(
     int directory_descriptor, std::string_view published_name, int published_descriptor,
     std::string_view displaced_name, const PosixDirectoryEntrySnapshot& displaced_snapshot,
@@ -1949,6 +2090,48 @@ rollback_new_posix_directory_entry_safely(int directory_descriptor, std::string_
     }
     return move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_published,
                                                          directory_descriptor, displaced_name);
+  } catch (...) {
+    return false;
+  }
+}
+
+[[nodiscard]] bool rollback_exchanged_posix_directory_entries_between_safely(
+    int published_directory, std::string_view published_name, int published_descriptor,
+    int displaced_directory, std::string_view displaced_name,
+    const PosixDirectoryEntrySnapshot& displaced_snapshot,
+    const std::filesystem::path& destination) noexcept {
+  try {
+    ProtectedDarwinQuarantine quarantine(displaced_directory, destination);
+    constexpr std::string_view quarantined_published = "published";
+    constexpr std::string_view quarantined_displaced = "displaced";
+    if (!move_posix_directory_entry_noreplace_noexcept(published_directory, published_name,
+                                                       quarantine.get(), quarantined_published)) {
+      return false;
+    }
+    if (!move_posix_directory_entry_noreplace_noexcept(displaced_directory, displaced_name,
+                                                       quarantine.get(), quarantined_displaced)) {
+      (void)move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_published,
+                                                          published_directory, published_name);
+      return false;
+    }
+    const bool identities_match =
+        path_identifies_descriptor_at(quarantine.get(), quarantined_published,
+                                      published_descriptor) &&
+        posix_directory_entry_matches_snapshot(quarantine.get(), quarantined_displaced,
+                                               displaced_snapshot);
+    if (!identities_match) {
+      (void)move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_displaced,
+                                                          displaced_directory, displaced_name);
+      (void)move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_published,
+                                                          published_directory, published_name);
+      return false;
+    }
+    if (!move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_displaced,
+                                                       published_directory, published_name)) {
+      return false;
+    }
+    return move_posix_directory_entry_noreplace_noexcept(quarantine.get(), quarantined_published,
+                                                         displaced_directory, displaced_name);
   } catch (...) {
     return false;
   }
@@ -3778,6 +3961,8 @@ struct AtomicOutputFile::Impl {
   PinnedWindowsDirectory output_directory;
 #else
   int directory_descriptor = -1;
+  int staging_directory_descriptor = -1;
+  std::string staging_directory_name;
 #endif
   int descriptor = -1;
   bool committed = false;
@@ -3795,26 +3980,42 @@ AtomicOutputFile::Impl::~Impl() {
     (void)_close(descriptor);
   }
 #else
-  if (!committed && descriptor >= 0 && directory_descriptor >= 0 && !temporary_name.empty()) {
+  if (!committed && descriptor >= 0 && staging_directory_descriptor >= 0 &&
+      !temporary_name.empty()) {
 #if defined(__linux__)
-    (void)unlink_descriptor_entry_safely(directory_descriptor, temporary_name, descriptor,
+    (void)unlink_descriptor_entry_safely(staging_directory_descriptor, temporary_name, descriptor,
                                          destination);
 #elif defined(__APPLE__)
-    (void)unlink_posix_descriptor_entry_safely(directory_descriptor, temporary_name, descriptor,
-                                               destination);
+    (void)unlink_posix_descriptor_entry_safely(staging_directory_descriptor, temporary_name,
+                                               descriptor, destination);
 #else
     struct stat descriptor_identity{};
     struct stat path_identity{};
     if (::fstat(descriptor, &descriptor_identity) == 0 &&
-        ::fstatat(directory_descriptor, temporary_name.c_str(), &path_identity,
+        ::fstatat(staging_directory_descriptor, temporary_name.c_str(), &path_identity,
                   AT_SYMLINK_NOFOLLOW) == 0 &&
         same_file_identity(descriptor_identity, path_identity)) {
-      (void)::unlinkat(directory_descriptor, temporary_name.c_str(), 0);
+      (void)::unlinkat(staging_directory_descriptor, temporary_name.c_str(), 0);
     }
 #endif
   }
   if (descriptor >= 0) {
     (void)::close(descriptor);
+  }
+  if (staging_directory_descriptor >= 0) {
+    struct stat retained_identity{};
+    struct stat named_identity{};
+    const bool retained_name_is_unchanged =
+        directory_descriptor >= 0 && !staging_directory_name.empty() &&
+        ::fstat(staging_directory_descriptor, &retained_identity) == 0 &&
+        ::fstatat(directory_descriptor, staging_directory_name.c_str(), &named_identity,
+                  AT_SYMLINK_NOFOLLOW) == 0 &&
+        S_ISDIR(retained_identity.st_mode) && S_ISDIR(named_identity.st_mode) &&
+        same_file_identity(retained_identity, named_identity);
+    if (retained_name_is_unchanged) {
+      (void)::unlinkat(directory_descriptor, staging_directory_name.c_str(), AT_REMOVEDIR);
+    }
+    (void)::close(staging_directory_descriptor);
   }
   if (directory_descriptor >= 0) {
     (void)::close(directory_descriptor);
@@ -3889,32 +4090,65 @@ AtomicOutputFile::AtomicOutputFile(
     const int inspect_error = errno == 0 ? ENOTDIR : errno;
     throw_file_error("cannot inspect stitch output directory", impl_->parent, inspect_error);
   }
+  errno = 0;
+  const long name_limit = ::fpathconf(directory, _PC_NAME_MAX);
+  if (name_limit >= 0 &&
+      impl_->destination.filename().native().size() > static_cast<std::size_t>(name_limit)) {
+    throw_file_error("stitch output filename exceeds the filesystem limit", impl_->destination,
+                     ENAMETOOLONG);
+  }
+  if (name_limit < 0 && errno != 0) {
+    throw_file_error("cannot inspect stitch output filename limit", impl_->parent, errno);
+  }
+
   std::random_device random;
   constexpr char hex[] = "0123456789abcdef";
-  int descriptor = -1;
-  std::string temporary_name;
   for (int attempt = 0; attempt < 128; ++attempt) {
     std::array<char, 32> token{};
     for (auto& digit : token) {
       digit = hex[random() & 0x0fU];
     }
-    temporary_name =
-        impl_->destination.filename().string() + ".tmp." + std::string(token.begin(), token.end());
-    descriptor = ::openat(directory, temporary_name.c_str(),
-                          O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-    if (descriptor >= 0) {
-      impl_->descriptor = descriptor;
-      impl_->temporary_name = std::move(temporary_name);
-      impl_->temporary = impl_->parent / impl_->temporary_name;
+    const auto staging_name = ".reco-stitch-" + std::string(token.begin(), token.end());
+    if (::mkdirat(directory, staging_name.c_str(), 0700) == 0) {
+      const int staging = ::openat(directory, staging_name.c_str(),
+                                   O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+      if (staging < 0) {
+        const int open_error = errno;
+        (void)::unlinkat(directory, staging_name.c_str(), AT_REMOVEDIR);
+        throw_file_error("cannot retain private stitch output staging directory",
+                         impl_->destination, open_error);
+      }
+      struct stat staging_identity{};
+      struct stat named_identity{};
+      if (::fstat(staging, &staging_identity) != 0 ||
+          ::fstatat(directory, staging_name.c_str(), &named_identity, AT_SYMLINK_NOFOLLOW) != 0 ||
+          !S_ISDIR(staging_identity.st_mode) ||
+          !same_file_identity(staging_identity, named_identity) ||
+          staging_identity.st_uid != ::geteuid() || (staging_identity.st_mode & 0077) != 0) {
+        const int inspect_error = errno == 0 ? EACCES : errno;
+        (void)::close(staging);
+        (void)::unlinkat(directory, staging_name.c_str(), AT_REMOVEDIR);
+        throw_file_error("stitch output staging directory is not private", impl_->destination,
+                         inspect_error);
+      }
+      impl_->staging_directory_descriptor = staging;
+      impl_->staging_directory_name = staging_name;
       break;
     }
     if (errno != EEXIST) {
-      const int open_error = errno;
-      throw_file_error("cannot create temporary stitch output", impl_->destination, open_error);
+      throw_file_error("cannot create private stitch output staging directory", impl_->destination,
+                       errno);
     }
   }
-  if (descriptor < 0) {
-    throw std::runtime_error("cannot create unique temporary stitch output");
+  if (impl_->staging_directory_descriptor < 0) {
+    throw std::runtime_error("cannot create unique private stitch output staging directory");
+  }
+  impl_->temporary_name = "output";
+  impl_->temporary = impl_->parent / impl_->staging_directory_name / impl_->temporary_name;
+  impl_->descriptor = ::openat(impl_->staging_directory_descriptor, impl_->temporary_name.c_str(),
+                               O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+  if (impl_->descriptor < 0) {
+    throw_file_error("cannot create private temporary stitch output", impl_->destination, errno);
   }
 #endif
 }
@@ -4005,100 +4239,77 @@ void AtomicOutputFile::commit() {
   }
   auto publication_lock = lock_output_directory(impl_->directory_descriptor, impl_->parent, {},
                                                 std::chrono::seconds(2));
-  std::string publication_name;
-  bool publication_exists = false;
   bool temporary_exists = true;
+  bool exchanged = false;
+  std::optional<DirectoryEntrySnapshot> displaced;
   try {
-    const auto linked = create_descriptor_publication_link_at(
-        impl_->directory_descriptor, impl_->destination, impl_->descriptor, false);
-    const bool descriptor_linked = linked.has_value();
-    publication_name = descriptor_linked ? *linked : impl_->temporary_name;
-    publication_exists = descriptor_linked;
-    if (!temporary_name_identifies_descriptor(impl_->directory_descriptor, publication_name,
-                                              impl_->descriptor)) {
+    if (!temporary_name_identifies_descriptor(impl_->staging_directory_descriptor,
+                                              impl_->temporary_name, impl_->descriptor)) {
       throw std::runtime_error("temporary stitch output identity changed before publication");
     }
     if (impl_->after_temporary_validation) {
-      impl_->after_temporary_validation(impl_->parent / publication_name);
+      impl_->after_temporary_validation(impl_->temporary);
     }
-    if (!temporary_name_identifies_descriptor(impl_->directory_descriptor, publication_name,
-                                              impl_->descriptor)) {
+    if (!temporary_name_identifies_descriptor(impl_->staging_directory_descriptor,
+                                              impl_->temporary_name, impl_->descriptor)) {
       throw std::runtime_error("temporary stitch output changed at the publication boundary");
     }
 
     const auto destination_name = impl_->destination.filename().string();
-    bool published = false;
-    bool destination_exists =
-        directory_entry_exists_at(impl_->directory_descriptor, destination_name);
-    if (!destination_exists) {
-      if (descriptor_linked) {
-        const auto status = link_descriptor_at(impl_->directory_descriptor, destination_name,
-                                               impl_->descriptor, false);
-        published = status == DescriptorLinkStatus::Linked;
-        destination_exists = status == DescriptorLinkStatus::AlreadyExists;
-      } else {
-        published = rename_directory_entry_noreplace_at(
-            impl_->directory_descriptor, publication_name, destination_name, impl_->destination);
-        destination_exists = !published;
-        temporary_exists = !published;
-      }
-      if (published) {
-        const auto rollback_new = [&] {
-          if (descriptor_linked) {
-            return unlink_descriptor_entry_safely(impl_->directory_descriptor, destination_name,
-                                                  impl_->descriptor, impl_->destination);
-          }
-          const bool rolled_back = rollback_new_directory_entry_safely(
-              impl_->directory_descriptor, destination_name, impl_->temporary_name,
-              impl_->descriptor, impl_->destination);
-          temporary_exists = rolled_back;
-          return rolled_back;
-        };
-        try {
-          if (impl_->publication_fault_hook) {
-            impl_->publication_fault_hook();
-          }
-          if (!temporary_name_identifies_descriptor(impl_->directory_descriptor, destination_name,
-                                                    impl_->descriptor)) {
-            throw std::runtime_error("published stitch output identity changed");
-          }
-        } catch (...) {
-          if (!rollback_new()) {
-            throw std::runtime_error("stitch output publication failed and rollback was refused");
-          }
-          throw;
+    const bool published_new = rename_directory_entry_noreplace_between_at(
+        impl_->staging_directory_descriptor, impl_->temporary_name, impl_->directory_descriptor,
+        destination_name, impl_->destination);
+    if (published_new) {
+      temporary_exists = false;
+      try {
+        if (impl_->publication_fault_hook) {
+          impl_->publication_fault_hook();
         }
+        if (!temporary_name_identifies_descriptor(impl_->directory_descriptor, destination_name,
+                                                  impl_->descriptor)) {
+          throw std::runtime_error("published stitch output identity changed");
+        }
+      } catch (...) {
+        const bool rolled_back = rollback_new_directory_entry_between_safely(
+            impl_->directory_descriptor, destination_name, impl_->staging_directory_descriptor,
+            impl_->temporary_name, impl_->descriptor, impl_->destination);
+        temporary_exists = rolled_back;
+        if (!rolled_back) {
+          throw std::runtime_error("stitch output publication failed and rollback was refused");
+        }
+        throw;
       }
-    }
-
-    if (!published && destination_exists) {
-      if (!temporary_name_identifies_descriptor(impl_->directory_descriptor, publication_name,
-                                                impl_->descriptor)) {
-        throw std::runtime_error("temporary stitch output changed before atomic exchange");
-      }
-      auto displaced =
-          capture_directory_entry_snapshot(impl_->directory_descriptor, destination_name);
-      if (S_ISDIR(displaced.identity.st_mode)) {
+    } else {
+      displaced.emplace(
+          capture_directory_entry_snapshot(impl_->directory_descriptor, destination_name));
+      if (S_ISDIR(displaced->identity.st_mode)) {
         throw std::runtime_error("stitch output destination identifies a directory");
       }
-      exchange_directory_entries_at(impl_->directory_descriptor, publication_name, destination_name,
-                                    impl_->destination);
+      if (!temporary_name_identifies_descriptor(impl_->staging_directory_descriptor,
+                                                impl_->temporary_name, impl_->descriptor)) {
+        throw std::runtime_error("temporary stitch output changed before atomic exchange");
+      }
+      exchange_directory_entries_between_at(impl_->staging_directory_descriptor,
+                                            impl_->temporary_name, impl_->directory_descriptor,
+                                            destination_name, impl_->destination);
       const auto rollback_exchange = [&] {
-        const bool rolled_back = rollback_exchanged_directory_entries_safely(
-            impl_->directory_descriptor, destination_name, impl_->descriptor, publication_name,
-            displaced, impl_->destination);
-        publication_exists = descriptor_linked && rolled_back;
-        temporary_exists = !descriptor_linked && rolled_back;
+        const bool rolled_back = rollback_exchanged_directory_entries_between_safely(
+            impl_->directory_descriptor, destination_name, impl_->descriptor,
+            impl_->staging_directory_descriptor, impl_->temporary_name, *displaced,
+            impl_->destination);
+        temporary_exists = rolled_back;
+        exchanged = !rolled_back;
         return rolled_back;
       };
+      exchanged = true;
       try {
         if (impl_->publication_fault_hook) {
           impl_->publication_fault_hook();
         }
         if (!temporary_name_identifies_descriptor(impl_->directory_descriptor, destination_name,
                                                   impl_->descriptor) ||
-            !directory_entry_matches_snapshot(impl_->directory_descriptor, publication_name,
-                                              displaced)) {
+            !directory_entry_matches_snapshot(impl_->staging_directory_descriptor,
+                                              impl_->temporary_name, *displaced)) {
           throw std::runtime_error("exchanged stitch output identity changed");
         }
       } catch (...) {
@@ -4107,32 +4318,21 @@ void AtomicOutputFile::commit() {
         }
         throw;
       }
-      if (!unlink_directory_entry_if_unchanged(impl_->directory_descriptor, publication_name,
-                                               displaced, impl_->destination)) {
+      if (!unlink_directory_entry_if_unchanged(impl_->staging_directory_descriptor,
+                                               impl_->temporary_name, *displaced,
+                                               impl_->destination)) {
         if (!rollback_exchange()) {
           throw std::runtime_error("displaced stitch output changed and rollback was refused");
         }
         throw std::runtime_error("cannot remove displaced stitch output");
       }
-      publication_exists = false;
       temporary_exists = false;
-      published = true;
-    }
-
-    if (!published) {
-      throw std::runtime_error("stitch output was not published");
-    }
-    if (publication_exists) {
-      (void)unlink_descriptor_entry_safely(impl_->directory_descriptor, publication_name,
-                                           impl_->descriptor, impl_->destination);
-      publication_exists = false;
-    }
-    if (temporary_exists) {
-      (void)unlink_descriptor_entry_safely(impl_->directory_descriptor, impl_->temporary_name,
-                                           impl_->descriptor, impl_->destination);
-      temporary_exists = false;
+      exchanged = false;
     }
     impl_->committed = true;
+    if (::fsync(impl_->staging_directory_descriptor) != 0) {
+      throw_file_error("cannot flush stitch output staging directory", impl_->temporary, errno);
+    }
     if (::fsync(impl_->directory_descriptor) != 0) {
       throw_file_error("cannot flush stitch output directory", impl_->parent, errno);
     }
@@ -4142,9 +4342,16 @@ void AtomicOutputFile::commit() {
     }
     impl_->descriptor = -1;
   } catch (...) {
-    if (publication_exists) {
-      (void)unlink_descriptor_entry_safely(impl_->directory_descriptor, publication_name,
-                                           impl_->descriptor, impl_->destination);
+    if (exchanged && displaced.has_value()) {
+      (void)rollback_exchanged_directory_entries_between_safely(
+          impl_->directory_descriptor, impl_->destination.filename().string(), impl_->descriptor,
+          impl_->staging_directory_descriptor, impl_->temporary_name, *displaced,
+          impl_->destination);
+    }
+    if (temporary_exists) {
+      (void)unlink_descriptor_entry_safely(impl_->staging_directory_descriptor,
+                                           impl_->temporary_name, impl_->descriptor,
+                                           impl_->destination);
     }
     throw;
   }
@@ -4170,20 +4377,21 @@ void AtomicOutputFile::commit() {
   bool exchanged = false;
   std::optional<PosixDirectoryEntrySnapshot> displaced;
   try {
-    if (!path_identifies_descriptor_at(impl_->directory_descriptor, impl_->temporary_name,
+    if (!path_identifies_descriptor_at(impl_->staging_directory_descriptor, impl_->temporary_name,
                                        impl_->descriptor)) {
       throw std::runtime_error("temporary stitch output identity changed before publication");
     }
     if (impl_->after_temporary_validation) {
-      impl_->after_temporary_validation(impl_->parent / impl_->temporary_name);
+      impl_->after_temporary_validation(impl_->temporary);
     }
-    if (!path_identifies_descriptor_at(impl_->directory_descriptor, impl_->temporary_name,
+    if (!path_identifies_descriptor_at(impl_->staging_directory_descriptor, impl_->temporary_name,
                                        impl_->descriptor)) {
       throw std::runtime_error("temporary stitch output changed at the publication boundary");
     }
     const auto destination_name = impl_->destination.filename().string();
-    if (::renameatx_np(impl_->directory_descriptor, impl_->temporary_name.c_str(),
-                       impl_->directory_descriptor, destination_name.c_str(), RENAME_EXCL) == 0) {
+    if (rename_posix_directory_entry_noreplace_between_at(
+            impl_->staging_directory_descriptor, impl_->temporary_name, impl_->directory_descriptor,
+            destination_name, impl_->destination)) {
       temporary_exists = false;
       try {
         if (impl_->publication_fault_hook) {
@@ -4194,29 +4402,33 @@ void AtomicOutputFile::commit() {
           throw std::runtime_error("published stitch output identity changed");
         }
       } catch (...) {
-        if (!rollback_new_posix_directory_entry_safely(impl_->directory_descriptor,
-                                                       destination_name, impl_->temporary_name,
-                                                       impl_->descriptor, impl_->destination)) {
+        if (!rollback_new_posix_directory_entry_between_safely(
+                impl_->directory_descriptor, destination_name, impl_->staging_directory_descriptor,
+                impl_->temporary_name, impl_->descriptor, impl_->destination)) {
           throw std::runtime_error("stitch output publication failed and rollback was refused");
         }
         temporary_exists = true;
         throw;
       }
-    } else if (errno == EEXIST) {
+    } else {
       displaced =
           capture_posix_directory_entry_snapshot(impl_->directory_descriptor, destination_name);
       if (S_ISDIR(displaced->identity.st_mode)) {
         throw std::runtime_error("stitch output destination identifies a directory");
       }
-      if (::renameatx_np(impl_->directory_descriptor, impl_->temporary_name.c_str(),
-                         impl_->directory_descriptor, destination_name.c_str(), RENAME_SWAP) != 0) {
-        throw_file_error("cannot exchange stitch output", impl_->destination, errno);
+      if (!path_identifies_descriptor_at(impl_->staging_directory_descriptor, impl_->temporary_name,
+                                         impl_->descriptor)) {
+        throw std::runtime_error("temporary stitch output changed before atomic exchange");
       }
+      exchange_posix_directory_entries_between_at(
+          impl_->staging_directory_descriptor, impl_->temporary_name, impl_->directory_descriptor,
+          destination_name, impl_->destination);
       exchanged = true;
       const auto rollback_exchange = [&] {
-        const bool rolled_back = rollback_exchanged_posix_directory_entries_safely(
-            impl_->directory_descriptor, destination_name, impl_->descriptor, impl_->temporary_name,
-            *displaced, impl_->destination);
+        const bool rolled_back = rollback_exchanged_posix_directory_entries_between_safely(
+            impl_->directory_descriptor, destination_name, impl_->descriptor,
+            impl_->staging_directory_descriptor, impl_->temporary_name, *displaced,
+            impl_->destination);
         temporary_exists = rolled_back;
         exchanged = !rolled_back;
         return rolled_back;
@@ -4227,7 +4439,7 @@ void AtomicOutputFile::commit() {
         }
         if (!path_identifies_descriptor_at(impl_->directory_descriptor, destination_name,
                                            impl_->descriptor) ||
-            !posix_directory_entry_matches_snapshot(impl_->directory_descriptor,
+            !posix_directory_entry_matches_snapshot(impl_->staging_directory_descriptor,
                                                     impl_->temporary_name, *displaced)) {
           throw std::runtime_error("exchanged stitch output identity changed");
         }
@@ -4237,8 +4449,9 @@ void AtomicOutputFile::commit() {
         }
         throw;
       }
-      if (!unlink_posix_directory_entry_if_unchanged(
-              impl_->directory_descriptor, impl_->temporary_name, *displaced, impl_->destination)) {
+      if (!unlink_posix_directory_entry_if_unchanged(impl_->staging_directory_descriptor,
+                                                     impl_->temporary_name, *displaced,
+                                                     impl_->destination)) {
         if (!rollback_exchange()) {
           throw std::runtime_error("displaced stitch output changed and rollback was refused");
         }
@@ -4246,10 +4459,14 @@ void AtomicOutputFile::commit() {
       }
       temporary_exists = false;
       exchanged = false;
-    } else {
-      throw_file_error("cannot publish stitch output", impl_->destination, errno);
     }
     impl_->committed = true;
+    if (::fsync(impl_->staging_directory_descriptor) != 0) {
+      throw_file_error("cannot flush stitch output staging directory", impl_->temporary, errno);
+    }
+    if (::fsync(impl_->directory_descriptor) != 0) {
+      throw_file_error("cannot flush stitch output directory", impl_->parent, errno);
+    }
     (void)::flock(impl_->directory_descriptor, LOCK_UN);
     if (::close(impl_->descriptor) != 0) {
       impl_->descriptor = -1;
@@ -4258,13 +4475,15 @@ void AtomicOutputFile::commit() {
     impl_->descriptor = -1;
   } catch (...) {
     if (exchanged && displaced.has_value()) {
-      (void)rollback_exchanged_posix_directory_entries_safely(
+      (void)rollback_exchanged_posix_directory_entries_between_safely(
           impl_->directory_descriptor, impl_->destination.filename().string(), impl_->descriptor,
-          impl_->temporary_name, *displaced, impl_->destination);
+          impl_->staging_directory_descriptor, impl_->temporary_name, *displaced,
+          impl_->destination);
     }
     if (temporary_exists) {
-      (void)unlink_posix_descriptor_entry_safely(impl_->directory_descriptor, impl_->temporary_name,
-                                                 impl_->descriptor, impl_->destination);
+      (void)unlink_posix_descriptor_entry_safely(impl_->staging_directory_descriptor,
+                                                 impl_->temporary_name, impl_->descriptor,
+                                                 impl_->destination);
     }
     (void)::flock(impl_->directory_descriptor, LOCK_UN);
     throw;
@@ -4273,9 +4492,12 @@ void AtomicOutputFile::commit() {
   if (::fsync(impl_->descriptor) != 0) {
     throw_file_error("cannot flush completed stitch output", impl_->temporary, errno);
   }
-  if (::linkat(impl_->directory_descriptor, impl_->temporary_name.c_str(),
+  if (::linkat(impl_->staging_directory_descriptor, impl_->temporary_name.c_str(),
                impl_->directory_descriptor, impl_->destination.filename().c_str(), 0) != 0) {
     throw_file_error("cannot publish completed stitch output", impl_->destination, errno);
+  }
+  if (::unlinkat(impl_->staging_directory_descriptor, impl_->temporary_name.c_str(), 0) != 0) {
+    throw_file_error("cannot remove temporary stitch output", impl_->temporary, errno);
   }
   impl_->committed = true;
 #endif

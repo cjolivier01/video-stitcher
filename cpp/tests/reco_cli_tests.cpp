@@ -640,6 +640,18 @@ void expect_true(bool condition, std::string_view message) {
   }
 }
 
+void expect_no_stitch_output_artifacts(const std::filesystem::path& directory,
+                                       std::string_view context) {
+  for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+    const auto filename = entry.path().filename().string();
+    const bool is_staging = filename.starts_with(".reco-stitch-");
+    const bool is_legacy_temporary = filename.find(".tmp.") != std::string::npos;
+    const bool is_legacy_publication = filename.find(".publish.") != std::string::npos;
+    expect_true(!is_staging && !is_legacy_temporary && !is_legacy_publication,
+                std::string(context) + " leaves no stitch output staging artifact");
+  }
+}
+
 template <typename T, typename U> void expect_eq(T actual, U expected, std::string_view message) {
   if (actual != expected) {
     std::cerr << "FAIL: " << message << " expected=" << expected << " actual=" << actual << '\n';
@@ -809,6 +821,28 @@ void stitch_frame_timing_preserves_source_gaps_and_rejects_overflow() {
   expect_true(overflow_rejected, "terminal source frame index overflow is rejected");
 }
 
+void stitch_second_conversion_supports_the_unsigned_gstreamer_range() {
+  expect_eq(detail::nanoseconds_from_seconds(0.000'000'000'5, "timestamp"), 1ULL,
+            "sub-nanosecond stitch time rounds to the nearest nanosecond");
+  expect_eq(detail::nanoseconds_from_seconds(10'000'000'000.0, "timestamp"),
+            10'000'000'000'000'000'000ULL,
+            "stitch time supports timestamps above the signed 64-bit range");
+
+  constexpr double kExclusiveUint64Seconds = 18'446'744'073.709'551'616;
+  const auto largest_representable_seconds = std::nextafter(kExclusiveUint64Seconds, 0.0);
+  expect_true(detail::nanoseconds_from_seconds(largest_representable_seconds, "timestamp") >
+                  static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()),
+              "largest representable stitch time remains in the unsigned range");
+  bool overflow_rejected = false;
+  try {
+    (void)detail::nanoseconds_from_seconds(kExclusiveUint64Seconds, "timestamp");
+  } catch (const std::runtime_error& error) {
+    overflow_rejected =
+        std::string_view(error.what()).find("GStreamer time range") != std::string_view::npos;
+  }
+  expect_true(overflow_rejected, "stitch time rejects the exclusive unsigned boundary");
+}
+
 void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
   TemporaryDirectory root;
   const auto destination = root.path() / "stitched.mp4";
@@ -821,6 +855,9 @@ void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
   }
   expect_eq(read_text_file(destination), std::string("first encoded output\n"),
             "stitch output transaction publishes a new file and repeated commit is a no-op");
+  expect_no_stitch_output_artifacts(root.path(), "new stitch output publication");
+  expect_eq(std::filesystem::hard_link_count(destination), std::uintmax_t{1},
+            "new stitch output has exactly one directory entry");
 
   {
     detail::AtomicOutputFile output(destination);
@@ -829,6 +866,27 @@ void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
   }
   expect_eq(read_text_file(destination), std::string("replacement encoded output\n"),
             "stitch output transaction atomically replaces an existing file");
+  expect_no_stitch_output_artifacts(root.path(), "replacement stitch output publication");
+  expect_eq(std::filesystem::hard_link_count(destination), std::uintmax_t{1},
+            "replacement stitch output does not retain a temporary hard link");
+
+  bool injected_failure_reported = false;
+  try {
+    detail::AtomicOutputFile output(
+        destination, {}, [] { throw std::runtime_error("injected stitch publication failure"); });
+    write_text_descriptor(output.descriptor(), "output that must roll back\n");
+    output.commit();
+  } catch (const std::runtime_error& error) {
+    injected_failure_reported =
+        std::string_view(error.what()).find("injected stitch publication failure") !=
+        std::string_view::npos;
+  }
+  expect_true(injected_failure_reported, "stitch publication reports an injected failure");
+  expect_eq(read_text_file(destination), std::string("replacement encoded output\n"),
+            "failed stitch replacement restores the previous output");
+  expect_no_stitch_output_artifacts(root.path(), "failed stitch output publication");
+  expect_eq(std::filesystem::hard_link_count(destination), std::uintmax_t{1},
+            "failed stitch replacement leaves one destination entry");
 
 #if defined(__linux__)
   std::filesystem::path attacker_entry;
@@ -2835,6 +2893,8 @@ int main(int argc, char** argv) {
   run_test_case("stitch_parse_matches_rust_defaults", stitch_parse_matches_rust_defaults);
   run_test_case("stitch_frame_timing_preserves_source_gaps_and_rejects_overflow",
                 stitch_frame_timing_preserves_source_gaps_and_rejects_overflow);
+  run_test_case("stitch_second_conversion_supports_the_unsigned_gstreamer_range",
+                stitch_second_conversion_supports_the_unsigned_gstreamer_range);
   run_test_case("stitch_output_transaction_is_descriptor_pinned_and_atomic",
                 stitch_output_transaction_is_descriptor_pinned_and_atomic);
   run_test_case("preview_and_calibrate_parse_matches_rust_defaults",
