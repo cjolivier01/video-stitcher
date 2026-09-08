@@ -3,7 +3,6 @@
 #include "reco/core/path.hpp"
 #include "rules_cc/cc/runfiles/runfiles.h"
 
-#include <cstdlib>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -21,10 +20,10 @@ using rules_cc::cc::runfiles::Runfiles;
 
 #if defined(_WIN32)
 constexpr std::string_view kProbeWorkerName = "reco_video_probe_worker.exe";
-constexpr char kPathSeparator = ';';
+constexpr std::filesystem::path::value_type kPathSeparator = L';';
 #else
 constexpr std::string_view kProbeWorkerName = "reco_video_probe_worker";
-constexpr char kPathSeparator = ':';
+constexpr std::filesystem::path::value_type kPathSeparator = ':';
 #endif
 
 std::optional<std::filesystem::path>
@@ -54,11 +53,11 @@ resolve_path_invocation(const std::filesystem::path& executable_path) {
     return existing_absolute_executable(executable_path);
   }
 
-  const char* path_value = std::getenv("PATH");
-  if (path_value == nullptr) {
+  const auto path_value = core::path_from_environment("PATH");
+  if (!path_value.has_value()) {
     return std::nullopt;
   }
-  const std::string path(path_value);
+  const auto& path = path_value->native();
   std::size_t begin = 0;
   while (begin <= path.size()) {
     const auto end = path.find(kPathSeparator, begin);
@@ -79,7 +78,7 @@ resolve_path_invocation(const std::filesystem::path& executable_path) {
       }
     }
 #endif
-    if (end == std::string::npos) {
+    if (end == std::filesystem::path::string_type::npos) {
       break;
     }
     begin = end + 1U;
@@ -91,9 +90,9 @@ resolve_path_invocation(const std::filesystem::path& executable_path) {
 
 std::optional<std::filesystem::path>
 resolve_deployed_video_probe_worker(const std::filesystem::path& executable_path) {
-  if (const char* configured = std::getenv("RECO_VIDEO_PROBE_WORKER");
-      configured != nullptr && configured[0] != '\0') {
-    return existing_absolute_executable(configured);
+  if (const auto configured = core::path_from_environment("RECO_VIDEO_PROBE_WORKER");
+      configured.has_value()) {
+    return existing_absolute_executable(*configured);
   }
 
   const auto resolved_executable = resolve_path_invocation(executable_path);
