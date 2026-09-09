@@ -25,6 +25,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -258,12 +259,13 @@ void require_exact_indexed_timeline(const ProbedInput& input, std::string_view l
 
 std::unique_ptr<GpuFileDecodeSource>
 open_decode_source(const ProbedInput& input, std::optional<std::uint64_t> start_frame,
-                   const std::shared_ptr<const NvbufSurfaceRuntime>& runtime) {
+                   const std::shared_ptr<const NvbufSurfaceRuntime>& runtime,
+                   const GpuDecodeOpeningSourceObserver& observer) {
   if (input.paths.size() == 1U) {
     return open_gstreamer_gpu_file_decode_source(decode_config(input.paths.front(),
                                                                input.stable_sources.front(),
                                                                input.probes.front(), start_frame),
-                                                 runtime);
+                                                 runtime, observer);
   }
 
   GpuChainedFileDecodeConfig config{.start_frame_index = start_frame};
@@ -419,14 +421,24 @@ public:
       while (!stop.stop_requested()) {
         if (cancellation_is_requested(requested_)) {
           observed_.store(true, std::memory_order_release);
-          if (auto* decoder = decoder_.load(std::memory_order_acquire); decoder != nullptr) {
-            decoder->request_stop();
+          std::lock_guard lock(resources_mutex_);
+          if (decoder_ != nullptr) {
+            decoder_->request_stop();
           }
-          if (auto* audio = audio_.load(std::memory_order_acquire); audio != nullptr) {
-            audio->request_stop();
+          if (opening_decoder_ != nullptr) {
+            opening_decoder_->request_stop();
           }
-          if (auto* encoder = encoder_.load(std::memory_order_acquire); encoder != nullptr) {
-            encoder->abort();
+          if (audio_ != nullptr) {
+            audio_->request_stop();
+          }
+          if (opening_audio_ != nullptr) {
+            opening_audio_->request_stop();
+          }
+          if (encoder_ != nullptr) {
+            encoder_->abort();
+          }
+          if (opening_encoder_ != nullptr) {
+            opening_encoder_->abort();
           }
           return;
         }
@@ -456,32 +468,69 @@ public:
   }
 
   void attach(GpuStereoDecodeSession& decoder) noexcept {
-    decoder_.store(&decoder, std::memory_order_release);
+    std::lock_guard lock(resources_mutex_);
+    decoder_ = &decoder;
     if (requested()) {
       decoder.request_stop();
     }
   }
 
   void attach(AudioPassthroughSource& audio) noexcept {
-    audio_.store(&audio, std::memory_order_release);
+    std::lock_guard lock(resources_mutex_);
+    audio_ = &audio;
     if (requested()) {
       audio.request_stop();
     }
   }
 
   void attach(GpuVideoEncodeSession& encoder) noexcept {
-    encoder_.store(&encoder, std::memory_order_release);
+    std::lock_guard lock(resources_mutex_);
+    encoder_ = &encoder;
     if (requested()) {
       encoder.abort();
     }
   }
 
+  [[nodiscard]] bool observe_opening_decoder(GpuFileDecodeSource* decoder) noexcept {
+    std::lock_guard lock(resources_mutex_);
+    opening_decoder_ = decoder;
+    const bool cancel = decoder != nullptr && requested();
+    if (cancel) {
+      decoder->request_stop();
+    }
+    return !cancel;
+  }
+
+  [[nodiscard]] bool observe_opening_audio(AudioPassthroughSource* audio) noexcept {
+    std::lock_guard lock(resources_mutex_);
+    opening_audio_ = audio;
+    const bool cancel = audio != nullptr && requested();
+    if (cancel) {
+      audio->request_stop();
+    }
+    return !cancel;
+  }
+
+  [[nodiscard]] bool observe_opening_encoder(GpuVideoEncodeSession* encoder) noexcept {
+    std::lock_guard lock(resources_mutex_);
+    opening_encoder_ = encoder;
+    const bool cancel = encoder != nullptr && requested();
+    if (cancel) {
+      encoder->abort();
+    }
+    return !cancel;
+  }
+
 private:
   const CancellationRequested& requested_;
   std::atomic<bool> observed_{false};
-  std::atomic<GpuStereoDecodeSession*> decoder_{nullptr};
-  std::atomic<AudioPassthroughSource*> audio_{nullptr};
-  std::atomic<GpuVideoEncodeSession*> encoder_{nullptr};
+  std::mutex resources_mutex_;
+  GpuStereoDecodeSession* decoder_ = nullptr;
+  GpuFileDecodeSource* opening_decoder_ = nullptr;
+  AudioPassthroughSource* audio_ = nullptr;
+  AudioPassthroughSource* opening_audio_ = nullptr;
+  GpuVideoEncodeSession* encoder_ = nullptr;
+  GpuVideoEncodeSession* opening_encoder_ = nullptr;
   std::jthread worker_;
 };
 
@@ -762,7 +811,10 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
     if (!audio_selection.segments.empty()) {
       audio.emplace(
           AudioPassthroughSource::open({.segments = audio_selection.segments,
-                                        .start_time_ns = audio_selection.local_start_time_ns}));
+                                        .start_time_ns = audio_selection.local_start_time_ns},
+                                       [&](AudioPassthroughSource* source) {
+                                         return cancellation.observe_opening_audio(source);
+                                       }));
       if (!audio->caps().has_value()) {
         audio.reset();
       } else {
@@ -787,12 +839,18 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
         .device_ordinal = 0,
         .pool_capacity = kStitchEncodePoolCapacity,
     };
-    encoder.emplace(GpuVideoEncodeSession::open(std::move(encode_config), runtime));
+    encoder.emplace(GpuVideoEncodeSession::open(
+        std::move(encode_config), runtime, {}, [&](GpuVideoEncodeSession* session) {
+          return cancellation.observe_opening_encoder(session);
+        }));
     cancellation.attach(*encoder);
     cancellation.throw_if_requested();
-    auto left = open_decode_source(left_input, start_frame, runtime);
+    const auto observe_opening_decoder = [&](GpuFileDecodeSource* source) {
+      return cancellation.observe_opening_decoder(source);
+    };
+    auto left = open_decode_source(left_input, start_frame, runtime, observe_opening_decoder);
     cancellation.throw_if_requested();
-    auto right = open_decode_source(right_input, start_frame, runtime);
+    auto right = open_decode_source(right_input, start_frame, runtime, observe_opening_decoder);
     cancellation.throw_if_requested();
     decoder.emplace(std::move(left), std::move(right),
                     GpuStereoDecodeConfig{.sync_offset = sync_offset,
