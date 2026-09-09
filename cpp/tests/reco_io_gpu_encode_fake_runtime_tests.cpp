@@ -1,4 +1,5 @@
 #include "reco/io/gpu_encode.hpp"
+#include "reco/io/gpu_preview.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -65,6 +66,24 @@ void expect_audio_error(Function&& function, std::string_view fragment, std::str
     std::cerr << "FAIL: " << message << " did not throw\n";
     ++failures;
   } catch (const AudioPassthroughError& error) {
+    if (std::string_view(error.what()).find(fragment) == std::string_view::npos) {
+      std::cerr << "FAIL: " << message << " missing error fragment: " << error.what() << '\n';
+      ++failures;
+    }
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: " << message << " threw unexpected exception: " << error.what() << '\n';
+    ++failures;
+  }
+}
+
+template <typename Function>
+void expect_preview_error(Function&& function, std::string_view fragment,
+                          std::string_view message) {
+  try {
+    function();
+    std::cerr << "FAIL: " << message << " did not throw\n";
+    ++failures;
+  } catch (const GpuPreviewError& error) {
     if (std::string_view(error.what()).find(fragment) == std::string_view::npos) {
       std::cerr << "FAIL: " << message << " missing error fragment: " << error.what() << '\n';
       ++failures;
@@ -1058,6 +1077,190 @@ void compressed_audio_stop_interrupts_discovery(const std::filesystem::path& eve
             "interrupted segment discovery releases every discoverer");
 }
 
+GpuPreviewConfig preview_config() {
+  return {
+      .width = 1280,
+      .height = 720,
+      .fps_numerator = 30,
+      .fps_denominator = 1,
+      .window_handle = 42,
+      .pool_capacity = 2,
+      .acquire_timeout = std::chrono::milliseconds(5),
+      .startup_timeout = std::chrono::milliseconds(5),
+  };
+}
+
+void gpu_preview_startup_failures_release_partial_resources(
+    const std::shared_ptr<const NvbufSurfaceRuntime>& runtime,
+    const std::filesystem::path& event_path) {
+  struct Failure {
+    std::string_view scenario;
+    std::string_view error;
+  };
+  constexpr Failure failures_to_test[] = {
+      {"init-error", "fake initialization failure"},
+      {"encode-parse-error", "fake parse failure"},
+      {"encode-parse-partial-error", "fake partial parse failure"},
+      {"encode-missing-source", "missing appsrc, overlay, or bus"},
+      {"encode-missing-preview-sink", "missing appsrc, overlay, or bus"},
+      {"encode-missing-bus", "missing appsrc, overlay, or bus"},
+      {"encode-state-error", "failed to enter PLAYING"},
+      {"encode-startup-timeout", "timed out"},
+      {"encode-startup-wrong-state", "timed out"},
+  };
+  for (const auto& failure : failures_to_test) {
+    std::filesystem::remove(event_path);
+    set_scenario(failure.scenario);
+    expect_preview_error([&] { (void)GpuPreviewSession::open(preview_config(), runtime); },
+                         failure.error, failure.scenario);
+    if (failure.scenario == "encode-parse-partial-error") {
+      expect_eq(count_event(read_events(event_path), "unref-pipeline"), 1U,
+                "partial preview parse pipeline is released");
+    }
+  }
+}
+
+void gpu_preview_presents_from_a_bounded_nvmm_pool(
+    const std::shared_ptr<const NvbufSurfaceRuntime>& runtime,
+    const std::filesystem::path& event_path) {
+  std::filesystem::remove(event_path);
+  set_scenario("encode-success");
+  auto trace = std::make_shared<Trace>();
+  auto preview = GpuPreviewSession::open(preview_config(), runtime, trace);
+  auto frame = preview.acquire_frame();
+  expect_true(frame.view().width() == 1280U && frame.view().height() == 720U,
+              "preview lease exposes its CUDA NV12 geometry");
+  preview.present(std::move(frame), 0, 33'333'333);
+  preview.stop();
+  expect_eq(trace->allocated.load(), 2U, "preview preallocates its bounded NVMM pool");
+  expect_eq(trace->submitted.load(), 1U, "preview submits one NVMM surface");
+  expect_eq(trace->released.load(), 1U, "preview surface returns through wrapped callback");
+  const auto events = read_events(event_path);
+  expect_eq(count_event(events, "overlay-window-42"), 1U,
+            "preview binds the GStreamer overlay to the Qt native window");
+  expect_eq(count_event(events, "push-buffer"), 1U,
+            "preview pushes the NVMM descriptor exactly once");
+}
+
+void gpu_preview_backpressure_releases_on_stop(
+    const std::shared_ptr<const NvbufSurfaceRuntime>& runtime) {
+  set_scenario("encode-pool-backpressure");
+  auto trace = std::make_shared<Trace>();
+  auto preview = GpuPreviewSession::open(preview_config(), runtime, trace);
+  for (std::uint64_t index = 0; index < 2; ++index) {
+    auto frame = preview.acquire_frame();
+    preview.present(std::move(frame), index, 1);
+  }
+  try {
+    (void)preview.acquire_frame();
+    std::cerr << "FAIL: bounded GPU preview pool did not time out\n";
+    ++failures;
+  } catch (const GpuPreviewError& error) {
+    expect_true(std::string_view(error.what()).find("timed out waiting") != std::string_view::npos,
+                "preview pool timeout is explicit");
+  }
+  preview.stop();
+  expect_eq(trace->released.load(), 2U, "preview stop releases retained downstream surfaces");
+  try {
+    (void)preview.acquire_frame();
+    std::cerr << "FAIL: stopped GPU preview accepted another frame\n";
+    ++failures;
+  } catch (const GpuPreviewError& error) {
+    expect_true(std::string_view(error.what()).find("no longer accepting") !=
+                    std::string_view::npos,
+                "stopped preview admission is closed");
+  }
+}
+
+void gpu_preview_rejects_timestamps_and_foreign_leases_without_consuming_them(
+    const std::shared_ptr<const NvbufSurfaceRuntime>& runtime) {
+  set_scenario("encode-success");
+  auto preview = GpuPreviewSession::open(preview_config(), runtime);
+  auto frame = preview.acquire_frame();
+  expect_preview_error([&] { preview.present(std::move(frame), 0, 0); }, "timestamps",
+                       "zero preview duration");
+  expect_true(static_cast<bool>(frame), "timestamp rejection retains the preview lease");
+  expect_preview_error(
+      [&] { preview.present(std::move(frame), std::numeric_limits<std::uint64_t>::max(), 1); },
+      "timestamps", "unset preview timestamp");
+  expect_preview_error(
+      [&] { preview.present(std::move(frame), std::numeric_limits<std::uint64_t>::max() - 1, 2); },
+      "timestamps", "overflowing preview timestamp");
+  preview.present(std::move(frame), 0, 1);
+
+  auto encoder = open_session(runtime);
+  auto foreign = encoder.acquire_frame();
+  expect_preview_error([&] { preview.present(std::move(foreign), 1, 1); }, "does not belong",
+                       "foreign encoder lease");
+  expect_true(static_cast<bool>(foreign), "foreign lease rejection does not consume its owner");
+}
+
+void gpu_preview_failures_are_sticky_and_release_pool_ownership(
+    const std::shared_ptr<const NvbufSurfaceRuntime>& runtime) {
+  {
+    set_scenario("encode-wrap-error");
+    auto trace = std::make_shared<Trace>();
+    auto preview = GpuPreviewSession::open(preview_config(), runtime, trace);
+    auto frame = preview.acquire_frame();
+    expect_preview_error([&] { preview.present(std::move(frame), 0, 1); }, "failed to wrap",
+                         "preview wrapped-buffer allocation failure");
+    expect_eq(trace->released.load(), 1U, "preview wrap failure returns the pool slot");
+  }
+  {
+    set_scenario("encode-push-error");
+    auto trace = std::make_shared<Trace>();
+    auto preview = GpuPreviewSession::open(preview_config(), runtime, trace);
+    auto frame = preview.acquire_frame();
+    expect_preview_error([&] { preview.present(std::move(frame), 0, 1); }, "flow status",
+                         "preview appsrc push failure");
+    expect_eq(trace->released.load(), 1U, "preview push rejection returns the pool slot");
+    expect_preview_error([&] { (void)preview.acquire_frame(); }, "flow status",
+                         "preview push rejection remains sticky");
+  }
+  {
+    set_scenario("encode-bus-error");
+    auto preview = GpuPreviewSession::open(preview_config(), runtime);
+    auto frame = preview.acquire_frame();
+    preview.present(std::move(frame), 0, 1);
+    expect_preview_error([&] { (void)preview.acquire_frame(); }, "fake encoder failure",
+                         "preview bus error is reported");
+    expect_preview_error([&] { (void)preview.acquire_frame(); }, "fake encoder failure",
+                         "preview bus error remains sticky");
+  }
+  {
+    set_scenario("encode-early-eos");
+    auto preview = GpuPreviewSession::open(preview_config(), runtime);
+    expect_preview_error([&] { (void)preview.acquire_frame(); }, "unexpected EOS",
+                         "preview rejects downstream EOS");
+  }
+}
+
+void gpu_preview_leases_survive_session_destruction(
+    const std::shared_ptr<const NvbufSurfaceRuntime>& runtime) {
+  set_scenario("encode-success");
+  auto trace = std::make_shared<Trace>();
+  std::optional<GpuEncodeFrameLease> outstanding;
+  {
+    auto preview = GpuPreviewSession::open(preview_config(), runtime, trace);
+    outstanding.emplace(preview.acquire_frame());
+  }
+  expect_true(outstanding->view().width() == 1280U,
+              "outstanding preview lease retains its CUDA NV12 view");
+  outstanding.reset();
+  expect_eq(trace->released.load(), 1U,
+            "last outstanding preview lease releases its retained pool");
+
+  set_scenario("encode-pool-backpressure");
+  trace = std::make_shared<Trace>();
+  {
+    auto preview = GpuPreviewSession::open(preview_config(), runtime, trace);
+    auto submitted = preview.acquire_frame();
+    preview.present(std::move(submitted), 0, 1);
+  }
+  expect_eq(trace->released.load(), 1U,
+            "preview destruction releases a downstream-retained surface");
+}
+
 } // namespace
 
 int main() {
@@ -1071,6 +1274,7 @@ int main() {
   set_environment("RECO_GLIB_DYLIB_PATH", gstreamer.string());
   set_environment("RECO_GSTPBUTILS_DYLIB_PATH", gstreamer.string());
   set_environment("RECO_GOBJECT_DYLIB_PATH", gstreamer.string());
+  set_environment("RECO_GSTVIDEO_DYLIB_PATH", gstreamer.string());
   set_environment("RECO_NVBUFSURFACE_DYLIB_PATH", nvbufsurface.string());
   set_environment("RECO_NVDS_UTILS_DYLIB_PATH", nvbufsurface.string());
   set_environment("RECO_CUDA_DRIVER_DYLIB_PATH", cuda.string());
@@ -1109,6 +1313,12 @@ int main() {
     compressed_audio_opening_observer_interrupts_discovery(event_path);
     compressed_audio_stop_interrupts_concurrent_read(event_path);
     compressed_audio_stop_interrupts_discovery(event_path);
+    gpu_preview_startup_failures_release_partial_resources(runtime, event_path);
+    gpu_preview_presents_from_a_bounded_nvmm_pool(runtime, event_path);
+    gpu_preview_backpressure_releases_on_stop(runtime);
+    gpu_preview_rejects_timestamps_and_foreign_leases_without_consuming_them(runtime);
+    gpu_preview_failures_are_sticky_and_release_pool_ownership(runtime);
+    gpu_preview_leases_survive_session_destruction(runtime);
   } catch (const std::exception& error) {
     std::cerr << "FAIL: unexpected top-level error: " << error.what() << '\n';
     ++failures;

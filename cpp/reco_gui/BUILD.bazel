@@ -4,6 +4,7 @@ cc_library(
     name = "reco_gui",
     srcs = [
         "src/app_model.cpp",
+        "src/gpu_preview_controller.cpp",
         "src/settings.cpp",
         "src/runtime.cpp",
         "src/telemetry.cpp",
@@ -11,6 +12,7 @@ cc_library(
     ],
     hdrs = [
         "include/reco/gui/app_model.hpp",
+        "include/reco/gui/gpu_preview_controller.hpp",
         "include/reco/gui/settings.hpp",
         "include/reco/gui/runtime.hpp",
         "include/reco/gui/telemetry.hpp",
@@ -20,7 +22,6 @@ cc_library(
     visibility = ["//visibility:public"],
     deps = [
         "//cpp/reco_core",
-        "//cpp/reco_detect",
         "//cpp/reco_io",
         "@nlohmann_json//:json",
     ],

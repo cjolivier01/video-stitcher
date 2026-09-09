@@ -19,6 +19,7 @@ cc_library(
         "//cpp/reco_core",
         "//cpp/reco_detect",
         "//cpp/reco_io",
+        "//cpp/reco_io:video_probe_worker_locator",
         "@rules_cc//cc/runfiles",
     ],
 )
@@ -30,6 +31,6 @@ cc_binary(
         "//cpp/reco_calibrate:reco_calibration_worker",
         "//cpp/reco_io:reco_video_probe_worker",
     ],
-    visibility = ["//cpp/tests:__pkg__"],
+    visibility = ["//visibility:public"],
     deps = [":reco_cli_lib"],
 )
