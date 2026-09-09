@@ -598,6 +598,83 @@ void timeout_is_end_to_end_and_reaps_the_worker() {
   expect_true(elapsed < std::chrono::seconds(2), "timeout includes bounded teardown");
 }
 
+void cancellation_interrupts_executable_snapshot_before_launch() {
+  const auto guardian_marker = temporary_path("cancelled-snapshot-guardian.pid");
+  std::filesystem::remove(guardian_marker);
+  EnvironmentValue snapshot_delay("RECO_FAKE_CALIBRATION_EXECUTABLE_SNAPSHOT_DELAY_MS", "3000");
+  EnvironmentValue guardian_ready("RECO_FAKE_CALIBRATION_GUARDIAN_READY_PATH",
+                                  guardian_marker.string());
+  auto request = lifecycle_request_fixture();
+  request.calibration_timeout_ns = 3'600'000'000'000ULL;
+  std::size_t cancellation_checks = 0;
+
+  const auto started = std::chrono::steady_clock::now();
+  bool cancelled = false;
+  try {
+    (void)run_gpu_calibration(request, ready_backends(), [&] {
+      ++cancellation_checks;
+      return cancellation_checks >= 5U;
+    });
+  } catch (const CalibrationCancelled&) {
+    cancelled = true;
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: executable snapshot cancellation returned the wrong error: " << error.what()
+              << '\n';
+    ++failures;
+  }
+
+  expect_true(cancelled, "executable snapshot reports explicit cancellation");
+  expect_true(cancellation_checks >= 5U,
+              "executable snapshot polls cancellation after launching its helper");
+  expect_true(std::chrono::steady_clock::now() - started < std::chrono::seconds(2),
+              "executable snapshot cancellation does not wait for a delayed chunk");
+  expect_true(!wait_for_pid_marker(guardian_marker, std::chrono::milliseconds(100)).has_value(),
+              "executable snapshot cancellation occurs before guardian launch");
+  std::filesystem::remove(guardian_marker);
+}
+
+void cancellation_terminates_the_active_worker() {
+  const auto marker = temporary_path("cancelled-worker.pid");
+  std::filesystem::remove(marker);
+  EnvironmentValue worker_marker("RECO_FAKE_CALIBRATION_WORKER_PID_PATH", marker.string());
+  EnvironmentValue cleanup_delay("RECO_FAKE_CALIBRATION_CGROUP_CLEANUP_DELAY_MS", "3000");
+  Scenario scenario("timeout");
+  auto request = lifecycle_request_fixture();
+  request.calibration_timeout_ns = 3'600'000'000'000ULL;
+  const auto cgroups_before = calibration_cgroups();
+  std::atomic<bool> cancel{false};
+  std::optional<pid_t> worker;
+  std::thread requester([&] {
+    worker = wait_for_pid_marker(marker, std::chrono::seconds(2));
+    cancel.store(true, std::memory_order_release);
+  });
+
+  const auto started = std::chrono::steady_clock::now();
+  bool cancelled = false;
+  try {
+    (void)run_gpu_calibration(request, ready_backends(),
+                              [&] { return cancel.exchange(false, std::memory_order_acq_rel); });
+  } catch (const CalibrationCancelled&) {
+    cancelled = true;
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: active calibration cancellation returned the wrong error: " << error.what()
+              << '\n';
+    ++failures;
+  }
+  requester.join();
+
+  expect_true(worker.has_value(), "active calibration worker reports its PID before cancellation");
+  expect_true(cancelled, "active calibration reports explicit cancellation");
+  expect_true(std::chrono::steady_clock::now() - started < std::chrono::seconds(3),
+              "active calibration cancellation returns within the cleanup bound");
+  if (worker.has_value()) {
+    wait_for_process_removal(*worker, "active calibration cancellation removes the worker");
+  }
+  expect_true(wait_for_cgroup_set(cgroups_before, std::chrono::seconds(5)),
+              "deferred cancellation cleanup removes its cgroups");
+  std::filesystem::remove(marker);
+}
+
 #if !defined(RECO_CALIBRATION_WIDE_ADDRESS_SANITIZER)
 void aggregate_host_memory_is_monitored() {
   Scenario scenario("memory");
@@ -963,22 +1040,55 @@ void caller_sigchld_policy_cannot_fake_success_or_steal_worker_ownership() {
   }
   expect_true(::sigaction(SIGCHLD, &original, nullptr) == 0, "SIGCHLD no-wait policy restores");
 
+  const auto guardian_marker = temporary_path("stable-parent-guardian.pid");
+  std::filesystem::remove(guardian_marker);
+  std::optional<pid_t> guardian;
+  std::optional<pid_t> guardian_parent;
+  {
+    EnvironmentValue guardian_ready("RECO_FAKE_CALIBRATION_GUARDIAN_READY_PATH",
+                                    guardian_marker.string());
+    EnvironmentValue guardian_delay("RECO_FAKE_CALIBRATION_GUARDIAN_DELAY_MS", "500");
+    std::thread observer([&] {
+      guardian = wait_for_pid_marker(guardian_marker, std::chrono::seconds(1));
+      if (guardian.has_value()) {
+        guardian_parent = process_parent(*guardian);
+      }
+    });
+    Scenario scenario("success");
+    try {
+      expect_eq(run_gpu_calibration(lifecycle_request_fixture(), ready_backends()).total_matches,
+                12U, "stable parent calibration succeeds");
+    } catch (const std::exception& error) {
+      std::cerr << "FAIL: stable parent calibration threw: " << error.what() << '\n';
+      ++failures;
+    }
+    observer.join();
+  }
+  expect_true(guardian.has_value(), "guardian reports its PID for parent verification");
+  expect_true(guardian_parent.has_value() && *guardian_parent != ::getpid(),
+              "guardian exit status is owned by a distinct process parent");
+  std::filesystem::remove(guardian_marker);
+
+  EnvironmentValue delayed_reap("RECO_FAKE_CALIBRATION_STABLE_PARENT_REAP_DELAY_MS", "20");
   std::atomic<bool> stop{false};
   std::thread thief([&] {
     while (!stop.load(std::memory_order_relaxed)) {
       int status = 0;
       (void)::waitpid(-1, &status, WNOHANG);
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      std::this_thread::yield();
     }
   });
   {
     Scenario scenario("success");
-    try {
-      expect_eq(run_gpu_calibration(request_fixture(), ready_backends()).total_matches, 12U,
-                "competing waitpid cannot steal calibration worker ownership");
-    } catch (const std::exception& error) {
-      std::cerr << "FAIL: competing waitpid threw: " << error.what() << '\n';
-      ++failures;
+    for (std::size_t attempt = 0; attempt < 16U; ++attempt) {
+      try {
+        expect_eq(run_gpu_calibration(lifecycle_request_fixture(), ready_backends()).total_matches,
+                  12U, "competing waitpid cannot steal calibration guardian ownership");
+      } catch (const std::exception& error) {
+        std::cerr << "FAIL: competing waitpid attempt " << attempt << " threw: " << error.what()
+                  << '\n';
+        ++failures;
+      }
     }
   }
   stop.store(true, std::memory_order_relaxed);
@@ -1525,6 +1635,8 @@ int main() {
   fake_worker = executable_runfile("cpp/tests/fake_calibration_worker");
   invalid_worker_paths_fail_before_launch();
 #if defined(__linux__)
+  run_case("executable snapshot cancellation",
+           cancellation_interrupts_executable_snapshot_before_launch);
   try {
     success_returns_the_bounded_result();
   } catch (const CalibrationExecutionError& error) {
@@ -1548,6 +1660,7 @@ int main() {
   run_case("delayed worker request", delayed_worker_request_io_obeys_the_deadline);
   run_case("worker failure containment", worker_failures_crashes_and_bad_frames_are_contained);
   run_case("end-to-end timeout", timeout_is_end_to_end_and_reaps_the_worker);
+  run_case("active cancellation", cancellation_terminates_the_active_worker);
 #if !defined(RECO_CALIBRATION_WIDE_ADDRESS_SANITIZER)
   run_case("aggregate memory monitoring", aggregate_host_memory_is_monitored);
   run_case("shared memory monitoring", shared_mapping_memory_is_monitored);

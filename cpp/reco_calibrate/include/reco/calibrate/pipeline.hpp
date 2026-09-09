@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -92,6 +93,15 @@ public:
   explicit CalibrationExecutionError(const std::string& message) : std::runtime_error(message) {}
 };
 
+/// Cooperative cancellation request observed by the calibration supervisor.
+using CalibrationCancellationRequested = std::function<bool()>;
+
+/// Calibration termination requested by its caller.
+class CalibrationCancelled final : public CalibrationExecutionError {
+public:
+  CalibrationCancelled() : CalibrationExecutionError("calibration cancelled") {}
+};
+
 [[nodiscard]] std::optional<std::string>
 validate_gpu_calibration_request(const GpuCalibrationRequest& request);
 /// Validates probe metadata for indexed calibration. Rejects estimated frame counts and
@@ -123,8 +133,11 @@ build_gpu_calibration_plan(const GpuCalibrationRequest& request,
     const reco::core::CameraParams& right_params, const CalibrationConfig& config,
     std::int64_t sync_offset = 0);
 /// Runs file-backed calibration in a bounded worker process. The worker path must be absolute.
-[[nodiscard]] CalibrationResult run_gpu_calibration(const GpuCalibrationRequest& request,
-                                                    const CalibrationBackendStatus& backends);
-[[nodiscard]] CalibrationResult run_gpu_calibration(const GpuCalibrationRequest& request);
+[[nodiscard]] CalibrationResult
+run_gpu_calibration(const GpuCalibrationRequest& request, const CalibrationBackendStatus& backends,
+                    const CalibrationCancellationRequested& cancellation_requested = {});
+[[nodiscard]] CalibrationResult
+run_gpu_calibration(const GpuCalibrationRequest& request,
+                    const CalibrationCancellationRequested& cancellation_requested = {});
 
 } // namespace reco::calibrate

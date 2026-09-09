@@ -8,15 +8,19 @@
 #include "reco/io/gstreamer.hpp"
 #include "reco/io/nvmm.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -28,6 +32,30 @@ using namespace reco::io;
 bool require_cuda() {
   const char* value = std::getenv("RECO_REQUIRE_CUDA_TEST");
   return value != nullptr && std::string_view(value) == "1";
+}
+
+std::filesystem::path probe_worker_runfile() {
+  const char* workspace = std::getenv("TEST_WORKSPACE");
+  if (workspace == nullptr || workspace[0] == '\0') {
+    throw std::runtime_error("TEST_WORKSPACE is not set");
+  }
+  std::string error;
+  std::unique_ptr<rules_cc::cc::runfiles::Runfiles> runfiles(
+      rules_cc::cc::runfiles::Runfiles::CreateForTest(&error));
+  if (!runfiles) {
+    throw std::runtime_error("failed to initialize Bazel runfiles: " + error);
+  }
+#if defined(_WIN32)
+  constexpr std::string_view executable = "cpp/reco_io/reco_video_probe_worker.exe";
+#else
+  constexpr std::string_view executable = "cpp/reco_io/reco_video_probe_worker";
+#endif
+  const auto logical_path = std::string(workspace) + "/" + std::string(executable);
+  const auto resolved = std::filesystem::path(runfiles->Rlocation(logical_path));
+  if (resolved.empty() || !std::filesystem::is_regular_file(resolved)) {
+    throw std::runtime_error("video probe worker runfile not found");
+  }
+  return std::filesystem::absolute(resolved);
 }
 
 class TemporaryDirectory {
@@ -70,6 +98,78 @@ public:
   std::atomic<std::uint32_t> released{0};
 };
 
+struct GpuLumaStatistics {
+  std::uint64_t sum = 0;
+  std::uint64_t sum_of_squares = 0;
+  std::uint64_t checksum = 0;
+};
+
+class GpuLumaInspector final {
+public:
+  GpuLumaInspector(const CudaBackend& backend, const NvrtcCompiler& compiler) : backend_(backend) {
+    constexpr std::string_view source = R"cuda(
+extern "C" __global__ void reco_luma_statistics(const unsigned char* luma,
+                                                 unsigned long long pitch,
+                                                 unsigned int width,
+                                                 unsigned int height,
+                                                 unsigned long long* output) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  unsigned long long sum = 0;
+  unsigned long long sum_of_squares = 0;
+  unsigned long long checksum = 1469598103934665603ULL;
+  for (unsigned int y = 0; y < height; ++y) {
+    const unsigned char* row = luma + static_cast<unsigned long long>(y) * pitch;
+    for (unsigned int x = 0; x < width; ++x) {
+      const unsigned long long value = row[x];
+      sum += value;
+      sum_of_squares += value * value;
+      checksum ^= value + static_cast<unsigned long long>(x) * 17ULL +
+                  static_cast<unsigned long long>(y) * 257ULL;
+      checksum *= 1099511628211ULL;
+    }
+  }
+  output[0] = sum;
+  output[1] = sum_of_squares;
+  output[2] = checksum;
+}
+)cuda";
+    const auto capability = backend_.compute_capability();
+    const auto architecture =
+        compiler.select_architecture(capability.major * 10 + capability.minor);
+    NvrtcCompileOptions options;
+    options.values = {"--std=c++17", "--gpu-architecture=compute_" + std::to_string(architecture)};
+    const auto compiled = compiler.compile(source, "reco_gpu_encode_luma_statistics.cu", options);
+    module_ = backend_.load_module_from_ptx(compiled.ptx);
+    kernel_ = module_.load_kernel("reco_luma_statistics");
+  }
+
+  [[nodiscard]] GpuLumaStatistics inspect(const CudaNv12FrameView& frame) const {
+    auto output = backend_.allocate(sizeof(GpuLumaStatistics));
+    backend_.memset_d8(output, 0);
+    auto luma = frame.y_plane().ptr();
+    auto pitch = static_cast<std::uint64_t>(frame.y_plane().pitch_bytes());
+    auto width = frame.width();
+    auto height = frame.height();
+    auto output_ptr = output.ptr();
+    std::array<void*, 5> arguments{&luma, &pitch, &width, &height, &output_ptr};
+    kernel_.launch_and_synchronize({.grid = {1, 1, 1}, .block = {1, 1, 1}}, arguments);
+    const auto bytes = backend_.copy_to_host(output);
+    if (bytes.size() != sizeof(GpuLumaStatistics)) {
+      throw std::runtime_error("GPU luma statistics returned an invalid scalar result");
+    }
+    GpuLumaStatistics statistics;
+    std::memcpy(&statistics, bytes.data(), sizeof(statistics));
+    return statistics;
+  }
+
+private:
+  CudaBackend backend_;
+  CudaModule module_;
+  CudaKernel kernel_;
+};
+
 std::string availability_error() {
   if (const auto error = CudaBackend::availability_error(); !error.empty()) {
     return "CUDA: " + error;
@@ -89,7 +189,29 @@ std::string availability_error() {
   return {};
 }
 
-void run_round_trip() {
+void verify_empty_video_track_is_rejected(const std::filesystem::path& worker) {
+  TemporaryDirectory temporary;
+  const auto fixture = temporary.path() / "empty-video-track-with-audio.mp4";
+  reco::tests::materialize_base64_fixture(
+      reco::tests::find_runfile("empty_video_track_with_audio_mp4.b64"), fixture);
+  try {
+    verify_muxed_gpu_video_output(fixture, Codec::H264, Format::Mp4, worker,
+                                  std::chrono::seconds(10));
+  } catch (const GpuEncodeError& error) {
+    const std::string_view message(error.what());
+    if (message.find("found no H.264, HEVC, or AV1 moving-video stream") !=
+            std::string_view::npos ||
+        message.find("reason not-linked") != std::string_view::npos) {
+      return;
+    }
+    throw std::runtime_error("zero-sample video track returned the wrong verification error: " +
+                             std::string(error.what()));
+  }
+  throw std::runtime_error(
+      "video track with zero samples and nonzero audio duration passed output verification");
+}
+
+void run_round_trip(const std::filesystem::path& worker) {
   // NVENC rejects sub-minimum macroblock geometries on current discrete GPUs.
   constexpr std::uint32_t width = 320;
   constexpr std::uint32_t height = 180;
@@ -143,8 +265,9 @@ void run_round_trip() {
       CudaPitchedPlaneView(rgba_storage.buffer.ptr(), rgba_storage.buffer.size(),
                            rgba_storage.pitch, width * 4U, height, context),
       width, height);
-  auto converter = CudaRgbaToNv12Converter::create({.width = width, .height = height}, backend,
-                                                   NvrtcCompiler::create());
+  auto compiler = NvrtcCompiler::create();
+  auto converter =
+      CudaRgbaToNv12Converter::create({.width = width, .height = height}, backend, compiler);
   std::vector<std::uint8_t> rgba(static_cast<std::size_t>(width) * height * 4U);
   for (std::uint32_t frame_index = 0; frame_index < frame_count; ++frame_index) {
     for (std::uint32_t y = 0; y < height; ++y) {
@@ -167,7 +290,7 @@ void run_round_trip() {
     encoder.submit_frame(std::move(output_frame), frame_index * duration_ns, duration_ns);
   }
   encoder.finish();
-  verify_muxed_gpu_video_output(output.string(), std::chrono::seconds(5));
+  verify_muxed_gpu_video_output(output, Codec::H264, Format::Mp4, worker, std::chrono::seconds(10));
 
   if (!std::filesystem::is_regular_file(output) || std::filesystem::file_size(output) < 1024U) {
     throw std::runtime_error("GPU encoder did not produce a usable output file");
@@ -184,16 +307,42 @@ void run_round_trip() {
                                                         .max_buffers = 2,
                                                         .read_timeout_ns = 10'000'000'000ULL},
                                                        runtime);
-  const auto decoded = decoder->read();
-  if (decoded.status != GpuDecodeFrameStatus::Frame || !decoded.frame.has_value() ||
-      decoded.frame->visible_width != width || decoded.frame->visible_height != height) {
-    throw std::runtime_error("NVDEC did not return the encoded frame geometry");
-  }
-  const auto mapped = map_gpu_decoded_frame_to_cuda_lease(*decoded.frame);
-  if (mapped.view().width() != width || mapped.view().height() != height) {
-    throw std::runtime_error("round-trip decode did not remain CUDA/NVMM resident");
+  GpuLumaInspector inspector(backend, compiler);
+  std::vector<GpuLumaStatistics> statistics;
+  constexpr std::size_t inspected_frame_count = 3;
+  statistics.reserve(inspected_frame_count);
+  for (std::size_t index = 0; index < inspected_frame_count; ++index) {
+    const auto decoded = decoder->read();
+    if (decoded.status != GpuDecodeFrameStatus::Frame || !decoded.frame.has_value() ||
+        decoded.frame->visible_width != width || decoded.frame->visible_height != height) {
+      throw std::runtime_error("NVDEC did not return the encoded frame geometry");
+    }
+    const auto mapped = map_gpu_decoded_frame_to_cuda_lease(*decoded.frame);
+    if (mapped.view().width() != width || mapped.view().height() != height) {
+      throw std::runtime_error("round-trip decode did not remain CUDA/NVMM resident");
+    }
+    if (mapped.view().color_matrix() != YuvColorMatrix::Bt709 ||
+        mapped.view().color_range() != YuvColorRange::Limited) {
+      throw std::runtime_error("round-trip decode did not preserve BT.709 limited-range metadata");
+    }
+    statistics.push_back(inspector.inspect(mapped.view()));
   }
   decoder->request_stop();
+
+  const auto pixel_count = static_cast<std::uint64_t>(width) * height;
+  for (const auto& frame : statistics) {
+    const auto count = static_cast<long double>(pixel_count);
+    const auto mean = static_cast<long double>(frame.sum) / count;
+    const auto variance = static_cast<long double>(frame.sum_of_squares) / count - mean * mean;
+    if (!(variance > 1.0L)) {
+      throw std::runtime_error("GPU encode/NVDEC round trip produced a uniform luma frame");
+    }
+  }
+  for (std::size_t index = 1; index < statistics.size(); ++index) {
+    if (statistics[index].checksum == statistics[index - 1U].checksum) {
+      throw std::runtime_error("GPU encode/NVDEC round trip produced stale frame content");
+    }
+  }
 
   auto remuxed_audio = AudioPassthroughSource::open(
       {.segments = {{.path = output.string(), .video_duration_ns = 10'000'000'000ULL}}});
@@ -206,6 +355,13 @@ void run_round_trip() {
 } // namespace
 
 int main() {
+  std::filesystem::path worker;
+  try {
+    worker = probe_worker_runfile();
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: video probe worker resolution: " << error.what() << '\n';
+    return EXIT_FAILURE;
+  }
   const auto unavailable = availability_error();
   if (!unavailable.empty()) {
     if (require_cuda()) {
@@ -216,7 +372,8 @@ int main() {
     return EXIT_SUCCESS;
   }
   try {
-    run_round_trip();
+    run_round_trip(worker);
+    verify_empty_video_track_is_rejected(worker);
     std::cout << "GPU encode/NVDEC round trip passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception& error) {

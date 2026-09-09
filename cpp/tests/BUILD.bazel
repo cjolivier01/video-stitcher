@@ -180,6 +180,16 @@ cc_test(
 )
 
 cc_test(
+    name = "reco_io_stable_media_file_tests",
+    size = "small",
+    srcs = ["reco_io_stable_media_file_tests.cpp"],
+    deps = [
+        "//cpp/reco_core",
+        "//cpp/reco_io",
+    ],
+)
+
+cc_test(
     name = "reco_io_gstreamer_tests",
     size = "small",
     srcs = [
@@ -223,7 +233,11 @@ cc_test(
         "base64_fixture.hpp",
         "reco_io_gpu_encode_runtime_tests.cpp",
     ],
-    data = ["fixtures/audio_only_mp4.b64"],
+    data = [
+        "fixtures/audio_only_mp4.b64",
+        "fixtures/empty_video_track_with_audio_mp4.b64",
+        "//cpp/reco_io:reco_video_probe_worker",
+    ],
     deps = [
         "//cpp/reco_core",
         "//cpp/reco_io",
@@ -239,6 +253,7 @@ cc_test(
         ":libfake_cuda_driver.so",
         ":libfake_gstreamer_runtime.so",
         ":libfake_nvbufsurface.so",
+        "//cpp/reco_io:reco_video_probe_worker",
     ],
     deps = ["//cpp/reco_io"],
 )
@@ -572,7 +587,7 @@ cc_test(
     ],
     env = {
         "ASAN_OPTIONS": "detect_leaks=0",
-        "TSAN_OPTIONS": "atexit_sleep_ms=0",
+        "TSAN_OPTIONS": "atexit_sleep_ms=0:die_after_fork=0",
     },
     tags = [
         "exclusive",

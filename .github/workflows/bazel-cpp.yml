@@ -87,6 +87,7 @@ jobs:
           //cpp/tests:reco_io_gpu_decode_session_tests
           //cpp/tests:reco_io_gstreamer_tests
           //cpp/tests:reco_io_nvmm_cuda_interop_tests
+          //cpp/tests:reco_io_stable_media_file_tests
       - name: Test GPU output with ASan
         run: >-
           bazel test --jobs=2 --local_test_jobs=1 --config=asan
@@ -160,6 +161,7 @@ jobs:
           //cpp/tests:reco_io_gpu_encode_runtime_tests
           //cpp/tests:reco_io_gstreamer_tests
           //cpp/tests:reco_io_nvmm_cuda_interop_tests
+          //cpp/tests:reco_io_stable_media_file_tests
       - name: Test process containment with TSan
         run: >-
           bazel test --jobs=2 --local_test_jobs=1 --config=tsan
@@ -254,11 +256,13 @@ jobs:
           trap 'rm -rf "$work_dir"' EXIT
           ffmpeg -hide_banner -loglevel error \
             -f lavfi -i 'testsrc2=size=1920x720:rate=30:duration=2' \
+            -f lavfi -i 'sine=frequency=1000:sample_rate=48000:duration=2' \
             -filter_complex \
-            '[0:v]setpts=PTS+5/TB,split=2[left_src][right_src];[left_src]crop=1280:720:0:0,format=yuv420p[left];[right_src]crop=1280:720:640:0,format=yuv420p[right]' \
-            -map '[left]' -c:v libx264 -preset ultrafast -g 30 -bf 0 -movflags +faststart \
+            '[0:v]setpts=PTS+5/TB,split=2[left_src][right_src];[left_src]crop=1280:720:0:0,format=yuv420p[left];[right_src]crop=1280:720:640:0,format=yuv420p[right];[1:a]asetpts=PTS+5/TB[audio]' \
+            -map '[left]' -map '[audio]' -c:v libx264 -preset ultrafast -g 30 -bf 0 \
+            -c:a aac -movflags +faststart \
             "$work_dir/left.mp4" \
-            -map '[right]' -c:v libx264 -preset ultrafast -g 30 -bf 0 -movflags +faststart \
+            -map '[right]' -an -c:v libx264 -preset ultrafast -g 30 -bf 0 -movflags +faststart \
             "$work_dir/right.mp4"
           stream_start="$(ffprobe -v error -select_streams v:0 \
             -show_entries stream=start_time -of default=noprint_wrappers=1:nokey=1 \
@@ -294,6 +298,47 @@ jobs:
           test "$(ffprobe -v error -select_streams v:0 \
             -show_entries stream=codec_type -of default=noprint_wrappers=1:nokey=1 \
             "$work_dir/stitched.mp4")" = "video"
+          test "$(ffprobe -v error -select_streams a:0 \
+            -show_entries stream=duration -of default=noprint_wrappers=1:nokey=1 \
+            "$work_dir/stitched.mp4")" = "0.100000"
+
+          printf '%s\n' 'existing destination' >"$work_dir/cancelled.mp4"
+          reco_binary="$(bazel --output_base="$RUNNER_TEMP/reco-bazel-output" info bazel-bin)/cpp/apps/reco_cli/reco"
+          "$reco_binary" stitch "$work_dir/left.mp4" "$work_dir/right.mp4" \
+            --calibration "$work_dir/match.json" \
+            --max-frames 60 \
+            --output "$work_dir/cancelled.mp4" \
+            >"$work_dir/cancelled.log" 2>&1 &
+          stitch_pid=$!
+          staging_ready=false
+          for _ in $(seq 1 100); do
+            if find "$work_dir" -maxdepth 1 -name '.reco-stitch-*' -print -quit | grep -q .; then
+              staging_ready=true
+              break
+            fi
+            kill -0 "$stitch_pid"
+            sleep 0.05
+          done
+          test "$staging_ready" = true
+          sleep 0.25
+          kill -INT "$stitch_pid"
+          if timeout 15s tail --pid="$stitch_pid" -f /dev/null; then
+            true
+          else
+            kill -KILL "$stitch_pid" || true
+            wait "$stitch_pid" || true
+            cat "$work_dir/cancelled.log"
+            exit 1
+          fi
+          if wait "$stitch_pid"; then
+            stitch_status=0
+          else
+            stitch_status=$?
+          fi
+          test "$stitch_status" = 130
+          test "$(cat "$work_dir/cancelled.mp4")" = 'existing destination'
+          test -z "$(find "$work_dir" -maxdepth 1 -name '.reco-stitch-*' -print -quit)"
+          grep -qx 'cancelled' "$work_dir/cancelled.log"
 
   jetson-nvmm-hardware-conditional:
     name: Bazel C++ Jetson NVMM stitch (hardware-conditional)

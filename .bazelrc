@@ -7,6 +7,7 @@ test --test_output=errors
 build:asan --copt=-fsanitize=address --linkopt=-fsanitize=address
 build:ubsan --copt=-fsanitize=undefined --linkopt=-fsanitize=undefined
 build:tsan --copt=-fsanitize=thread --linkopt=-fsanitize=thread
+build:no-elide-constructors --cxxopt=-fno-elide-constructors
 
 build:profiling --define reco_profiling=true
 build:ffmpeg --define reco_ffmpeg=true

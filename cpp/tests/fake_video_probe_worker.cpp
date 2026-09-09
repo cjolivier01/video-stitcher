@@ -789,7 +789,7 @@ int main(int argc, char** argv) {
       const bool negative = std::strcmp(scenario, "negative-metadata") == 0;
       const bool oversized = std::strcmp(scenario, "oversized-metadata") == 0;
       response = {
-          {"protocol_version", 5},
+          {"protocol_version", 6},
           {"ok", true},
           {"width",
            negative ? nlohmann::json(-2)

@@ -204,17 +204,12 @@ struct FakeMainContext {
 };
 
 struct FakeDiscovererInfo : FakeObject {
-  explicit FakeDiscovererInfo(bool has_audio_value, bool has_video_value = true)
-      : FakeObject(ObjectKind::DiscovererInfo), has_audio(has_audio_value),
-        has_video(has_video_value) {}
+  explicit FakeDiscovererInfo(bool has_audio_value)
+      : FakeObject(ObjectKind::DiscovererInfo), has_audio(has_audio_value) {}
   bool has_audio = false;
-  bool has_video = true;
 };
 
-struct FakeDiscovererStreamInfo {
-  std::uint32_t width = 1280;
-  std::uint32_t height = 720;
-};
+struct FakeDiscovererStreamInfo {};
 
 struct GListAbi {
   void* data = nullptr;
@@ -247,6 +242,7 @@ struct FakePipeline : FakeObject {
   std::string description;
   std::atomic<bool> eos_sent{false};
   std::uint32_t pushed_buffers = 0;
+  std::mutex retained_buffers_mutex;
   std::vector<FakeWrappedBuffer*> retained_buffers;
 };
 
@@ -644,8 +640,11 @@ void release_retained_buffers(FakePipeline* pipeline) {
   if (pipeline == nullptr) {
     return;
   }
-  auto retained = std::move(pipeline->retained_buffers);
-  pipeline->retained_buffers.clear();
+  std::vector<FakeWrappedBuffer*> retained;
+  {
+    std::lock_guard lock(pipeline->retained_buffers_mutex);
+    retained.swap(pipeline->retained_buffers);
+  }
   for (auto* buffer : retained) {
     release_wrapped_buffer(buffer);
   }
@@ -878,8 +877,22 @@ RECO_FAKE_EXPORT void* gst_parse_launch(const char* description, GErrorAbi** err
          : audio_demux  ? "parse-audio"
          : parser_probe ? "parse-probe"
                         : "parse-decoder");
-  if (parser_probe && std::strstr(description, "video/x-h264;video/x-h265") != nullptr) {
+  if (parser_probe) {
+    record(std::strstr(description, "fdsrc fd=") != nullptr ? "probe-fd-source"
+                                                            : "probe-file-source");
+  }
+  if (parser_probe && (std::strstr(description, "video/x-h264") != nullptr ||
+                       std::strstr(description, "video/x-h265") != nullptr)) {
     record("probe-codec-filter");
+  }
+  if (parser_probe &&
+      (std::strstr(description, "caps=\"video/x-h264\" ! identity name=container_info") !=
+           nullptr ||
+       std::strstr(description, "caps=\"video/x-h265\" ! identity name=container_info") !=
+           nullptr ||
+       std::strstr(description, "caps=\"video/x-av1\" ! identity name=container_info") !=
+           nullptr)) {
+    record("probe-exact-codec-filter");
   }
   if (parser_probe && std::strstr(description, "parsebin") != nullptr) {
     record("probe-parsebin");
@@ -897,10 +910,18 @@ RECO_FAKE_EXPORT void* gst_parse_launch(const char* description, GErrorAbi** err
   if (parser_probe && std::strstr(description, "h265parse") != nullptr) {
     record("probe-h265-parser");
   }
+  if (parser_probe && std::strstr(description, "av1parse") != nullptr) {
+    record("probe-av1-parser");
+  }
+  if (parser_probe && std::strstr(description, "flvdemux") != nullptr) {
+    record("probe-flv-demux");
+  }
   if (parser_probe && std::strstr(description, "video/x-raw") != nullptr) {
     record("raw-video-caps");
   }
-  if (description != nullptr && std::strstr(description, "nvv4l2decoder") != nullptr) {
+  if (description != nullptr && (std::strstr(description, "decodebin") != nullptr ||
+                                 std::strstr(description, "nvv4l2decoder") != nullptr ||
+                                 std::strstr(description, "avdec_") != nullptr)) {
     record("decoder-element");
   }
   if (scenario() == "parse-error" || scenario() == "probe-parse-error" ||
@@ -1043,6 +1064,13 @@ RECO_FAKE_EXPORT int gst_element_set_state(void* pipeline_pointer, int state) {
     return 0;
   }
   pipeline->state = state;
+  if (state == 1 && pipeline->encoder && scenario() == "encode-stop-blocked-open") {
+    {
+      std::lock_guard lock(pipeline->flush_mutex);
+      pipeline->flush_started = true;
+    }
+    pipeline->flush_changed.notify_all();
+  }
   if (state == 4 && scenario() == "retained-frame-running" && !pipeline->decode_thread.joinable()) {
     pipeline->decode_thread = std::thread([pipeline] {
       std::unique_lock lock(pipeline->flush_mutex);
@@ -1110,6 +1138,12 @@ RECO_FAKE_EXPORT int gst_element_get_state(void* pipeline_pointer, int* state, i
       *state = 2;
     }
     return 2;
+  }
+  if (pipeline->encoder && scenario() == "encode-stop-blocked-open") {
+    std::unique_lock lock(pipeline->flush_mutex);
+    record("encode-get-state-blocked");
+    pipeline->flush_changed.wait(lock, [&] { return pipeline->flush_started; });
+    record("encode-get-state-unblocked");
   }
   if (pipeline->encoder && scenario() == "encode-startup-timeout") {
     if (state != nullptr) {
@@ -1365,8 +1399,8 @@ RECO_FAKE_EXPORT int gst_element_seek_simple(void* pipeline_pointer, int format,
     ++static_cast<FakePipeline*>(pipeline_pointer)->seek_generation;
     return 1;
   }
-  if (format != 3 || target < 0 || scenario() == "probe-seek-unsupported" ||
-      scenario() == "probe-durationless-unseekable-15") {
+  if (format != 3 || target < 0 || scenario() == "audio-seek-error" ||
+      scenario() == "probe-seek-unsupported" || scenario() == "probe-durationless-unseekable-15") {
     return 0;
   }
   static_cast<FakePipeline*>(pipeline_pointer)->seek_target_ns = target;
@@ -1527,8 +1561,7 @@ RECO_FAKE_EXPORT void* gst_discoverer_discover_uri(void*, const char* uri, GErro
   record("discover-audio");
   const bool silent_middle = scenario() == "audio-silent-middle" && uri != nullptr &&
                              std::string_view(uri).find("silent") != std::string_view::npos;
-  return new FakeDiscovererInfo(scenario() != "audio-no-stream" && !silent_middle,
-                                scenario() != "encoded-output-no-video");
+  return new FakeDiscovererInfo(scenario() != "audio-no-stream" && !silent_middle);
 }
 
 RECO_FAKE_EXPORT void* g_main_context_new() { return new FakeMainContext; }
@@ -1584,8 +1617,7 @@ RECO_FAKE_EXPORT int g_main_context_iteration(void* context_pointer, int may_blo
   record("discover-audio");
   const bool silent_middle =
       scenario() == "audio-silent-middle" && uri.find("silent") != std::string::npos;
-  auto* info = new FakeDiscovererInfo(scenario() != "audio-no-stream" && !silent_middle,
-                                      scenario() != "encoded-output-no-video");
+  auto* info = new FakeDiscovererInfo(scenario() != "audio-no-stream" && !silent_middle);
   if (callback != nullptr) {
     callback(discoverer, info, nullptr, callback_data);
   }
@@ -1611,10 +1643,6 @@ RECO_FAKE_EXPORT void g_main_context_unref(void* context) {
 
 RECO_FAKE_EXPORT int gst_discoverer_info_get_result(const void*) { return 0; }
 
-RECO_FAKE_EXPORT std::uint64_t gst_discoverer_info_get_duration(const void*) {
-  return scenario() == "encoded-output-zero-duration" ? 0 : 1'000'000'000ULL;
-}
-
 RECO_FAKE_EXPORT void* gst_discoverer_info_get_audio_streams(void* info_pointer) {
   const auto* info = static_cast<FakeDiscovererInfo*>(info_pointer);
   return info != nullptr && info->has_audio
@@ -1622,29 +1650,10 @@ RECO_FAKE_EXPORT void* gst_discoverer_info_get_audio_streams(void* info_pointer)
              : nullptr;
 }
 
-RECO_FAKE_EXPORT void* gst_discoverer_info_get_video_streams(void* info_pointer) {
-  const auto* info = static_cast<FakeDiscovererInfo*>(info_pointer);
-  return info != nullptr && info->has_video
-             ? static_cast<void*>(new GListAbi{
-                   .data =
-                       new FakeDiscovererStreamInfo{
-                           .width = scenario() == "encoded-output-zero-geometry" ? 0U : 1280U,
-                           .height = scenario() == "encoded-output-zero-geometry" ? 0U : 720U}})
-             : nullptr;
-}
-
 RECO_FAKE_EXPORT void gst_discoverer_stream_info_list_free(void* streams) {
   auto* list = static_cast<GListAbi*>(streams);
   delete static_cast<FakeDiscovererStreamInfo*>(list->data);
   delete list;
-}
-
-RECO_FAKE_EXPORT std::uint32_t gst_discoverer_video_info_get_width(const void* stream) {
-  return static_cast<const FakeDiscovererStreamInfo*>(stream)->width;
-}
-
-RECO_FAKE_EXPORT std::uint32_t gst_discoverer_video_info_get_height(const void* stream) {
-  return static_cast<const FakeDiscovererStreamInfo*>(stream)->height;
 }
 
 RECO_FAKE_EXPORT void* gst_pad_get_current_caps(void* pad_pointer) {
@@ -1841,7 +1850,7 @@ RECO_FAKE_EXPORT void* gst_app_sink_try_pull_sample(void* sink_pointer, std::uin
       sink->observed_seek_generation = sink->pipeline->seek_generation;
       sink->probe_pulls_since_seek = 0;
     }
-    if (scenario() == "probe-no-supported-video") {
+    if (scenario() == "probe-no-supported-video" || scenario() == "probe-video-caps-zero-samples") {
       sink->probe_eos = true;
       return nullptr;
     }
@@ -2583,7 +2592,9 @@ RECO_FAKE_EXPORT void* gst_caps_get_structure(const void* caps, std::uint32_t in
 }
 
 RECO_FAKE_EXPORT const char* gst_structure_get_name(const void*) {
-  return scenario() == "probe-wrong-codec-caps" ? "video/x-vp9" : "video/x-h264";
+  return scenario() == "probe-wrong-codec-caps"        ? "video/x-vp9"
+         : scenario() == "probe-av1-exact-frame-count" ? "video/x-av1"
+                                                       : "video/x-h264";
 }
 
 RECO_FAKE_EXPORT int gst_structure_get_boolean(const void*, const char* field, int* value) {
@@ -2599,10 +2610,14 @@ RECO_FAKE_EXPORT const char* gst_structure_get_string(const void*, const char* f
     return nullptr;
   }
   if (std::strcmp(field, "stream-format") == 0) {
-    return scenario() == "probe-avc-caps" ? "avc" : "byte-stream";
+    return scenario() == "probe-avc-caps"                ? "avc"
+           : scenario() == "probe-av1-exact-frame-count" ? "obu-stream"
+                                                         : "byte-stream";
   }
   if (std::strcmp(field, "alignment") == 0) {
-    return scenario() == "probe-nal-caps" ? "nal" : "au";
+    return scenario() == "probe-nal-caps"                ? "nal"
+           : scenario() == "probe-av1-exact-frame-count" ? "frame"
+                                                         : "au";
   }
   return nullptr;
 }
@@ -2715,6 +2730,7 @@ RECO_FAKE_EXPORT int gst_app_src_push_buffer(void* source_pointer, void* buffer_
       (source->audio && scenario() == "encode-audio-backpressure") ||
       scenario() == "encode-finalize-timeout" || scenario() == "encode-eos-rejected" ||
       scenario() == "encode-bus-error") {
+    std::lock_guard lock(pipeline->retained_buffers_mutex);
     pipeline->retained_buffers.push_back(buffer);
   } else {
     release_wrapped_buffer(buffer);

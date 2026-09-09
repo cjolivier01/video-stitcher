@@ -1563,14 +1563,28 @@ std::unique_ptr<GpuFileDecodeSource> open_gstreamer_gpu_file_decode_source_inter
 
 std::unique_ptr<GpuFileDecodeSource>
 open_gstreamer_gpu_file_decode_source(GpuFileDecodeConfig config, NvbufSurfaceAbi abi) {
-  return detail::open_gstreamer_gpu_file_decode_source_interruptibly(std::move(config), abi, {});
+  return open_gstreamer_gpu_file_decode_source(std::move(config), abi, {});
+}
+
+std::unique_ptr<GpuFileDecodeSource>
+open_gstreamer_gpu_file_decode_source(GpuFileDecodeConfig config, NvbufSurfaceAbi abi,
+                                      const GpuDecodeOpeningSourceObserver& observer) {
+  return detail::open_gstreamer_gpu_file_decode_source_interruptibly(std::move(config), abi,
+                                                                     observer);
 }
 
 std::unique_ptr<GpuFileDecodeSource>
 open_gstreamer_gpu_file_decode_source(GpuFileDecodeConfig config,
                                       std::shared_ptr<const NvbufSurfaceRuntime> runtime) {
+  return open_gstreamer_gpu_file_decode_source(std::move(config), std::move(runtime), {});
+}
+
+std::unique_ptr<GpuFileDecodeSource>
+open_gstreamer_gpu_file_decode_source(GpuFileDecodeConfig config,
+                                      std::shared_ptr<const NvbufSurfaceRuntime> runtime,
+                                      const GpuDecodeOpeningSourceObserver& observer) {
   return detail::open_gstreamer_gpu_file_decode_source_interruptibly(std::move(config),
-                                                                     std::move(runtime), {});
+                                                                     std::move(runtime), observer);
 }
 
 } // namespace reco::io

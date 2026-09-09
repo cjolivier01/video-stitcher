@@ -34,6 +34,7 @@ void* mapped_device_pointer(std::uint64_t descriptor) {
 std::mutex cuda_buffers_mutex;
 std::unordered_map<void*, std::unique_ptr<abi::CudaBuffer>> cuda_buffers;
 std::atomic<std::uintptr_t> next_fake_device_pointer{0x60000000U};
+std::atomic<std::uint64_t> surface_create_count{0};
 
 struct FakeSurfaceAllocation {
   abi::Surface surface;
@@ -69,6 +70,12 @@ extern "C" void nvds_version(unsigned int* major, unsigned int* minor) {
 }
 
 #if !defined(RECO_FAKE_NVBUFSURFACE_7_1)
+extern "C" void recoFakeNvbufSurfaceResetAllocationCount() { surface_create_count = 0; }
+
+extern "C" std::uint64_t recoFakeNvbufSurfaceAllocationCount() {
+  return surface_create_count.load();
+}
+
 extern "C" int NvBufSurfaceCreate(void** output, std::uint32_t batch_size, void* raw_params) {
   if (output == nullptr || raw_params == nullptr || batch_size != 1U) {
     return -1;
@@ -78,6 +85,7 @@ extern "C" int NvBufSurfaceCreate(void** output, std::uint32_t batch_size, void*
       (create->height % 2U) != 0) {
     return -1;
   }
+  ++surface_create_count;
   auto allocation =
       std::unique_ptr<FakeSurfaceAllocation>(new (std::nothrow) FakeSurfaceAllocation);
   if (!allocation) {

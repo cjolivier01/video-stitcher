@@ -10,6 +10,7 @@
 #include "reco/detect/probe.hpp"
 #include "reco/io/gpu_decode.hpp"
 #include "reco/io/gstreamer.hpp"
+#include "reco/io/stable_media_file.hpp"
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "stitch.hpp"
 
@@ -243,7 +244,12 @@ struct PinnedWindowsPath {
 struct PinnedWindowsProtectedPath {
   std::filesystem::path path;
   std::string label;
-  PinnedWindowsPath identity;
+  std::optional<PinnedWindowsPath> identity;
+  std::shared_ptr<const io::StableMediaFile> stable_source;
+  BY_HANDLE_FILE_INFORMATION target_identity{};
+  BY_HANDLE_FILE_INFORMATION entry_identity{};
+
+  void verify_unchanged() const;
 };
 
 struct PinnedWindowsDirectory {
@@ -516,9 +522,13 @@ void PinnedWindowsPath::verify_unchanged(const std::filesystem::path& path,
   }
 }
 
-[[nodiscard]] PinnedWindowsPath pin_windows_path_for_publication(const std::filesystem::path& path,
-                                                                 std::string_view label) {
+[[nodiscard]] PinnedWindowsPath pin_windows_path_for_publication(
+    const std::filesystem::path& path, std::string_view label,
+    const std::shared_ptr<const io::StableMediaFile>& stable_source = {}) {
   constexpr DWORD kReadOnlySharing = FILE_SHARE_READ;
+  if (stable_source) {
+    stable_source->verify_unchanged();
+  }
   const HANDLE directory_entry =
       CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, kReadOnlySharing, nullptr, OPEN_EXISTING,
                   FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
@@ -527,18 +537,74 @@ void PinnedWindowsPath::verify_unchanged(const std::filesystem::path& path,
                      static_cast<int>(GetLastError()));
   }
   PinnedWindowsPath pinned{.directory_entry = UniqueWindowsHandle(directory_entry)};
-  const HANDLE target =
-      CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, kReadOnlySharing, nullptr, OPEN_EXISTING,
-                  FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  HANDLE target = INVALID_HANDLE_VALUE;
+  if (stable_source) {
+    const auto retained = reinterpret_cast<HANDLE>(_get_osfhandle(stable_source->descriptor()));
+    if (retained != INVALID_HANDLE_VALUE) {
+      target =
+          ReOpenFile(retained, FILE_READ_ATTRIBUTES, kReadOnlySharing, FILE_FLAG_BACKUP_SEMANTICS);
+    }
+  } else {
+    target =
+        CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, kReadOnlySharing, nullptr, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+  }
   if (target == INVALID_HANDLE_VALUE) {
     throw_file_error("cannot retain " + std::string(label), path, static_cast<int>(GetLastError()));
   }
   pinned.target = UniqueWindowsHandle(target);
+  if (stable_source) {
+    stable_source->verify_unchanged();
+  }
   return pinned;
 }
 
 [[nodiscard]] bool same_windows_file_identity(const BY_HANDLE_FILE_INFORMATION& left,
                                               const BY_HANDLE_FILE_INFORMATION& right);
+
+void PinnedWindowsProtectedPath::verify_unchanged() const {
+  if (stable_source) {
+    stable_source->verify_unchanged();
+  } else if (identity.has_value()) {
+    identity->verify_unchanged(path, label);
+  } else {
+    throw std::logic_error("protected Windows path has no retained identity");
+  }
+}
+
+[[nodiscard]] PinnedWindowsProtectedPath
+pin_windows_protected_path(const detail::AtomicOutputProtectedPath& protected_path) {
+  PinnedWindowsProtectedPath pinned{.path = protected_path.path,
+                                    .label = protected_path.label,
+                                    .stable_source = protected_path.stable_source};
+  if (!pinned.stable_source) {
+    pinned.identity.emplace(pin_windows_path_for_publication(pinned.path, pinned.label));
+    return pinned;
+  }
+
+  pinned.stable_source->verify_unchanged();
+  const auto target = reinterpret_cast<HANDLE>(_get_osfhandle(pinned.stable_source->descriptor()));
+  if (target == INVALID_HANDLE_VALUE ||
+      GetFileInformationByHandle(target, &pinned.target_identity) == 0) {
+    throw_file_error("cannot inspect " + pinned.label, pinned.path,
+                     static_cast<int>(GetLastError()));
+  }
+  constexpr DWORD kReadOnlySharing = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+  const HANDLE entry = CreateFileW(
+      pinned.path.c_str(), FILE_READ_ATTRIBUTES, kReadOnlySharing, nullptr, OPEN_EXISTING,
+      FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+  if (entry == INVALID_HANDLE_VALUE) {
+    throw_file_error("cannot inspect " + pinned.label + " path", pinned.path,
+                     static_cast<int>(GetLastError()));
+  }
+  UniqueWindowsHandle retained_entry(entry);
+  if (GetFileInformationByHandle(entry, &pinned.entry_identity) == 0) {
+    throw_file_error("cannot inspect " + pinned.label + " path", pinned.path,
+                     static_cast<int>(GetLastError()));
+  }
+  pinned.stable_source->verify_unchanged();
+  return pinned;
+}
 
 [[nodiscard]] std::optional<std::string>
 windows_protected_alias_error(HANDLE candidate,
@@ -549,11 +615,12 @@ windows_protected_alias_error(HANDLE candidate,
                             "cannot inspect stitch output identity");
   }
   for (const auto& protected_path : protected_paths) {
-    BY_HANDLE_FILE_INFORMATION target_identity{};
-    BY_HANDLE_FILE_INFORMATION entry_identity{};
-    if (GetFileInformationByHandle(protected_path.identity.target.get(), &target_identity) == 0 ||
-        GetFileInformationByHandle(protected_path.identity.directory_entry.get(),
-                                   &entry_identity) == 0) {
+    BY_HANDLE_FILE_INFORMATION target_identity = protected_path.target_identity;
+    BY_HANDLE_FILE_INFORMATION entry_identity = protected_path.entry_identity;
+    if (protected_path.identity.has_value() &&
+        (GetFileInformationByHandle(protected_path.identity->target.get(), &target_identity) == 0 ||
+         GetFileInformationByHandle(protected_path.identity->directory_entry.get(),
+                                    &entry_identity) == 0)) {
       throw std::system_error(static_cast<int>(GetLastError()), std::system_category(),
                               "cannot inspect protected stitch input identity");
     }
@@ -569,7 +636,7 @@ windows_protected_alias_error(HANDLE candidate,
     HANDLE directory, std::wstring_view destination_name,
     const std::vector<PinnedWindowsProtectedPath>& protected_paths) {
   for (const auto& protected_path : protected_paths) {
-    protected_path.identity.verify_unchanged(protected_path.path, protected_path.label);
+    protected_path.verify_unchanged();
   }
   constexpr ACCESS_MASK access = FILE_READ_ATTRIBUTES | SYNCHRONIZE;
   constexpr ULONG sharing = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
@@ -1027,9 +1094,14 @@ struct PinnedFileIdentity {
   }
 };
 
-[[nodiscard]] PinnedFileIdentity pin_input_identity(const std::filesystem::path& path,
-                                                    std::string_view label) {
-  const int descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+[[nodiscard]] PinnedFileIdentity
+pin_input_identity(const std::filesystem::path& path, std::string_view label,
+                   const std::shared_ptr<const io::StableMediaFile>& stable_source = {}) {
+  if (stable_source) {
+    stable_source->verify_unchanged();
+  }
+  const int descriptor = stable_source ? ::fcntl(stable_source->descriptor(), F_DUPFD_CLOEXEC, 0)
+                                       : ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (descriptor < 0) {
     throw_file_error("cannot open " + std::string(label), path, errno);
   }
@@ -1044,6 +1116,48 @@ struct PinnedFileIdentity {
   if (!S_ISREG(pinned.identity.st_mode) || pinned.identity.st_size <= 0) {
     throw std::runtime_error(std::string(label) + " must be a regular file: " + path.string());
   }
+  if (stable_source) {
+    stable_source->verify_unchanged();
+  }
+  return pinned;
+}
+
+struct PinnedLinuxProtectedPath {
+  std::string label;
+  std::filesystem::path path;
+  std::optional<PinnedFileIdentity> identity;
+  std::shared_ptr<const io::StableMediaFile> stable_source;
+  struct stat target_identity{};
+  struct stat path_identity{};
+
+  void verify_unchanged() const {
+    if (stable_source) {
+      stable_source->verify_unchanged();
+    } else if (identity.has_value()) {
+      identity->verify_unchanged();
+    } else {
+      throw std::logic_error("protected Linux path has no retained identity");
+    }
+  }
+};
+
+[[nodiscard]] PinnedLinuxProtectedPath
+pin_linux_protected_path(const detail::AtomicOutputProtectedPath& protected_path) {
+  PinnedLinuxProtectedPath pinned{.label = protected_path.label,
+                                  .path = protected_path.path,
+                                  .stable_source = protected_path.stable_source};
+  if (!pinned.stable_source) {
+    pinned.identity.emplace(pin_input_identity(pinned.path, pinned.label));
+    return pinned;
+  }
+  pinned.stable_source->verify_unchanged();
+  if (::fstat(pinned.stable_source->descriptor(), &pinned.target_identity) != 0) {
+    throw_file_error("cannot inspect " + pinned.label, pinned.path, errno);
+  }
+  if (::lstat(pinned.path.c_str(), &pinned.path_identity) != 0) {
+    throw_file_error("cannot inspect " + pinned.label + " path", pinned.path, errno);
+  }
+  pinned.stable_source->verify_unchanged();
   return pinned;
 }
 
@@ -1053,19 +1167,25 @@ struct PinnedFileIdentity {
 
 [[nodiscard]] std::optional<std::string>
 protected_file_alias_error(const struct stat& identity,
-                           const std::vector<PinnedFileIdentity>& protected_paths) {
+                           const std::vector<PinnedLinuxProtectedPath>& protected_paths) {
   for (const auto& protected_path : protected_paths) {
-    if (same_file_identity(identity, protected_path.identity) ||
-        same_file_identity(identity, protected_path.path_identity)) {
+    struct stat target_identity = protected_path.target_identity;
+    struct stat path_identity = protected_path.path_identity;
+    if (protected_path.identity.has_value()) {
+      target_identity = protected_path.identity->identity;
+      path_identity = protected_path.identity->path_identity;
+    }
+    if (same_file_identity(identity, target_identity) ||
+        same_file_identity(identity, path_identity)) {
       return "stitch output aliases " + protected_path.label;
     }
   }
   return std::nullopt;
 }
 
-[[nodiscard]] std::optional<std::string>
-validate_linux_stitch_output_identity(int directory_descriptor, std::string_view destination_name,
-                                      const std::vector<PinnedFileIdentity>& protected_paths) {
+[[nodiscard]] std::optional<std::string> validate_linux_stitch_output_identity(
+    int directory_descriptor, std::string_view destination_name,
+    const std::vector<PinnedLinuxProtectedPath>& protected_paths) {
   for (const auto& protected_path : protected_paths) {
     protected_path.verify_unchanged();
   }
@@ -1866,12 +1986,31 @@ lock_posix_output_directory(const std::filesystem::path& destination,
 }
 #endif
 
-[[nodiscard]] PinnedPosixPath pin_posix_path_for_publication(const std::filesystem::path& path,
-                                                             std::string_view label) {
+[[nodiscard]] PinnedPosixPath pin_posix_path_for_publication(
+    const std::filesystem::path& path, std::string_view label,
+    const std::shared_ptr<const io::StableMediaFile>& stable_source = {}) {
   PinnedPosixPath pinned;
   pinned.label = std::string(label);
   pinned.path = path;
-  pinned.descriptor = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (stable_source) {
+    stable_source->verify_unchanged();
+  }
+#if defined(F_DUPFD_CLOEXEC)
+  pinned.descriptor = stable_source ? ::fcntl(stable_source->descriptor(), F_DUPFD_CLOEXEC, 0)
+                                    : ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+#else
+  pinned.descriptor = stable_source ? ::dup(stable_source->descriptor())
+                                    : ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (stable_source && pinned.descriptor >= 0) {
+    const int flags = ::fcntl(pinned.descriptor, F_GETFD);
+    if (flags < 0 || ::fcntl(pinned.descriptor, F_SETFD, flags | FD_CLOEXEC) != 0) {
+      const int saved_error = errno;
+      (void)::close(pinned.descriptor);
+      pinned.descriptor = -1;
+      errno = saved_error;
+    }
+  }
+#endif
   if (pinned.descriptor < 0) {
     throw_file_error("cannot open " + pinned.label, path, errno);
   }
@@ -1884,6 +2023,48 @@ lock_posix_output_directory(const std::filesystem::path& destination,
   if (!S_ISREG(pinned.identity.st_mode) || pinned.identity.st_size <= 0) {
     throw std::runtime_error(pinned.label + " must be a regular file: " + path.string());
   }
+  if (stable_source) {
+    stable_source->verify_unchanged();
+  }
+  return pinned;
+}
+
+struct PinnedPosixProtectedPath {
+  std::string label;
+  std::filesystem::path path;
+  std::optional<PinnedPosixPath> identity;
+  std::shared_ptr<const io::StableMediaFile> stable_source;
+  struct stat target_identity{};
+  struct stat path_identity{};
+
+  void verify_unchanged() const {
+    if (stable_source) {
+      stable_source->verify_unchanged();
+    } else if (identity.has_value()) {
+      identity->verify_unchanged();
+    } else {
+      throw std::logic_error("protected POSIX path has no retained identity");
+    }
+  }
+};
+
+[[nodiscard]] PinnedPosixProtectedPath
+pin_posix_protected_path(const detail::AtomicOutputProtectedPath& protected_path) {
+  PinnedPosixProtectedPath pinned{.label = protected_path.label,
+                                  .path = protected_path.path,
+                                  .stable_source = protected_path.stable_source};
+  if (!pinned.stable_source) {
+    pinned.identity.emplace(pin_posix_path_for_publication(pinned.path, pinned.label));
+    return pinned;
+  }
+  pinned.stable_source->verify_unchanged();
+  if (::fstat(pinned.stable_source->descriptor(), &pinned.target_identity) != 0) {
+    throw_file_error("cannot inspect " + pinned.label, pinned.path, errno);
+  }
+  if (::lstat(pinned.path.c_str(), &pinned.path_identity) != 0) {
+    throw_file_error("cannot inspect " + pinned.label + " path", pinned.path, errno);
+  }
+  pinned.stable_source->verify_unchanged();
   return pinned;
 }
 
@@ -1911,19 +2092,25 @@ pinned_posix_alias_error(const struct stat& identity, const PinnedPosixPath& lef
 
 [[nodiscard]] std::optional<std::string>
 protected_posix_alias_error(const struct stat& identity,
-                            const std::vector<PinnedPosixPath>& protected_paths) {
+                            const std::vector<PinnedPosixProtectedPath>& protected_paths) {
   for (const auto& protected_path : protected_paths) {
-    if (same_file_identity(identity, protected_path.identity) ||
-        same_file_identity(identity, protected_path.path_identity)) {
+    struct stat target_identity = protected_path.target_identity;
+    struct stat path_identity = protected_path.path_identity;
+    if (protected_path.identity.has_value()) {
+      target_identity = protected_path.identity->identity;
+      path_identity = protected_path.identity->path_identity;
+    }
+    if (same_file_identity(identity, target_identity) ||
+        same_file_identity(identity, path_identity)) {
       return "stitch output aliases " + protected_path.label;
     }
   }
   return std::nullopt;
 }
 
-[[nodiscard]] std::optional<std::string>
-validate_posix_stitch_output_identity(int directory_descriptor, std::string_view destination_name,
-                                      const std::vector<PinnedPosixPath>& protected_paths) {
+[[nodiscard]] std::optional<std::string> validate_posix_stitch_output_identity(
+    int directory_descriptor, std::string_view destination_name,
+    const std::vector<PinnedPosixProtectedPath>& protected_paths) {
   for (const auto& protected_path : protected_paths) {
     protected_path.verify_unchanged();
   }
@@ -2451,6 +2638,46 @@ void write_all(int descriptor, std::string_view contents, const std::filesystem:
 }
 #endif
 
+#if defined(_WIN32)
+[[nodiscard]] bool discard_atomic_output_entry_nofollow(HANDLE directory,
+                                                        std::wstring_view name) noexcept {
+  DWORD open_error = ERROR_SUCCESS;
+  const HANDLE deletion_handle = open_windows_file_relative(
+      directory, name, DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN,
+      FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT, open_error);
+  if (deletion_handle == INVALID_HANDLE_VALUE) {
+    return open_error == ERROR_FILE_NOT_FOUND || open_error == ERROR_PATH_NOT_FOUND;
+  }
+  UniqueWindowsHandle retained_deletion_handle(deletion_handle);
+  return discard_open_file(deletion_handle);
+}
+#else
+[[nodiscard]] bool discard_atomic_output_entry_nofollow(int directory_descriptor,
+                                                        std::string_view name) noexcept {
+  const std::string filename(name);
+  struct stat identity{};
+  if (::fstatat(directory_descriptor, filename.c_str(), &identity, AT_SYMLINK_NOFOLLOW) != 0) {
+    return errno == ENOENT;
+  }
+  const int flags = S_ISDIR(identity.st_mode) ? AT_REMOVEDIR : 0;
+  return ::unlinkat(directory_descriptor, filename.c_str(), flags) == 0 || errno == ENOENT;
+}
+#endif
+
+void throw_if_atomic_output_cancelled(const CancellationRequested& cancellation_requested) {
+  if (!cancellation_requested) {
+    return;
+  }
+  try {
+    if (!cancellation_requested()) {
+      return;
+    }
+  } catch (...) {
+  }
+  throw detail::AtomicOutputCancelled();
+}
+
 void write_calibration_json_atomically_impl(
     std::string_view json, const std::filesystem::path& destination,
     const std::filesystem::path& left_input, const std::filesystem::path& right_input,
@@ -2459,7 +2686,8 @@ void write_calibration_json_atomically_impl(
     const std::function<void()>& before_commit, bool force_rename_fallback,
     const std::function<void()>& publication_fault_hook,
     const std::function<void()>& on_lock_contention, std::chrono::milliseconds lock_timeout,
-    const std::function<void(const std::filesystem::path&)>& before_windows_publish_replace) {
+    const std::function<void(const std::filesystem::path&)>& before_windows_publish_replace,
+    const CancellationRequested& cancellation_requested) {
   std::string contents(json);
   contents.push_back('\n');
 #if defined(_WIN32)
@@ -2493,6 +2721,7 @@ void write_calibration_json_atomically_impl(
     if (before_publish) {
       before_publish();
     }
+    throw_if_atomic_output_cancelled(cancellation_requested);
     if (const auto error = reco::calibrate::validate_calibration_output_identity(
             left_input, right_input, destination, lens_profiles);
         error.has_value()) {
@@ -2501,6 +2730,7 @@ void write_calibration_json_atomically_impl(
     if (before_commit) {
       before_commit();
     }
+    throw_if_atomic_output_cancelled(cancellation_requested);
     left_reservation.verify_unchanged(left_input, "left video input");
     right_reservation.verify_unchanged(right_input, "right video input");
     for (std::size_t index = 0; index < profile_reservations.size(); ++index) {
@@ -2516,6 +2746,7 @@ void write_calibration_json_atomically_impl(
       if (publication_fault_hook) {
         publication_fault_hook();
       }
+      throw_if_atomic_output_cancelled(cancellation_requested);
       left_reservation.verify_unchanged(left_input, "left video input");
       right_reservation.verify_unchanged(right_input, "right video input");
       for (std::size_t index = 0; index < profile_reservations.size(); ++index) {
@@ -2600,6 +2831,7 @@ void write_calibration_json_atomically_impl(
     if (before_publish) {
       before_publish();
     }
+    throw_if_atomic_output_cancelled(cancellation_requested);
     if (!temporary_name_identifies_descriptor(directory_descriptor.get(), temporary.name,
                                               temporary.descriptor.get())) {
       temporary_exists = false;
@@ -2617,6 +2849,7 @@ void write_calibration_json_atomically_impl(
       if (!commit_hook_ran && before_commit) {
         before_commit();
       }
+      throw_if_atomic_output_cancelled(cancellation_requested);
       commit_hook_ran = true;
       if (const auto error =
               validate_pinned_output_identity(directory_descriptor.get(), destination_name,
@@ -2646,6 +2879,7 @@ void write_calibration_json_atomically_impl(
       if (!publication_fault_hook_ran && publication_fault_hook) {
         publication_fault_hook();
       }
+      throw_if_atomic_output_cancelled(cancellation_requested);
       publication_fault_hook_ran = true;
     };
     const auto run_publication_fault_or_rollback = [&](const auto& rollback) {
@@ -2875,7 +3109,6 @@ void write_calibration_json_atomically_impl(
   (void)before_windows_publish_replace;
   (void)force_rename_fallback;
 #if !defined(__APPLE__)
-  (void)publication_fault_hook;
   (void)on_lock_contention;
   (void)lock_timeout;
 #endif
@@ -2926,6 +3159,7 @@ void write_calibration_json_atomically_impl(
     if (before_publish) {
       before_publish();
     }
+    throw_if_atomic_output_cancelled(cancellation_requested);
 #if defined(__APPLE__)
     if (const auto error = validate_pinned_posix_output_identity_at(
             output_directory.get(), destination_name, left_identity, right_identity,
@@ -2940,6 +3174,7 @@ void write_calibration_json_atomically_impl(
     if (before_commit) {
       before_commit();
     }
+    throw_if_atomic_output_cancelled(cancellation_requested);
     left_identity.verify_unchanged();
     right_identity.verify_unchanged();
     for (const auto& profile : profile_identities) {
@@ -2975,6 +3210,7 @@ void write_calibration_json_atomically_impl(
         if (publication_fault_hook) {
           publication_fault_hook();
         }
+        throw_if_atomic_output_cancelled(cancellation_requested);
       } catch (...) {
         if (!rollback_new_output()) {
           throw std::runtime_error(
@@ -3026,6 +3262,7 @@ void write_calibration_json_atomically_impl(
         if (publication_fault_hook) {
           publication_fault_hook();
         }
+        throw_if_atomic_output_cancelled(cancellation_requested);
       } catch (...) {
         if (!rollback_exchange_if_unchanged()) {
           throw std::runtime_error(
@@ -3077,6 +3314,10 @@ void write_calibration_json_atomically_impl(
       throw_file_error("failed to publish calibration output", destination, errno);
     }
 #else
+    if (publication_fault_hook) {
+      publication_fault_hook();
+    }
+    throw_if_atomic_output_cancelled(cancellation_requested);
     if (::link(temporary.c_str(), destination.c_str()) != 0) {
       if (errno == EEXIST) {
         throw std::runtime_error(
@@ -3134,7 +3375,8 @@ void write_calibration_json_atomically_impl(
 
 void write_calibration_result(const reco::calibrate::CalibrationResult& result,
                               const reco::calibrate::GpuCalibrationRequest& request,
-                              const std::function<void()>& before_publish = {}) {
+                              const std::function<void()>& validate_inputs = {},
+                              const CancellationRequested& cancellation_requested = {}) {
   const auto json = reco::core::calibration_to_json(result.calibration);
   const auto reparsed = reco::core::parse_match_calibration_json(json);
   if (!reparsed.has_value() || !reparsed->validate().empty()) {
@@ -3154,7 +3396,9 @@ void write_calibration_result(const reco::calibrate::CalibrationResult& result,
   }
   detail::write_calibration_json_atomically(
       json, reco::core::path_from_utf8(request.output), reco::core::path_from_utf8(left_path),
-      reco::core::path_from_utf8(right_path), before_publish, profiles);
+      reco::core::path_from_utf8(right_path), validate_inputs, profiles, validate_inputs, false, {},
+      {}, std::chrono::seconds(2), {}, cancellation_requested);
+  throw_if_atomic_output_cancelled(cancellation_requested);
 }
 
 void write_calibration_result_summary(const reco::calibrate::CalibrationResult& result,
@@ -4161,17 +4405,17 @@ struct AtomicOutputFile::Impl {
   PinnedWindowsDirectory output_directory;
   std::vector<PinnedWindowsProtectedPath> protected_paths;
 #elif defined(__linux__)
-  std::vector<PinnedFileIdentity> protected_paths;
+  std::vector<PinnedLinuxProtectedPath> protected_paths;
 #else
-  std::vector<PinnedPosixPath> protected_paths;
+  std::vector<PinnedPosixProtectedPath> protected_paths;
 #endif
 #if !defined(_WIN32)
   int directory_descriptor = -1;
   int staging_directory_descriptor = -1;
   std::string staging_directory_name;
-  mutable int verification_descriptor = -1;
 #endif
   int descriptor = -1;
+  mutable std::shared_ptr<const io::StableMediaFile> verification_source;
   bool committed = false;
 
   ~Impl();
@@ -4182,33 +4426,35 @@ AtomicOutputFile::Impl::~Impl() {
   if (descriptor >= 0) {
     const auto handle = reinterpret_cast<HANDLE>(_get_osfhandle(descriptor));
     if (!committed && handle != INVALID_HANDLE_VALUE) {
-      (void)discard_windows_entry_safely(output_directory.handle.get(),
-                                         temporary.filename().wstring(), handle);
+      if (!discard_windows_entry_safely(output_directory.handle.get(),
+                                        temporary.filename().wstring(), handle)) {
+        (void)discard_atomic_output_entry_nofollow(output_directory.handle.get(),
+                                                   temporary.filename().wstring());
+      }
     }
     (void)_close(descriptor);
   }
 #else
-  if (verification_descriptor >= 0) {
-    (void)::close(verification_descriptor);
-  }
   if (!committed && descriptor >= 0 && staging_directory_descriptor >= 0 &&
       !temporary_name.empty()) {
 #if defined(__linux__)
-    (void)unlink_descriptor_entry_safely(staging_directory_descriptor, temporary_name, descriptor,
-                                         destination);
+    const bool removed = unlink_descriptor_entry_safely(staging_directory_descriptor,
+                                                        temporary_name, descriptor, destination);
 #elif defined(__APPLE__)
-    (void)unlink_posix_descriptor_entry_safely(staging_directory_descriptor, temporary_name,
-                                               descriptor, destination);
+    const bool removed = unlink_posix_descriptor_entry_safely(
+        staging_directory_descriptor, temporary_name, descriptor, destination);
 #else
     struct stat descriptor_identity{};
     struct stat path_identity{};
-    if (::fstat(descriptor, &descriptor_identity) == 0 &&
-        ::fstatat(staging_directory_descriptor, temporary_name.c_str(), &path_identity,
-                  AT_SYMLINK_NOFOLLOW) == 0 &&
-        same_file_identity(descriptor_identity, path_identity)) {
-      (void)::unlinkat(staging_directory_descriptor, temporary_name.c_str(), 0);
-    }
+    const bool removed = ::fstat(descriptor, &descriptor_identity) == 0 &&
+                         ::fstatat(staging_directory_descriptor, temporary_name.c_str(),
+                                   &path_identity, AT_SYMLINK_NOFOLLOW) == 0 &&
+                         same_file_identity(descriptor_identity, path_identity) &&
+                         ::unlinkat(staging_directory_descriptor, temporary_name.c_str(), 0) == 0;
 #endif
+    if (!removed) {
+      (void)discard_atomic_output_entry_nofollow(staging_directory_descriptor, temporary_name);
+    }
   }
   if (descriptor >= 0) {
     (void)::close(descriptor);
@@ -4254,10 +4500,7 @@ AtomicOutputFile::AtomicOutputFile(
   impl_->output_directory = pin_windows_output_directory(impl_->destination);
   impl_->protected_paths.reserve(protected_paths.size());
   for (const auto& protected_path : protected_paths) {
-    impl_->protected_paths.push_back(
-        {.path = protected_path.path,
-         .label = protected_path.label,
-         .identity = pin_windows_path_for_publication(protected_path.path, protected_path.label)});
+    impl_->protected_paths.push_back(pin_windows_protected_path(protected_path));
   }
   if (const auto error = validate_windows_stitch_output_identity(
           impl_->output_directory.handle.get(), impl_->destination.filename().wstring(),
@@ -4276,12 +4519,14 @@ AtomicOutputFile::AtomicOutputFile(
     auto filename = impl_->destination.filename();
     filename += ".tmp." + std::string(token.begin(), token.end());
     DWORD open_error = ERROR_SUCCESS;
-    handle = open_windows_file_relative(
-        impl_->output_directory.handle.get(), filename.wstring(),
-        GENERIC_WRITE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_CREATE,
-        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
-        open_error);
+    // Readers may verify the muxed stream and a DELETE-only handle may rename it, but the
+    // encoder's retained handle denies every competing writer through publication.
+    handle = open_windows_file_relative(impl_->output_directory.handle.get(), filename.wstring(),
+                                        GENERIC_WRITE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                                        FILE_SHARE_READ | FILE_SHARE_DELETE, FILE_CREATE,
+                                        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT |
+                                            FILE_OPEN_REPARSE_POINT,
+                                        open_error);
     if (handle != INVALID_HANDLE_VALUE) {
       impl_->descriptor =
           _open_osfhandle(reinterpret_cast<std::intptr_t>(handle), _O_BINARY | _O_WRONLY);
@@ -4318,7 +4563,7 @@ AtomicOutputFile::AtomicOutputFile(
 #if defined(__linux__)
   impl_->protected_paths.reserve(protected_paths.size());
   for (const auto& protected_path : protected_paths) {
-    impl_->protected_paths.push_back(pin_input_identity(protected_path.path, protected_path.label));
+    impl_->protected_paths.push_back(pin_linux_protected_path(protected_path));
   }
   if (const auto error = validate_linux_stitch_output_identity(
           directory, impl_->destination.filename().string(), impl_->protected_paths);
@@ -4328,8 +4573,7 @@ AtomicOutputFile::AtomicOutputFile(
 #else
   impl_->protected_paths.reserve(protected_paths.size());
   for (const auto& protected_path : protected_paths) {
-    impl_->protected_paths.push_back(
-        pin_posix_path_for_publication(protected_path.path, protected_path.label));
+    impl_->protected_paths.push_back(pin_posix_protected_path(protected_path));
   }
   if (const auto error = validate_posix_stitch_output_identity(
           directory, impl_->destination.filename().string(), impl_->protected_paths);
@@ -4409,51 +4653,69 @@ int AtomicOutputFile::descriptor() const {
   return impl_->descriptor;
 }
 
-std::filesystem::path AtomicOutputFile::verification_path() const {
+std::shared_ptr<const io::StableMediaFile> AtomicOutputFile::verification_source() const {
   const int retained_descriptor = descriptor();
-#if defined(__linux__)
-  if (impl_->verification_descriptor < 0) {
-    impl_->verification_descriptor =
-        ::openat(impl_->staging_directory_descriptor, impl_->temporary_name.c_str(),
-                 O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (impl_->verification_descriptor < 0 ||
-        !temporary_name_identifies_descriptor(impl_->staging_directory_descriptor,
-                                              impl_->temporary_name,
-                                              impl_->verification_descriptor) ||
-        !temporary_name_identifies_descriptor(impl_->staging_directory_descriptor,
-                                              impl_->temporary_name, retained_descriptor)) {
-      if (impl_->verification_descriptor >= 0) {
-        (void)::close(impl_->verification_descriptor);
-        impl_->verification_descriptor = -1;
-      }
-      throw std::runtime_error("cannot retain a readable stitch output verification handle");
-    }
+  if (impl_->verification_source) {
+    return impl_->verification_source;
   }
-  return std::filesystem::path("/proc") / std::to_string(::getpid()) / "fd" /
-         std::to_string(impl_->verification_descriptor);
-#elif defined(__APPLE__)
-  if (impl_->verification_descriptor < 0) {
-    impl_->verification_descriptor =
-        ::openat(impl_->staging_directory_descriptor, impl_->temporary_name.c_str(),
-                 O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (impl_->verification_descriptor < 0 ||
-        !path_identifies_descriptor_at(impl_->staging_directory_descriptor, impl_->temporary_name,
-                                       impl_->verification_descriptor) ||
-        !path_identifies_descriptor_at(impl_->staging_directory_descriptor, impl_->temporary_name,
-                                       retained_descriptor)) {
-      if (impl_->verification_descriptor >= 0) {
-        (void)::close(impl_->verification_descriptor);
-        impl_->verification_descriptor = -1;
-      }
-      throw std::runtime_error("cannot retain a readable stitch output verification handle");
-    }
+#if defined(_WIN32)
+  const auto writer = reinterpret_cast<HANDLE>(_get_osfhandle(retained_descriptor));
+  DWORD open_error = ERROR_SUCCESS;
+  const HANDLE reader = open_windows_file_relative(
+      impl_->output_directory.handle.get(), impl_->temporary.filename().wstring(),
+      FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN,
+      FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT, open_error);
+  if (reader == INVALID_HANDLE_VALUE) {
+    throw_file_error("cannot retain a readable stitch output verification handle", impl_->temporary,
+                     static_cast<int>(open_error));
   }
-  return std::filesystem::path("/dev/fd") / std::to_string(impl_->verification_descriptor);
-#elif defined(_WIN32)
-  return impl_->output_directory.resolved_path / impl_->temporary.filename();
+  UniqueWindowsHandle retained_reader(reader);
+  BY_HANDLE_FILE_INFORMATION writer_identity{};
+  BY_HANDLE_FILE_INFORMATION reader_identity{};
+  if (writer == INVALID_HANDLE_VALUE || GetFileInformationByHandle(writer, &writer_identity) == 0 ||
+      GetFileInformationByHandle(reader, &reader_identity) == 0 ||
+      !same_windows_file_identity(writer_identity, reader_identity)) {
+    throw std::runtime_error("cannot retain the encoded stitch output identity for verification");
+  }
+  const auto raw_reader = retained_reader.release();
+  const int verification_descriptor =
+      _open_osfhandle(reinterpret_cast<std::intptr_t>(raw_reader), _O_RDONLY | _O_BINARY);
+  if (verification_descriptor < 0) {
+    (void)CloseHandle(raw_reader);
+    throw_file_error("cannot create a readable stitch output verification descriptor",
+                     impl_->temporary, errno);
+  }
 #else
-  return impl_->temporary;
+  const int verification_descriptor =
+      ::openat(impl_->staging_directory_descriptor, impl_->temporary_name.c_str(),
+               O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  const bool reader_matches =
+#if defined(__linux__)
+      verification_descriptor >= 0 &&
+      temporary_name_identifies_descriptor(impl_->staging_directory_descriptor,
+                                           impl_->temporary_name, verification_descriptor) &&
+      temporary_name_identifies_descriptor(impl_->staging_directory_descriptor,
+                                           impl_->temporary_name, retained_descriptor);
+#else
+      verification_descriptor >= 0 &&
+      path_identifies_descriptor_at(impl_->staging_directory_descriptor, impl_->temporary_name,
+                                    verification_descriptor) &&
+      path_identifies_descriptor_at(impl_->staging_directory_descriptor, impl_->temporary_name,
+                                    retained_descriptor);
 #endif
+  if (!reader_matches) {
+    const int open_error = errno;
+    if (verification_descriptor >= 0) {
+      (void)::close(verification_descriptor);
+    }
+    throw_file_error("cannot retain a readable stitch output verification handle", impl_->temporary,
+                     open_error == 0 ? ESTALE : open_error);
+  }
+#endif
+  impl_->verification_source = io::detail::adopt_stable_media_worker_descriptor(
+      verification_descriptor, core::path_to_utf8(impl_->temporary));
+  return impl_->verification_source;
 }
 
 const std::filesystem::path& AtomicOutputFile::temporary_path() const {
@@ -4463,7 +4725,7 @@ const std::filesystem::path& AtomicOutputFile::temporary_path() const {
   return impl_->temporary;
 }
 
-void AtomicOutputFile::commit() {
+void AtomicOutputFile::commit(const CancellationRequested& cancellation_requested) {
   if (!impl_) {
     throw std::runtime_error("stitch output transaction is empty");
   }
@@ -4529,6 +4791,7 @@ void AtomicOutputFile::commit() {
     if (impl_->publication_fault_hook) {
       impl_->publication_fault_hook();
     }
+    throw_if_atomic_output_cancelled(cancellation_requested);
     if (const auto error = validate_windows_stitch_output_identity(
             impl_->output_directory.handle.get(), impl_->destination.filename().wstring(),
             impl_->protected_paths);
@@ -4536,11 +4799,16 @@ void AtomicOutputFile::commit() {
       throw std::runtime_error(*error);
     }
   };
-  publish_windows_output(
-      impl_->output_directory.handle.get(), impl_->output_directory.resolved_path,
-      impl_->destination.filename().wstring(), impl_->temporary.filename().wstring(),
-      publication_handle, impl_->destination, destination_published,
-      impl_->after_temporary_validation, final_commit_gate, false);
+  try {
+    publish_windows_output(
+        impl_->output_directory.handle.get(), impl_->output_directory.resolved_path,
+        impl_->destination.filename().wstring(), impl_->temporary.filename().wstring(),
+        publication_handle, impl_->destination, destination_published,
+        impl_->after_temporary_validation, final_commit_gate, false);
+  } catch (...) {
+    (void)discard_open_file(publication_handle);
+    throw;
+  }
   impl_->committed = destination_published;
   if (_close(impl_->descriptor) != 0) {
     impl_->descriptor = -1;
@@ -4589,6 +4857,7 @@ void AtomicOutputFile::commit() {
         if (impl_->publication_fault_hook) {
           impl_->publication_fault_hook();
         }
+        throw_if_atomic_output_cancelled(cancellation_requested);
         if (!temporary_name_identifies_descriptor(impl_->directory_descriptor, destination_name,
                                                   impl_->descriptor)) {
           throw std::runtime_error("published stitch output identity changed");
@@ -4640,6 +4909,7 @@ void AtomicOutputFile::commit() {
         if (impl_->publication_fault_hook) {
           impl_->publication_fault_hook();
         }
+        throw_if_atomic_output_cancelled(cancellation_requested);
         if (!temporary_name_identifies_descriptor(impl_->directory_descriptor, destination_name,
                                                   impl_->descriptor) ||
             !directory_entry_matches_snapshot(impl_->staging_directory_descriptor,
@@ -4742,6 +5012,7 @@ void AtomicOutputFile::commit() {
         if (impl_->publication_fault_hook) {
           impl_->publication_fault_hook();
         }
+        throw_if_atomic_output_cancelled(cancellation_requested);
         if (!path_identifies_descriptor_at(impl_->directory_descriptor, destination_name,
                                            impl_->descriptor)) {
           throw std::runtime_error("published stitch output identity changed");
@@ -4792,6 +5063,7 @@ void AtomicOutputFile::commit() {
         if (impl_->publication_fault_hook) {
           impl_->publication_fault_hook();
         }
+        throw_if_atomic_output_cancelled(cancellation_requested);
         if (!path_identifies_descriptor_at(impl_->directory_descriptor, destination_name,
                                            impl_->descriptor) ||
             !posix_directory_entry_matches_snapshot(impl_->staging_directory_descriptor,
@@ -4852,6 +5124,10 @@ void AtomicOutputFile::commit() {
   if (::fsync(impl_->descriptor) != 0) {
     throw_file_error("cannot flush completed stitch output", impl_->temporary, errno);
   }
+  if (impl_->publication_fault_hook) {
+    impl_->publication_fault_hook();
+  }
+  throw_if_atomic_output_cancelled(cancellation_requested);
   if (::linkat(impl_->staging_directory_descriptor, impl_->temporary_name.c_str(),
                impl_->directory_descriptor, impl_->destination.filename().c_str(), 0) != 0) {
     throw_file_error("cannot publish completed stitch output", impl_->destination, errno);
@@ -4881,11 +5157,12 @@ void write_calibration_json_atomically(
     const std::function<void()>& before_commit, bool force_rename_fallback,
     const std::function<void()>& publication_fault_hook,
     const std::function<void()>& on_lock_contention, std::chrono::milliseconds lock_timeout,
-    const std::function<void(const std::filesystem::path&)>& before_windows_publish_replace) {
+    const std::function<void(const std::filesystem::path&)>& before_windows_publish_replace,
+    const CancellationRequested& cancellation_requested) {
   write_calibration_json_atomically_impl(json, destination, left_input, right_input, before_publish,
                                          lens_profiles, before_commit, force_rename_fallback,
                                          publication_fault_hook, on_lock_contention, lock_timeout,
-                                         before_windows_publish_replace);
+                                         before_windows_publish_replace, cancellation_requested);
 }
 
 } // namespace detail
@@ -5032,7 +5309,18 @@ std::string help_text() {
 }
 
 int run_command(const Command& command, std::ostream& out, std::ostream& err,
-                const std::filesystem::path& executable_path) {
+                const std::filesystem::path& executable_path,
+                const CancellationRequested& cancellation_requested) {
+  const auto cancellation_requested_now = [&] {
+    if (!cancellation_requested) {
+      return false;
+    }
+    try {
+      return cancellation_requested();
+    } catch (...) {
+      return true;
+    }
+  };
   if (std::holds_alternative<HelpCommand>(command)) {
     out << help_text() << '\n';
     return 0;
@@ -5089,6 +5377,10 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err,
   }
 
   if (const auto* calibrate = std::get_if<CalibrateCommand>(&command)) {
+    if (cancellation_requested_now()) {
+      err << "cancelled\n";
+      return kCancelledExitCode;
+    }
     reco::calibrate::GpuCalibrationRequest request;
     request.left.path = calibrate->left;
     request.left.lens_profile = calibrate->left_profile;
@@ -5129,6 +5421,10 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err,
 
     const auto backends = reco::calibrate::probe_calibration_backends();
     const auto plan = reco::calibrate::build_gpu_calibration_plan(request, backends);
+    if (cancellation_requested_now()) {
+      err << "cancelled\n";
+      return kCancelledExitCode;
+    }
     out << reco::calibrate::describe_calibration_plan(plan);
     if (!plan.ready) {
       err << "error: " << plan.blocked_reason.value_or("C++ GPU calibration is unavailable")
@@ -5165,7 +5461,8 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err,
         pinned_request.right.lens_profile_expected_identity =
             right_profile_identity->portable_identity();
       }
-      auto result = reco::calibrate::run_gpu_calibration(pinned_request, backends);
+      auto result =
+          reco::calibrate::run_gpu_calibration(pinned_request, backends, cancellation_requested);
       if (result.left_lens_profile.has_value()) {
         result.left_lens_profile->path = request.left.lens_profile;
       }
@@ -5175,6 +5472,9 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err,
                                               : request.left.lens_profile;
       }
       const auto verify_pinned_inputs = [&] {
+        if (cancellation_requested_now()) {
+          throw reco::calibrate::CalibrationCancelled();
+        }
         left_identity.verify_unchanged();
         right_identity.verify_unchanged();
         if (left_profile_identity.has_value()) {
@@ -5184,16 +5484,39 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err,
           right_profile_identity->verify_unchanged();
         }
       };
+      if (cancellation_requested_now()) {
+        throw reco::calibrate::CalibrationCancelled();
+      }
       verify_pinned_inputs();
+      if (cancellation_requested_now()) {
+        throw reco::calibrate::CalibrationCancelled();
+      }
       // Publish against the original user-visible entries while the descriptors used by the
       // worker remain pinned. This preserves both symlink and target identities through commit.
-      write_calibration_result(result, request, verify_pinned_inputs);
+      write_calibration_result(result, request, verify_pinned_inputs, cancellation_requested_now);
 #else
-      const auto result = reco::calibrate::run_gpu_calibration(request, backends);
-      write_calibration_result(result, request);
+      const auto result =
+          reco::calibrate::run_gpu_calibration(request, backends, cancellation_requested);
+      if (cancellation_requested_now()) {
+        throw reco::calibrate::CalibrationCancelled();
+      }
+      write_calibration_result(result, request, {}, cancellation_requested_now);
 #endif
+      if (cancellation_requested_now()) {
+        throw reco::calibrate::CalibrationCancelled();
+      }
       write_calibration_result_summary(result, request.output, out);
+    } catch (const detail::AtomicOutputCancelled&) {
+      err << "cancelled\n";
+      return kCancelledExitCode;
+    } catch (const reco::calibrate::CalibrationCancelled&) {
+      err << "cancelled\n";
+      return kCancelledExitCode;
     } catch (const std::exception& error) {
+      if (cancellation_requested_now()) {
+        err << "cancelled\n";
+        return kCancelledExitCode;
+      }
       err << "error: " << error.what() << '\n';
       return 2;
     }
@@ -5201,14 +5524,22 @@ int run_command(const Command& command, std::ostream& out, std::ostream& err,
   }
 
   if (const auto* stitch = std::get_if<StitchCommand>(&command)) {
+    if (cancellation_requested_now()) {
+      err << "cancelled\n";
+      return kCancelledExitCode;
+    }
     const auto backends = reco::calibrate::probe_calibration_backends();
     const auto plan = build_stitch_plan(*stitch, backends);
+    if (cancellation_requested_now()) {
+      err << "cancelled\n";
+      return kCancelledExitCode;
+    }
     write_runtime_plan(out, plan);
     if (plan.blocked_reason.has_value()) {
       err << "error: " << *plan.blocked_reason << '\n';
       return 2;
     }
-    return detail::run_gpu_stitch(*stitch, executable_path, out, err);
+    return detail::run_gpu_stitch(*stitch, executable_path, out, err, cancellation_requested);
   }
 
   RuntimePlan runtime_plan;

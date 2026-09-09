@@ -10,23 +10,40 @@
 #include "reco/io/audio_passthrough.hpp"
 #include "reco/io/gpu_decode.hpp"
 #include "reco/io/gpu_encode.hpp"
+#include "reco/io/gpu_memory.hpp"
 #include "reco/io/gpu_video_probe.hpp"
 #include "reco/io/output.hpp"
+#include "reco/io/stable_media_file.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
+
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <cerrno>
+#include <climits>
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
 
 namespace reco::cli::detail {
 
@@ -47,12 +64,79 @@ namespace {
 
 using namespace reco::io;
 
-constexpr std::uint64_t kProbeTimeoutNs = 120'000'000'000ULL;
+constexpr auto kProbeTimeout = std::chrono::seconds(120);
+constexpr std::uint64_t kProbeTimeoutNs =
+    std::chrono::duration_cast<std::chrono::nanoseconds>(kProbeTimeout).count();
 constexpr std::size_t kMaximumInputSegments = 4096;
+constexpr std::size_t kStitchDecodeSourceCapacity = 4;
+constexpr std::size_t kStitchStereoQueueCapacity = 4;
+constexpr std::size_t kStitchEncodePoolCapacity = 8;
+
+std::size_t open_descriptor_count() {
+#if defined(_WIN32)
+  const int limit = _getmaxstdio();
+  std::size_t count = 0;
+  for (int descriptor = 0; descriptor < limit; ++descriptor) {
+    if (_get_osfhandle(descriptor) != -1) {
+      ++count;
+    }
+  }
+  return count;
+#else
+#if defined(__APPLE__)
+  constexpr const char* descriptor_directory = "/dev/fd";
+#else
+  constexpr const char* descriptor_directory = "/proc/self/fd";
+#endif
+  if (auto* directory = ::opendir(descriptor_directory); directory != nullptr) {
+    std::size_t count = 0;
+    while (const auto* entry = ::readdir(directory)) {
+      if (entry->d_name[0] >= '0' && entry->d_name[0] <= '9') {
+        ++count;
+      }
+    }
+    (void)::closedir(directory);
+    return count;
+  }
+
+  struct rlimit limits{};
+  if (::getrlimit(RLIMIT_NOFILE, &limits) != 0 || limits.rlim_cur == RLIM_INFINITY ||
+      limits.rlim_cur > static_cast<rlim_t>(INT_MAX)) {
+    throw std::runtime_error("cannot inspect the process descriptor budget");
+  }
+  std::size_t count = 0;
+  for (int descriptor = 0; descriptor < static_cast<int>(limits.rlim_cur); ++descriptor) {
+    if (::fcntl(descriptor, F_GETFD) >= 0 || errno != EBADF) {
+      ++count;
+    }
+  }
+  return count;
+#endif
+}
+
+std::size_t descriptor_limit() {
+#if defined(_WIN32)
+  return static_cast<std::size_t>(_getmaxstdio());
+#else
+  struct rlimit limits{};
+  if (::getrlimit(RLIMIT_NOFILE, &limits) != 0) {
+    throw std::runtime_error("cannot inspect the process descriptor limit");
+  }
+  return limits.rlim_cur == RLIM_INFINITY
+             ? std::numeric_limits<std::size_t>::max()
+             : static_cast<std::size_t>(std::min<rlim_t>(
+                   limits.rlim_cur, static_cast<rlim_t>(std::numeric_limits<std::size_t>::max())));
+#endif
+}
 
 struct ProbedInput {
   std::vector<std::string> paths;
+  std::vector<std::shared_ptr<const StableMediaFile>> stable_sources;
   std::vector<GpuVideoProbe> probes;
+};
+
+struct RetainedInputSources {
+  std::vector<std::shared_ptr<const StableMediaFile>> decode;
 };
 
 struct AudioSelection {
@@ -85,14 +169,17 @@ std::vector<std::string> split_input_segments(std::string_view input, std::strin
   return paths;
 }
 
-GpuFileDecodeConfig decode_config(const std::string& path, const GpuVideoProbe& probe,
+GpuFileDecodeConfig decode_config(const std::string& path,
+                                  std::shared_ptr<const StableMediaFile> stable_source,
+                                  const GpuVideoProbe& probe,
                                   std::optional<std::uint64_t> start_frame) {
   GpuFileDecodeConfig config{
       .path = path,
+      .stable_source = std::move(stable_source),
       .codec = gpu_decode_codec_for_path(path),
       .elementary_stream = gpu_decode_path_is_elementary_stream(path),
       .container = gpu_decode_container_for_path(path),
-      .max_buffers = 4,
+      .max_buffers = static_cast<std::uint32_t>(kStitchDecodeSourceCapacity),
       .drop = false,
       .read_timeout_ns = 30'000'000'000ULL,
   };
@@ -108,17 +195,24 @@ GpuFileDecodeConfig decode_config(const std::string& path, const GpuVideoProbe& 
   return config;
 }
 
-ProbedInput probe_input(std::vector<std::string> paths, const std::filesystem::path& worker,
-                        std::string_view label) {
-  ProbedInput input{.paths = std::move(paths)};
+ProbedInput probe_input(std::vector<std::string> paths, RetainedInputSources sources,
+                        const std::filesystem::path& worker, std::string_view label,
+                        const CancellationRequested& cancellation_requested) {
+  if (paths.size() != sources.decode.size()) {
+    throw std::logic_error("stable stitch input count does not match its paths");
+  }
+  ProbedInput input{.paths = std::move(paths), .stable_sources = std::move(sources.decode)};
   input.probes.reserve(input.paths.size());
-  for (const auto& path : input.paths) {
+  for (std::size_t index = 0; index < input.paths.size(); ++index) {
+    const auto& path = input.paths[index];
+    auto probe_source = input.stable_sources[index]->open_cursor();
     input.probes.push_back(
         probe_gpu_video({.path = path,
+                         .stable_source = std::move(probe_source),
                          .codec = gpu_decode_codec_for_path(path),
                          .elementary_stream = gpu_decode_path_is_elementary_stream(path),
                          .container = gpu_decode_container_for_path(path)},
-                        worker, kProbeTimeoutNs));
+                        worker, kProbeTimeoutNs, cancellation_requested));
   }
   const auto& first = input.probes.front();
   for (std::size_t index = 1; index < input.probes.size(); ++index) {
@@ -165,21 +259,26 @@ void require_exact_indexed_timeline(const ProbedInput& input, std::string_view l
 
 std::unique_ptr<GpuFileDecodeSource>
 open_decode_source(const ProbedInput& input, std::optional<std::uint64_t> start_frame,
-                   const std::shared_ptr<const NvbufSurfaceRuntime>& runtime) {
+                   const std::shared_ptr<const NvbufSurfaceRuntime>& runtime,
+                   const GpuDecodeOpeningSourceObserver& observer) {
   if (input.paths.size() == 1U) {
-    return open_gstreamer_gpu_file_decode_source(
-        decode_config(input.paths.front(), input.probes.front(), start_frame), runtime);
+    return open_gstreamer_gpu_file_decode_source(decode_config(input.paths.front(),
+                                                               input.stable_sources.front(),
+                                                               input.probes.front(), start_frame),
+                                                 runtime, observer);
   }
 
   GpuChainedFileDecodeConfig config{.start_frame_index = start_frame};
   config.segments.reserve(input.paths.size());
   for (std::size_t index = 0; index < input.paths.size(); ++index) {
     const auto& probe = input.probes[index];
-    config.segments.push_back({.config = decode_config(input.paths[index], probe, std::nullopt),
-                               .exact_frame_count = probe.indexed_sampling_cadence_verified &&
-                                                            !probe.total_frames_is_estimated
-                                                        ? std::optional(probe.total_frames)
-                                                        : std::nullopt});
+    config.segments.push_back(
+        {.config =
+             decode_config(input.paths[index], input.stable_sources[index], probe, std::nullopt),
+         .exact_frame_count =
+             probe.indexed_sampling_cadence_verified && !probe.total_frames_is_estimated
+                 ? std::optional(probe.total_frames)
+                 : std::nullopt});
   }
   return open_gstreamer_gpu_chained_file_decode_source(std::move(config), runtime);
 }
@@ -218,11 +317,18 @@ std::uint64_t rounded_frames_from_seconds(long double seconds, std::uint32_t fps
 }
 
 AudioSelection select_audio_segments(const ProbedInput& input, std::uint64_t start_time_ns) {
+  const auto segment_duration = [&](std::size_t index) {
+    const auto& probe = input.probes[index];
+    if (!probe.indexed_sampling_cadence_verified || probe.total_frames_is_estimated) {
+      throw std::runtime_error("audio selection requires an exact indexed video timeline");
+    }
+    return stitch_timeline_duration_ns(probe.total_frames, probe.fps_numerator,
+                                       probe.fps_denominator);
+  };
   std::size_t first_segment = 0;
   std::uint64_t local_start = start_time_ns;
-  while (first_segment < input.paths.size() &&
-         local_start >= input.probes[first_segment].duration_ns) {
-    local_start -= input.probes[first_segment].duration_ns;
+  while (first_segment < input.paths.size() && local_start >= segment_duration(first_segment)) {
+    local_start -= segment_duration(first_segment);
     ++first_segment;
   }
   if (first_segment >= input.paths.size()) {
@@ -231,8 +337,9 @@ AudioSelection select_audio_segments(const ProbedInput& input, std::uint64_t sta
 
   AudioSelection selection;
   for (std::size_t index = first_segment; index < input.paths.size(); ++index) {
-    selection.segments.push_back(
-        {.path = input.paths[index], .video_duration_ns = input.probes[index].duration_ns});
+    selection.segments.push_back({.path = input.paths[index],
+                                  .stable_source = input.stable_sources[index],
+                                  .video_duration_ns = segment_duration(index)});
   }
   selection.local_start_time_ns = local_start;
   return selection;
@@ -267,7 +374,215 @@ void reject_unported_stitch_options(const StitchCommand& command) {
   }
 }
 
+RetainedInputSources retain_media_inputs(const std::vector<std::string>& paths) {
+  RetainedInputSources retained;
+  retained.decode.reserve(paths.size());
+  for (const auto& path : paths) {
+    auto source = StableMediaFile::open(core::path_from_utf8(path));
+    retained.decode.push_back(std::move(source));
+  }
+  return retained;
+}
+
+void verify_retained_inputs(const ProbedInput& left, const ProbedInput& right,
+                            const StableMediaFile& calibration) {
+  for (const auto& input : left.stable_sources) {
+    input->verify_unchanged();
+  }
+  for (const auto& input : right.stable_sources) {
+    input->verify_unchanged();
+  }
+  calibration.verify_unchanged();
+}
+
+bool cancellation_is_requested(const CancellationRequested& requested) noexcept {
+  if (!requested) {
+    return false;
+  }
+  try {
+    return requested();
+  } catch (...) {
+    return true;
+  }
+}
+
+class StitchCancelled final : public std::runtime_error {
+public:
+  StitchCancelled() : std::runtime_error("stitch cancelled") {}
+};
+
+class StitchCancellationRelay final {
+public:
+  explicit StitchCancellationRelay(const CancellationRequested& requested) : requested_(requested) {
+    if (!requested_) {
+      return;
+    }
+    worker_ = std::jthread([this](std::stop_token stop) {
+      while (!stop.stop_requested()) {
+        if (cancellation_is_requested(requested_)) {
+          observed_.store(true, std::memory_order_release);
+          std::lock_guard lock(resources_mutex_);
+          if (decoder_ != nullptr) {
+            decoder_->request_stop();
+          }
+          if (opening_decoder_ != nullptr) {
+            opening_decoder_->request_stop();
+          }
+          if (audio_ != nullptr) {
+            audio_->request_stop();
+          }
+          if (opening_audio_ != nullptr) {
+            opening_audio_->request_stop();
+          }
+          if (encoder_ != nullptr) {
+            encoder_->abort();
+          }
+          if (opening_encoder_ != nullptr) {
+            opening_encoder_->abort();
+          }
+          return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+    });
+  }
+
+  StitchCancellationRelay(const StitchCancellationRelay&) = delete;
+  StitchCancellationRelay& operator=(const StitchCancellationRelay&) = delete;
+
+  ~StitchCancellationRelay() {
+    worker_.request_stop();
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+  }
+
+  [[nodiscard]] bool requested() const noexcept {
+    return observed_.load(std::memory_order_acquire) || cancellation_is_requested(requested_);
+  }
+
+  void throw_if_requested() const {
+    if (requested()) {
+      throw StitchCancelled();
+    }
+  }
+
+  void attach(GpuStereoDecodeSession& decoder) noexcept {
+    std::lock_guard lock(resources_mutex_);
+    decoder_ = &decoder;
+    if (requested()) {
+      decoder.request_stop();
+    }
+  }
+
+  void attach(AudioPassthroughSource& audio) noexcept {
+    std::lock_guard lock(resources_mutex_);
+    audio_ = &audio;
+    if (requested()) {
+      audio.request_stop();
+    }
+  }
+
+  void attach(GpuVideoEncodeSession& encoder) noexcept {
+    std::lock_guard lock(resources_mutex_);
+    encoder_ = &encoder;
+    if (requested()) {
+      encoder.abort();
+    }
+  }
+
+  [[nodiscard]] bool observe_opening_decoder(GpuFileDecodeSource* decoder) noexcept {
+    std::lock_guard lock(resources_mutex_);
+    opening_decoder_ = decoder;
+    const bool cancel = decoder != nullptr && requested();
+    if (cancel) {
+      decoder->request_stop();
+    }
+    return !cancel;
+  }
+
+  [[nodiscard]] bool observe_opening_audio(AudioPassthroughSource* audio) noexcept {
+    std::lock_guard lock(resources_mutex_);
+    opening_audio_ = audio;
+    const bool cancel = audio != nullptr && requested();
+    if (cancel) {
+      audio->request_stop();
+    }
+    return !cancel;
+  }
+
+  [[nodiscard]] bool observe_opening_encoder(GpuVideoEncodeSession* encoder) noexcept {
+    std::lock_guard lock(resources_mutex_);
+    opening_encoder_ = encoder;
+    const bool cancel = encoder != nullptr && requested();
+    if (cancel) {
+      encoder->abort();
+    }
+    return !cancel;
+  }
+
+private:
+  const CancellationRequested& requested_;
+  std::atomic<bool> observed_{false};
+  std::mutex resources_mutex_;
+  GpuStereoDecodeSession* decoder_ = nullptr;
+  GpuFileDecodeSource* opening_decoder_ = nullptr;
+  AudioPassthroughSource* audio_ = nullptr;
+  AudioPassthroughSource* opening_audio_ = nullptr;
+  GpuVideoEncodeSession* encoder_ = nullptr;
+  GpuVideoEncodeSession* opening_encoder_ = nullptr;
+  std::jthread worker_;
+};
+
 } // namespace
+
+std::size_t stitch_descriptor_requirement(std::size_t input_segments) {
+  constexpr std::size_t calibration_authority = 1;
+  if (input_segments > std::numeric_limits<std::size_t>::max() - calibration_authority -
+                           kStitchTransientDescriptorReserve) {
+    throw std::overflow_error("stitch input descriptor requirement overflows");
+  }
+  return input_segments + calibration_authority + kStitchTransientDescriptorReserve;
+}
+
+bool stitch_descriptor_budget_fits(std::size_t open_descriptors, std::size_t limit,
+                                   std::size_t input_segments) {
+  const auto required = stitch_descriptor_requirement(input_segments);
+  return open_descriptors <= limit && required <= limit - open_descriptors;
+}
+
+void require_stitch_descriptor_budget(std::size_t input_segments) {
+  const auto required = stitch_descriptor_requirement(input_segments);
+#if defined(_WIN32)
+  const auto initial_open = open_descriptor_count();
+  constexpr std::size_t kMaximumWindowsCrtDescriptors = 8192;
+  if (required <=
+      kMaximumWindowsCrtDescriptors - std::min(initial_open, kMaximumWindowsCrtDescriptors)) {
+    const auto requested = std::min(kMaximumWindowsCrtDescriptors, initial_open + required);
+    if (requested > descriptor_limit()) {
+      (void)_setmaxstdio(static_cast<int>(requested));
+    }
+  }
+#endif
+  const auto current = open_descriptor_count();
+  const auto limit = descriptor_limit();
+  if (!stitch_descriptor_budget_fits(current, limit, input_segments)) {
+    throw std::runtime_error("stitch requires " + std::to_string(required) +
+                             " additional file descriptors for " + std::to_string(input_segments) +
+                             " input segments, but only " +
+                             std::to_string(current > limit ? 0 : limit - current) +
+                             " are available; raise the process descriptor limit or use fewer "
+                             "recording segments");
+  }
+}
+
+std::uint64_t stitch_timeline_duration_ns(std::uint64_t frame_count, std::uint32_t fps_numerator,
+                                          std::uint32_t fps_denominator) {
+  if (fps_numerator == 0 || fps_denominator == 0) {
+    throw std::invalid_argument("stitch source frame rate must be non-zero");
+  }
+  return timestamp_for_frame(frame_count, fps_numerator, fps_denominator);
+}
 
 StitchFrameWindow derive_stitch_frame_window(std::optional<double> start_time,
                                              std::optional<double> end_time,
@@ -321,32 +636,72 @@ StitchFrameTiming derive_stitch_frame_timing(std::uint64_t source_frame_index,
   return {.pts_ns = pts, .duration_ns = next_pts - pts};
 }
 
+std::optional<std::uint64_t> clip_stitch_audio_duration(std::optional<std::uint64_t> pts_ns,
+                                                        std::optional<std::uint64_t> dts_ns,
+                                                        std::uint64_t duration_ns,
+                                                        std::uint64_t video_duration_ns) {
+  const auto presentation_timestamp = pts_ns.has_value() ? pts_ns : dts_ns;
+  if (!presentation_timestamp.has_value()) {
+    throw std::runtime_error("compressed audio packet has no finite presentation timestamp");
+  }
+  if (*presentation_timestamp >= video_duration_ns) {
+    return std::nullopt;
+  }
+  if (duration_ns == 0) {
+    throw std::runtime_error(
+        "compressed audio packet duration is unknown; cannot bound stream-copy output");
+  }
+  return std::min(duration_ns, video_duration_ns - *presentation_timestamp);
+}
+
 int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& executable_path,
-                   std::ostream& out, std::ostream& err) {
+                   std::ostream& out, std::ostream& err,
+                   const CancellationRequested& cancellation_requested) {
   try {
+    if (cancellation_is_requested(cancellation_requested)) {
+      throw StitchCancelled();
+    }
     reject_unported_stitch_options(command);
     auto left_paths = split_input_segments(command.left, "left");
     auto right_paths = split_input_segments(command.right, "right");
+    if (left_paths.size() > std::numeric_limits<std::size_t>::max() - right_paths.size()) {
+      throw std::overflow_error("combined stitch input segment count overflows");
+    }
+    require_stitch_descriptor_budget(left_paths.size() + right_paths.size());
     const auto calibration_path = core::path_from_utf8(command.calibration);
     const auto output_path = core::path_from_utf8(command.output);
+    auto left_sources = retain_media_inputs(left_paths);
+    auto right_sources = retain_media_inputs(right_paths);
+    auto calibration_source = StableMediaFile::open(calibration_path);
     std::vector<AtomicOutputProtectedPath> protected_paths;
     protected_paths.reserve(left_paths.size() + right_paths.size() + 1U);
     for (const auto& path : left_paths) {
-      protected_paths.push_back(
-          {.path = core::path_from_utf8(path), .label = "a left input segment"});
+      const auto index = protected_paths.size();
+      protected_paths.push_back({.path = core::path_from_utf8(path),
+                                 .label = "a left input segment",
+                                 .stable_source = left_sources.decode[index]});
     }
+    const auto right_protected_offset = protected_paths.size();
     for (const auto& path : right_paths) {
-      protected_paths.push_back(
-          {.path = core::path_from_utf8(path), .label = "a right input segment"});
+      const auto index = protected_paths.size() - right_protected_offset;
+      protected_paths.push_back({.path = core::path_from_utf8(path),
+                                 .label = "a right input segment",
+                                 .stable_source = right_sources.decode[index]});
     }
-    protected_paths.push_back({.path = calibration_path, .label = "the calibration file"});
+    protected_paths.push_back({.path = calibration_path,
+                               .label = "the calibration file",
+                               .stable_source = calibration_source});
     AtomicOutputFile output(output_path, {}, {}, protected_paths);
+    std::optional<AudioPassthroughSource> audio;
+    std::optional<GpuVideoEncodeSession> encoder;
+    std::optional<GpuStereoDecodeSession> decoder;
+    StitchCancellationRelay cancellation(cancellation_requested);
+    cancellation.throw_if_requested();
 
-    std::string calibration_error;
-    auto calibration = core::load_match_calibration_file(command.calibration, &calibration_error);
+    auto calibration = core::parse_match_calibration_json(
+        calibration_source->read_all(core::kMaxCalibrationFileSize));
     if (!calibration.has_value()) {
-      throw std::runtime_error(calibration_error.empty() ? "invalid calibration JSON"
-                                                         : calibration_error);
+      throw std::runtime_error("invalid calibration JSON");
     }
     calibration->blend_width = command.blend;
 
@@ -354,8 +709,11 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
     if (!worker.has_value()) {
       throw std::runtime_error("cannot locate the deployed reco_video_probe_worker executable");
     }
-    auto left_input = probe_input(std::move(left_paths), *worker, "left");
-    auto right_input = probe_input(std::move(right_paths), *worker, "right");
+    auto left_input = probe_input(std::move(left_paths), std::move(left_sources), *worker, "left",
+                                  cancellation_requested);
+    auto right_input = probe_input(std::move(right_paths), std::move(right_sources), *worker,
+                                   "right", cancellation_requested);
+    cancellation.throw_if_requested();
     require_exact_indexed_timeline(left_input, "left");
     require_exact_indexed_timeline(right_input, "right");
     const auto& left_probe = left_input.probes.front();
@@ -382,19 +740,36 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
     const auto limit = window.frame_limit;
     const std::int64_t sync_offset =
         command.sync_offset != 0 ? command.sync_offset : calibration->sync_offset;
-    if (const auto sync_error =
-            validate_gpu_stereo_decode_config({.sync_offset = sync_offset, .queue_capacity = 4});
+    if (const auto sync_error = validate_gpu_stereo_decode_config(
+            {.sync_offset = sync_offset, .queue_capacity = kStitchStereoQueueCapacity});
         sync_error.has_value()) {
       throw std::runtime_error(*sync_error);
     }
     auto runtime = discover_nvbufsurface_runtime();
+    cancellation.throw_if_requested();
 
     auto backend = core::CudaBackend::create();
+    cancellation.throw_if_requested();
+    const auto memory_estimate = estimate_gpu_stitch_memory({
+        .output_width = command.width,
+        .output_height = command.height,
+        .left_width = left_probe.width,
+        .left_height = left_probe.height,
+        .right_width = right_probe.width,
+        .right_height = right_probe.height,
+        .decode_source_capacity = kStitchDecodeSourceCapacity,
+        .stereo_queue_capacity = kStitchStereoQueueCapacity,
+        .encode_pool_capacity = kStitchEncodePoolCapacity,
+    });
+    require_gpu_memory_preflight(
+        evaluate_gpu_memory_preflight(memory_estimate.total_bytes, backend.memory_info(0)),
+        "GPU stitch pipeline allocation");
     auto renderer = core::CudaStereoStitchRenderer::create({.calibration = *calibration,
                                                             .output_width = command.width,
                                                             .output_height = command.height,
                                                             .device_ordinal = 0},
                                                            backend, core::NvrtcCompiler::create());
+    cancellation.throw_if_requested();
     auto rgba_storage =
         backend.allocate_pitched(static_cast<std::size_t>(command.width) * 4U, command.height, 4);
     const core::CudaRgbaFrameView rgba(
@@ -405,6 +780,7 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
         command.width, command.height);
     auto converter = core::CudaRgbaToNv12Converter::create(
         {.width = command.width, .height = command.height}, backend, core::NvrtcCompiler::create());
+    cancellation.throw_if_requested();
 
     const auto codec = parse_codec(command.codec);
     const auto quality = parse_quality(command.quality);
@@ -429,18 +805,23 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
       encoder_factory = factory;
     }
 
-    std::optional<AudioPassthroughSource> audio;
     const auto audio_selection = select_audio_segments(
         left_input, audio_start_time_ns(window.start_time_ns, sync_offset, left_probe.fps_numerator,
                                         left_probe.fps_denominator));
     if (!audio_selection.segments.empty()) {
       audio.emplace(
           AudioPassthroughSource::open({.segments = audio_selection.segments,
-                                        .start_time_ns = audio_selection.local_start_time_ns}));
+                                        .start_time_ns = audio_selection.local_start_time_ns},
+                                       [&](AudioPassthroughSource* source) {
+                                         return cancellation.observe_opening_audio(source);
+                                       }));
       if (!audio->caps().has_value()) {
         audio.reset();
+      } else {
+        cancellation.attach(*audio);
       }
     }
+    cancellation.throw_if_requested();
 
     GpuEncodeConfig encode_config{
         .output_path = {},
@@ -456,18 +837,32 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
         .audio_caps = audio.has_value() ? audio->caps() : std::nullopt,
         .quality_value = command.quality_value,
         .device_ordinal = 0,
-        .pool_capacity = 8,
+        .pool_capacity = kStitchEncodePoolCapacity,
     };
-    auto encoder = GpuVideoEncodeSession::open(std::move(encode_config), runtime);
-    auto left = open_decode_source(left_input, start_frame, runtime);
-    auto right = open_decode_source(right_input, start_frame, runtime);
-    GpuStereoDecodeSession decoder(std::move(left), std::move(right),
-                                   {.sync_offset = sync_offset, .queue_capacity = 4});
+    encoder.emplace(GpuVideoEncodeSession::open(
+        std::move(encode_config), runtime, {}, [&](GpuVideoEncodeSession* session) {
+          return cancellation.observe_opening_encoder(session);
+        }));
+    cancellation.attach(*encoder);
+    cancellation.throw_if_requested();
+    const auto observe_opening_decoder = [&](GpuFileDecodeSource* source) {
+      return cancellation.observe_opening_decoder(source);
+    };
+    auto left = open_decode_source(left_input, start_frame, runtime, observe_opening_decoder);
+    cancellation.throw_if_requested();
+    auto right = open_decode_source(right_input, start_frame, runtime, observe_opening_decoder);
+    cancellation.throw_if_requested();
+    decoder.emplace(std::move(left), std::move(right),
+                    GpuStereoDecodeConfig{.sync_offset = sync_offset,
+                                          .queue_capacity = kStitchStereoQueueCapacity});
+    cancellation.attach(*decoder);
+    cancellation.throw_if_requested();
 
     std::optional<CompressedAudioPacket> pending_audio;
     bool audio_eos = false;
-    const auto forward_audio_before = [&](std::uint64_t video_duration_ns) {
+    const auto forward_audio_before = [&](std::uint64_t video_duration_ns, bool final_boundary) {
       while (audio.has_value() && !audio_eos) {
+        cancellation.throw_if_requested();
         if (!pending_audio.has_value()) {
           auto read = audio->read();
           if (read.status == AudioPassthroughStatus::EndOfStream) {
@@ -479,28 +874,37 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
           }
           pending_audio = std::move(*read.packet);
         }
-        const auto timestamp = pending_audio->timestamp_ns();
-        if (!timestamp.has_value()) {
-          throw std::runtime_error("compressed audio packet has no finite timestamp");
-        }
-        if (*timestamp >= video_duration_ns) {
+        if (!final_boundary && pending_audio->duration_ns == 0) {
           break;
         }
-        encoder.submit_audio_packet(std::move(*pending_audio));
+        const auto clipped_duration =
+            clip_stitch_audio_duration(pending_audio->pts_ns, pending_audio->dts_ns,
+                                       pending_audio->duration_ns, video_duration_ns);
+        if (!clipped_duration.has_value()) {
+          break;
+        }
+        if (!final_boundary && *clipped_duration != pending_audio->duration_ns) {
+          break;
+        }
+        pending_audio->duration_ns = *clipped_duration;
+        encoder->submit_audio_packet(std::move(*pending_audio));
         pending_audio.reset();
       }
     };
 
     const auto started = std::chrono::steady_clock::now();
     std::uint64_t frames = 0;
+    std::uint64_t video_duration_ns = 0;
     std::optional<std::uint64_t> first_source_frame_index;
     std::optional<std::uint64_t> previous_source_frame_index;
     while (!limit.has_value() || frames < *limit) {
-      auto decoded = decoder.read();
+      cancellation.throw_if_requested();
+      auto decoded = decoder->read();
       if (decoded.status == GpuStereoDecodeStatus::EndOfStream) {
         break;
       }
       if (decoded.status == GpuStereoDecodeStatus::Stopped || !decoded.frames.has_value()) {
+        cancellation.throw_if_requested();
         throw std::runtime_error("stereo decoder stopped before end-of-stream");
       }
       auto left_frame = map_gpu_decoded_frame_to_cuda_lease(decoded.frames->left);
@@ -511,11 +915,13 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
            decoded.frames->right.rotation_degrees != 180)) {
         throw std::runtime_error("90/270-degree stereo input rotation is not supported");
       }
-      renderer.render(left_frame.view(), right_frame.view(), rgba,
-                      {.flip_left_180 = decoded.frames->left.rotation_degrees == 180,
-                       .flip_right_180 = decoded.frames->right.rotation_degrees == 180});
-      auto encoded = encoder.acquire_frame();
-      converter.convert(rgba, encoded.view());
+      auto encoded = encoder->acquire_frame();
+      auto batch = renderer.begin_batch();
+      renderer.enqueue(batch, left_frame.view(), right_frame.view(), rgba,
+                       {.flip_left_180 = decoded.frames->left.rotation_degrees == 180,
+                        .flip_right_180 = decoded.frames->right.rotation_degrees == 180});
+      converter.enqueue(batch, rgba, encoded.view());
+      batch.wait();
       const auto source_frame_index = decoded.frames->left.frame_index;
       if (previous_source_frame_index.has_value() &&
           source_frame_index <= *previous_source_frame_index) {
@@ -527,28 +933,50 @@ int run_gpu_stitch(const StitchCommand& command, const std::filesystem::path& ex
       const auto timing =
           derive_stitch_frame_timing(source_frame_index, *first_source_frame_index,
                                      left_probe.fps_numerator, left_probe.fps_denominator);
-      encoder.submit_frame(std::move(encoded), timing.pts_ns, timing.duration_ns);
-      forward_audio_before(timing.pts_ns + timing.duration_ns);
+      encoder->submit_frame(std::move(encoded), timing.pts_ns, timing.duration_ns);
+      video_duration_ns = timing.pts_ns + timing.duration_ns;
+      forward_audio_before(video_duration_ns, false);
       previous_source_frame_index = source_frame_index;
       ++frames;
     }
-    decoder.request_stop();
+    decoder->request_stop();
+    if (frames == 0) {
+      encoder->abort();
+      if (audio.has_value()) {
+        audio->request_stop();
+      }
+      throw std::runtime_error("stereo inputs produced no aligned video frames");
+    }
+    forward_audio_before(video_duration_ns, true);
     if (audio.has_value()) {
       audio->request_stop();
     }
-    if (frames == 0) {
-      encoder.abort();
-      throw std::runtime_error("stereo inputs produced no aligned video frames");
-    }
-    encoder.finish();
-    verify_muxed_gpu_video_output(core::path_to_utf8(output.verification_path()));
-    output.commit();
+    cancellation.throw_if_requested();
+    encoder->finish();
+    cancellation.throw_if_requested();
+    verify_muxed_gpu_video_output(output.verification_source(), *codec, format, *worker,
+                                  kProbeTimeout, cancellation_requested);
+    cancellation.throw_if_requested();
+    verify_retained_inputs(left_input, right_input, *calibration_source);
+    cancellation.throw_if_requested();
+    output.commit([&] { return cancellation.requested(); });
+    cancellation.throw_if_requested();
     const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started);
     const auto rate = elapsed.count() > 0.0 ? static_cast<double>(frames) / elapsed.count() : 0.0;
     out << "Stitched " << frames << " frames to " << command.output << " in " << elapsed.count()
         << "s (" << rate << " fps, CUDA/NVMM/NVENC)\n";
     return 0;
+  } catch (const StitchCancelled&) {
+    err << "cancelled\n";
+    return kCancelledExitCode;
+  } catch (const AtomicOutputCancelled&) {
+    err << "cancelled\n";
+    return kCancelledExitCode;
   } catch (const std::exception& error) {
+    if (cancellation_is_requested(cancellation_requested)) {
+      err << "cancelled\n";
+      return kCancelledExitCode;
+    }
     err << "error: " << error.what() << '\n';
     return 2;
   }

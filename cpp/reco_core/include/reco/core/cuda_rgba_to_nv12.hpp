@@ -24,9 +24,11 @@ struct CudaRgbaToNv12Config {
 /// Construction compiles and loads one NVRTC kernel for a fixed frame shape.
 /// Each conversion borrows its input and output allocations, performs one
 /// bounded CUDA launch without allocating or transferring pixels to the host,
-/// and synchronizes the CUDA context before returning. Output matrix and range
-/// metadata are read from the supplied `CudaNv12FrameView`; RGBA alpha is
-/// ignored when producing gamma-coded YCbCr samples.
+/// and waits for a retained stream completion event before returning. Converters
+/// and renderers created from the same backend share this ordered stream without
+/// synchronizing unrelated CUDA context work. Output matrix and range metadata
+/// are read from the supplied `CudaNv12FrameView`; RGBA alpha is ignored when
+/// producing gamma-coded YCbCr samples.
 class CudaRgbaToNv12Converter {
 public:
   /// Creates a converter using the process-default CUDA and NVRTC libraries.
@@ -41,8 +43,11 @@ public:
   CudaRgbaToNv12Converter& operator=(CudaRgbaToNv12Converter&&) noexcept;
   ~CudaRgbaToNv12Converter();
 
-  /// Converts one borrowed frame and synchronizes before either view may be released.
+  /// Converts one borrowed frame and waits for completion before either view may be released.
   void convert(const CudaRgbaFrameView& input, const CudaNv12FrameView& output) const;
+  /// Enqueues conversion without waiting; both borrowed frame owners must outlive `batch.wait()`.
+  void enqueue(CudaExecutionBatch& batch, const CudaRgbaFrameView& input,
+               const CudaNv12FrameView& output) const;
 
   /// Process-local CUDA context identity accepted by this converter.
   [[nodiscard]] CudaContextId context_id() const;

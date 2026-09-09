@@ -2,8 +2,10 @@
 
 #include "reco/core/cuda_frame.hpp"
 #include "reco/io/nvmm.hpp"
+#include "reco/io/stable_media_file.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -22,21 +24,29 @@ inline constexpr std::uint32_t kMaximumGpuStereoQueueCapacity = 16;
 enum class GpuDecodeCodec {
   H264,
   Hevc,
+  Av1,
 };
 
 enum class GpuDecodeContainer {
   QuickTime,
   Matroska,
   MpegTs,
+  Flv,
 };
 
 struct GpuFileDecodeConfig {
+  // User-facing path used only for diagnostics and explicit format selection.
   std::string path;
+  // When present, media bytes are read only from this retained descriptor.
+  std::shared_ptr<const StableMediaFile> stable_source;
   // Elementary streams require an explicit parser. Supported containers
-  // select H264 or HEVC from their video pad at runtime.
+  // select H.264, HEVC, or AV1 from their video pad at runtime.
   GpuDecodeCodec codec = GpuDecodeCodec::H264;
   bool elementary_stream = false;
   std::optional<GpuDecodeContainer> container;
+  // Containerized inputs normally select H.264/HEVC/AV1 dynamically. Set this only when the
+  // container is required to expose exactly `codec`, avoiding parser autoplugging.
+  bool require_selected_codec = false;
   std::uint32_t max_buffers = 4;
   bool drop = false;
   // Bounds one appsink read, including repeated poll wakeups.
@@ -109,6 +119,12 @@ public:
   /// Accurately seeks an indexed source without rebuilding its decode pipeline.
   virtual void seek_to_frame(std::uint64_t frame_index);
 };
+
+/// Observes a partially opened decoder so another thread can interrupt native startup.
+///
+/// The observer receives the source before the pipeline starts, followed by `nullptr` when opening
+/// finishes. Returning false requests an immediate stopped source.
+using GpuDecodeOpeningSourceObserver = std::function<bool(GpuFileDecodeSource*)>;
 
 /// Failure while loading or consuming a GPU-resident GStreamer decode stream.
 class GpuDecodeError : public std::runtime_error {
@@ -229,10 +245,19 @@ build_gstreamer_gpu_file_decode_pipeline(const GpuFileDecodeConfig& config);
 /// Opens an NVDEC/NVMM appsink source using the selected DeepStream surface ABI.
 [[nodiscard]] std::unique_ptr<GpuFileDecodeSource>
 open_gstreamer_gpu_file_decode_source(GpuFileDecodeConfig config, NvbufSurfaceAbi abi);
+/// Opens an NVDEC/NVMM source while making partial startup interruptible through `observer`.
+[[nodiscard]] std::unique_ptr<GpuFileDecodeSource>
+open_gstreamer_gpu_file_decode_source(GpuFileDecodeConfig config, NvbufSurfaceAbi abi,
+                                      const GpuDecodeOpeningSourceObserver& observer);
 /// Opens an NVDEC/NVMM source bound to the retained surface runtime.
 [[nodiscard]] std::unique_ptr<GpuFileDecodeSource>
 open_gstreamer_gpu_file_decode_source(GpuFileDecodeConfig config,
                                       std::shared_ptr<const NvbufSurfaceRuntime> runtime);
+/// Opens retained NVDEC/NVMM bindings while making partial startup interruptible.
+[[nodiscard]] std::unique_ptr<GpuFileDecodeSource>
+open_gstreamer_gpu_file_decode_source(GpuFileDecodeConfig config,
+                                      std::shared_ptr<const NvbufSurfaceRuntime> runtime,
+                                      const GpuDecodeOpeningSourceObserver& observer);
 /// Lazily opens one NVDEC/NVMM segment at a time and rebases frames globally.
 [[nodiscard]] std::unique_ptr<GpuFileDecodeSource>
 open_gstreamer_gpu_chained_file_decode_source(GpuChainedFileDecodeConfig config,

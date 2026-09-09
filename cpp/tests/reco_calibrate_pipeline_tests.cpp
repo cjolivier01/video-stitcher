@@ -343,7 +343,8 @@ void plan_keeps_calibration_gpu_resident() {
               "ready plan reports verified device residency");
   expect_true(description.find("nvv4l2decoder") != std::string::npos,
               "plan describes hardware decode pipeline");
-  expect_true(description.find("qtdemux ! capsfilter caps=\"video/x-h264;video/x-h265\" ! "
+  expect_true(description.find("qtdemux ! capsfilter "
+                               "caps=\"video/x-h264;video/x-h265;video/x-av1\" ! "
                                "parsebin ! identity name=display_info silent=true ! "
                                "nvv4l2decoder") != std::string::npos,
               "containerized inputs select a supported video pad");

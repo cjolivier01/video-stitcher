@@ -427,19 +427,27 @@ std::optional<std::string> validate_audio_passthrough_config(const AudioPassthro
   return std::nullopt;
 }
 
-std::string build_gstreamer_audio_passthrough_pipeline(std::string_view path) {
-  const auto container = gpu_decode_container_for_path(path);
-  if (!container.has_value() || gpu_decode_path_is_elementary_stream(path)) {
+std::string build_audio_passthrough_pipeline(const AudioPassthroughSegment& segment) {
+  const auto container = gpu_decode_container_for_path(segment.path);
+  if (!container.has_value() || gpu_decode_path_is_elementary_stream(segment.path)) {
     throw std::invalid_argument("audio passthrough requires a supported container input");
   }
   std::ostringstream pipeline;
-  pipeline << "filesrc location=" << quote_property(path) << " ! "
-           << gpu_decode_container_demuxer(*container)
+  if (segment.stable_source) {
+    pipeline << "fdsrc fd=" << segment.stable_source->descriptor() << " ! ";
+  } else {
+    pipeline << "filesrc location=" << quote_property(segment.path) << " ! ";
+  }
+  pipeline << gpu_decode_container_demuxer(*container)
            << " ! capsfilter caps=\"audio/mpeg;audio/x-opus;audio/x-vorbis;audio/x-flac;"
               "audio/x-alac;audio/x-ac3;audio/x-eac3\""
            << " ! parsebin ! appsink name=audio_sink sync=false emit-signals=false "
               "max-buffers=1 drop=false";
   return pipeline.str();
+}
+
+std::string build_gstreamer_audio_passthrough_pipeline(std::string_view path) {
+  return build_audio_passthrough_pipeline({.path = std::string(path)});
 }
 
 struct AudioPassthroughSource::Impl {
@@ -456,6 +464,9 @@ struct AudioPassthroughSource::Impl {
       }
       throw AudioPassthroughError(detail);
     }
+  }
+
+  void start() {
     try {
       prime();
     } catch (...) {
@@ -482,6 +493,7 @@ struct AudioPassthroughSource::Impl {
       api->object_unref(pipeline);
       pipeline = nullptr;
     }
+    active_stable_source.reset();
   }
 
   void close_segment() noexcept {
@@ -519,16 +531,35 @@ struct AudioPassthroughSource::Impl {
     return detail;
   }
 
-  bool segment_has_audio(std::string_view path) {
+  bool segment_has_audio(const AudioPassthroughSegment& segment) {
     GErrorAbi* error = nullptr;
-    char* uri = api->filename_to_uri(std::string(path).c_str(), &error);
-    if (uri == nullptr) {
-      throw AudioPassthroughError(take_error(error, "failed to create an audio input URI"));
+    char* allocated_uri = nullptr;
+    std::string retained_uri;
+    if (segment.stable_source) {
+      retained_uri = "fd://" + std::to_string(segment.stable_source->descriptor());
+    } else {
+      allocated_uri = api->filename_to_uri(segment.path.c_str(), &error);
+      if (allocated_uri == nullptr) {
+        throw AudioPassthroughError(take_error(error, "failed to create an audio input URI"));
+      }
     }
-    const std::unique_ptr<void, GstreamerAudioApi::Free> uri_owner(uri, api->free);
+    const std::unique_ptr<void, GstreamerAudioApi::Free> uri_owner(allocated_uri, api->free);
+    const char* uri = segment.stable_source ? retained_uri.c_str() : allocated_uri;
     if (error != nullptr) {
       api->error_free(std::exchange(error, nullptr));
     }
+    struct RewindStableSource {
+      std::shared_ptr<const StableMediaFile> source;
+      bool armed = true;
+      ~RewindStableSource() {
+        if (source && armed) {
+          try {
+            source->rewind();
+          } catch (...) {
+          }
+        }
+      }
+    } rewind{segment.stable_source};
 
     void* context = api->main_context_new();
     if (context == nullptr) {
@@ -598,7 +629,7 @@ struct AudioPassthroughSource::Impl {
       active_discovery_context = context;
       api->discoverer_start(discoverer);
       active.started = true;
-      queued = api->discoverer_discover_uri_async(discoverer, static_cast<const char*>(uri));
+      queued = api->discoverer_discover_uri_async(discoverer, uri);
     }
     if (queued == 0) {
       throw AudioPassthroughError("failed to queue audio input stream discovery");
@@ -619,7 +650,12 @@ struct AudioPassthroughSource::Impl {
                                       ? "GStreamer audio stream discovery failed"
                                       : std::move(discovery.error));
     }
-    return discovery.has_audio;
+    const bool has_audio = discovery.has_audio;
+    if (segment.stable_source) {
+      segment.stable_source->rewind();
+      rewind.armed = false;
+    }
+    return has_audio;
   }
 
   std::optional<std::string> take_bus_error() {
@@ -668,8 +704,15 @@ struct AudioPassthroughSource::Impl {
       trim_before_ns = trim;
       const bool supported_container = !gpu_decode_path_is_elementary_stream(segment->path) &&
                                        gpu_decode_container_for_path(segment->path).has_value();
-      if (supported_container && segment_has_audio(segment->path)) {
-        break;
+      if (supported_container) {
+        auto readable_segment = *segment;
+        if (segment->stable_source) {
+          readable_segment.stable_source = segment->stable_source->open_cursor();
+        }
+        if (segment_has_audio(readable_segment)) {
+          active_stable_source = std::move(readable_segment.stable_source);
+          break;
+        }
       }
       next_output_ns = *segment_output_end;
       segment_output_end.reset();
@@ -677,7 +720,9 @@ struct AudioPassthroughSource::Impl {
         return false;
       }
     }
-    const auto description = build_gstreamer_audio_passthrough_pipeline(segment->path);
+    auto readable_segment = *segment;
+    readable_segment.stable_source = active_stable_source;
+    const auto description = build_audio_passthrough_pipeline(readable_segment);
     GErrorAbi* error = nullptr;
     void* candidate_pipeline = api->parse_launch(description.c_str(), &error);
     const std::unique_ptr<GErrorAbi, GstreamerAudioApi::ErrorFree> parse_error_owner(
@@ -727,11 +772,14 @@ struct AudioPassthroughSource::Impl {
       throw AudioPassthroughError(detail);
     }
     if (trim_before_ns > 0) {
-      (void)api->element_seek_simple(
-          pipeline, kGstFormatTime, kGstSeekFlush | kGstSeekKeyUnit,
-          static_cast<std::int64_t>(std::min<std::uint64_t>(
-              trim_before_ns,
-              static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))));
+      if (api->element_seek_simple(
+              pipeline, kGstFormatTime, kGstSeekFlush | kGstSeekKeyUnit,
+              static_cast<std::int64_t>(std::min<std::uint64_t>(
+                  trim_before_ns,
+                  static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())))) == 0) {
+        close_segment();
+        throw AudioPassthroughError("failed to seek compressed audio to the requested trim point");
+      }
     }
     return true;
   }
@@ -880,6 +928,7 @@ struct AudioPassthroughSource::Impl {
   void* bus = nullptr;
   void* active_discoverer = nullptr;
   void* active_discovery_context = nullptr;
+  std::shared_ptr<const StableMediaFile> active_stable_source;
   std::optional<std::string> caps_value;
   std::optional<CompressedAudioPacket> pending;
   std::optional<std::uint64_t> segment_output_end;
@@ -892,10 +941,40 @@ struct AudioPassthroughSource::Impl {
 };
 
 AudioPassthroughSource AudioPassthroughSource::open(AudioPassthroughConfig config) {
+  return open(std::move(config), {});
+}
+
+AudioPassthroughSource
+AudioPassthroughSource::open(AudioPassthroughConfig config,
+                             const AudioPassthroughOpeningSourceObserver& observer) {
   if (const auto error = validate_audio_passthrough_config(config); error.has_value()) {
     throw std::invalid_argument(*error);
   }
-  return AudioPassthroughSource(std::make_unique<Impl>(std::move(config)));
+  AudioPassthroughSource source(std::make_unique<Impl>(std::move(config)));
+  bool observed = false;
+  if (observer) {
+    observed = true;
+    if (!observer(&source)) {
+      source.request_stop();
+      (void)observer(nullptr);
+      return source;
+    }
+  }
+  try {
+    source.impl_->start();
+  } catch (...) {
+    if (observed) {
+      try {
+        (void)observer(nullptr);
+      } catch (...) {
+      }
+    }
+    throw;
+  }
+  if (observed) {
+    (void)observer(nullptr);
+  }
+  return source;
 }
 
 AudioPassthroughSource::AudioPassthroughSource(std::unique_ptr<Impl> impl)

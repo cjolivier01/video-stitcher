@@ -41,8 +41,22 @@ std::string_view parser_for_codec(GpuDecodeCodec codec) {
     return "h264parse";
   case GpuDecodeCodec::Hevc:
     return "h265parse";
+  case GpuDecodeCodec::Av1:
+    return "av1parse";
   }
   return "h264parse";
+}
+
+std::string_view caps_for_codec(GpuDecodeCodec codec) {
+  switch (codec) {
+  case GpuDecodeCodec::H264:
+    return "video/x-h264";
+  case GpuDecodeCodec::Hevc:
+    return "video/x-h265";
+  case GpuDecodeCodec::Av1:
+    return "video/x-av1";
+  }
+  return "video/x-h264";
 }
 
 std::string lowercase(std::string_view value) {
@@ -60,6 +74,8 @@ std::string_view gpu_decode_codec_name(GpuDecodeCodec codec) {
     return "h264";
   case GpuDecodeCodec::Hevc:
     return "hevc";
+  case GpuDecodeCodec::Av1:
+    return "av1";
   }
   return "h264";
 }
@@ -72,6 +88,8 @@ std::string_view gpu_decode_container_demuxer(GpuDecodeContainer container) {
     return "matroskademux";
   case GpuDecodeContainer::MpegTs:
     return "tsdemux";
+  case GpuDecodeContainer::Flv:
+    return "flvdemux";
   }
   return "qtdemux";
 }
@@ -81,12 +99,16 @@ GpuDecodeCodec gpu_decode_codec_for_path(std::string_view path) {
   if (ext == ".h265" || ext == ".hevc" || ext == ".265") {
     return GpuDecodeCodec::Hevc;
   }
+  if (ext == ".av1") {
+    return GpuDecodeCodec::Av1;
+  }
   return GpuDecodeCodec::H264;
 }
 
 bool gpu_decode_path_is_elementary_stream(std::string_view path) {
   const auto ext = lowercase(reco::core::path_from_utf8(path).extension().string());
-  return ext == ".h264" || ext == ".264" || ext == ".h265" || ext == ".hevc" || ext == ".265";
+  return ext == ".h264" || ext == ".264" || ext == ".h265" || ext == ".hevc" || ext == ".265" ||
+         ext == ".av1";
 }
 
 std::optional<GpuDecodeContainer> gpu_decode_container_for_path(std::string_view path) {
@@ -99,6 +121,9 @@ std::optional<GpuDecodeContainer> gpu_decode_container_for_path(std::string_view
   }
   if (ext == ".ts" || ext == ".mts" || ext == ".m2ts") {
     return GpuDecodeContainer::MpegTs;
+  }
+  if (ext == ".flv") {
+    return GpuDecodeContainer::Flv;
   }
   return std::nullopt;
 }
@@ -211,12 +236,19 @@ std::string build_gstreamer_gpu_file_decode_pipeline(const GpuFileDecodeConfig& 
     throw std::invalid_argument(*error);
   }
   std::ostringstream pipeline;
-  pipeline << "filesrc location=" << quote_gstreamer_property(config.path) << " ! ";
+  if (config.stable_source) {
+    pipeline << "fdsrc fd=" << config.stable_source->descriptor() << " ! ";
+  } else {
+    pipeline << "filesrc location=" << quote_gstreamer_property(config.path) << " ! ";
+  }
   if (config.elementary_stream) {
     pipeline << parser_for_codec(config.codec);
+  } else if (config.require_selected_codec) {
+    pipeline << gpu_decode_container_demuxer(*config.container) << " ! capsfilter caps=\""
+             << caps_for_codec(config.codec) << "\" ! " << parser_for_codec(config.codec);
   } else {
     pipeline << gpu_decode_container_demuxer(*config.container)
-             << " ! capsfilter caps=\"video/x-h264;video/x-h265\" ! parsebin";
+             << " ! capsfilter caps=\"video/x-h264;video/x-h265;video/x-av1\" ! parsebin";
   }
   pipeline << " ! identity name=display_info silent=true"
            << " ! nvv4l2decoder"

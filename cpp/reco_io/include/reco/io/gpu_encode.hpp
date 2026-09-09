@@ -2,12 +2,15 @@
 
 #include "reco/core/cuda_frame.hpp"
 #include "reco/io/audio_passthrough.hpp"
+#include "reco/io/gpu_video_probe.hpp"
 #include "reco/io/nvmm.hpp"
 #include "reco/io/output.hpp"
 
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -85,16 +88,33 @@ private:
   friend class GpuVideoEncodeSession;
 };
 
+class GpuVideoEncodeSession;
+
+/// Observes a partially opened encoder so another thread can interrupt native startup.
+///
+/// The observer receives the session before the pipeline enters PLAYING, followed by `nullptr`
+/// when opening finishes. Returning false requests an immediately aborted session.
+using GpuEncodeOpeningSessionObserver = std::function<bool(GpuVideoEncodeSession*)>;
+
 /// Bounded `memory:NVMM` appsrc session feeding only NVIDIA hardware encoders.
 class GpuVideoEncodeSession final {
 public:
   /// Opens the production GStreamer and DeepStream runtime bindings.
   [[nodiscard]] static GpuVideoEncodeSession
   open(GpuEncodeConfig config, std::shared_ptr<GpuEncodeTraceSink> trace_sink = {});
+  /// Opens the production bindings while making partial startup interruptible through `observer`.
+  [[nodiscard]] static GpuVideoEncodeSession open(GpuEncodeConfig config,
+                                                  std::shared_ptr<GpuEncodeTraceSink> trace_sink,
+                                                  const GpuEncodeOpeningSessionObserver& observer);
   /// Opens against an already retained NvBufSurface runtime.
   [[nodiscard]] static GpuVideoEncodeSession
   open(GpuEncodeConfig config, std::shared_ptr<const NvbufSurfaceRuntime> runtime,
        std::shared_ptr<GpuEncodeTraceSink> trace_sink = {});
+  /// Opens retained bindings while making partial startup interruptible through `observer`.
+  [[nodiscard]] static GpuVideoEncodeSession
+  open(GpuEncodeConfig config, std::shared_ptr<const NvbufSurfaceRuntime> runtime,
+       std::shared_ptr<GpuEncodeTraceSink> trace_sink,
+       const GpuEncodeOpeningSessionObserver& observer);
 
   GpuVideoEncodeSession(const GpuVideoEncodeSession&) = delete;
   GpuVideoEncodeSession& operator=(const GpuVideoEncodeSession&) = delete;
@@ -126,8 +146,21 @@ private:
 [[nodiscard]] std::optional<std::string> validate_gpu_encode_config(const GpuEncodeConfig& config);
 [[nodiscard]] std::string_view gstreamer_hardware_encoder_factory(Codec codec);
 [[nodiscard]] std::string build_gstreamer_gpu_encode_pipeline(const GpuEncodeConfig& config);
-/// Verifies that a finalized muxed file exposes at least one video stream without decoding it.
-void verify_muxed_gpu_video_output(std::string_view path,
-                                   std::chrono::milliseconds timeout = std::chrono::seconds(10));
+/// Verifies one parser-selected compressed video access unit in an isolated worker.
+///
+/// The worker uses only a demuxer, parser, compressed caps filters, and an appsink. It never
+/// instantiates a video decoder or materializes pixels. H.264, HEVC, and AV1 in MP4, fragmented
+/// MP4, Matroska, QuickTime, and FLV containers are supported.
+void verify_muxed_gpu_video_output(
+    const std::filesystem::path& path, Codec codec, Format format,
+    const std::filesystem::path& probe_worker,
+    std::chrono::milliseconds timeout = std::chrono::seconds(10),
+    const GpuVideoProbeCancellationRequested& cancellation_requested = {});
+/// Verifies the exact retained file authority without reopening its diagnostic pathname.
+void verify_muxed_gpu_video_output(
+    std::shared_ptr<const StableMediaFile> source, Codec codec, Format format,
+    const std::filesystem::path& probe_worker,
+    std::chrono::milliseconds timeout = std::chrono::seconds(10),
+    const GpuVideoProbeCancellationRequested& cancellation_requested = {});
 
 } // namespace reco::io

@@ -1,8 +1,11 @@
 #pragma once
 
+#include "reco/io/stable_media_file.hpp"
+
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -14,8 +17,11 @@ namespace reco::io {
 
 /// One video segment whose compressed audio may be passed through.
 struct AudioPassthroughSegment {
-  /// Input video path. Elementary video streams are retained as silent timeline gaps.
+  /// User-facing input path used for explicit container selection and diagnostics.
   std::string path;
+  /// Optional retained authority. An independent cursor is acquired only while this segment is
+  /// active, and a pathname substitute is never consumed.
+  std::shared_ptr<const StableMediaFile> stable_source;
   /// Probed video duration used to preserve the joined video timeline when audio is absent.
   std::uint64_t video_duration_ns = 0;
 };
@@ -58,10 +64,22 @@ public:
   using std::runtime_error::runtime_error;
 };
 
+class AudioPassthroughSource;
+
+/// Observes a partially opened source so another thread can interrupt native startup.
+///
+/// The observer receives the source before discovery or pipeline startup can block, followed by
+/// `nullptr` when opening finishes. Returning false requests an immediate stopped source.
+using AudioPassthroughOpeningSourceObserver = std::function<bool(AudioPassthroughSource*)>;
+
 /// GStreamer compressed-audio reader. Video pads are never decoded or materialized.
 class AudioPassthroughSource final {
 public:
+  /// Opens without observing partial startup.
   [[nodiscard]] static AudioPassthroughSource open(AudioPassthroughConfig config);
+  /// Opens while making partial startup interruptible through `observer`.
+  [[nodiscard]] static AudioPassthroughSource
+  open(AudioPassthroughConfig config, const AudioPassthroughOpeningSourceObserver& observer);
 
   AudioPassthroughSource(const AudioPassthroughSource&) = delete;
   AudioPassthroughSource& operator=(const AudioPassthroughSource&) = delete;
