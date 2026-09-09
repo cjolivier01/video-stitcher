@@ -70,7 +70,7 @@ InterruptMonitor::InterruptMonitor() : impl_(std::make_unique<Impl>()) {
   interrupt_requested = 0;
   struct sigaction action{};
   action.sa_handler = handle_posix_interrupt;
-  if (::sigemptyset(&action.sa_mask) != 0) {
+  if (sigemptyset(&action.sa_mask) != 0) {
     throw std::system_error(errno, std::generic_category(),
                             "cannot initialize the cancellation signal mask");
   }

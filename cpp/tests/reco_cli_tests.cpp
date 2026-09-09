@@ -378,7 +378,7 @@ int run_windows_interrupt_child(int argc, wchar_t** argv) {
   try {
     detail::InterruptMonitor interrupts;
     {
-      detail::AtomicOutputFile output(std::filesystem::path(argv[2]));
+      detail::AtomicOutputFile output{std::filesystem::path(argv[2])};
       write_text_descriptor(output.descriptor(), "partial output\n");
       if (SetEvent(ready) == 0) {
         throw std::runtime_error("cannot signal Windows interrupt-child readiness");
