@@ -242,6 +242,7 @@ struct FakePipeline : FakeObject {
   std::string description;
   std::atomic<bool> eos_sent{false};
   std::uint32_t pushed_buffers = 0;
+  std::mutex retained_buffers_mutex;
   std::vector<FakeWrappedBuffer*> retained_buffers;
 };
 
@@ -639,8 +640,11 @@ void release_retained_buffers(FakePipeline* pipeline) {
   if (pipeline == nullptr) {
     return;
   }
-  auto retained = std::move(pipeline->retained_buffers);
-  pipeline->retained_buffers.clear();
+  std::vector<FakeWrappedBuffer*> retained;
+  {
+    std::lock_guard lock(pipeline->retained_buffers_mutex);
+    retained.swap(pipeline->retained_buffers);
+  }
   for (auto* buffer : retained) {
     release_wrapped_buffer(buffer);
   }
@@ -2726,6 +2730,7 @@ RECO_FAKE_EXPORT int gst_app_src_push_buffer(void* source_pointer, void* buffer_
       (source->audio && scenario() == "encode-audio-backpressure") ||
       scenario() == "encode-finalize-timeout" || scenario() == "encode-eos-rejected" ||
       scenario() == "encode-bus-error") {
+    std::lock_guard lock(pipeline->retained_buffers_mutex);
     pipeline->retained_buffers.push_back(buffer);
   } else {
     release_wrapped_buffer(buffer);

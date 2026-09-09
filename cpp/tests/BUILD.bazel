@@ -587,7 +587,7 @@ cc_test(
     ],
     env = {
         "ASAN_OPTIONS": "detect_leaks=0",
-        "TSAN_OPTIONS": "atexit_sleep_ms=0",
+        "TSAN_OPTIONS": "atexit_sleep_ms=0:die_after_fork=0",
     },
     tags = [
         "exclusive",
