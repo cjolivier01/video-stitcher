@@ -1040,22 +1040,55 @@ void caller_sigchld_policy_cannot_fake_success_or_steal_worker_ownership() {
   }
   expect_true(::sigaction(SIGCHLD, &original, nullptr) == 0, "SIGCHLD no-wait policy restores");
 
+  const auto guardian_marker = temporary_path("stable-parent-guardian.pid");
+  std::filesystem::remove(guardian_marker);
+  std::optional<pid_t> guardian;
+  std::optional<pid_t> guardian_parent;
+  {
+    EnvironmentValue guardian_ready("RECO_FAKE_CALIBRATION_GUARDIAN_READY_PATH",
+                                    guardian_marker.string());
+    EnvironmentValue guardian_delay("RECO_FAKE_CALIBRATION_GUARDIAN_DELAY_MS", "500");
+    std::thread observer([&] {
+      guardian = wait_for_pid_marker(guardian_marker, std::chrono::seconds(1));
+      if (guardian.has_value()) {
+        guardian_parent = process_parent(*guardian);
+      }
+    });
+    Scenario scenario("success");
+    try {
+      expect_eq(run_gpu_calibration(lifecycle_request_fixture(), ready_backends()).total_matches,
+                12U, "stable parent calibration succeeds");
+    } catch (const std::exception& error) {
+      std::cerr << "FAIL: stable parent calibration threw: " << error.what() << '\n';
+      ++failures;
+    }
+    observer.join();
+  }
+  expect_true(guardian.has_value(), "guardian reports its PID for parent verification");
+  expect_true(guardian_parent.has_value() && *guardian_parent != ::getpid(),
+              "guardian exit status is owned by a distinct process parent");
+  std::filesystem::remove(guardian_marker);
+
+  EnvironmentValue delayed_reap("RECO_FAKE_CALIBRATION_STABLE_PARENT_REAP_DELAY_MS", "20");
   std::atomic<bool> stop{false};
   std::thread thief([&] {
     while (!stop.load(std::memory_order_relaxed)) {
       int status = 0;
       (void)::waitpid(-1, &status, WNOHANG);
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      std::this_thread::yield();
     }
   });
   {
     Scenario scenario("success");
-    try {
-      expect_eq(run_gpu_calibration(request_fixture(), ready_backends()).total_matches, 12U,
-                "competing waitpid cannot steal calibration worker ownership");
-    } catch (const std::exception& error) {
-      std::cerr << "FAIL: competing waitpid threw: " << error.what() << '\n';
-      ++failures;
+    for (std::size_t attempt = 0; attempt < 16U; ++attempt) {
+      try {
+        expect_eq(run_gpu_calibration(lifecycle_request_fixture(), ready_backends()).total_matches,
+                  12U, "competing waitpid cannot steal calibration guardian ownership");
+      } catch (const std::exception& error) {
+        std::cerr << "FAIL: competing waitpid attempt " << attempt << " threw: " << error.what()
+                  << '\n';
+        ++failures;
+      }
     }
   }
   stop.store(true, std::memory_order_relaxed);
