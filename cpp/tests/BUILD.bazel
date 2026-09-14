@@ -805,6 +805,15 @@ cc_test(
 )
 
 cc_test(
+    name = "reco_gui_gpu_preview_controller_tests",
+    size = "small",
+    srcs = ["reco_gui_gpu_preview_controller_tests.cpp"],
+    deps = [
+        "//cpp/reco_gui",
+    ],
+)
+
+cc_test(
     name = "reco_obs_metadata_tests",
     size = "small",
     srcs = ["reco_obs_metadata_tests.cpp"],

@@ -955,6 +955,10 @@ RECO_FAKE_EXPORT void* gst_bin_get_by_name(void* pipeline_pointer, const char* n
     record("get-audio-sink");
     return scenario() == "audio-missing-sink" ? nullptr : new FakeSink(pipeline);
   }
+  if (name != nullptr && std::strcmp(name, "preview_sink") == 0) {
+    record("get-preview-sink");
+    return scenario() == "encode-missing-preview-sink" ? nullptr : new FakeSink(pipeline);
+  }
   if (name != nullptr && std::strcmp(name, "sink") == 0) {
     record("get-sink");
     return scenario() == "missing-sink" ? nullptr : new FakeSink(pipeline);
@@ -2751,6 +2755,14 @@ RECO_FAKE_EXPORT int gst_app_src_end_of_stream(void* source_pointer) {
     source->pipeline->eos_sent = true;
   }
   return 0;
+}
+
+RECO_FAKE_EXPORT void gst_video_overlay_set_window_handle(void* sink_pointer,
+                                                          std::uintptr_t handle) {
+  const auto* sink = static_cast<FakeSink*>(sink_pointer);
+  record(sink != nullptr && sink->kind == ObjectKind::Sink
+             ? "overlay-window-" + std::to_string(handle)
+             : "overlay-invalid-sink");
 }
 
 RECO_FAKE_EXPORT void gst_mini_object_unref(void* object) {

@@ -1,5 +1,6 @@
 #include "reco/io/gpu_encode.hpp"
 #include "reco/io/gpu_memory.hpp"
+#include "reco/io/gpu_preview.hpp"
 
 #include <cstdlib>
 #include <iostream>
@@ -285,6 +286,60 @@ void gpu_memory_estimates_are_overflow_checked_and_topology_aware() {
       "safety-adjusted memory requirement rejects overflow");
 }
 
+void gpu_preview_pipeline_is_bounded_and_nvmm_only() {
+  GpuPreviewConfig config{
+      .width = 1280,
+      .height = 720,
+      .fps_numerator = 30,
+      .fps_denominator = 1,
+      .window_handle = 42,
+      .device_ordinal = 2,
+      .pool_capacity = 3,
+  };
+  expect_true(!validate_gpu_preview_config(config).has_value(), "valid GPU preview accepted");
+  const auto pipeline = build_gstreamer_gpu_preview_pipeline(config);
+  expect_true(pipeline.find("video/x-raw(memory:NVMM)") != std::string::npos,
+              "preview appsrc requires NVMM");
+  expect_true(pipeline.find("max-buffers=3") != std::string::npos,
+              "preview appsrc and queue are bounded");
+  expect_true(pipeline.find("nveglglessink") != std::string::npos,
+              "desktop preview selects NVIDIA EGL sink");
+  expect_true(pipeline.find("gpu-id=2") != std::string::npos,
+              "desktop preview sink uses the CUDA surface device");
+  expect_true(pipeline.find("nvv4l2") == std::string::npos &&
+                  pipeline.find("videoconvert") == std::string::npos,
+              "preview neither encodes nor enters a CPU converter");
+
+  config.sink = GpuPreviewSink::Nvidia3d;
+  expect_true(validate_gpu_preview_config(config).has_value(),
+              "Jetson preview rejects a device the sink cannot select");
+  config.device_ordinal = 0;
+  const auto jetson_pipeline = build_gstreamer_gpu_preview_pipeline(config);
+  expect_true(jetson_pipeline.find("nv3dsink") != std::string::npos,
+              "Jetson preview selects NVIDIA 3D sink");
+  expect_true(jetson_pipeline.find("create-window") == std::string::npos &&
+                  jetson_pipeline.find("force-aspect-ratio") == std::string::npos,
+              "Jetson preview omits EGL-only sink properties");
+  config.window_handle = 0;
+  expect_true(validate_gpu_preview_config(config).has_value(),
+              "preview rejects a missing native window");
+  config = GpuPreviewConfig{
+      .width = 1279, .height = 720, .fps_numerator = 30, .fps_denominator = 1, .window_handle = 42};
+  expect_true(validate_gpu_preview_config(config).has_value(), "preview rejects odd dimensions");
+  config.width = 1280;
+  config.fps_numerator = 241;
+  expect_true(validate_gpu_preview_config(config).has_value(),
+              "preview rejects excessive frame rates");
+  config.fps_numerator = 30;
+  config.pool_capacity = 1;
+  expect_true(validate_gpu_preview_config(config).has_value(),
+              "preview rejects an undersized surface pool");
+  config.pool_capacity = 2;
+  config.acquire_timeout = std::chrono::milliseconds(0);
+  expect_true(validate_gpu_preview_config(config).has_value(),
+              "preview rejects an unbounded immediate acquire loop");
+}
+
 } // namespace
 
 int main() {
@@ -293,6 +348,7 @@ int main() {
   codec_and_container_factories_are_explicit();
   compressed_audio_is_stream_copied_through_a_bounded_mux_branch();
   gpu_memory_estimates_are_overflow_checked_and_topology_aware();
+  gpu_preview_pipeline_is_bounded_and_nvmm_only();
   if (failures != 0) {
     std::cerr << failures << " test(s) failed\n";
     return EXIT_FAILURE;

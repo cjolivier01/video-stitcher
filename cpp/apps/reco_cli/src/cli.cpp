@@ -11,6 +11,7 @@
 #include "reco/io/gpu_decode.hpp"
 #include "reco/io/gstreamer.hpp"
 #include "reco/io/stable_media_file.hpp"
+#include "reco/io/video_probe_worker.hpp"
 #include "rules_cc/cc/runfiles/runfiles.h"
 #include "stitch.hpp"
 
@@ -70,11 +71,9 @@ namespace {
 using rules_cc::cc::runfiles::Runfiles;
 
 #if defined(_WIN32)
-constexpr std::string_view probe_worker_name = "reco_video_probe_worker.exe";
 constexpr std::string_view calibration_worker_name = "reco_calibration_worker.exe";
 constexpr std::filesystem::path::value_type path_separator = L';';
 #else
-constexpr std::string_view probe_worker_name = "reco_video_probe_worker";
 constexpr std::string_view calibration_worker_name = "reco_calibration_worker";
 constexpr std::filesystem::path::value_type path_separator = ':';
 #endif
@@ -183,8 +182,7 @@ resolve_worker_impl(const std::filesystem::path& executable_path, const char* en
 
 std::optional<std::filesystem::path>
 resolve_video_probe_worker_impl(const std::filesystem::path& executable_path) {
-  return resolve_worker_impl(executable_path, "RECO_VIDEO_PROBE_WORKER", probe_worker_name,
-                             "cpp/reco_io", "reco_io");
+  return reco::io::resolve_deployed_video_probe_worker(executable_path);
 }
 
 std::optional<std::filesystem::path>

@@ -1,5 +1,17 @@
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
 
+cc_library(
+    name = "video_probe_worker_locator",
+    srcs = ["src/video_probe_worker.cpp"],
+    hdrs = ["include/reco/io/video_probe_worker.hpp"],
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//cpp/reco_core",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
 _RECO_IO_SRCS = [
     "src/audio_passthrough.cpp",
     "src/gstreamer.cpp",
@@ -11,6 +23,7 @@ _RECO_IO_SRCS = [
     "src/gpu_decode_session.cpp",
     "src/gpu_encode.cpp",
     "src/gpu_memory.cpp",
+    "src/gpu_preview.cpp",
     "src/gpu_video_probe.cpp",
     "src/gpu_video_probe_internal.hpp",
     "src/gpu_video_probe_process.cpp",
@@ -32,6 +45,7 @@ _RECO_IO_HDRS = [
     "include/reco/io/gpu_decode.hpp",
     "include/reco/io/gpu_encode.hpp",
     "include/reco/io/gpu_memory.hpp",
+    "include/reco/io/gpu_preview.hpp",
     "include/reco/io/gpu_video_probe.hpp",
     "include/reco/io/detail/nvbufsurface_7_1.hpp",
     "include/reco/io/detail/nvbufsurface_9_1.hpp",

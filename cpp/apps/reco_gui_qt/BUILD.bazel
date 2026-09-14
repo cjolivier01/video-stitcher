@@ -3,11 +3,18 @@ load("@rules_cc//cc:defs.bzl", "cc_binary")
 cc_binary(
     name = "reco_gui_qt",
     srcs = ["main.cpp"],
+    data = [
+        "//cpp/apps/reco_cli:reco",
+        "//cpp/reco_io:reco_video_probe_worker",
+    ],
     local_defines = ["QT_NO_KEYWORDS"],
     visibility = ["//visibility:public"],
     deps = [
         "//cpp/reco_core",
         "//cpp/reco_gui",
+        "//cpp/reco_io",
+        "//cpp/reco_io:video_probe_worker_locator",
         "@local_config_qt//:qt_widgets",
+        "@rules_cc//cc/runfiles",
     ],
 )

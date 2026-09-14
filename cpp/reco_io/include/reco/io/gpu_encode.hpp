@@ -85,6 +85,7 @@ private:
 
   std::unique_ptr<State> state_;
 
+  friend class GpuFrameLeaseAccess;
   friend class GpuVideoEncodeSession;
 };
 
