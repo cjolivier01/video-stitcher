@@ -1,7 +1,10 @@
 #include <array>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
 
 #ifndef RECO_FAKE_CUDA_DRIVER_MARKER
 #define RECO_FAKE_CUDA_DRIVER_MARKER 1
@@ -43,6 +46,23 @@ constexpr std::uintptr_t kReadOnlyBase = 0x52000000;
 constexpr std::uintptr_t kYPlaneSize = 1280U * 720U;
 constexpr std::uintptr_t kAllocationSize = 1280U * 1080U;
 constexpr std::size_t kVmmGranularity = 0x10000U;
+constexpr std::size_t kDefaultTotalMemoryBytes = 8ULL * 1024ULL * 1024ULL * 1024ULL;
+constexpr std::size_t kDefaultFreeMemoryBytes = 6ULL * 1024ULL * 1024ULL * 1024ULL;
+
+std::size_t memory_bytes_from_environment(const char* name, std::size_t fallback) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') {
+    return fallback;
+  }
+  char* end = nullptr;
+  errno = 0;
+  const auto parsed = std::strtoull(value, &end, 10);
+  if (errno != 0 || end == value || *end != '\0' ||
+      parsed > std::numeric_limits<std::size_t>::max()) {
+    return fallback;
+  }
+  return static_cast<std::size_t>(parsed);
+}
 
 std::uintptr_t allocation_base(std::uintptr_t pointer) {
   if (pointer >= kDefaultBase && pointer < kDefaultBase + kAllocationSize) {
@@ -103,6 +123,11 @@ extern "C" int cuDeviceGetAttribute(int* value, int attribute, int device) {
   }
   if (attribute == 76) {
     *value = 6;
+    return 0;
+  }
+  if (attribute == 18) {
+    const char* integrated = std::getenv("RECO_FAKE_CUDA_INTEGRATED");
+    *value = integrated != nullptr && std::strcmp(integrated, "1") == 0 ? 1 : 0;
     return 0;
   }
   return 1;
@@ -265,7 +290,16 @@ extern "C" int cuMemFree_v2(std::uint64_t) { return 1; }
 extern "C" int cuMemsetD8_v2(std::uint64_t, unsigned char, std::size_t) { return 1; }
 extern "C" int cuMemcpy2D_v2(const void*) { return 1; }
 extern "C" int cuMemcpyDtoH_v2(void*, std::uint64_t, std::size_t) { return 1; }
-extern "C" int cuMemGetInfo_v2(std::size_t*, std::size_t*) { return 1; }
+extern "C" int cuMemGetInfo_v2(std::size_t* free_bytes, std::size_t* total_bytes) {
+  if (free_bytes == nullptr || total_bytes == nullptr ||
+      current_context != reinterpret_cast<void*>(0xC0DA)) {
+    return 1;
+  }
+  *free_bytes = memory_bytes_from_environment("RECO_FAKE_CUDA_FREE_BYTES", kDefaultFreeMemoryBytes);
+  *total_bytes =
+      memory_bytes_from_environment("RECO_FAKE_CUDA_TOTAL_BYTES", kDefaultTotalMemoryBytes);
+  return 0;
+}
 extern "C" int cuMemAddressReserve(unsigned long long*, std::size_t, std::size_t,
                                    unsigned long long, unsigned long long) {
   return 1;

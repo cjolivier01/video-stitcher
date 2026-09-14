@@ -19,11 +19,13 @@ std::string encode(const nlohmann::json& value) {
 }
 
 nlohmann::json valid_request() {
-  return {{"protocol_version", 5U},
+  return {{"protocol_version", 6U},
           {"path", nlohmann::json::binary({0x76, 0x69, 0x64, 0x65, 0x6f})},
+          {"stable_source", false},
           {"codec", 0},
           {"elementary_stream", false},
           {"container", 0},
+          {"require_selected_codec", false},
           {"max_buffers", 4U},
           {"drop", false},
           {"timeout_ns", 1'000'000'000ULL}};
@@ -56,7 +58,7 @@ template <typename Function> void expect_success(Function&& function, std::strin
 }
 
 nlohmann::json valid_response() {
-  return {{"protocol_version", 5U},
+  return {{"protocol_version", 6U},
           {"ok", true},
           {"width", 1920U},
           {"height", 1080U},
@@ -95,6 +97,33 @@ void request_numeric_domains_are_enforced() {
   floating_codec["codec"] = 0.0;
   expect_probe_error([&] { (void)reco::io::detail::decode_probe_request(encode(floating_codec)); },
                      "codec", "floating-point codec is rejected");
+
+  auto missing_strict_codec = valid_request();
+  missing_strict_codec.erase("require_selected_codec");
+  expect_probe_error(
+      [&] { (void)reco::io::detail::decode_probe_request(encode(missing_strict_codec)); },
+      "require_selected_codec", "strict codec selection is mandatory in protocol version 6");
+
+  auto strict_codec = valid_request();
+  strict_codec["require_selected_codec"] = true;
+  if (!reco::io::detail::decode_probe_request(encode(strict_codec)).config.require_selected_codec) {
+    std::cerr << "FAIL: strict codec selection round trips in worker requests\n";
+    ++failures;
+  }
+}
+
+void stable_source_authority_is_explicit() {
+  auto request = valid_request();
+  request["stable_source"] = true;
+  const auto decoded = reco::io::detail::decode_probe_request(encode(request));
+  if (!decoded.expects_stable_source || decoded.config.stable_source) {
+    std::cerr << "FAIL: protocol separates stable-source authority from serialized metadata\n";
+    ++failures;
+  }
+
+  request.erase("stable_source");
+  expect_probe_error([&] { (void)reco::io::detail::decode_probe_request(encode(request)); },
+                     "stable_source", "stable-source authority is mandatory in protocol version 6");
 }
 
 void response_numeric_domains_are_enforced() {
@@ -109,25 +138,25 @@ void response_numeric_domains_are_enforced() {
   missing_cadence_proof.erase("indexed_sampling_cadence_verified");
   expect_probe_error(
       [&] { (void)reco::io::detail::decode_probe_response(encode(missing_cadence_proof)); },
-      "indexed_sampling_cadence_verified", "cadence proof is mandatory in protocol version 5");
+      "indexed_sampling_cadence_verified", "cadence proof is mandatory in protocol version 6");
 
   auto missing_caps_proof = base;
   missing_caps_proof.erase("selected_stream_caps_verified");
   expect_probe_error(
       [&] { (void)reco::io::detail::decode_probe_response(encode(missing_caps_proof)); },
-      "selected_stream_caps_verified", "caps proof is mandatory in protocol version 5");
+      "selected_stream_caps_verified", "caps proof is mandatory in protocol version 6");
 
   auto missing_stream_origin = base;
   missing_stream_origin.erase("first_stream_time_ns");
   expect_probe_error(
       [&] { (void)reco::io::detail::decode_probe_response(encode(missing_stream_origin)); },
-      "first_stream_time_ns", "stream-time origin is mandatory in protocol version 5");
+      "first_stream_time_ns", "stream-time origin is mandatory in protocol version 6");
 
   auto missing_multiplicity = base;
   missing_multiplicity.erase("timestamp_multiplicity");
   expect_probe_error(
       [&] { (void)reco::io::detail::decode_probe_response(encode(missing_multiplicity)); },
-      "timestamp_multiplicity", "timestamp multiplicity is mandatory in protocol version 5");
+      "timestamp_multiplicity", "timestamp multiplicity is mandatory in protocol version 6");
 
   for (const auto& [key, value] : std::initializer_list<std::pair<std::string, nlohmann::json>>{
            {"protocol_version", std::numeric_limits<std::uint64_t>::max()},
@@ -344,6 +373,7 @@ void cbor_nesting_is_bounded_before_parsing() {
 
 int main() {
   request_numeric_domains_are_enforced();
+  stable_source_authority_is_explicit();
   response_numeric_domains_are_enforced();
   stream_time_origin_round_trips();
   timestamp_multiplicity_round_trips();

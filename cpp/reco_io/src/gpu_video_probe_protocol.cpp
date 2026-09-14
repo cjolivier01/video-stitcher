@@ -16,7 +16,7 @@ namespace {
 
 constexpr std::size_t kMaximumErrorMessageBytes = 1024;
 constexpr std::size_t kMaximumCborNestingDepth = 32;
-constexpr std::uint32_t kProbeProtocolVersion = 5;
+constexpr std::uint32_t kProbeProtocolVersion = 6;
 constexpr double kMaximumSaneFps = 1000.0;
 constexpr std::uint32_t kMaximumGpuVideoDimension = 8'192;
 constexpr std::uint64_t kMaximumNv12FrameBytes = 8'192ULL * 8'192ULL * 3ULL / 2ULL;
@@ -144,7 +144,7 @@ int encode_container(const std::optional<GpuDecodeContainer>& container) {
 
 GpuDecodeCodec decode_codec(int value) {
   if (value < static_cast<int>(GpuDecodeCodec::H264) ||
-      value > static_cast<int>(GpuDecodeCodec::Hevc)) {
+      value > static_cast<int>(GpuDecodeCodec::Av1)) {
     throw std::invalid_argument("video probe worker request has an invalid codec");
   }
   return static_cast<GpuDecodeCodec>(value);
@@ -155,7 +155,7 @@ std::optional<GpuDecodeContainer> decode_container(int value) {
     return std::nullopt;
   }
   if (value < static_cast<int>(GpuDecodeContainer::QuickTime) ||
-      value > static_cast<int>(GpuDecodeContainer::MpegTs)) {
+      value > static_cast<int>(GpuDecodeContainer::Flv)) {
     throw std::invalid_argument("video probe worker request has an invalid container");
   }
   return static_cast<GpuDecodeContainer>(value);
@@ -375,9 +375,11 @@ std::size_t decode_probe_ipc_frame_header(const ProbeIpcFrameHeader& header) {
 std::string encode_probe_request(const GpuFileDecodeConfig& config, std::uint64_t timeout_ns) {
   const nlohmann::json request{{"protocol_version", kProbeProtocolVersion},
                                {"path", nlohmann::json::binary(bytes(config.path))},
+                               {"stable_source", config.stable_source != nullptr},
                                {"codec", static_cast<int>(config.codec)},
                                {"elementary_stream", config.elementary_stream},
                                {"container", encode_container(config.container)},
+                               {"require_selected_codec", config.require_selected_codec},
                                {"max_buffers", config.max_buffers},
                                {"drop", config.drop},
                                {"timeout_ns", timeout_ns}};
@@ -399,12 +401,16 @@ ProbeWorkerRequest decode_probe_request(std::string_view payload) {
   }
   ProbeWorkerRequest decoded;
   decoded.config.path = required_bytes(request, "path", "video probe worker request");
+  decoded.expects_stable_source =
+      required_value<bool>(request, "stable_source", "video probe worker request");
   decoded.config.codec =
       decode_codec(required_value<int>(request, "codec", "video probe worker request"));
   decoded.config.elementary_stream =
       required_value<bool>(request, "elementary_stream", "video probe worker request");
   decoded.config.container =
       decode_container(required_value<int>(request, "container", "video probe worker request"));
+  decoded.config.require_selected_codec =
+      required_value<bool>(request, "require_selected_codec", "video probe worker request");
   decoded.config.max_buffers =
       required_value<std::uint32_t>(request, "max_buffers", "video probe worker request");
   decoded.config.drop = required_value<bool>(request, "drop", "video probe worker request");

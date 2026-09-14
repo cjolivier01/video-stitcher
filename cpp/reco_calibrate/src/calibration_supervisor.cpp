@@ -77,9 +77,34 @@ extern "C" void __sanitizer_syscall_post_impl_fork(long result) noexcept;
 
 namespace reco::calibrate::detail {
 
+namespace {
+
+[[nodiscard]] bool
+cancellation_is_requested(const CalibrationCancellationRequested& requested) noexcept {
+  if (!requested) {
+    return false;
+  }
+  try {
+    return requested();
+  } catch (...) {
+    return true;
+  }
+}
+
+void throw_if_cancelled(const CalibrationCancellationRequested& requested) {
+  if (cancellation_is_requested(requested)) {
+    throw CalibrationCancelled();
+  }
+}
+
+} // namespace
+
 #if !defined(__linux__)
 
-CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest&) {
+CalibrationResult
+run_gpu_calibration_supervised(const GpuCalibrationRequest&,
+                               const CalibrationCancellationRequested& cancellation_requested) {
+  throw_if_cancelled(cancellation_requested);
 #if defined(_WIN32)
   throw CalibrationExecutionError(
       "isolated GPU calibration is not implemented on Windows and fails closed");
@@ -113,6 +138,35 @@ constexpr std::size_t kMaximumScratchRelativePathBytes = 4'096U;
 constexpr std::size_t kMaximumScratchTraversalComponents = 65'536U;
 constexpr std::string_view kAdmissionFileName = "reco-video-stitcher-calibration.lock";
 constexpr std::string_view kCgroupPrefix = "reco-calibration-";
+
+class CalibrationCancellationState {
+public:
+  explicit CalibrationCancellationState(
+      const CalibrationCancellationRequested& cancellation_requested)
+      : cancellation_requested_(cancellation_requested) {}
+
+  [[nodiscard]] bool poll() noexcept {
+    if (latched_) {
+      return true;
+    }
+    if (!cancellation_is_requested(cancellation_requested_)) {
+      return false;
+    }
+    latched_ = true;
+    cleanup_deadline_ = Clock::now() + kCleanupReserve;
+    return true;
+  }
+
+  [[nodiscard]] Clock::time_point
+  cleanup_deadline(Clock::time_point operation_deadline) const noexcept {
+    return latched_ ? std::min(operation_deadline, cleanup_deadline_) : operation_deadline;
+  }
+
+private:
+  const CalibrationCancellationRequested& cancellation_requested_;
+  bool latched_ = false;
+  Clock::time_point cleanup_deadline_ = Clock::time_point::max();
+};
 constexpr std::string_view kCleanupCgroupPrefix = "reco-calibration-cleanup-";
 constexpr std::string_view kSandboxPrefix = "reco-calibration-sandbox-";
 #if defined(__x86_64__)
@@ -169,7 +223,7 @@ struct ForkProtectedDescriptorState {
   int value = -1;
 };
 
-constexpr std::size_t kMaximumForkProtectedDescriptors = 3;
+constexpr std::size_t kMaximumForkProtectedDescriptors = 4;
 std::atomic_flag fork_descriptor_guard = ATOMIC_FLAG_INIT;
 pthread_once_t fork_descriptor_once = PTHREAD_ONCE_INIT;
 int fork_descriptor_registration_error = 0;
@@ -440,6 +494,19 @@ private:
   return configured != nullptr && point == configured;
 }
 
+[[nodiscard]] int test_delay_milliseconds(const char* name) noexcept {
+  const char* configured = std::getenv(name);
+  if (configured == nullptr || configured[0] == '\0') {
+    return 0;
+  }
+  const std::string_view text(configured);
+  int value = 0;
+  const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+  return error == std::errc{} && end == text.data() + text.size() && value >= 0 && value <= 60'000
+             ? value
+             : 0;
+}
+
 void require_observable_child_status() {
   struct sigaction action{};
   if (::sigaction(SIGCHLD, nullptr, &action) != 0) {
@@ -494,6 +561,57 @@ struct ProcessExit {
   int code = 0;
   int status = 0;
 };
+
+constexpr std::uint32_t kStableProcessLaunchMagic = 0x52434c50U;
+constexpr std::uint32_t kStableProcessExitMagic = 0x52434558U;
+
+struct StableProcessLaunchMessage {
+  std::uint32_t magic = kStableProcessLaunchMagic;
+  std::int32_t pid = -1;
+};
+
+struct StableProcessExitMessage {
+  std::uint32_t magic = kStableProcessExitMagic;
+  std::int32_t pid = -1;
+  std::int32_t code = 0;
+  std::int32_t status = 0;
+};
+
+[[nodiscard]] ProcessExit
+receive_stable_process_exit_noexcept(int channel, pid_t expected_pid,
+                                     Clock::time_point deadline) noexcept {
+  while (Clock::now() < deadline) {
+    StableProcessExitMessage message;
+    iovec bytes{.iov_base = &message, .iov_len = sizeof(message)};
+    msghdr frame{};
+    frame.msg_iov = &bytes;
+    frame.msg_iovlen = 1;
+    ssize_t received = -1;
+    do {
+      received = ::recvmsg(channel, &frame, MSG_DONTWAIT);
+    } while (received < 0 && errno == EINTR);
+    if (received == static_cast<ssize_t>(sizeof(message)) &&
+        message.magic == kStableProcessExitMagic && message.pid == expected_pid &&
+        (message.code == CLD_EXITED || message.code == CLD_KILLED || message.code == CLD_DUMPED) &&
+        (frame.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) == 0) {
+      return {.known = true, .code = message.code, .status = message.status};
+    }
+    if (received == 0 || (received < 0 && errno != EAGAIN && errno != EWOULDBLOCK) ||
+        (received > 0 && received != static_cast<ssize_t>(sizeof(message)))) {
+      return {};
+    }
+    pollfd item{.fd = channel, .events = POLLIN, .revents = 0};
+    const auto polled = ::poll(&item, 1, deadline_timeout(deadline));
+    if (polled < 0 && errno != EINTR) {
+      return {};
+    }
+    if (polled > 0 && (item.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0 &&
+        (item.revents & POLLIN) == 0) {
+      return {};
+    }
+  }
+  return {};
+}
 
 class DeferredProcessReaper {
 public:
@@ -581,34 +699,34 @@ public:
   OwnedProcess() = default;
   OwnedProcess(pid_t pid, int pidfd, Clock::time_point cleanup_deadline = Clock::time_point::min())
       : pid_(pid), pidfd_(pidfd), cleanup_deadline_(cleanup_deadline) {}
-  OwnedProcess(pid_t pid, int pidfd, std::thread launcher, int launcher_stop,
-               Clock::time_point cleanup_deadline, std::shared_ptr<ProcessExit> launcher_exit)
-      : pid_(pid), pidfd_(pidfd), launcher_(std::move(launcher)), launcher_stop_(launcher_stop),
-        cleanup_deadline_(cleanup_deadline), launcher_exit_(std::move(launcher_exit)) {}
+  OwnedProcess(pid_t pid, int pidfd, int status_channel, int stable_parent_pidfd,
+               Clock::time_point cleanup_deadline)
+      : pid_(pid), pidfd_(pidfd), stable_status_channel_(status_channel),
+        stable_parent_pidfd_(stable_parent_pidfd), cleanup_deadline_(cleanup_deadline) {}
   OwnedProcess(const OwnedProcess&) = delete;
   OwnedProcess& operator=(const OwnedProcess&) = delete;
   OwnedProcess(OwnedProcess&& other) noexcept
       : pid_(std::exchange(other.pid_, -1)), pidfd_(std::move(other.pidfd_)),
-        reaped_(std::exchange(other.reaped_, true)), launcher_(std::move(other.launcher_)),
-        launcher_stop_(std::move(other.launcher_stop_)), cleanup_deadline_(other.cleanup_deadline_),
-        launcher_exit_(std::move(other.launcher_exit_)) {}
+        reaped_(std::exchange(other.reaped_, true)),
+        stable_status_channel_(std::move(other.stable_status_channel_)),
+        stable_parent_pidfd_(std::move(other.stable_parent_pidfd_)),
+        cleanup_deadline_(other.cleanup_deadline_) {}
   OwnedProcess& operator=(OwnedProcess&& other) noexcept {
     if (this != &other) {
       terminate_and_reap_noexcept();
-      stop_launcher_noexcept();
+      finish_stable_parent_noexcept();
       pid_ = std::exchange(other.pid_, -1);
       pidfd_ = std::move(other.pidfd_);
       reaped_ = std::exchange(other.reaped_, true);
-      launcher_ = std::move(other.launcher_);
-      launcher_stop_ = std::move(other.launcher_stop_);
+      stable_status_channel_ = std::move(other.stable_status_channel_);
+      stable_parent_pidfd_ = std::move(other.stable_parent_pidfd_);
       cleanup_deadline_ = other.cleanup_deadline_;
-      launcher_exit_ = std::move(other.launcher_exit_);
     }
     return *this;
   }
   ~OwnedProcess() {
     terminate_and_reap_noexcept();
-    stop_launcher_noexcept();
+    finish_stable_parent_noexcept();
   }
 
   [[nodiscard]] pid_t pid() const { return pid_; }
@@ -618,9 +736,15 @@ public:
     return pidfd_.release();
   }
   void detach_noexcept() noexcept {
-    defer_process_reap_noexcept(pidfd_);
+    if (stable_parent_pidfd_) {
+      signal_pidfd_noexcept(pidfd_.get(), SIGKILL);
+      pidfd_.reset();
+      stable_status_channel_.reset();
+    } else {
+      defer_process_reap_noexcept(pidfd_);
+    }
     reaped_ = true;
-    stop_launcher_noexcept();
+    finish_stable_parent_noexcept();
   }
 
   [[nodiscard]] bool exited() const {
@@ -635,8 +759,10 @@ public:
     return result > 0 && (item.revents & (POLLIN | POLLHUP | POLLERR)) != 0;
   }
 
-  void wait_until(Clock::time_point deadline) const {
+  void wait_until(Clock::time_point deadline,
+                  const CalibrationCancellationRequested& cancellation_requested = {}) const {
     while (!exited()) {
+      throw_if_cancelled(cancellation_requested);
       if (Clock::now() >= deadline) {
         throw CalibrationExecutionError("calibration worker exceeded its end-to-end deadline");
       }
@@ -653,13 +779,15 @@ public:
     if (reaped_ || !pidfd_) {
       return result;
     }
-    if (launcher_.joinable()) {
-      launcher_.join();
-      launcher_stop_.reset();
-      if (launcher_exit_ != nullptr) {
-        result = *launcher_exit_;
-      }
+    if (stable_status_channel_) {
+      const auto reserve_deadline = Clock::now() + kCleanupReserve;
+      const auto deadline = cleanup_deadline_ == Clock::time_point::min()
+                                ? reserve_deadline
+                                : std::min(reserve_deadline, cleanup_deadline_);
+      result = receive_stable_process_exit_noexcept(stable_status_channel_.get(), pid_, deadline);
+      stable_status_channel_.reset();
       reaped_ = true;
+      finish_stable_parent_noexcept();
       return result;
     }
     siginfo_t information{};
@@ -676,7 +804,6 @@ public:
     }
     result = {.known = true, .code = information.si_code, .status = information.si_status};
     reaped_ = true;
-    stop_launcher_noexcept();
     return result;
   }
 
@@ -701,32 +828,50 @@ private:
         break;
       }
     }
-    defer_process_reap_noexcept(pidfd_);
+    if (stable_parent_pidfd_) {
+      pidfd_.reset();
+      stable_status_channel_.reset();
+    } else {
+      defer_process_reap_noexcept(pidfd_);
+    }
     reaped_ = true;
   }
 
-  void stop_launcher_noexcept() noexcept {
-    if (launcher_stop_) {
-      const char stop = 'S';
-      ssize_t written = -1;
-      do {
-        written = ::send(launcher_stop_.get(), &stop, 1, MSG_NOSIGNAL);
-      } while (written < 0 && errno == EINTR);
-      (void)written;
-      launcher_stop_.reset();
+  void finish_stable_parent_noexcept() noexcept {
+    if (!stable_parent_pidfd_) {
+      return;
     }
-    if (launcher_.joinable()) {
-      launcher_.join();
+    const auto reserve_deadline = Clock::now() + kCleanupReserve;
+    const auto deadline = cleanup_deadline_ == Clock::time_point::min()
+                              ? reserve_deadline
+                              : std::min(reserve_deadline, cleanup_deadline_);
+    pollfd item{.fd = stable_parent_pidfd_.get(), .events = POLLIN, .revents = 0};
+    while (Clock::now() < deadline) {
+      const auto polled = ::poll(&item, 1, deadline_timeout(deadline));
+      if (polled > 0) {
+        siginfo_t information{};
+        constexpr auto pidfd_id_type = static_cast<idtype_t>(3);
+        while (::waitid(pidfd_id_type, static_cast<id_t>(stable_parent_pidfd_.get()), &information,
+                        WEXITED | __WALL) != 0 &&
+               errno == EINTR) {
+        }
+        stable_parent_pidfd_.reset();
+        return;
+      }
+      if (polled < 0 && errno != EINTR) {
+        break;
+      }
     }
+    signal_pidfd_noexcept(stable_parent_pidfd_.get(), SIGKILL);
+    defer_process_reap_noexcept(stable_parent_pidfd_);
   }
 
   pid_t pid_ = -1;
   UniqueFd pidfd_;
   bool reaped_ = false;
-  std::thread launcher_;
-  UniqueFd launcher_stop_;
+  UniqueFd stable_status_channel_;
+  UniqueFd stable_parent_pidfd_;
   Clock::time_point cleanup_deadline_ = Clock::time_point::min();
-  std::shared_ptr<ProcessExit> launcher_exit_;
 };
 
 [[noreturn]] void cgroup_cleanup_exit(int status) noexcept {
@@ -770,7 +915,7 @@ void close_cgroup_cleanup_descriptors(int parent, int lifetime, int caller_pidfd
 
 [[noreturn]] void cgroup_cleanup_child(int parent, int lifetime, int caller_pidfd,
                                        int return_cgroup, const char* name,
-                                       const char* cleanup_name) noexcept {
+                                       const char* cleanup_name, int cleanup_delay_ms) noexcept {
   close_cgroup_cleanup_descriptors(parent, lifetime, caller_pidfd, return_cgroup);
 
   std::array<pollfd, 2> lifetime_events{
@@ -781,6 +926,11 @@ void close_cgroup_cleanup_descriptors(int parent, int lifetime, int caller_pidfd
   }
   (void)::close(lifetime);
   (void)::close(caller_pidfd);
+  if (cleanup_delay_ms > 0) {
+    pollfd delay{.fd = -1, .events = 0, .revents = 0};
+    while (::poll(&delay, 0, cleanup_delay_ms) < 0 && errno == EINTR) {
+    }
+  }
 
   while (true) {
     const auto directory = ::openat(parent, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
@@ -857,7 +1007,8 @@ void close_cgroup_cleanup_descriptors(int parent, int lifetime, int caller_pidfd
 [[nodiscard]] OwnedProcess spawn_cgroup_cleanup_process(int parent, int cleanup_cgroup,
                                                         int return_cgroup, int lifetime,
                                                         int caller_pidfd, const char* name,
-                                                        const char* cleanup_name) {
+                                                        const char* cleanup_name,
+                                                        int cleanup_delay_ms) {
 #if !defined(SYS_clone3)
   (void)parent;
   (void)lifetime;
@@ -866,6 +1017,7 @@ void close_cgroup_cleanup_descriptors(int parent, int lifetime, int caller_pidfd
   (void)return_cgroup;
   (void)name;
   (void)cleanup_name;
+  (void)cleanup_delay_ms;
   throw CalibrationExecutionError(
       "Linux clone3 is unavailable; calibration cgroup cleanup fails closed");
 #else
@@ -885,7 +1037,8 @@ void close_cgroup_cleanup_descriptors(int parent, int lifetime, int caller_pidfd
   __sanitizer_syscall_post_impl_fork(result);
 #endif
   if (result == 0) {
-    cgroup_cleanup_child(parent, lifetime, caller_pidfd, return_cgroup, name, cleanup_name);
+    cgroup_cleanup_child(parent, lifetime, caller_pidfd, return_cgroup, name, cleanup_name,
+                         cleanup_delay_ms);
   }
   if (result < 0 || pidfd < 0) {
     throw CalibrationExecutionError(
@@ -898,8 +1051,10 @@ void close_cgroup_cleanup_descriptors(int parent, int lifetime, int caller_pidfd
 class ExternalProcessAuthority {
 public:
   ExternalProcessAuthority() = default;
-  ExternalProcessAuthority(int descriptor, Clock::time_point cleanup_deadline)
-      : pidfd_(descriptor), cleanup_deadline_(cleanup_deadline) {}
+  ExternalProcessAuthority(int descriptor, Clock::time_point cleanup_deadline,
+                           const CalibrationCancellationState& cancellation_state)
+      : pidfd_(descriptor), cleanup_deadline_(cleanup_deadline),
+        cancellation_state_(&cancellation_state) {}
   ExternalProcessAuthority(const ExternalProcessAuthority&) = delete;
   ExternalProcessAuthority& operator=(const ExternalProcessAuthority&) = delete;
   ExternalProcessAuthority(ExternalProcessAuthority&&) noexcept = default;
@@ -908,8 +1063,11 @@ public:
     if (pidfd_) {
       signal_pidfd_noexcept(pidfd_.get(), SIGKILL);
       pollfd item{.fd = pidfd_.get(), .events = POLLIN, .revents = 0};
-      while (Clock::now() < cleanup_deadline_) {
-        const auto result = ::poll(&item, 1, deadline_timeout(cleanup_deadline_));
+      const auto cleanup_deadline = cancellation_state_ == nullptr
+                                        ? cleanup_deadline_
+                                        : cancellation_state_->cleanup_deadline(cleanup_deadline_);
+      while (Clock::now() < cleanup_deadline) {
+        const auto result = ::poll(&item, 1, deadline_timeout(cleanup_deadline));
         if (result != 0) {
           break;
         }
@@ -920,6 +1078,7 @@ public:
 private:
   UniqueFd pidfd_;
   Clock::time_point cleanup_deadline_ = Clock::time_point::min();
+  const CalibrationCancellationState* cancellation_state_ = nullptr;
 };
 
 class AdmissionLock {
@@ -1223,8 +1382,11 @@ void scavenge_stale_calibration_cgroups(int parent) {
 
 class CgroupMemoryBoundary {
 public:
-  CgroupMemoryBoundary(std::uint64_t memory_limit, Clock::time_point teardown_deadline)
-      : teardown_deadline_(teardown_deadline) {
+  CgroupMemoryBoundary(std::uint64_t memory_limit, Clock::time_point teardown_deadline,
+                       CalibrationCancellationState& cancellation_state,
+                       const CalibrationCancellationRequested& cancellation_requested)
+      : teardown_deadline_(teardown_deadline), cancellation_state_(&cancellation_state),
+        cancellation_requested_(&cancellation_requested) {
     if (force_cgroup_unavailable_for_test()) {
       throw CalibrationExecutionError(
           "a delegated cgroup-v2 memory controller is required for calibration");
@@ -1287,7 +1449,16 @@ public:
       return;
     }
     cleanup_lifetime_.reset();
-    cleanup_process_.wait_until(teardown_deadline_);
+    if (cancellation_state_->poll()) {
+      finish_after_cancellation();
+      throw CalibrationCancelled();
+    }
+    try {
+      cleanup_process_.wait_until(teardown_deadline_, *cancellation_requested_);
+    } catch (const CalibrationCancelled&) {
+      finish_after_cancellation();
+      throw;
+    }
     const auto status = cleanup_process_.reap();
     if (!status.known || status.code != CLD_EXITED || status.status != EXIT_SUCCESS) {
       throw CalibrationExecutionError("calibration cgroup cleanup authority failed");
@@ -1296,6 +1467,16 @@ public:
   }
 
 private:
+  void finish_after_cancellation() noexcept {
+    try {
+      cleanup_process_.wait_until(cancellation_state_->cleanup_deadline(teardown_deadline_));
+      (void)cleanup_process_.reap();
+    } catch (...) {
+      cleanup_process_.detach_noexcept();
+    }
+    finished_ = true;
+  }
+
   [[nodiscard]] bool create_under(const std::filesystem::path& path, int return_cgroup,
                                   std::uint64_t memory_limit) {
     UniqueFd parent(::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
@@ -1356,7 +1537,8 @@ private:
     }
     auto cleanup = spawn_cgroup_cleanup_process(
         parent.get(), cleanup_directory.get(), return_cgroup, lifetime_read.get(),
-        caller_pidfd.get(), name.c_str(), cleanup_name.c_str());
+        caller_pidfd.get(), name.c_str(), cleanup_name.c_str(),
+        test_delay_milliseconds("RECO_FAKE_CALIBRATION_CGROUP_CLEANUP_DELAY_MS"));
     cleanup_removal.dismiss();
     lifetime_read.reset();
     caller_pidfd.reset();
@@ -1413,11 +1595,14 @@ private:
   ForkProtectedFd cleanup_lifetime_;
   OwnedProcess cleanup_process_;
   Clock::time_point teardown_deadline_;
+  CalibrationCancellationState* cancellation_state_ = nullptr;
+  const CalibrationCancellationRequested* cancellation_requested_ = nullptr;
   bool finished_ = false;
 };
 
-[[noreturn]] void executable_snapshot_child(int source, int channel,
-                                            const struct stat& expected) noexcept {
+[[noreturn]] void executable_snapshot_child(int source, int channel, const struct stat& expected,
+                                            Clock::time_point deadline,
+                                            int chunk_delay_ms) noexcept {
   close_cgroup_cleanup_descriptors(source, channel, source, channel);
 #if !defined(SYS_memfd_create)
   cgroup_cleanup_exit(EXIT_FAILURE);
@@ -1440,6 +1625,19 @@ private:
   std::uint64_t copied = 0;
   const auto expected_size = static_cast<std::uint64_t>(expected.st_size);
   while (copied < expected_size) {
+    if (Clock::now() >= deadline) {
+      (void)::close(snapshot);
+      cgroup_cleanup_exit(EXIT_FAILURE);
+    }
+    if (chunk_delay_ms > 0) {
+      pollfd delay{.fd = -1, .events = 0, .revents = 0};
+      while (::poll(&delay, 0, chunk_delay_ms) < 0 && errno == EINTR) {
+      }
+      if (Clock::now() >= deadline) {
+        (void)::close(snapshot);
+        cgroup_cleanup_exit(EXIT_FAILURE);
+      }
+    }
     const auto read_size =
         static_cast<std::size_t>(std::min<std::uint64_t>(buffer.size(), expected_size - copied));
     ssize_t received = -1;
@@ -1452,6 +1650,10 @@ private:
     }
     std::size_t offset = 0;
     while (offset < static_cast<std::size_t>(received)) {
+      if (Clock::now() >= deadline) {
+        (void)::close(snapshot);
+        cgroup_cleanup_exit(EXIT_FAILURE);
+      }
       ssize_t written = -1;
       do {
         written =
@@ -1555,8 +1757,10 @@ private:
 
 class PinnedExecutable {
 public:
-  PinnedExecutable(const std::filesystem::path& path, Clock::time_point deadline)
+  PinnedExecutable(const std::filesystem::path& path, Clock::time_point deadline,
+                   const CalibrationCancellationRequested& cancellation_requested)
       : display_path_(path.string()) {
+    throw_if_cancelled(cancellation_requested);
     if (!path.is_absolute()) {
       throw CalibrationExecutionError(
           "GPU calibration worker path must name an executable regular file");
@@ -1576,6 +1780,7 @@ public:
       throw CalibrationExecutionError(
           "GPU calibration worker executable must not carry file capabilities");
     }
+    throw_if_cancelled(cancellation_requested);
 
 #if !defined(SYS_clone3)
     throw CalibrationExecutionError("bounded executable snapshots require clone3");
@@ -1591,6 +1796,8 @@ public:
     arguments.flags = CLONE_PIDFD;
     arguments.pidfd = reinterpret_cast<std::uint64_t>(&pidfd);
     arguments.exit_signal = 0;
+    const auto snapshot_delay_ms =
+        test_delay_milliseconds("RECO_FAKE_CALIBRATION_EXECUTABLE_SNAPSHOT_DELAY_MS");
 #if defined(RECO_CALIBRATION_THREAD_SANITIZER)
     __sanitizer_syscall_pre_impl_fork();
 #endif
@@ -1600,7 +1807,8 @@ public:
 #endif
     if (child == 0) {
       (void)::close(parent_transport.get());
-      executable_snapshot_child(source.get(), child_transport.get(), before);
+      executable_snapshot_child(source.get(), child_transport.get(), before, deadline,
+                                snapshot_delay_ms);
     }
     if (child < 0 || pidfd < 0) {
       throw CalibrationExecutionError(errno_message("cannot create executable snapshot helper"));
@@ -1608,6 +1816,7 @@ public:
     OwnedProcess helper(child, pidfd, deadline);
     child_transport.reset();
     while (true) {
+      throw_if_cancelled(cancellation_requested);
       std::array<pollfd, 2> events{
           pollfd{.fd = parent_transport.get(), .events = POLLIN, .revents = 0},
           pollfd{.fd = helper.pidfd(), .events = POLLIN, .revents = 0},
@@ -1616,7 +1825,16 @@ public:
       if (polled < 0 && errno == EINTR) {
         continue;
       }
-      if (polled <= 0) {
+      if (polled < 0) {
+        throw CalibrationExecutionError(errno_message("cannot monitor executable snapshot"));
+      }
+      if (polled == 0) {
+        if (Clock::now() >= deadline) {
+          throw CalibrationExecutionError("calibration worker snapshot exceeded its deadline");
+        }
+        continue;
+      }
+      if (Clock::now() >= deadline) {
         throw CalibrationExecutionError("calibration worker snapshot exceeded its deadline");
       }
       if ((events[0].revents & POLLIN) != 0) {
@@ -1629,7 +1847,7 @@ public:
         throw CalibrationExecutionError("calibration executable snapshot helper failed");
       }
     }
-    helper.wait_until(deadline);
+    helper.wait_until(deadline, cancellation_requested);
     const auto helper_status = helper.reap();
     struct stat after{};
     struct stat snapshot{};
@@ -1648,6 +1866,7 @@ public:
         (::fcntl(descriptor_.get(), F_GET_SEALS) & seals) != seals) {
       throw CalibrationExecutionError("calibration worker changed while it was snapshotted");
     }
+    throw_if_cancelled(cancellation_requested);
 #endif
   }
 
@@ -1890,11 +2109,13 @@ private:
   return {.descriptor = std::move(descriptor), .address = std::move(name)};
 }
 
-[[nodiscard]] UniqueFd accept_authenticated(const UnixListener& listener, OwnedProcess& process,
-                                            Clock::time_point deadline,
-                                            std::uint64_t resident_limit = 0,
-                                            ScratchQuotaMonitor* scratch_monitor = nullptr) {
+[[nodiscard]] UniqueFd
+accept_authenticated(const UnixListener& listener, OwnedProcess& process,
+                     Clock::time_point deadline, std::uint64_t resident_limit = 0,
+                     ScratchQuotaMonitor* scratch_monitor = nullptr,
+                     const CalibrationCancellationRequested& cancellation_requested = {}) {
   while (Clock::now() < deadline) {
+    throw_if_cancelled(cancellation_requested);
     if (scratch_monitor != nullptr) {
       scratch_monitor->enforce(process);
     }
@@ -2018,8 +2239,10 @@ void enforce_resident_limit(const OwnedProcess& process, std::uint64_t limit) {
 void wait_for_socket(int socket, const OwnedProcess& process, short events,
                      Clock::time_point deadline, int abort_socket = -1,
                      std::uint64_t resident_limit = 0,
-                     ScratchQuotaMonitor* scratch_monitor = nullptr) {
+                     ScratchQuotaMonitor* scratch_monitor = nullptr,
+                     const CalibrationCancellationRequested& cancellation_requested = {}) {
   while (Clock::now() < deadline) {
+    throw_if_cancelled(cancellation_requested);
     if (scratch_monitor != nullptr) {
       scratch_monitor->enforce(process);
     }
@@ -2057,11 +2280,12 @@ void wait_for_socket(int socket, const OwnedProcess& process, short events,
 
 void write_all(int socket, const OwnedProcess& process, std::string_view bytes,
                Clock::time_point deadline, int abort_socket = -1, std::uint64_t resident_limit = 0,
-               ScratchQuotaMonitor* scratch_monitor = nullptr) {
+               ScratchQuotaMonitor* scratch_monitor = nullptr,
+               const CalibrationCancellationRequested& cancellation_requested = {}) {
   std::size_t offset = 0;
   while (offset < bytes.size()) {
     wait_for_socket(socket, process, POLLOUT, deadline, abort_socket, resident_limit,
-                    scratch_monitor);
+                    scratch_monitor, cancellation_requested);
     const auto written = ::send(socket, bytes.data() + offset, bytes.size() - offset, MSG_NOSIGNAL);
     if (written < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
       continue;
@@ -2075,11 +2299,12 @@ void write_all(int socket, const OwnedProcess& process, std::string_view bytes,
 
 void read_exact(int socket, const OwnedProcess& process, char* destination, std::size_t size,
                 Clock::time_point deadline, int abort_socket = -1, std::uint64_t resident_limit = 0,
-                ScratchQuotaMonitor* scratch_monitor = nullptr) {
+                ScratchQuotaMonitor* scratch_monitor = nullptr,
+                const CalibrationCancellationRequested& cancellation_requested = {}) {
   std::size_t offset = 0;
   while (offset < size) {
     wait_for_socket(socket, process, POLLIN, deadline, abort_socket, resident_limit,
-                    scratch_monitor);
+                    scratch_monitor, cancellation_requested);
     const auto received = ::recv(socket, destination + offset, size - offset, 0);
     if (received < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
       continue;
@@ -2091,14 +2316,14 @@ void read_exact(int socket, const OwnedProcess& process, char* destination, std:
   }
 }
 
-[[nodiscard]] std::string read_frame(int socket, const OwnedProcess& process,
-                                     Clock::time_point deadline,
-                                     std::size_t maximum_success_frame_bytes, int abort_socket = -1,
-                                     std::uint64_t resident_limit = 0,
-                                     ScratchQuotaMonitor* scratch_monitor = nullptr) {
+[[nodiscard]] std::string
+read_frame(int socket, const OwnedProcess& process, Clock::time_point deadline,
+           std::size_t maximum_success_frame_bytes, int abort_socket = -1,
+           std::uint64_t resident_limit = 0, ScratchQuotaMonitor* scratch_monitor = nullptr,
+           const CalibrationCancellationRequested& cancellation_requested = {}) {
   CalibrationWorkerFrameHeader header{};
   read_exact(socket, process, header.data(), header.size(), deadline, abort_socket, resident_limit,
-             scratch_monitor);
+             scratch_monitor, cancellation_requested);
   const auto decoded = decode_calibration_worker_header(header);
   if (decoded.message == CalibrationWorkerMessage::Success &&
       (maximum_success_frame_bytes < header.size() ||
@@ -2110,14 +2335,14 @@ void read_exact(int socket, const OwnedProcess& process, char* destination, std:
   const auto payload_offset = response.size();
   response.resize(payload_offset + decoded.payload_size);
   read_exact(socket, process, response.data() + payload_offset, decoded.payload_size, deadline,
-             abort_socket, resident_limit, scratch_monitor);
+             abort_socket, resident_limit, scratch_monitor, cancellation_requested);
   return response;
 }
 
 void send_file_fd(int socket, const OwnedProcess& process, char marker, int file_descriptor,
                   Clock::time_point deadline, int abort_socket = -1,
-                  std::uint64_t resident_limit = 0,
-                  ScratchQuotaMonitor* scratch_monitor = nullptr) {
+                  std::uint64_t resident_limit = 0, ScratchQuotaMonitor* scratch_monitor = nullptr,
+                  const CalibrationCancellationRequested& cancellation_requested = {}) {
   std::array<char, CMSG_SPACE(sizeof(int))> control{};
   iovec bytes{.iov_base = &marker, .iov_len = 1};
   msghdr message{};
@@ -2133,7 +2358,7 @@ void send_file_fd(int socket, const OwnedProcess& process, char marker, int file
 
   while (true) {
     wait_for_socket(socket, process, POLLOUT, deadline, abort_socket, resident_limit,
-                    scratch_monitor);
+                    scratch_monitor, cancellation_requested);
     const auto sent = ::sendmsg(socket, &message, MSG_NOSIGNAL);
     if (sent < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
       continue;
@@ -2146,8 +2371,10 @@ void send_file_fd(int socket, const OwnedProcess& process, char marker, int file
 }
 
 [[nodiscard]] ExternalProcessAuthority
-receive_worker_authority(int socket, const OwnedProcess& guardian, Clock::time_point deadline) {
-  wait_for_socket(socket, guardian, POLLIN, deadline);
+receive_worker_authority(int socket, const OwnedProcess& guardian, Clock::time_point deadline,
+                         const CalibrationCancellationState& cancellation_state,
+                         const CalibrationCancellationRequested& cancellation_requested = {}) {
+  wait_for_socket(socket, guardian, POLLIN, deadline, -1, 0, nullptr, cancellation_requested);
   char marker = '\0';
   std::array<char, CMSG_SPACE(sizeof(int) * 2U)> control{};
   iovec bytes{.iov_base = &marker, .iov_len = 1};
@@ -2193,7 +2420,7 @@ receive_worker_authority(int socket, const OwnedProcess& guardian, Clock::time_p
     }
     throw CalibrationExecutionError("calibration guardian returned invalid worker authority");
   }
-  return ExternalProcessAuthority(authority, deadline);
+  return ExternalProcessAuthority(authority, deadline, cancellation_state);
 }
 
 void write_plain_all(int descriptor, std::string_view bytes, Clock::time_point deadline) {
@@ -3534,9 +3761,8 @@ clone_process(std::uint64_t flags, Child&& child, int cgroup = -1,
     arguments.cgroup = static_cast<std::uint64_t>(cgroup);
   }
   arguments.pidfd = reinterpret_cast<std::uint64_t>(&pidfd);
-  // No-signal clone children cannot be consumed by an unrelated waitpid(-1).
-  // OwnedProcess reaps them with waitid(P_PIDFD, ..., __WALL), so completion
-  // status remains authoritative.
+  // __WALL covers both no-signal clone helpers and children whose termination
+  // signal changes to SIGCHLD across exec.
   arguments.exit_signal = 0;
 #if defined(RECO_CALIBRATION_THREAD_SANITIZER)
   __sanitizer_syscall_pre_impl_fork();
@@ -3559,98 +3785,282 @@ clone_process(std::uint64_t flags, Child&& child, int cgroup = -1,
 #endif
 }
 
+[[nodiscard]] bool send_stable_process_launch(int channel, pid_t pid, int pidfd) noexcept {
+  const StableProcessLaunchMessage launch{.pid = static_cast<std::int32_t>(pid)};
+  std::array<char, CMSG_SPACE(sizeof(int))> control{};
+  iovec bytes{.iov_base = const_cast<StableProcessLaunchMessage*>(&launch),
+              .iov_len = sizeof(launch)};
+  msghdr message{};
+  message.msg_iov = &bytes;
+  message.msg_iovlen = 1;
+  message.msg_control = control.data();
+  message.msg_controllen = control.size();
+  auto* header = CMSG_FIRSTHDR(&message);
+  header->cmsg_level = SOL_SOCKET;
+  header->cmsg_type = SCM_RIGHTS;
+  header->cmsg_len = CMSG_LEN(sizeof(int));
+  std::memcpy(CMSG_DATA(header), &pidfd, sizeof(pidfd));
+  ssize_t sent = -1;
+  do {
+    sent = ::sendmsg(channel, &message, MSG_NOSIGNAL);
+  } while (sent < 0 && errno == EINTR);
+  return sent == static_cast<ssize_t>(sizeof(launch));
+}
+
+[[nodiscard]] std::optional<pid_t> pidfd_process_id(int pidfd) noexcept {
+  char path[64]{};
+  const auto path_size = std::snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", pidfd);
+  if (path_size <= 0 || static_cast<std::size_t>(path_size) >= sizeof(path)) {
+    return std::nullopt;
+  }
+  const auto descriptor = ::open(path, O_RDONLY | O_CLOEXEC);
+  if (descriptor < 0) {
+    return std::nullopt;
+  }
+  std::array<char, 4096> contents{};
+  ssize_t size = -1;
+  do {
+    size = ::read(descriptor, contents.data(), contents.size() - 1U);
+  } while (size < 0 && errno == EINTR);
+  (void)::close(descriptor);
+  if (size <= 0) {
+    return std::nullopt;
+  }
+
+  std::string_view remaining(contents.data(), static_cast<std::size_t>(size));
+  while (!remaining.empty()) {
+    const auto newline = remaining.find('\n');
+    const auto line = remaining.substr(0, newline);
+    if (line.starts_with("Pid:")) {
+      auto value = line.substr(std::string_view("Pid:").size());
+      while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
+        value.remove_prefix(1);
+      }
+      pid_t process = -1;
+      const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), process);
+      return error == std::errc{} && end == value.data() + value.size() && process > 1
+                 ? std::optional<pid_t>(process)
+                 : std::nullopt;
+    }
+    if (newline == std::string_view::npos) {
+      break;
+    }
+    remaining.remove_prefix(newline + 1U);
+  }
+  return std::nullopt;
+}
+
+[[nodiscard]] std::pair<pid_t, UniqueFd> receive_stable_process_launch(int channel) {
+  StableProcessLaunchMessage launch;
+  std::array<char, CMSG_SPACE(sizeof(int) * 2U)> control{};
+  iovec bytes{.iov_base = &launch, .iov_len = sizeof(launch)};
+  msghdr message{};
+  message.msg_iov = &bytes;
+  message.msg_iovlen = 1;
+  message.msg_control = control.data();
+  message.msg_controllen = control.size();
+  ssize_t received = -1;
+  do {
+    received = ::recvmsg(channel, &message, MSG_CMSG_CLOEXEC | MSG_DONTWAIT);
+  } while (received < 0 && errno == EINTR);
+
+  int authority = -1;
+  bool invalid = received != static_cast<ssize_t>(sizeof(launch)) ||
+                 launch.magic != kStableProcessLaunchMagic || launch.pid <= 1 ||
+                 (message.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) != 0;
+  for (auto* header = CMSG_FIRSTHDR(&message); header != nullptr;
+       header = CMSG_NXTHDR(&message, header)) {
+    if (header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS ||
+        header->cmsg_len < CMSG_LEN(sizeof(int))) {
+      invalid = true;
+      continue;
+    }
+    const auto count = (header->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+    const auto* descriptors = reinterpret_cast<const int*>(CMSG_DATA(header));
+    for (std::size_t index = 0; index < count; ++index) {
+      if (authority < 0) {
+        authority = descriptors[index];
+      } else {
+        invalid = true;
+        (void)::close(descriptors[index]);
+      }
+    }
+  }
+  if (invalid || authority < 0) {
+    if (authority >= 0) {
+      (void)::close(authority);
+    }
+    throw CalibrationExecutionError("stable calibration parent returned invalid authority");
+  }
+  if (pidfd_process_id(authority) != static_cast<pid_t>(launch.pid)) {
+    (void)::close(authority);
+    throw CalibrationExecutionError("stable calibration parent returned mismatched authority");
+  }
+  return {static_cast<pid_t>(launch.pid), UniqueFd(authority)};
+}
+
+void terminate_stable_process_child_noexcept(pid_t child, int pidfd) noexcept {
+  if (pidfd >= 0) {
+    signal_pidfd_noexcept(pidfd, SIGKILL);
+  } else if (child > 0) {
+    while (::kill(child, SIGKILL) != 0 && errno == EINTR) {
+    }
+  }
+  if (child <= 0) {
+    return;
+  }
+  siginfo_t information{};
+  constexpr auto pidfd_id_type = static_cast<idtype_t>(3);
+  const auto type = pidfd >= 0 ? pidfd_id_type : P_PID;
+  const auto id = static_cast<id_t>(pidfd >= 0 ? pidfd : child);
+  while (::waitid(type, id, &information, WEXITED | __WALL) != 0 && errno == EINTR) {
+  }
+}
+
+template <typename Child>
+[[noreturn]] void stable_process_parent_child(int channel, int parent_channel,
+                                              pid_t expected_parent, std::uint64_t flags,
+                                              int reap_delay_ms, Child& child) noexcept {
+  (void)::close(parent_channel);
+  if (::prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || ::getppid() != expected_parent) {
+    cgroup_cleanup_exit(EXIT_FAILURE);
+  }
+  struct sigaction child_exit_action{};
+  child_exit_action.sa_handler = SIG_DFL;
+  if (::sigemptyset(&child_exit_action.sa_mask) != 0 ||
+      ::sigaction(SIGCHLD, &child_exit_action, nullptr) != 0) {
+    cgroup_cleanup_exit(EXIT_FAILURE);
+  }
+  // The monitor never execs, and the caller is not the guardian's parent, so
+  // an exec-time reset to SIGCHLD cannot expose guardian status to caller waiters.
+  const auto stable_parent = ::getpid();
+  int pidfd = -1;
+  clone_args arguments{};
+  arguments.flags = flags | CLONE_PIDFD;
+  arguments.pidfd = reinterpret_cast<std::uint64_t>(&pidfd);
+  arguments.exit_signal = 0;
+#if defined(RECO_CALIBRATION_THREAD_SANITIZER)
+  __sanitizer_syscall_pre_impl_fork();
+#endif
+  const auto child_pid = static_cast<pid_t>(::syscall(SYS_clone3, &arguments, sizeof(arguments)));
+#if defined(RECO_CALIBRATION_THREAD_SANITIZER)
+  __sanitizer_syscall_post_impl_fork(child_pid);
+#endif
+  if (child_pid == 0) {
+    (void)::close(channel);
+    child(stable_parent);
+    cgroup_cleanup_exit(EXIT_FAILURE);
+  }
+  if (child_pid < 0 || pidfd < 0) {
+    terminate_stable_process_child_noexcept(child_pid, pidfd);
+    cgroup_cleanup_exit(EXIT_FAILURE);
+  }
+  if (!send_stable_process_launch(channel, child_pid, pidfd)) {
+    terminate_stable_process_child_noexcept(child_pid, pidfd);
+    (void)::close(pidfd);
+    cgroup_cleanup_exit(EXIT_FAILURE);
+  }
+
+  pollfd exited{.fd = pidfd, .events = POLLIN, .revents = 0};
+  while (::poll(&exited, 1, -1) < 0 && errno == EINTR) {
+  }
+  if (reap_delay_ms > 0) {
+    pollfd delay{.fd = -1, .events = 0, .revents = 0};
+    while (::poll(&delay, 0, reap_delay_ms) < 0 && errno == EINTR) {
+    }
+  }
+  siginfo_t information{};
+  constexpr auto pidfd_id_type = static_cast<idtype_t>(3);
+  while (::waitid(pidfd_id_type, static_cast<id_t>(pidfd), &information, WEXITED | __WALL) != 0) {
+    if (errno == EINTR) {
+      continue;
+    }
+    (void)::close(pidfd);
+    cgroup_cleanup_exit(EXIT_FAILURE);
+  }
+  (void)::close(pidfd);
+  const StableProcessExitMessage status{
+      .pid = information.si_pid, .code = information.si_code, .status = information.si_status};
+  ssize_t sent = -1;
+  do {
+    sent = ::send(channel, &status, sizeof(status), MSG_NOSIGNAL);
+  } while (sent < 0 && errno == EINTR);
+  (void)::close(channel);
+  cgroup_cleanup_exit(sent == static_cast<ssize_t>(sizeof(status)) ? EXIT_SUCCESS : EXIT_FAILURE);
+}
+
 template <typename Child>
 [[nodiscard]] OwnedProcess clone_process_with_stable_parent(std::uint64_t flags, Child&& child,
                                                             Clock::time_point cleanup_deadline) {
-  std::array<int, 2> stop_pipe{-1, -1};
-  if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, stop_pipe.data()) !=
-      0) {
-    throw CalibrationExecutionError(errno_message("cannot create calibration launcher lifetime"));
-  }
-  UniqueFd stop_read(stop_pipe[0]);
-  UniqueFd stop_write(stop_pipe[1]);
-  struct LaunchState {
-    std::mutex mutex;
-    std::condition_variable ready;
-    pid_t pid = -1;
-    int pidfd = -1;
-    bool complete = false;
-  } state;
-  auto launcher_exit = std::make_shared<ProcessExit>();
-
-  std::thread launcher([flags, child = std::forward<Child>(child), &state,
-                        stop = std::move(stop_read), cleanup_deadline, launcher_exit]() mutable {
-    pid_t pid = -1;
-    int authority = -1;
-    int monitor = -1;
-    try {
-      auto process = clone_process(flags, std::move(child), -1, cleanup_deadline);
-      pid = process.pid();
-      if (inject_stable_parent_failure("pidfd-duplicate")) {
-        errno = EMFILE;
-      } else {
-        monitor = ::fcntl(process.pidfd(), F_DUPFD_CLOEXEC, 3);
-      }
-      if (monitor < 0) {
-        signal_pidfd_noexcept(process.pidfd(), SIGKILL);
-        pid = -1;
-      } else {
-        authority = process.release_pidfd();
-      }
-    } catch (...) {
-      pid = -1;
-      authority = -1;
+  UniqueFd parent_transport;
+  auto child_transport = ForkProtectedFd::create([&] {
+    std::array<int, 2> transport{-1, -1};
+    if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, transport.data()) !=
+        0) {
+      return -1;
     }
-    {
-      std::lock_guard lock(state.mutex);
-      state.pid = pid;
-      state.pidfd = authority;
-      state.complete = true;
-      state.ready.notify_one();
-    }
-    if (monitor < 0) {
-      return;
-    }
-    UniqueFd monitor_fd(monitor);
-    while (true) {
-      std::array<pollfd, 2> items{
-          pollfd{.fd = monitor_fd.get(), .events = POLLIN, .revents = 0},
-          pollfd{.fd = stop.get(), .events = POLLIN, .revents = 0},
-      };
-      const auto result = ::poll(items.data(), items.size(), -1);
-      if (result < 0 && errno == EINTR) {
-        continue;
-      }
-      if (result > 0 && (items[0].revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
-        siginfo_t information{};
-        constexpr auto pidfd_id_type = static_cast<idtype_t>(3);
-        while (::waitid(pidfd_id_type, static_cast<id_t>(monitor_fd.get()), &information,
-                        WEXITED | __WALL) != 0) {
-          if (errno == EINTR) {
-            continue;
-          }
-          return;
-        }
-        *launcher_exit = {
-            .known = true, .code = information.si_code, .status = information.si_status};
-      }
-      return;
-    }
+    parent_transport.reset(transport[0]);
+    return transport[1];
   });
-
-  {
-    std::unique_lock lock(state.mutex);
-    state.ready.wait(lock, [&state] { return state.complete; });
+  if (!child_transport) {
+    throw CalibrationExecutionError(errno_message("cannot create stable parent transport"));
   }
-  if (state.pid <= 0 || state.pidfd < 0) {
-    const char stop = 'S';
-    (void)::send(stop_write.get(), &stop, 1, MSG_NOSIGNAL);
-    stop_write.reset();
-    launcher.join();
+  const auto expected_parent = ::getpid();
+  const auto reap_delay_ms =
+      test_delay_milliseconds("RECO_FAKE_CALIBRATION_STABLE_PARENT_REAP_DELAY_MS");
+  auto stable_parent = clone_process(
+      0,
+      [&] {
+        stable_process_parent_child(child_transport.get(), parent_transport.get(), expected_parent,
+                                    flags, reap_delay_ms, child);
+      },
+      -1, cleanup_deadline);
+  child_transport.reset();
+
+  std::optional<std::pair<pid_t, UniqueFd>> launch;
+  while (Clock::now() < cleanup_deadline) {
+    std::array<pollfd, 2> events{
+        pollfd{.fd = parent_transport.get(), .events = POLLIN, .revents = 0},
+        pollfd{.fd = stable_parent.pidfd(), .events = POLLIN, .revents = 0},
+    };
+    const auto polled = ::poll(events.data(), events.size(), deadline_timeout(cleanup_deadline));
+    if (polled < 0 && errno == EINTR) {
+      continue;
+    }
+    if (polled < 0) {
+      throw CalibrationExecutionError(errno_message("cannot monitor stable calibration parent"));
+    }
+    if ((events[0].revents & POLLIN) != 0) {
+      launch = receive_stable_process_launch(parent_transport.get());
+      break;
+    }
+    if ((events[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0 ||
+        (events[1].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) != 0) {
+      throw CalibrationExecutionError("stable calibration parent failed during launch");
+    }
+  }
+  if (!launch.has_value()) {
+    throw CalibrationExecutionError("stable calibration parent exceeded its launch deadline");
+  }
+
+  int authority = -1;
+  if (inject_stable_parent_failure("pidfd-duplicate")) {
+    errno = EMFILE;
+  } else {
+    authority = ::fcntl(launch->second.get(), F_DUPFD_CLOEXEC, 3);
+  }
+  if (authority < 0) {
+    signal_pidfd_noexcept(launch->second.get(), SIGKILL);
+    try {
+      stable_parent.wait_until(std::min(Clock::now() + kCleanupReserve, cleanup_deadline));
+      (void)stable_parent.reap();
+    } catch (...) {
+      stable_parent.detach_noexcept();
+    }
     throw CalibrationExecutionError("cannot create stable calibration launcher process");
   }
-  return OwnedProcess(state.pid, state.pidfd, std::move(launcher), stop_write.release(),
-                      cleanup_deadline, std::move(launcher_exit));
+  return OwnedProcess(launch->first, authority, parent_transport.release(),
+                      stable_parent.release_pidfd(), cleanup_deadline);
 }
 
 [[nodiscard]] std::vector<char*> make_argv(const std::string& executable,
@@ -3791,10 +4201,9 @@ private:
   }
   UniqueFd gate_read(gate[0]);
   UniqueFd gate_write(gate[1]);
-  const auto expected_parent = ::getpid();
   auto process = clone_process_with_stable_parent(
       0,
-      [&] {
+      [&](pid_t expected_parent) {
         guardian_child(executable.fd(), argv.data(), environment.data(), gate_read.get(),
                        gate_write.get(), expected_parent);
       },
@@ -4073,16 +4482,26 @@ int run_calibration_guardian_fd(int descriptor, const char* executable,
   }
 }
 
-CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest& request) {
+CalibrationResult
+run_gpu_calibration_supervised(const GpuCalibrationRequest& request,
+                               const CalibrationCancellationRequested& cancellation_requested) {
+  CalibrationCancellationState cancellation_state(cancellation_requested);
+  const CalibrationCancellationRequested latched_cancellation_requested = [&cancellation_state] {
+    return cancellation_state.poll();
+  };
+  throw_if_cancelled(latched_cancellation_requested);
   const auto timeout = std::chrono::nanoseconds(request.calibration_timeout_ns);
   if (timeout <= kCleanupReserve || Clock::time_point::max() - Clock::now() < timeout) {
     throw CalibrationExecutionError("calibration timeout is outside the supervisor clock range");
   }
   const auto deadline = Clock::now() + timeout;
   require_observable_child_status();
+  throw_if_cancelled(latched_cancellation_requested);
   AdmissionLock admission;
   check_admission_headroom(request.calibration_host_memory_limit_bytes);
-  PinnedExecutable executable(std::filesystem::path(request.calibration_worker_path), deadline);
+  PinnedExecutable executable(std::filesystem::path(request.calibration_worker_path), deadline,
+                              latched_cancellation_requested);
+  throw_if_cancelled(latched_cancellation_requested);
   auto worker_request = request;
   const auto open_retained_input = [](const std::string& path, std::string_view label,
                                       std::optional<CalibrationFileIdentity>& expected_identity) {
@@ -4112,6 +4531,7 @@ CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest& re
                                         worker_request.left.expected_identity);
   auto right_input = open_retained_input(right_open_path, "right calibration video",
                                          worker_request.right.expected_identity);
+  throw_if_cancelled(latched_cancellation_requested);
   worker_request.left.retained_path = retained_descriptor_path(left_input.get());
   worker_request.right.retained_path = retained_descriptor_path(right_input.get());
   UniqueFd left_profile;
@@ -4137,36 +4557,49 @@ CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest& re
     }
   };
   const auto encoded_request = encode_calibration_worker_request(worker_request);
-  CgroupMemoryBoundary memory_boundary(request.calibration_host_memory_limit_bytes, deadline);
+  CgroupMemoryBoundary memory_boundary(request.calibration_host_memory_limit_bytes, deadline,
+                                       cancellation_state, latched_cancellation_requested);
+  throw_if_cancelled(latched_cancellation_requested);
   try {
     auto listener = create_listener();
     auto guardian = spawn_guardian(executable, listener.address, deadline);
-    auto channel = accept_authenticated(listener, guardian, deadline);
-    send_file_fd(channel.get(), guardian, 'L', admission.fd(), deadline);
-    send_file_fd(channel.get(), guardian, 'X', executable.fd(), deadline);
-    send_file_fd(channel.get(), guardian, 'C', memory_boundary.fd(), deadline);
-    write_all(channel.get(), guardian, encoded_request, deadline);
+    auto channel = accept_authenticated(listener, guardian, deadline, 0, nullptr,
+                                        latched_cancellation_requested);
+    send_file_fd(channel.get(), guardian, 'L', admission.fd(), deadline, -1, 0, nullptr,
+                 latched_cancellation_requested);
+    send_file_fd(channel.get(), guardian, 'X', executable.fd(), deadline, -1, 0, nullptr,
+                 latched_cancellation_requested);
+    send_file_fd(channel.get(), guardian, 'C', memory_boundary.fd(), deadline, -1, 0, nullptr,
+                 latched_cancellation_requested);
+    write_all(channel.get(), guardian, encoded_request, deadline, -1, 0, nullptr,
+              latched_cancellation_requested);
     if (left_input) {
-      send_file_fd(channel.get(), guardian, 'I', left_input.get(), deadline);
+      send_file_fd(channel.get(), guardian, 'I', left_input.get(), deadline, -1, 0, nullptr,
+                   latched_cancellation_requested);
     }
     if (right_input) {
-      send_file_fd(channel.get(), guardian, 'J', right_input.get(), deadline);
+      send_file_fd(channel.get(), guardian, 'J', right_input.get(), deadline, -1, 0, nullptr,
+                   latched_cancellation_requested);
     }
     if (left_profile) {
-      send_file_fd(channel.get(), guardian, 'K', left_profile.get(), deadline);
+      send_file_fd(channel.get(), guardian, 'K', left_profile.get(), deadline, -1, 0, nullptr,
+                   latched_cancellation_requested);
     }
     if (right_profile) {
-      send_file_fd(channel.get(), guardian, 'M', right_profile.get(), deadline);
+      send_file_fd(channel.get(), guardian, 'M', right_profile.get(), deadline, -1, 0, nullptr,
+                   latched_cancellation_requested);
     }
     if (::shutdown(channel.get(), SHUT_WR) != 0) {
       throw CalibrationExecutionError("cannot finish the calibration guardian request");
     }
-    auto worker_authority = receive_worker_authority(channel.get(), guardian, deadline);
+    auto worker_authority = receive_worker_authority(
+        channel.get(), guardian, deadline, cancellation_state, latched_cancellation_requested);
     (void)worker_authority;
     auto response = read_frame(channel.get(), guardian, deadline,
                                maximum_calibration_worker_success_frame_bytes(
-                                   request.config.num_frames, request.config.akaze.max_keypoints));
-    guardian.wait_until(deadline);
+                                   request.config.num_frames, request.config.akaze.max_keypoints),
+                               -1, 0, nullptr, latched_cancellation_requested);
+    guardian.wait_until(deadline, latched_cancellation_requested);
     const auto status = guardian.reap();
     certify_channel_eof(channel.get());
     if (memory_boundary.oom_killed()) {
@@ -4185,6 +4618,7 @@ CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest& re
       throw CalibrationExecutionError("calibration guardian terminated abnormally");
     }
     auto result = decode_calibration_worker_response(response);
+    throw_if_cancelled(latched_cancellation_requested);
     if (result.frames_used > request.config.num_frames ||
         result.per_frame.size() > request.config.num_frames) {
       throw CalibrationExecutionError(
@@ -4226,6 +4660,7 @@ CalibrationResult run_gpu_calibration_supervised(const GpuCalibrationRequest& re
                             worker_request.right.lens_profile_expected_identity);
     }
     memory_boundary.finish();
+    throw_if_cancelled(latched_cancellation_requested);
     return result;
   } catch (...) {
     if (memory_boundary.oom_killed()) {

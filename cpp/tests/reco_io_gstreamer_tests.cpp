@@ -157,6 +157,8 @@ void gpu_file_decode_pipeline_preserves_nvmm() {
   expect_eq(gpu_decode_codec_name(config.codec), std::string_view("h264"), "GPU decode codec name");
   expect_true(gpu_decode_codec_for_path("clip.hevc") == GpuDecodeCodec::Hevc,
               "HEVC extension selects HEVC parser");
+  expect_true(gpu_decode_codec_for_path("clip.av1") == GpuDecodeCodec::Av1,
+              "AV1 extension selects AV1 parser");
   expect_true(gpu_decode_path_is_elementary_stream("clip.hevc"),
               "HEVC extension selects elementary stream path");
   expect_true(gpu_decode_codec_for_path("clip.mp4") == GpuDecodeCodec::H264,
@@ -171,10 +173,13 @@ void gpu_file_decode_pipeline_preserves_nvmm() {
               "unsupported VP8/VP9 WebM container is rejected");
   expect_true(gpu_decode_container_for_path("clip.ts") == GpuDecodeContainer::MpegTs,
               "transport stream extension selects tsdemux");
+  expect_true(gpu_decode_container_for_path("clip.flv") == GpuDecodeContainer::Flv,
+              "FLV extension selects flvdemux");
   const auto pipeline = build_gstreamer_gpu_file_decode_pipeline(config);
   expect_true(pipeline.find("filesrc location=\"/data/left video.mp4\"") != std::string::npos,
               "GPU file source is quoted");
-  expect_true(pipeline.find("qtdemux ! capsfilter caps=\"video/x-h264;video/x-h265\" ! "
+  expect_true(pipeline.find("qtdemux ! capsfilter "
+                            "caps=\"video/x-h264;video/x-h265;video/x-av1\" ! "
                             "parsebin ! identity name=display_info silent=true ! "
                             "nvv4l2decoder") != std::string::npos,
               "containerized H264/HEVC video pad and hardware decode selected");
@@ -207,7 +212,7 @@ void gpu_file_decode_pipeline_preserves_nvmm() {
   config.container = gpu_decode_container_for_path(config.path);
   const auto matroska = build_gstreamer_gpu_file_decode_pipeline(config);
   expect_true(matroska.find("matroskademux ! capsfilter "
-                            "caps=\"video/x-h264;video/x-h265\" ! parsebin ! "
+                            "caps=\"video/x-h264;video/x-h265;video/x-av1\" ! parsebin ! "
                             "identity name=display_info silent=true ! nvv4l2decoder") !=
                   std::string::npos,
               "Matroska H264/HEVC video pad and hardware decode selected");
@@ -216,10 +221,21 @@ void gpu_file_decode_pipeline_preserves_nvmm() {
   config.codec = GpuDecodeCodec::Hevc;
   config.container = GpuDecodeContainer::QuickTime;
   const auto hevc_mp4 = build_gstreamer_gpu_file_decode_pipeline(config);
-  expect_true(hevc_mp4.find("qtdemux ! capsfilter caps=\"video/x-h264;video/x-h265\" ! "
+  expect_true(hevc_mp4.find("qtdemux ! capsfilter "
+                            "caps=\"video/x-h264;video/x-h265;video/x-av1\" ! "
                             "parsebin ! identity name=display_info silent=true ! "
                             "nvv4l2decoder") != std::string::npos,
               "containerized HEVC uses automatic video parser selection");
+
+  config.require_selected_codec = true;
+  const auto strict_hevc_mp4 = build_gstreamer_gpu_file_decode_pipeline(config);
+  expect_true(strict_hevc_mp4.find("qtdemux ! capsfilter caps=\"video/x-h265\" ! h265parse ! "
+                                   "identity name=display_info silent=true ! nvv4l2decoder") !=
+                  std::string::npos,
+              "strict container decode bypasses parser autoplugging");
+  expect_true(strict_hevc_mp4.find("parsebin") == std::string::npos,
+              "strict container decode cannot autoplug a decoder");
+  config.require_selected_codec = false;
 
   config.path = "/data/left \"quoted\" video.mp4";
   config.elementary_stream = gpu_decode_path_is_elementary_stream(config.path);

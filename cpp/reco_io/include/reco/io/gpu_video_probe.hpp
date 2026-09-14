@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -58,6 +59,15 @@ public:
   explicit GpuVideoProbeError(std::string message) : std::runtime_error(std::move(message)) {}
 };
 
+/// Cooperative cancellation request observed by the probe supervisor.
+using GpuVideoProbeCancellationRequested = std::function<bool()>;
+
+/// Probe termination requested by its caller.
+class GpuVideoProbeCancelled final : public GpuVideoProbeError {
+public:
+  GpuVideoProbeCancelled() : GpuVideoProbeError("video probe cancelled") {}
+};
+
 /// Uses the production GStreamer demux/parser topology to probe a local input.
 ///
 /// The pipeline stops before NVDEC and never produces a decoded frame. The
@@ -85,8 +95,9 @@ public:
 /// reserves 256 MiB for the sealed RAM-backed executable snapshot, admitting at
 /// most two concurrent probes; other platforms admit at most four. Calls beyond
 /// the platform limit fail before allocating another snapshot or process.
-[[nodiscard]] GpuVideoProbe probe_gpu_video(const GpuFileDecodeConfig& config,
-                                            const std::filesystem::path& worker_path,
-                                            std::uint64_t timeout_ns);
+[[nodiscard]] GpuVideoProbe
+probe_gpu_video(const GpuFileDecodeConfig& config, const std::filesystem::path& worker_path,
+                std::uint64_t timeout_ns,
+                const GpuVideoProbeCancellationRequested& cancellation_requested = {});
 
 } // namespace reco::io

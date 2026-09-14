@@ -18,6 +18,7 @@ using ProbeIpcFrameHeader = std::array<char, kProbeIpcFrameHeaderBytes>;
 struct ProbeWorkerRequest {
   GpuFileDecodeConfig config;
   std::uint64_t timeout_ns = 0;
+  bool expects_stable_source = false;
 };
 
 [[nodiscard]] ProbeIpcFrameHeader encode_probe_ipc_frame_header(std::size_t payload_size);

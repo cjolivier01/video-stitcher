@@ -1,5 +1,17 @@
 load("@rules_cc//cc:defs.bzl", "cc_binary", "cc_library", "cc_test")
 
+cc_library(
+    name = "video_probe_worker_locator",
+    srcs = ["src/video_probe_worker.cpp"],
+    hdrs = ["include/reco/io/video_probe_worker.hpp"],
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//cpp/reco_core",
+        "@rules_cc//cc/runfiles",
+    ],
+)
+
 _RECO_IO_SRCS = [
     "src/audio_passthrough.cpp",
     "src/gstreamer.cpp",
@@ -10,6 +22,8 @@ _RECO_IO_SRCS = [
     "src/gpu_decode_chain.cpp",
     "src/gpu_decode_session.cpp",
     "src/gpu_encode.cpp",
+    "src/gpu_memory.cpp",
+    "src/gpu_preview.cpp",
     "src/gpu_video_probe.cpp",
     "src/gpu_video_probe_internal.hpp",
     "src/gpu_video_probe_process.cpp",
@@ -21,6 +35,8 @@ _RECO_IO_SRCS = [
     "src/output.cpp",
     "src/settings.cpp",
     "src/stacked_video.cpp",
+    "src/stable_media_file.cpp",
+    "src/stable_media_file_internal.hpp",
 ]
 
 _RECO_IO_HDRS = [
@@ -28,6 +44,8 @@ _RECO_IO_HDRS = [
     "include/reco/io/gstreamer.hpp",
     "include/reco/io/gpu_decode.hpp",
     "include/reco/io/gpu_encode.hpp",
+    "include/reco/io/gpu_memory.hpp",
+    "include/reco/io/gpu_preview.hpp",
     "include/reco/io/gpu_video_probe.hpp",
     "include/reco/io/detail/nvbufsurface_7_1.hpp",
     "include/reco/io/detail/nvbufsurface_9_1.hpp",
@@ -36,6 +54,7 @@ _RECO_IO_HDRS = [
     "include/reco/io/output.hpp",
     "include/reco/io/settings.hpp",
     "include/reco/io/stacked_video.hpp",
+    "include/reco/io/stable_media_file.hpp",
 ]
 
 _RECO_IO_DEPS = [
@@ -70,6 +89,13 @@ cc_library(
 )
 
 cc_library(
+    name = "gpu_video_probe_worker_request",
+    srcs = ["src/gpu_video_probe_worker_request.cpp"],
+    hdrs = ["src/gpu_video_probe_worker_request.hpp"],
+    includes = ["src"],
+)
+
+cc_library(
     name = "reco_io_forced_guardian_fallbacks",
     testonly = True,
     srcs = _RECO_IO_SRCS,
@@ -100,7 +126,10 @@ cc_binary(
         "src/gpu_video_probe_worker_main.cpp",
     ],
     visibility = ["//visibility:public"],
-    deps = [":reco_io"],
+    deps = [
+        ":gpu_video_probe_worker_request",
+        ":reco_io",
+    ],
 )
 
 cc_binary(
@@ -114,7 +143,17 @@ cc_binary(
     ],
     local_defines = ["RECO_PROBE_TEST_WORKER_DESCRIPTOR_REUSE"],
     visibility = ["//cpp/tests:__pkg__"],
-    deps = [":reco_io_forced_guardian_fallbacks"],
+    deps = [
+        ":gpu_video_probe_worker_request",
+        ":reco_io_forced_guardian_fallbacks",
+    ],
+)
+
+cc_test(
+    name = "gpu_video_probe_worker_request_tests",
+    size = "small",
+    srcs = ["src/gpu_video_probe_worker_request_tests.cpp"],
+    deps = [":gpu_video_probe_worker_request"],
 )
 
 cc_test(

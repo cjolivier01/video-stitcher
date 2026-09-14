@@ -1,7 +1,9 @@
 #include "reco/cli/cli.hpp"
+#include "reco/cli/interrupt.hpp"
 
 #include "reco/calibrate/pipeline.hpp"
 #include "reco/core/path.hpp"
+#include "reco/io/stable_media_file.hpp"
 
 #include <algorithm>
 #include <array>
@@ -37,6 +39,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -364,6 +367,34 @@ int run_windows_publication_writer_child(int argc, wchar_t** argv) {
   return 0;
 }
 
+int run_windows_interrupt_child(int argc, wchar_t** argv) {
+  if (argc != 4) {
+    return 95;
+  }
+  const HANDLE ready = OpenEventW(EVENT_MODIFY_STATE, FALSE, argv[3]);
+  if (ready == nullptr) {
+    return 96;
+  }
+  try {
+    detail::InterruptMonitor interrupts;
+    {
+      detail::AtomicOutputFile output{std::filesystem::path(argv[2])};
+      write_text_descriptor(output.descriptor(), "partial output\n");
+      if (SetEvent(ready) == 0) {
+        throw std::runtime_error("cannot signal Windows interrupt-child readiness");
+      }
+      while (!interrupts.requested()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+    }
+  } catch (...) {
+    (void)CloseHandle(ready);
+    return 97;
+  }
+  (void)CloseHandle(ready);
+  return kCancelledExitCode;
+}
+
 bool wait_windows_process_success(HANDLE process, DWORD timeout_ms) {
   if (process == nullptr) {
     return false;
@@ -588,6 +619,25 @@ AtomicReadResult read_atomic_output(const std::filesystem::path& path) {
 #endif
 }
 
+std::size_t retained_io_resource_count() {
+#if defined(_WIN32)
+  DWORD count = 0;
+  if (GetProcessHandleCount(GetCurrentProcess(), &count) == 0) {
+    throw std::runtime_error("cannot count process handles");
+  }
+  return count;
+#else
+#if defined(__APPLE__)
+  constexpr const char* descriptor_directory = "/dev/fd";
+#else
+  constexpr const char* descriptor_directory = "/proc/self/fd";
+#endif
+  return static_cast<std::size_t>(
+      std::distance(std::filesystem::directory_iterator(descriptor_directory),
+                    std::filesystem::directory_iterator{}));
+#endif
+}
+
 void make_executable(const std::filesystem::path& path) {
 #if !defined(_WIN32)
   std::error_code error;
@@ -650,6 +700,133 @@ void expect_no_stitch_output_artifacts(const std::filesystem::path& directory,
     expect_true(!is_staging && !is_legacy_temporary && !is_legacy_publication,
                 std::string(context) + " leaves no stitch output staging artifact");
   }
+}
+
+void interrupt_request_unwinds_stitch_output_staging() {
+  TemporaryDirectory root;
+  const auto destination = root.path() / "cancelled.mp4";
+  write_text_file(destination, "existing destination\n");
+
+#if defined(_WIN32)
+  if (GetConsoleCP() == 0) {
+    expect_true(AllocConsole() != 0, "Windows cancellation test allocates a console");
+  }
+  const auto event_name = L"Local\\RecoInterruptReady-" + std::to_wstring(GetCurrentProcessId()) +
+                          L"-" + std::to_wstring(GetTickCount64());
+  const HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, event_name.c_str());
+  expect_true(ready != nullptr, "Windows cancellation test creates its readiness event");
+
+  std::wstring executable(32768, L'\0');
+  const DWORD executable_size =
+      GetModuleFileNameW(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+  expect_true(executable_size != 0 && executable_size < executable.size(),
+              "Windows cancellation test resolves its child executable");
+  executable.resize(executable_size < executable.size() ? executable_size : 0);
+  std::wstring command = quote_windows_argument(executable);
+  for (const auto argument :
+       {std::wstring_view(L"--reco-interrupt-child"), std::wstring_view(destination.native()),
+        std::wstring_view(event_name)}) {
+    command.push_back(L' ');
+    command += quote_windows_argument(argument);
+  }
+  command.push_back(L'\0');
+  STARTUPINFOW startup{.cb = sizeof(startup)};
+  PROCESS_INFORMATION process{};
+  const bool started =
+      ready != nullptr && !executable.empty() &&
+      CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE,
+                     CREATE_NEW_PROCESS_GROUP, nullptr, nullptr, &startup, &process) != 0;
+  expect_true(started, "Windows cancellation child starts in a new process group");
+  if (started) {
+    (void)CloseHandle(process.hThread);
+  }
+  const bool active = started && WaitForSingleObject(ready, 10000) == WAIT_OBJECT_0;
+  expect_true(active, "Windows cancellation child enters active staged work");
+  const bool delivered =
+      active && GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, process.dwProcessId) != 0;
+  expect_true(delivered, "CTRL_BREAK_EVENT is delivered to the child process group");
+  const bool exited = delivered && WaitForSingleObject(process.hProcess, 5000) == WAIT_OBJECT_0;
+  expect_true(exited, "Windows cancellation child exits within the cancellation bound");
+  DWORD exit_code = 0;
+  if (started) {
+    if (!exited) {
+      (void)TerminateProcess(process.hProcess, 98);
+      (void)WaitForSingleObject(process.hProcess, 5000);
+    }
+    (void)GetExitCodeProcess(process.hProcess, &exit_code);
+    (void)CloseHandle(process.hProcess);
+  }
+  if (ready != nullptr) {
+    (void)CloseHandle(ready);
+  }
+  expect_true(exited && exit_code == static_cast<DWORD>(kCancelledExitCode),
+              "Windows console cancellation exits with status 130");
+#else
+  int ready[2]{};
+  if (::pipe(ready) != 0) {
+    throw std::system_error(errno, std::generic_category(), "cannot create interrupt test pipe");
+  }
+  const pid_t child = ::fork();
+  if (child == 0) {
+    (void)::close(ready[0]);
+    int status = 91;
+    try {
+      detail::InterruptMonitor interrupts;
+      {
+        detail::AtomicOutputFile output(destination);
+        write_text_descriptor(output.descriptor(), "partial output\n");
+        const char value = 1;
+        if (::write(ready[1], &value, 1) != 1) {
+          throw std::runtime_error("cannot signal interrupt child readiness");
+        }
+        while (!interrupts.requested()) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+      }
+      status = kCancelledExitCode;
+    } catch (...) {
+      status = 92;
+    }
+    (void)::close(ready[1]);
+    ::_exit(status);
+  }
+  (void)::close(ready[1]);
+  char value = 0;
+  const bool started =
+      child > 0 && read_byte_with_timeout(ready[0], value, std::chrono::seconds(5));
+  (void)::close(ready[0]);
+  expect_true(started, "interrupt child creates its retained staging output");
+  if (started) {
+    expect_true(::kill(child, SIGINT) == 0, "SIGINT is delivered to the stitch child");
+  }
+
+  int child_status = 0;
+  bool exited = false;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (child > 0 && std::chrono::steady_clock::now() < deadline) {
+    const auto result = ::waitpid(child, &child_status, WNOHANG);
+    if (result == child) {
+      exited = true;
+      break;
+    }
+    if (result < 0 && errno != EINTR) {
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  if (!exited && child > 0) {
+    (void)::kill(child, SIGKILL);
+    while (::waitpid(child, &child_status, 0) < 0 && errno == EINTR) {
+    }
+  }
+  expect_true(exited, "SIGINT child exits within the cancellation bound");
+  expect_true(exited && WIFEXITED(child_status) && WEXITSTATUS(child_status) == kCancelledExitCode,
+              "SIGINT child unwinds with the cancellation status");
+#endif
+
+  expect_true(read_text_file(destination) == "existing destination\n",
+              "cancellation preserves the existing destination");
+  expect_no_stitch_output_artifacts(root.path(), "cancellation");
 }
 
 template <typename T, typename U> void expect_eq(T actual, U expected, std::string_view message) {
@@ -821,6 +998,33 @@ void stitch_frame_timing_preserves_source_gaps_and_rejects_overflow() {
   expect_true(overflow_rejected, "terminal source frame index overflow is rejected");
 }
 
+void stitch_audio_is_clipped_by_presentation_time_at_the_video_boundary() {
+  const auto crossing = detail::clip_stitch_audio_duration(90U, 80U, 20U, 100U);
+  expect_eq(crossing.value_or(0), 10ULL,
+            "terminal audio duration is clipped from its presentation timestamp");
+
+  const auto outside = detail::clip_stitch_audio_duration(100U, 90U, 20U, 100U);
+  expect_true(!outside.has_value(),
+              "decode timestamp does not admit audio presented at the video boundary");
+
+  const auto dts_fallback = detail::clip_stitch_audio_duration(std::nullopt, 95U, 10U, 100U);
+  expect_eq(dts_fallback.value_or(0), 5ULL,
+            "decode timestamp is used only when presentation time is unavailable");
+
+  const auto contained = detail::clip_stitch_audio_duration(40U, 30U, 20U, 100U);
+  expect_eq(contained.value_or(0), 20ULL, "fully contained audio duration is unchanged");
+
+  bool unknown_duration_rejected = false;
+  try {
+    (void)detail::clip_stitch_audio_duration(40U, 30U, 0U, 100U);
+  } catch (const std::runtime_error& error) {
+    unknown_duration_rejected =
+        std::string_view(error.what()).find("duration is unknown") != std::string_view::npos;
+  }
+  expect_true(unknown_duration_rejected,
+              "unknown compressed duration fails closed at the final boundary");
+}
+
 void stitch_second_conversion_supports_the_unsigned_gstreamer_range() {
   expect_eq(detail::nanoseconds_from_seconds(0.000'000'000'5, "timestamp"), 1ULL,
             "sub-nanosecond stitch time rounds to the nearest nanosecond");
@@ -860,22 +1064,104 @@ void stitch_frame_window_uses_one_rounded_timeline() {
     empty_window_rejected = true;
   }
   expect_true(empty_window_rejected, "sub-frame end window is rejected explicitly");
+
+  expect_eq(detail::stitch_timeline_duration_ns(3, 30'000, 1'001), 100'100'000ULL,
+            "audio segment duration follows the exact rational frame boundary");
+  expect_eq(detail::stitch_timeline_duration_ns(1'001, 30'000, 1'001), 33'400'033'333ULL,
+            "chained segment duration does not inherit container duration drift");
+}
+
+void stitch_descriptor_budget_is_checked_before_input_acquisition() {
+  const auto required = detail::stitch_descriptor_requirement(8192);
+  expect_eq(required, std::size_t{8192 + 1 + detail::kStitchTransientDescriptorReserve},
+            "stitch descriptor estimate retains one authority per segment");
+  expect_true(detail::stitch_descriptor_budget_fits(7, required + 7, 8192),
+              "stitch descriptor budget accepts the exact available boundary");
+  expect_true(!detail::stitch_descriptor_budget_fits(7, required + 6, 8192),
+              "stitch descriptor budget rejects one descriptor below the boundary");
+
+  bool overflow_rejected = false;
+  try {
+    (void)detail::stitch_descriptor_requirement(std::numeric_limits<std::size_t>::max());
+  } catch (const std::overflow_error&) {
+    overflow_rejected = true;
+  }
+  expect_true(overflow_rejected, "stitch descriptor estimate rejects arithmetic overflow");
+
+#if !defined(_WIN32)
+  struct rlimit original{};
+  if (::getrlimit(RLIMIT_NOFILE, &original) != 0) {
+    throw std::runtime_error("cannot inspect the test descriptor limit");
+  }
+  struct RestoreLimit {
+    struct rlimit value{};
+    ~RestoreLimit() { (void)::setrlimit(RLIMIT_NOFILE, &value); }
+  } restore{original};
+  struct rlimit constrained = original;
+  constrained.rlim_cur = std::min<rlim_t>(original.rlim_cur, 32);
+  if (::setrlimit(RLIMIT_NOFILE, &constrained) != 0) {
+    throw std::runtime_error("cannot constrain the test descriptor limit");
+  }
+  const auto descriptor_count = [&] {
+    std::size_t count = 0;
+    for (int descriptor = 0; descriptor < static_cast<int>(constrained.rlim_cur); ++descriptor) {
+      if (::fcntl(descriptor, F_GETFD) >= 0 || errno != EBADF) {
+        ++count;
+      }
+    }
+    return count;
+  };
+  const auto before = descriptor_count();
+
+  for (int attempt = 0; attempt < 16; ++attempt) {
+    bool rejected = false;
+    try {
+      detail::require_stitch_descriptor_budget(2);
+    } catch (const std::runtime_error& error) {
+      rejected = std::string_view(error.what()).find("raise the process descriptor limit") !=
+                 std::string_view::npos;
+    }
+    expect_true(rejected, "low descriptor limit is rejected without partial acquisition");
+  }
+  expect_eq(descriptor_count(), before,
+            "repeated low-limit admission failures do not leak descriptors");
+#endif
 }
 
 void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
   TemporaryDirectory root;
   const auto destination = root.path() / "stitched.mp4";
+
+  const auto descriptor_budget_input = root.path() / "descriptor-budget-input.mp4";
+  write_text_file(descriptor_budget_input, "descriptor budget input\n");
+  const auto retained_input = reco::io::StableMediaFile::open(descriptor_budget_input);
+  std::vector<detail::AtomicOutputProtectedPath> repeated_protected_paths;
+  repeated_protected_paths.reserve(128);
+  for (int index = 0; index < 128; ++index) {
+    repeated_protected_paths.push_back({.path = descriptor_budget_input,
+                                        .label = "the repeated protected input",
+                                        .stable_source = retained_input});
+  }
+  const auto retained_resources_before = retained_io_resource_count();
+  {
+    detail::AtomicOutputFile output(root.path() / "descriptor-budget-output.mp4", {}, {},
+                                    repeated_protected_paths);
+    expect_true(retained_io_resource_count() <= retained_resources_before + 8,
+                "publication protection reuses retained input authorities");
+    write_text_descriptor(output.descriptor(), "descriptor budget output\n");
+  }
+  expect_true(retained_io_resource_count() <= retained_resources_before + 1,
+              "publication protection cleanup releases transaction resources");
+
   {
     detail::AtomicOutputFile output(destination);
     write_text_descriptor(output.descriptor(), "first encoded output\n");
     expect_true(output.descriptor() >= 0, "stitch output exposes a retained descriptor");
-    const auto verification = read_atomic_output(output.verification_path());
-    expect_true(verification.status == AtomicReadStatus::Success,
-                "stitch output exposes a readable verification stream");
-    expect_eq(verification.contents, std::string("first encoded output\n"),
+    const auto verification = output.verification_source();
+    expect_eq(verification->read_all(4096), std::string("first encoded output\n"),
               "verification stream reads independently from the write descriptor");
 #if defined(_WIN32)
-    const HANDLE ordinary_reader = CreateFileW(output.verification_path().c_str(), GENERIC_READ,
+    const HANDLE ordinary_reader = CreateFileW(output.temporary_path().c_str(), GENERIC_READ,
                                                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     expect_true(ordinary_reader != INVALID_HANDLE_VALUE,
@@ -892,6 +1178,57 @@ void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
   expect_no_stitch_output_artifacts(root.path(), "new stitch output publication");
   expect_eq(std::filesystem::hard_link_count(destination), std::uintmax_t{1},
             "new stitch output has exactly one directory entry");
+
+#if defined(_WIN32)
+  const auto integrity_destination = root.path() / "write-locked-stitch.mp4";
+  bool publication_hook_ran = false;
+  bool publication_writer_denied = false;
+  {
+    detail::AtomicOutputFile output(
+        integrity_destination, [&](const std::filesystem::path& publication) {
+          publication_hook_ran = true;
+          SetLastError(ERROR_SUCCESS);
+          const HANDLE competing_writer =
+              CreateFileW(publication.c_str(), GENERIC_WRITE,
+                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                          OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+          const DWORD writer_error = GetLastError();
+          publication_writer_denied =
+              competing_writer == INVALID_HANDLE_VALUE && writer_error == ERROR_SHARING_VIOLATION;
+          if (competing_writer != INVALID_HANDLE_VALUE) {
+            constexpr char attacker_contents[] = "mutated after verification\n";
+            DWORD written = 0;
+            (void)WriteFile(competing_writer, attacker_contents,
+                            static_cast<DWORD>(sizeof(attacker_contents) - 1U), &written, nullptr);
+            (void)CloseHandle(competing_writer);
+          }
+        });
+    write_text_descriptor(output.descriptor(), "verified encoded output\n");
+    const auto verification = output.verification_source();
+    expect_eq(verification->read_all(4096), std::string("verified encoded output\n"),
+              "Windows verification observes the descriptor-bound bytes");
+
+    SetLastError(ERROR_SUCCESS);
+    const HANDLE competing_writer =
+        CreateFileW(output.temporary_path().c_str(), GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL, nullptr);
+    const DWORD writer_error = GetLastError();
+    expect_true(competing_writer == INVALID_HANDLE_VALUE && writer_error == ERROR_SHARING_VIOLATION,
+                "Windows temporary rejects a second writer after verification");
+    if (competing_writer != INVALID_HANDLE_VALUE) {
+      (void)CloseHandle(competing_writer);
+    }
+    output.commit();
+  }
+  expect_true(publication_hook_ran,
+              "Windows write-lock fixture reaches the final publication window");
+  expect_true(publication_writer_denied,
+              "Windows temporary rejects mutation at the publication boundary");
+  expect_eq(read_text_file(integrity_destination), std::string("verified encoded output\n"),
+            "Windows publication preserves the bytes that were verified");
+  expect_no_stitch_output_artifacts(root.path(), "write-locked Windows stitch publication");
+#endif
 
   {
     detail::AtomicOutputFile output(destination);
@@ -991,6 +1328,9 @@ void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
     write_text_descriptor(output.descriptor(), "retained parent output\n");
     std::filesystem::remove(active_output_parent);
     std::filesystem::create_directory_symlink(redirected_output_parent, active_output_parent);
+    const auto verification = output.verification_source();
+    expect_eq(verification->read_all(4096), std::string("retained parent output\n"),
+              "verification follows the retained output parent after path retargeting");
     output.commit();
     expect_eq(read_text_file(retained_output_parent / "parent-race.mp4"),
               std::string("retained parent output\n"),
@@ -999,13 +1339,57 @@ void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
               "redirected output parent cannot replace a protected file");
   }
 
-#if defined(__linux__)
+#if !defined(_WIN32)
+  const auto staging_destination = root.path() / "staging-race.mp4";
+  const auto retained_staging = root.path() / "retained-staging";
+  std::filesystem::path substituted_staging;
+  {
+    detail::AtomicOutputFile output(staging_destination);
+    write_text_descriptor(output.descriptor(), "retained staging output\n");
+    substituted_staging = output.temporary_path().parent_path();
+    std::filesystem::rename(substituted_staging, retained_staging);
+    std::filesystem::create_directory(substituted_staging);
+    write_text_file(substituted_staging / output.temporary_path().filename(),
+                    "staging pathname substitute\n");
+    const auto verification = output.verification_source();
+    expect_eq(verification->read_all(4096), std::string("retained staging output\n"),
+              "verification opens the retained staging directory identity");
+    output.commit();
+  }
+  expect_eq(read_text_file(staging_destination), std::string("retained staging output\n"),
+            "publication moves the verified retained staging identity");
+  expect_eq(read_text_file(substituted_staging / "output"),
+            std::string("staging pathname substitute\n"),
+            "retained publication leaves the substituted staging tree untouched");
+  std::filesystem::remove_all(substituted_staging);
+  std::filesystem::remove_all(retained_staging);
+#endif
+
+  std::vector<std::filesystem::path> retained_windows_temporaries;
+  const auto remove_transaction_temporary = [&](const std::filesystem::path& publication) {
+#if defined(_WIN32)
+    auto retained = publication;
+    retained += ".retained";
+    std::filesystem::rename(publication, retained);
+    retained_windows_temporaries.push_back(std::move(retained));
+#else
+    std::filesystem::remove(publication);
+#endif
+  };
+  const auto expect_no_retained_windows_temporary = [&] {
+#if defined(_WIN32)
+    expect_true(!retained_windows_temporaries.empty() &&
+                    !std::filesystem::exists(retained_windows_temporaries.back()),
+                "Windows stitch cleanup removes the renamed descriptor-bound temporary");
+#endif
+  };
+
   std::filesystem::path attacker_entry;
   bool substitution_rejected = false;
   {
     detail::AtomicOutputFile output(destination, [&](const std::filesystem::path& publication) {
       attacker_entry = publication;
-      std::filesystem::remove(publication);
+      remove_transaction_temporary(publication);
       write_text_file(publication, "attacker replacement\n");
     });
     write_text_file(output.temporary_path(), "descriptor-bound encoded output\n");
@@ -1020,10 +1404,77 @@ void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
               "stitch publication rejects a substituted temporary directory entry");
   expect_eq(read_text_file(destination), std::string("replacement encoded output\n"),
             "rejected stitch publication preserves the existing destination");
-  expect_eq(read_text_file(attacker_entry), std::string("attacker replacement\n"),
-            "stitch cleanup does not unlink an attacker replacement");
-  std::filesystem::remove(attacker_entry);
+  expect_true(!std::filesystem::exists(attacker_entry),
+              "stitch cleanup removes a substituted temporary file");
+  expect_no_retained_windows_temporary();
+  expect_no_stitch_output_artifacts(root.path(), "substituted stitch temporary file cleanup");
 
+  std::filesystem::path attacker_directory;
+  bool directory_substitution_rejected = false;
+  {
+    detail::AtomicOutputFile output(destination, [&](const std::filesystem::path& publication) {
+      attacker_directory = publication;
+      remove_transaction_temporary(publication);
+      std::filesystem::create_directory(publication);
+    });
+    write_text_descriptor(output.descriptor(), "descriptor-bound directory output\n");
+    try {
+      output.commit();
+    } catch (const std::runtime_error& error) {
+      directory_substitution_rejected =
+          std::string_view(error.what()).find("temporary") != std::string_view::npos;
+    }
+  }
+  expect_true(directory_substitution_rejected,
+              "stitch publication rejects a substituted temporary directory");
+  expect_true(!std::filesystem::exists(attacker_directory),
+              "stitch cleanup removes a substituted empty directory");
+  expect_no_retained_windows_temporary();
+  expect_eq(read_text_file(destination), std::string("replacement encoded output\n"),
+            "directory substitution preserves the existing destination");
+  expect_no_stitch_output_artifacts(root.path(), "substituted stitch directory cleanup");
+
+  const auto symlink_victim = root.path() / "stitch-cleanup-victim.mp4";
+  const auto symlink_probe = root.path() / "stitch-cleanup-symlink-probe";
+  write_text_file(symlink_victim, "protected victim content\n");
+  std::error_code symlink_error;
+  std::filesystem::create_symlink(symlink_victim, symlink_probe, symlink_error);
+  if (!symlink_error) {
+    std::filesystem::remove(symlink_probe);
+    std::filesystem::path attacker_symlink;
+    bool symlink_substitution_rejected = false;
+    {
+      const std::array protected_paths{
+          detail::AtomicOutputProtectedPath{symlink_victim, "the cleanup victim"}};
+      detail::AtomicOutputFile output(
+          destination,
+          [&](const std::filesystem::path& publication) {
+            attacker_symlink = publication;
+            remove_transaction_temporary(publication);
+            std::filesystem::create_symlink(symlink_victim, publication);
+          },
+          {}, protected_paths);
+      write_text_descriptor(output.descriptor(), "descriptor-bound symlink output\n");
+      try {
+        output.commit();
+      } catch (const std::runtime_error& error) {
+        symlink_substitution_rejected =
+            std::string_view(error.what()).find("temporary") != std::string_view::npos;
+      }
+    }
+    expect_true(symlink_substitution_rejected,
+                "stitch publication rejects a substituted temporary symlink");
+    expect_true(!std::filesystem::exists(attacker_symlink),
+                "stitch cleanup removes a substituted symlink without following it");
+    expect_no_retained_windows_temporary();
+    expect_eq(read_text_file(symlink_victim), std::string("protected victim content\n"),
+              "stitch cleanup preserves a substituted symlink victim");
+    expect_eq(read_text_file(destination), std::string("replacement encoded output\n"),
+              "symlink substitution preserves the existing destination");
+    expect_no_stitch_output_artifacts(root.path(), "substituted stitch symlink cleanup");
+  }
+
+#if defined(__linux__)
   const auto descriptor_count = [] {
     return static_cast<std::size_t>(
         std::distance(std::filesystem::directory_iterator("/proc/self/fd"),
@@ -1055,10 +1506,8 @@ void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
     write_text_descriptor(output.descriptor(), "retained parent encoded output\n");
     std::filesystem::remove(active_parent);
     std::filesystem::create_directory_symlink(redirected_parent, active_parent);
-    const auto verification = read_atomic_output(output.verification_path());
-    expect_true(verification.status == AtomicReadStatus::Success,
-                "Windows verification path remains readable while output is retained");
-    expect_eq(verification.contents, std::string("retained parent encoded output\n"),
+    const auto verification = output.verification_source();
+    expect_eq(verification->read_all(4096), std::string("retained parent encoded output\n"),
               "Windows verification follows the retained output directory");
     output.commit();
     expect_eq(read_text_file(retained_parent / "stitched.mp4"),
@@ -1068,6 +1517,33 @@ void stitch_output_transaction_is_descriptor_pinned_and_atomic() {
                 "Windows redirected output parent receives no publication");
   }
 #endif
+}
+
+void stitch_output_commit_cancellation_restores_previous_output() {
+  TemporaryDirectory root;
+  const auto destination = root.path() / "cancelled-stitch.mp4";
+  write_text_file(destination, "previous stitch output\n");
+
+  bool cancellation_requested = false;
+  bool final_publication_gate_reached = false;
+  bool cancellation_reported = false;
+  try {
+    detail::AtomicOutputFile output(destination, {}, [&] {
+      final_publication_gate_reached = true;
+      cancellation_requested = true;
+    });
+    write_text_descriptor(output.descriptor(), "cancelled replacement output\n");
+    output.commit([&] { return cancellation_requested; });
+  } catch (const detail::AtomicOutputCancelled&) {
+    cancellation_reported = true;
+  }
+
+  expect_true(final_publication_gate_reached,
+              "stitch cancellation is coordinated at the final publication gate");
+  expect_true(cancellation_reported, "stitch commit reports publication cancellation");
+  expect_eq(read_text_file(destination), std::string("previous stitch output\n"),
+            "cancelled stitch commit restores the previous output");
+  expect_no_stitch_output_artifacts(root.path(), "cancelled stitch commit rollback");
 }
 
 void preview_and_calibrate_parse_matches_rust_defaults() {
@@ -2773,6 +3249,44 @@ void calibration_output_replacement_is_exclusive_and_atomic() {
   expect_true(!orphaned_temporary, "calibration replacement leaves no temporary files");
 }
 
+void calibration_output_commit_cancellation_publishes_nothing() {
+  TemporaryDirectory root;
+  const auto destination = root.path() / "cancelled-match.json";
+  const auto left_input = root.path() / "left.mp4";
+  const auto right_input = root.path() / "right.mp4";
+  write_text_file(left_input, "left calibration input\n");
+  write_text_file(right_input, "right calibration input\n");
+
+  bool cancellation_requested = false;
+  bool final_publication_gate_reached = false;
+  bool cancellation_reported = false;
+  try {
+    detail::write_calibration_json_atomically(
+        R"json({"writer":"cancelled"})json", destination, left_input, right_input, {}, {}, {},
+        false,
+        [&] {
+          final_publication_gate_reached = true;
+          cancellation_requested = true;
+        },
+        {}, std::chrono::seconds(2), {}, [&] { return cancellation_requested; });
+  } catch (const detail::AtomicOutputCancelled&) {
+    cancellation_reported = true;
+  }
+
+  expect_true(final_publication_gate_reached,
+              "calibration cancellation is coordinated at the final publication gate");
+  expect_true(cancellation_reported, "calibration publication reports cancellation");
+  expect_true(!std::filesystem::exists(destination),
+              "cancelled calibration publication leaves no output");
+  for (const auto& entry : std::filesystem::directory_iterator(root.path())) {
+    const auto filename = entry.path().filename().string();
+    expect_true(filename.find(".tmp.") == std::string::npos &&
+                    filename.find(".publish.") == std::string::npos &&
+                    filename.find(".rollback.") == std::string::npos,
+                "cancelled calibration publication leaves no transaction artifacts");
+  }
+}
+
 void command_execution_dispatches_available_stages() {
   const auto calibration_path = write_valid_calibration_file();
   std::ostringstream out;
@@ -2807,13 +3321,25 @@ void command_execution_dispatches_available_stages() {
               "blocked stitch writes runtime plan");
   expect_true(out.str().find("nvv4l2decoder") != std::string::npos,
               "blocked stitch describes GPU decode contract");
-  expect_true(out.str().find("qtdemux ! capsfilter caps=\"video/x-h264;video/x-h265\" ! "
+  expect_true(out.str().find("qtdemux ! capsfilter "
+                             "caps=\"video/x-h264;video/x-h265;video/x-av1\" ! "
                              "parsebin ! identity name=display_info silent=true ! "
                              "nvv4l2decoder") != std::string::npos,
               "blocked stitch selects a supported video pad for containers");
   expect_true(out.str().find("video/x-raw(memory:NVMM),format=NV12") != std::string::npos,
               "blocked stitch preserves NVMM decode caps");
   expect_true(err.str().find("error:") != std::string::npos, "blocked stitch writes stderr");
+
+  out.str("");
+  out.clear();
+  err.str("");
+  err.clear();
+  const auto cancelled_stitch_status =
+      run_command(Command{stitch}, out, err, {}, [] { return true; });
+  expect_eq(cancelled_stitch_status, kCancelledExitCode,
+            "pre-cancelled stitch uses the cancellation exit status");
+  expect_true(out.str().empty(), "pre-cancelled stitch starts no runtime plan");
+  expect_eq(err.str(), std::string("cancelled\n"), "pre-cancelled stitch reports cancellation");
 
   out.str("");
   out.clear();
@@ -2830,6 +3356,17 @@ void command_execution_dispatches_available_stages() {
   err.str("");
   err.clear();
   CalibrateCommand calibrate{.left = "left.mp4", .right = "right.mp4"};
+  const auto cancelled_calibration_status =
+      run_command(Command{calibrate}, out, err, {}, [] { return true; });
+  expect_eq(cancelled_calibration_status, kCancelledExitCode,
+            "pre-cancelled calibration uses the cancellation exit status");
+  expect_true(out.str().empty(), "pre-cancelled calibration starts no runtime plan");
+  expect_eq(err.str(), std::string("cancelled\n"),
+            "pre-cancelled calibration reports cancellation");
+  out.str("");
+  out.clear();
+  err.str("");
+  err.clear();
 #if defined(__linux__)
   const auto fake_nvbufsurface = find_shared_library_runfile("fake_nvbufsurface");
   ScopedEnvironment nvbufsurface_runtime("RECO_NVBUFSURFACE_DYLIB_PATH",
@@ -2998,6 +3535,9 @@ int wmain(int argc, wchar_t** argv) {
   if (argc >= 2 && std::wstring_view(argv[1]) == L"--reco-publication-writer-child") {
     return run_windows_publication_writer_child(argc, argv);
   }
+  if (argc >= 2 && std::wstring_view(argv[1]) == L"--reco-interrupt-child") {
+    return run_windows_interrupt_child(argc, argv);
+  }
 #else
 int main(int argc, char** argv) {
   (void)argc;
@@ -3007,12 +3547,20 @@ int main(int argc, char** argv) {
   run_test_case("stitch_parse_matches_rust_defaults", stitch_parse_matches_rust_defaults);
   run_test_case("stitch_frame_timing_preserves_source_gaps_and_rejects_overflow",
                 stitch_frame_timing_preserves_source_gaps_and_rejects_overflow);
+  run_test_case("stitch_audio_is_clipped_by_presentation_time_at_the_video_boundary",
+                stitch_audio_is_clipped_by_presentation_time_at_the_video_boundary);
   run_test_case("stitch_second_conversion_supports_the_unsigned_gstreamer_range",
                 stitch_second_conversion_supports_the_unsigned_gstreamer_range);
   run_test_case("stitch_frame_window_uses_one_rounded_timeline",
                 stitch_frame_window_uses_one_rounded_timeline);
+  run_test_case("stitch_descriptor_budget_is_checked_before_input_acquisition",
+                stitch_descriptor_budget_is_checked_before_input_acquisition);
   run_test_case("stitch_output_transaction_is_descriptor_pinned_and_atomic",
                 stitch_output_transaction_is_descriptor_pinned_and_atomic);
+  run_test_case("stitch_output_commit_cancellation_restores_previous_output",
+                stitch_output_commit_cancellation_restores_previous_output);
+  run_test_case("interrupt_request_unwinds_stitch_output_staging",
+                interrupt_request_unwinds_stitch_output_staging);
   run_test_case("preview_and_calibrate_parse_matches_rust_defaults",
                 preview_and_calibrate_parse_matches_rust_defaults);
   run_test_case("live_command_parse_matches_rust_defaults",
@@ -3024,6 +3572,8 @@ int main(int argc, char** argv) {
                 probe_worker_discovery_handles_path_and_bzlmod_runfiles);
   run_test_case("calibration_output_replacement_is_exclusive_and_atomic",
                 calibration_output_replacement_is_exclusive_and_atomic);
+  run_test_case("calibration_output_commit_cancellation_publishes_nothing",
+                calibration_output_commit_cancellation_publishes_nothing);
   run_test_case("command_execution_dispatches_available_stages",
                 command_execution_dispatches_available_stages);
   return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

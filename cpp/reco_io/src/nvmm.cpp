@@ -857,6 +857,31 @@ std::optional<std::string> validate_nvbufsurface_runtime_provenance(
 #endif
 }
 
+core::CudaMemoryInfo
+query_nvmm_cuda_memory_info(const std::shared_ptr<const NvbufSurfaceRuntime>& runtime,
+                            std::uint32_t gpu_id) {
+#if defined(__linux__)
+  if (gpu_id > static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
+    throw NvmmError("NvBufSurface CUDA memory query device ordinal is out of range");
+  }
+  if (const auto error = validate_nvbufsurface_runtime_provenance(runtime); error.has_value()) {
+    throw NvmmError("NvBufSurface CUDA memory query requires a valid runtime: " + *error);
+  }
+  auto cuda = cuda_functions();
+  require_healthy_cuda_context(cuda);
+  try {
+    return cuda->span_backend.memory_info(static_cast<int>(gpu_id));
+  } catch (const std::exception& error) {
+    throw NvmmError("failed to query CUDA memory for the NvBufSurface runtime: " +
+                    std::string(error.what()));
+  }
+#else
+  (void)runtime;
+  (void)gpu_id;
+  throw NvmmError("NvBufSurface CUDA memory query is only supported on Linux");
+#endif
+}
+
 std::optional<std::string> validate_nvmm_frame_info(const NvmmFrameInfo& info) {
   if (info.abi != NvbufSurfaceAbi::DeepStream7_1 && info.abi != NvbufSurfaceAbi::DeepStream9_1) {
     return "unsupported NvBufSurface ABI";

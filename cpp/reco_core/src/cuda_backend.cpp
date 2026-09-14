@@ -29,6 +29,7 @@ using CUfunction = void*;
 using CUmodule = void*;
 using CUresult = int;
 using CUstream = void*;
+using CUevent = void*;
 #if defined(_WIN32)
 #define RECO_CUDA_API __stdcall
 #else
@@ -44,6 +45,8 @@ static_assert(sizeof(CUdeviceptr) == sizeof(void*));
 static_assert(sizeof(CUmemGenericAllocationHandle) == 8);
 
 constexpr CUresult kCudaSuccess = 0;
+constexpr unsigned int kStreamNonBlocking = 1;
+constexpr unsigned int kEventDisableTiming = 2;
 constexpr unsigned int kMemoryTypeHost = 1;
 constexpr unsigned int kMemoryTypeDevice = 2;
 constexpr int kPointerAttributeContext = 1;
@@ -68,6 +71,7 @@ constexpr unsigned int kMemAccessFlagsProtRead = 1;
 constexpr unsigned int kMemAllocGranularityMinimum = 0;
 constexpr int kDeviceAttributeComputeCapabilityMajor = 75;
 constexpr int kDeviceAttributeComputeCapabilityMinor = 76;
+constexpr int kDeviceAttributeIntegrated = 18;
 constexpr std::size_t kMaximumDriverLibraryPathBytes = 32U * 1024U;
 
 struct CUuuid {
@@ -148,6 +152,15 @@ public:
     if (sym == nullptr) {
       throw std::runtime_error(std::string("missing CUDA symbol ") + name);
     }
+    return reinterpret_cast<Fn>(sym);
+  }
+
+  template <typename Fn> Fn optional_symbol(const char* name) const noexcept {
+#if defined(_WIN32)
+    auto* sym = reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(handle_), name));
+#else
+    auto* sym = dlsym(handle_, name);
+#endif
     return reinterpret_cast<Fn>(sym);
   }
 
@@ -318,6 +331,15 @@ struct CudaBackend::Impl {
     cu_module_unload = driver.symbol<decltype(cu_module_unload)>("cuModuleUnload");
     cu_module_get_function = driver.symbol<decltype(cu_module_get_function)>("cuModuleGetFunction");
     cu_launch_kernel = driver.symbol<decltype(cu_launch_kernel)>("cuLaunchKernel");
+    cu_stream_create = driver.optional_symbol<decltype(cu_stream_create)>("cuStreamCreate");
+    cu_stream_destroy = driver.optional_symbol<decltype(cu_stream_destroy)>("cuStreamDestroy_v2");
+    cu_stream_synchronize =
+        driver.optional_symbol<decltype(cu_stream_synchronize)>("cuStreamSynchronize");
+    cu_event_create = driver.optional_symbol<decltype(cu_event_create)>("cuEventCreate");
+    cu_event_destroy = driver.optional_symbol<decltype(cu_event_destroy)>("cuEventDestroy_v2");
+    cu_event_record = driver.optional_symbol<decltype(cu_event_record)>("cuEventRecord");
+    cu_event_synchronize =
+        driver.optional_symbol<decltype(cu_event_synchronize)>("cuEventSynchronize");
     check_cuda("cuInit", cu_init(0));
   }
 
@@ -401,6 +423,8 @@ struct CudaBackend::Impl {
   DynamicLibrary driver;
   std::mutex context_mutex;
   std::unordered_map<int, CUcontext> retained_contexts;
+  std::mutex execution_stream_mutex;
+  std::unordered_map<int, std::weak_ptr<void>> execution_streams;
   std::atomic<bool> context_restore_failed{false};
   CUresult (*cu_init)(unsigned int) = nullptr;
   CUresult (*cu_device_get_count)(int*) = nullptr;
@@ -451,6 +475,13 @@ struct CudaBackend::Impl {
   CUresult (*cu_launch_kernel)(CUfunction, unsigned int, unsigned int, unsigned int, unsigned int,
                                unsigned int, unsigned int, unsigned int, CUstream, void**,
                                void**) = nullptr;
+  CUresult (*cu_stream_create)(CUstream*, unsigned int) = nullptr;
+  CUresult (*cu_stream_destroy)(CUstream) = nullptr;
+  CUresult (*cu_stream_synchronize)(CUstream) = nullptr;
+  CUresult (*cu_event_create)(CUevent*, unsigned int) = nullptr;
+  CUresult (*cu_event_destroy)(CUevent) = nullptr;
+  CUresult (*cu_event_record)(CUevent, CUstream) = nullptr;
+  CUresult (*cu_event_synchronize)(CUevent) = nullptr;
 };
 
 #undef RECO_CUDA_API
@@ -570,6 +601,149 @@ struct CudaValidatedSpan::State {
   bool is_vmm = false;
   bool vmm_identity_complete = false;
 };
+
+struct CudaExecutionStream::State {
+  State(std::shared_ptr<CudaBackend::Impl> backend_in, CUcontext context_in, int device_ordinal_in,
+        CUstream stream_in, CUevent completion_event_in)
+      : backend(std::move(backend_in)), context(context_in), device_ordinal(device_ordinal_in),
+        stream(stream_in), completion_event(completion_event_in) {}
+
+  State(const State&) = delete;
+  State& operator=(const State&) = delete;
+
+  ~State() {
+    if (backend == nullptr || context == nullptr) {
+      return;
+    }
+    try {
+      const CUcontext previous_context = backend->current_context();
+      backend->set_current_context(context);
+      if (completion_event != nullptr) {
+        (void)backend->cu_event_destroy(completion_event);
+      }
+      if (stream != nullptr) {
+        (void)backend->cu_stream_destroy(stream);
+      }
+      backend->restore_context(previous_context);
+    } catch (...) {
+    }
+  }
+
+  std::shared_ptr<CudaBackend::Impl> backend;
+  CUcontext context = nullptr;
+  int device_ordinal = -1;
+  CUstream stream = nullptr;
+  CUevent completion_event = nullptr;
+  std::mutex submission_mutex;
+};
+
+struct CudaExecutionBatch::Impl {
+  explicit Impl(std::shared_ptr<CudaExecutionStream::State> stream_in)
+      : stream(std::move(stream_in)), submission_lock(stream->submission_mutex) {
+    previous_context = stream->backend->current_context();
+    stream->backend->set_current_context(stream->context);
+    active = true;
+  }
+
+  Impl(const Impl&) = delete;
+  Impl& operator=(const Impl&) = delete;
+
+  ~Impl() { abandon(); }
+
+  void abandon() noexcept {
+    if (!active) {
+      return;
+    }
+    if (launch_submitted) {
+      (void)stream->backend->cu_stream_synchronize(stream->stream);
+    }
+    stream->backend->restore_context_noexcept(previous_context);
+    active = false;
+    if (submission_lock.owns_lock()) {
+      submission_lock.unlock();
+    }
+  }
+
+  std::shared_ptr<CudaExecutionStream::State> stream;
+  std::unique_lock<std::mutex> submission_lock;
+  CUcontext previous_context = nullptr;
+  bool active = false;
+  bool launch_submitted = false;
+  std::vector<CudaValidatedSpan> retained_spans;
+  std::vector<std::shared_ptr<void>> retained_modules;
+};
+
+CudaExecutionStream::CudaExecutionStream(std::shared_ptr<State> state) : state_(std::move(state)) {}
+
+std::uintptr_t CudaExecutionStream::context_id() const {
+  if (state_ == nullptr) {
+    throw std::logic_error("cannot inspect an empty CUDA execution stream");
+  }
+  return reinterpret_cast<std::uintptr_t>(state_->context);
+}
+
+int CudaExecutionStream::device_ordinal() const {
+  if (state_ == nullptr) {
+    throw std::logic_error("cannot inspect an empty CUDA execution stream");
+  }
+  return state_->device_ordinal;
+}
+
+CudaExecutionBatch CudaExecutionStream::begin_batch() const {
+  if (state_ == nullptr) {
+    throw std::logic_error("cannot begin a batch on an empty CUDA execution stream");
+  }
+  return CudaExecutionBatch(state_);
+}
+
+CudaExecutionBatch::CudaExecutionBatch(std::shared_ptr<CudaExecutionStream::State> stream)
+    : impl_(std::make_unique<Impl>(std::move(stream))) {}
+
+CudaExecutionBatch::~CudaExecutionBatch() = default;
+
+CudaExecutionBatch::operator bool() const { return impl_ != nullptr && impl_->active; }
+
+void CudaExecutionBatch::retain(CudaValidatedSpan span) {
+  if (!*this) {
+    throw std::logic_error("cannot retain a CUDA span in a completed execution batch");
+  }
+  if (!span) {
+    throw std::invalid_argument("CUDA execution batch cannot retain an empty span");
+  }
+  impl_->retained_spans.push_back(std::move(span));
+}
+
+void CudaExecutionBatch::wait() {
+  if (!*this) {
+    throw std::logic_error("cannot wait on a completed CUDA execution batch");
+  }
+  auto& state = *impl_;
+  if (!state.launch_submitted) {
+    state.stream->backend->restore_context(state.previous_context);
+    state.active = false;
+    state.submission_lock.unlock();
+    return;
+  }
+
+  try {
+    check_cuda("cuEventRecord", state.stream->backend->cu_event_record(
+                                    state.stream->completion_event, state.stream->stream));
+    check_cuda("cuEventSynchronize",
+               state.stream->backend->cu_event_synchronize(state.stream->completion_event));
+  } catch (...) {
+    state.abandon();
+    throw;
+  }
+
+  state.active = false;
+  try {
+    state.stream->backend->restore_context(state.previous_context);
+  } catch (...) {
+    state.submission_lock.unlock();
+    throw;
+  }
+  state.submission_lock.unlock();
+}
 
 CudaValidatedSpan::CudaValidatedSpan(std::shared_ptr<State> state) : state_(std::move(state)) {}
 
@@ -879,6 +1053,41 @@ void CudaKernel::launch_and_synchronize(const CudaLaunchConfig& config,
   backend->restore_context(previous_context);
 }
 
+void CudaKernel::launch_and_synchronize(const CudaExecutionStream& stream,
+                                        const CudaLaunchConfig& config,
+                                        std::span<void*> args) const {
+  auto batch = stream.begin_batch();
+  enqueue(batch, config, args);
+  batch.wait();
+}
+
+void CudaKernel::enqueue(CudaExecutionBatch& batch, const CudaLaunchConfig& config,
+                         std::span<void*> args) const {
+  if (!*this) {
+    throw std::invalid_argument("CUDA kernel launch requires a live kernel");
+  }
+  if (!batch) {
+    throw std::invalid_argument("CUDA kernel launch requires a live execution batch");
+  }
+  validate_dim3(config.grid, "grid");
+  validate_dim3(config.block, "block");
+  auto& batch_state = *batch.impl_;
+  const auto& backend = module_state_->backend;
+  if (batch_state.stream->backend != backend ||
+      batch_state.stream->context != module_state_->context) {
+    throw std::invalid_argument("CUDA kernel and execution batch must share one context");
+  }
+
+  batch_state.retained_modules.push_back(module_state_);
+  void** kernel_args = args.empty() ? nullptr : args.data();
+  check_cuda("cuLaunchKernel",
+             backend->cu_launch_kernel(static_cast<CUfunction>(function_), config.grid.x,
+                                       config.grid.y, config.grid.z, config.block.x, config.block.y,
+                                       config.block.z, config.shared_memory_bytes,
+                                       batch_state.stream->stream, kernel_args, nullptr));
+  batch_state.launch_submitted = true;
+}
+
 void CudaKernel::launch(const CudaLaunchConfig& config, std::span<void*> args) const {
   if (!*this) {
     throw std::invalid_argument("CUDA kernel launch requires a live kernel");
@@ -1049,10 +1258,19 @@ std::uintptr_t CudaBackend::primary_context_id(int ordinal) const {
   return identity;
 }
 
-CudaMemoryInfo CudaBackend::memory_info() const {
-  impl_->ensure_primary_context(0);
+CudaMemoryInfo CudaBackend::memory_info(int ordinal) const {
+  PrimaryContextScope scope(*impl_, ordinal);
   CudaMemoryInfo info;
   check_cuda("cuMemGetInfo_v2", impl_->cu_mem_get_info(&info.free_bytes, &info.total_bytes));
+  int integrated = 0;
+  check_cuda("cuDeviceGetAttribute (integrated)",
+             impl_->cu_device_get_attribute(&integrated, kDeviceAttributeIntegrated,
+                                            impl_->device(ordinal)));
+  if (integrated != 0 && integrated != 1) {
+    throw std::runtime_error("CUDA driver returned an invalid integrated-memory attribute");
+  }
+  info.integrated = integrated != 0;
+  scope.restore();
   return info;
 }
 
@@ -1494,6 +1712,51 @@ CudaKernel CudaBackend::load_kernel_from_ptx(std::string_view ptx, std::string_v
   validate_ptx(ptx);
   validate_no_nul(function_name, "kernel function name");
   return load_module_from_ptx(ptx, device_ordinal).load_kernel(function_name);
+}
+
+CudaExecutionStream CudaBackend::execution_stream(int device_ordinal) const {
+  if (device_ordinal < 0 || device_ordinal >= device_count()) {
+    throw std::invalid_argument("CUDA execution stream device ordinal is out of range");
+  }
+  if (impl_->cu_stream_create == nullptr || impl_->cu_stream_destroy == nullptr ||
+      impl_->cu_stream_synchronize == nullptr || impl_->cu_event_create == nullptr ||
+      impl_->cu_event_destroy == nullptr || impl_->cu_event_record == nullptr ||
+      impl_->cu_event_synchronize == nullptr) {
+    throw std::runtime_error("CUDA driver does not expose required stream/event APIs");
+  }
+
+  std::lock_guard<std::mutex> lock(impl_->execution_stream_mutex);
+  if (const auto existing = impl_->execution_streams[device_ordinal].lock()) {
+    return CudaExecutionStream(std::static_pointer_cast<CudaExecutionStream::State>(existing));
+  }
+
+  PrimaryContextScope scope(*impl_, device_ordinal);
+  const CUcontext context = scope.current();
+  if (context == nullptr) {
+    throw std::runtime_error("CUDA execution stream did not establish a current context");
+  }
+  CUstream stream = nullptr;
+  CUevent completion_event = nullptr;
+  std::shared_ptr<CudaExecutionStream::State> state;
+  check_cuda("cuStreamCreate", impl_->cu_stream_create(&stream, kStreamNonBlocking));
+  try {
+    check_cuda("cuEventCreate", impl_->cu_event_create(&completion_event, kEventDisableTiming));
+    state = std::make_shared<CudaExecutionStream::State>(impl_, context, device_ordinal, stream,
+                                                         completion_event);
+    impl_->execution_streams[device_ordinal] = state;
+    scope.restore();
+    return CudaExecutionStream(std::move(state));
+  } catch (...) {
+    if (state != nullptr) {
+      state.reset();
+    } else {
+      if (completion_event != nullptr) {
+        (void)impl_->cu_event_destroy(completion_event);
+      }
+      (void)impl_->cu_stream_destroy(stream);
+    }
+    throw;
+  }
 }
 
 void CudaBackend::synchronize() const {

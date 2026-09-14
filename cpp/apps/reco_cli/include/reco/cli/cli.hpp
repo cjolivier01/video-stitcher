@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -8,10 +9,15 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <variant>
 #include <vector>
+
+namespace reco::io {
+class StableMediaFile;
+}
 
 namespace reco::cli {
 
@@ -161,15 +167,40 @@ struct HelpCommand {};
 using Command = std::variant<StitchCommand, PreviewCommand, CalibrateCommand, CameraCommand,
                              LibcameraCommand, GoproCommand, InfoCommand, HelpCommand>;
 
+/// Thread-safe, non-throwing cancellation query used by long-running command implementations.
+using CancellationRequested = std::function<bool()>;
+
+/// Conventional shell status returned when a command unwinds after cancellation.
+inline constexpr int kCancelledExitCode = 130;
+
 [[nodiscard]] std::variant<float, ParseError> parse_blend(std::string_view value);
 [[nodiscard]] std::variant<WxH, ParseError> parse_wxh(std::string_view value);
 [[nodiscard]] std::variant<Command, ParseError> parse_args(const std::vector<std::string>& args);
 [[nodiscard]] std::string_view command_name(const Command& command);
 [[nodiscard]] std::string help_text();
 int run_command(const Command& command, std::ostream& out, std::ostream& err,
-                const std::filesystem::path& executable_path = {});
+                const std::filesystem::path& executable_path = {},
+                const CancellationRequested& cancellation_requested = {});
 
 namespace detail {
+
+/// Raised when cancellation is observed before atomic output publication becomes irreversible.
+class AtomicOutputCancelled final : public std::runtime_error {
+public:
+  AtomicOutputCancelled() : std::runtime_error("atomic output publication cancelled") {}
+};
+
+/// Fixed descriptor headroom for output, one transient cursor, multimedia, and probe IPC.
+inline constexpr std::size_t kStitchTransientDescriptorReserve = 64;
+
+/// Persistent input authorities plus bounded output, probe, decoder, and audio headroom.
+[[nodiscard]] std::size_t stitch_descriptor_requirement(std::size_t input_segments);
+/// Pure descriptor-admission boundary used by the CLI and platform tests.
+[[nodiscard]] bool stitch_descriptor_budget_fits(std::size_t open_descriptors,
+                                                 std::size_t descriptor_limit,
+                                                 std::size_t input_segments);
+/// Rejects a stitch before opening any input when its process descriptor budget is insufficient.
+void require_stitch_descriptor_budget(std::size_t input_segments);
 
 /// Rounds non-negative seconds to the full unsigned GStreamer nanosecond range.
 [[nodiscard]] std::uint64_t nanoseconds_from_seconds(double seconds, std::string_view label);
@@ -178,6 +209,8 @@ namespace detail {
 struct AtomicOutputProtectedPath {
   std::filesystem::path path;
   std::string label;
+  /// Retained media authority that publication must protect. Empty preserves the generic API.
+  std::shared_ptr<const io::StableMediaFile> stable_source;
 };
 
 /// Descriptor-pinned temporary output with identity-checked atomic publication.
@@ -198,12 +231,13 @@ public:
 
   /// Borrowed descriptor passed directly to GStreamer's `fdsink`.
   [[nodiscard]] int descriptor() const;
-  /// Stable identity path used for post-mux stream discovery.
-  [[nodiscard]] std::filesystem::path verification_path() const;
+  /// Readable retained authority for post-mux stream discovery.
+  [[nodiscard]] std::shared_ptr<const io::StableMediaFile> verification_source() const;
   /// Original temporary entry, exposed only for diagnostics and race tests.
   [[nodiscard]] const std::filesystem::path& temporary_path() const;
   /// Flushes, validates, and atomically publishes the retained file.
-  void commit();
+  /// Cancellation is sampled at the final rollback-capable publication boundary.
+  void commit(const CancellationRequested& cancellation_requested = {});
 
 private:
   struct Impl;
@@ -223,6 +257,11 @@ struct StitchFrameWindow {
   std::optional<std::uint64_t> frame_limit;
 };
 
+/// Returns the exact nanosecond boundary after `frame_count` constant-cadence frames.
+[[nodiscard]] std::uint64_t stitch_timeline_duration_ns(std::uint64_t frame_count,
+                                                        std::uint32_t fps_numerator,
+                                                        std::uint32_t fps_denominator);
+
 /// Rounds a requested time window to the source cadence using the Rust stitch semantics.
 [[nodiscard]] StitchFrameWindow derive_stitch_frame_window(std::optional<double> start_time,
                                                            std::optional<double> end_time,
@@ -235,6 +274,12 @@ struct StitchFrameWindow {
                                                            std::uint64_t first_source_frame_index,
                                                            std::uint32_t fps_numerator,
                                                            std::uint32_t fps_denominator);
+
+/// Returns a packet duration clipped to the final video boundary, or empty when presentation
+/// begins outside it. Unknown durations fail closed because stream-copy cannot split a packet.
+[[nodiscard]] std::optional<std::uint64_t>
+clip_stitch_audio_duration(std::optional<std::uint64_t> pts_ns, std::optional<std::uint64_t> dts_ns,
+                           std::uint64_t duration_ns, std::uint64_t video_duration_ns);
 
 /// Resolves the deployed video probe worker for CLI startup and hardening tests.
 [[nodiscard]] std::optional<std::filesystem::path>
@@ -259,7 +304,8 @@ void write_calibration_json_atomically(
     const std::function<void()>& publication_fault_hook = {},
     const std::function<void()>& on_lock_contention = {},
     std::chrono::milliseconds lock_timeout = std::chrono::seconds(2),
-    const std::function<void(const std::filesystem::path&)>& before_windows_publish_replace = {});
+    const std::function<void(const std::filesystem::path&)>& before_windows_publish_replace = {},
+    const CancellationRequested& cancellation_requested = {});
 
 } // namespace detail
 

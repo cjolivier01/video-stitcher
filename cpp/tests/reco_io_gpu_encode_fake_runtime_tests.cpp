@@ -1,4 +1,5 @@
 #include "reco/io/gpu_encode.hpp"
+#include "reco/io/gpu_preview.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -16,6 +17,10 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+
+#if defined(__linux__)
+#include <dlfcn.h>
+#endif
 
 namespace {
 
@@ -71,6 +76,24 @@ void expect_audio_error(Function&& function, std::string_view fragment, std::str
   }
 }
 
+template <typename Function>
+void expect_preview_error(Function&& function, std::string_view fragment,
+                          std::string_view message) {
+  try {
+    function();
+    std::cerr << "FAIL: " << message << " did not throw\n";
+    ++failures;
+  } catch (const GpuPreviewError& error) {
+    if (std::string_view(error.what()).find(fragment) == std::string_view::npos) {
+      std::cerr << "FAIL: " << message << " missing error fragment: " << error.what() << '\n';
+      ++failures;
+    }
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: " << message << " threw unexpected exception: " << error.what() << '\n';
+    ++failures;
+  }
+}
+
 bool ends_with(std::string_view value, std::string_view suffix) {
   return value.size() >= suffix.size() && value.substr(value.size() - suffix.size()) == suffix;
 }
@@ -90,6 +113,62 @@ std::filesystem::path find_fake_runtime_runfile(std::string_view runtime_name) {
   }
   throw std::runtime_error("fake runtime runfile not found: " + std::string(runtime_name));
 }
+
+std::filesystem::path find_probe_worker_runfile() {
+  const char* runfiles = std::getenv("TEST_SRCDIR");
+  if (runfiles == nullptr || runfiles[0] == '\0') {
+    throw std::runtime_error("TEST_SRCDIR is not set");
+  }
+#if defined(_WIN32)
+  constexpr std::string_view worker_name = "reco_video_probe_worker.exe";
+#else
+  constexpr std::string_view worker_name = "reco_video_probe_worker";
+#endif
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(runfiles)) {
+    if (entry.path().filename() == worker_name && std::filesystem::is_regular_file(entry.path())) {
+      return std::filesystem::absolute(entry.path());
+    }
+  }
+  throw std::runtime_error("video probe worker runfile not found");
+}
+
+#if defined(__linux__)
+class FakeNvbufSurfaceControl final {
+public:
+  explicit FakeNvbufSurfaceControl(const std::filesystem::path& path) {
+    library_ = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (library_ == nullptr) {
+      throw std::runtime_error("failed to open fake NvBufSurface control library");
+    }
+    reset_ =
+        reinterpret_cast<void (*)()>(dlsym(library_, "recoFakeNvbufSurfaceResetAllocationCount"));
+    count_ = reinterpret_cast<std::uint64_t (*)()>(
+        dlsym(library_, "recoFakeNvbufSurfaceAllocationCount"));
+    if (reset_ == nullptr || count_ == nullptr) {
+      dlclose(library_);
+      library_ = nullptr;
+      throw std::runtime_error("fake NvBufSurface allocation controls are missing");
+    }
+  }
+
+  ~FakeNvbufSurfaceControl() {
+    if (library_ != nullptr) {
+      dlclose(library_);
+    }
+  }
+
+  FakeNvbufSurfaceControl(const FakeNvbufSurfaceControl&) = delete;
+  FakeNvbufSurfaceControl& operator=(const FakeNvbufSurfaceControl&) = delete;
+
+  void reset() const { reset_(); }
+  [[nodiscard]] std::uint64_t count() const { return count_(); }
+
+private:
+  void* library_ = nullptr;
+  void (*reset_)() = nullptr;
+  std::uint64_t (*count_)() = nullptr;
+};
+#endif
 
 void set_environment(const char* name, const std::string& value) {
 #if defined(_WIN32)
@@ -181,6 +260,43 @@ GpuVideoEncodeSession open_session(const std::shared_ptr<const NvbufSurfaceRunti
   return GpuVideoEncodeSession::open(config(), runtime, trace);
 }
 
+#if defined(__linux__)
+void gpu_memory_preflight_prevents_partial_nvmm_pool_allocation(
+    const std::shared_ptr<const NvbufSurfaceRuntime>& runtime,
+    const FakeNvbufSurfaceControl& nvbuf) {
+  constexpr std::uint64_t mebibyte = 1024ULL * 1024ULL;
+  constexpr std::uint64_t gibibyte = 1024ULL * mebibyte;
+  set_scenario("encode-success");
+
+  set_environment("RECO_FAKE_CUDA_TOTAL_BYTES", std::to_string(8ULL * gibibyte));
+  set_environment("RECO_FAKE_CUDA_FREE_BYTES", std::to_string(64ULL * mebibyte));
+  set_environment("RECO_FAKE_CUDA_INTEGRATED", "0");
+  nvbuf.reset();
+  auto trace = std::make_shared<Trace>();
+  expect_encode_error([&] { (void)open_session(runtime, trace); }, "reduce output dimensions",
+                      "insufficient discrete GPU memory fails preflight");
+  expect_eq(nvbuf.count(), 0ULL, "failed preflight creates no NvBufSurface allocation");
+  expect_eq(trace->allocated.load(), 0U, "failed preflight publishes no pool allocation");
+
+  set_environment("RECO_FAKE_CUDA_FREE_BYTES", std::to_string(1536ULL * mebibyte));
+  set_environment("RECO_FAKE_CUDA_INTEGRATED", "1");
+  nvbuf.reset();
+  expect_encode_error([&] { (void)open_session(runtime); }, "integrated CUDA device",
+                      "integrated GPU keeps shared-memory safety reserve");
+  expect_eq(nvbuf.count(), 0ULL,
+            "integrated-memory preflight fails before the first NvBufSurface allocation");
+
+  set_environment("RECO_FAKE_CUDA_FREE_BYTES", std::to_string(6ULL * gibibyte));
+  set_environment("RECO_FAKE_CUDA_INTEGRATED", "0");
+  nvbuf.reset();
+  {
+    auto session = open_session(runtime);
+    session.abort();
+  }
+  expect_eq(nvbuf.count(), 8ULL, "normal GPU budget allocates the complete bounded pool");
+}
+#endif
+
 void startup_failures_release_partial_resources(
     const std::shared_ptr<const NvbufSurfaceRuntime>& runtime,
     const std::filesystem::path& event_path) {
@@ -207,6 +323,41 @@ void startup_failures_release_partial_resources(
                 "partial parse pipeline is released");
     }
   }
+}
+
+void encoder_opening_observer_interrupts_startup(
+    const std::shared_ptr<const NvbufSurfaceRuntime>& runtime,
+    const std::filesystem::path& event_path) {
+  using namespace std::chrono_literals;
+  std::filesystem::remove(event_path);
+  set_scenario("encode-stop-blocked-open");
+  std::atomic<GpuVideoEncodeSession*> opening_session{nullptr};
+  auto opening = std::async(std::launch::async, [&] {
+    return GpuVideoEncodeSession::open(config(), runtime, {}, [&](GpuVideoEncodeSession* session) {
+      opening_session.store(session, std::memory_order_release);
+      return true;
+    });
+  });
+
+  expect_true(wait_for_event(event_path, "encode-get-state-blocked"),
+              "encoder blocks after its opening observer attaches");
+  auto* partial_session = opening_session.load(std::memory_order_acquire);
+  expect_true(partial_session != nullptr, "opening observer exposes the partial encoder session");
+  if (partial_session != nullptr) {
+    partial_session->abort();
+  }
+  expect_true(opening.wait_for(500ms) == std::future_status::ready,
+              "partial encoder abort interrupts native startup");
+  auto session = opening.get();
+  expect_true(opening_session.load(std::memory_order_acquire) == nullptr,
+              "encoder opening observer is cleared before return");
+  expect_encode_error([&] { (void)session.acquire_frame(); }, "no longer accepting frames",
+                      "interrupted encoder returns in the aborted state");
+  const auto events = read_events(event_path);
+  expect_eq(count_event(events, "encode-get-state-unblocked"), 1U,
+            "encoder startup returns after its abort request");
+  expect_true(count_event(events, "state-null") >= 1U,
+              "encoder opening cancellation stops the partial pipeline");
 }
 
 void wrapped_callbacks_and_move_assignment_release_exactly_once(
@@ -423,21 +574,138 @@ void compressed_audio_packets_use_the_bounded_audio_appsrc(
             "audio appsrc receives terminal EOS before mux finalization");
 }
 
-void finalized_output_requires_a_discoverable_video_stream() {
-  set_scenario("encode-success");
-  verify_muxed_gpu_video_output("fake-output.mp4", std::chrono::milliseconds(5));
-  set_scenario("encoded-output-no-video");
-  expect_encode_error(
-      [&] { verify_muxed_gpu_video_output("fake-output.mp4", std::chrono::milliseconds(5)); },
-      "contains no video stream", "audio-only muxed output is rejected before publication");
-  for (const std::string_view scenario :
-       {"encoded-output-zero-duration", "encoded-output-zero-geometry"}) {
-    set_scenario(scenario);
-    expect_encode_error(
-        [&] { verify_muxed_gpu_video_output("fake-output.mp4", std::chrono::milliseconds(5)); },
-        "contains no decodable video samples",
-        "empty or malformed muxed video track is rejected before publication");
+void finalized_output_requires_a_compressed_video_sample(const std::filesystem::path& worker,
+                                                         const std::filesystem::path& event_path) {
+  auto output_path = event_path;
+  output_path.replace_extension(".mp4");
+  {
+    std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
+    output << "fake muxed output";
   }
+
+  std::filesystem::remove(event_path);
+  set_scenario("probe-exact-frame-count");
+  verify_muxed_gpu_video_output(output_path, Codec::H264, Format::Mp4, worker,
+                                std::chrono::seconds(10));
+  auto events = read_events(event_path);
+  expect_eq(count_event(events, "parse-probe"), 1U,
+            "output verification uses the parser-only worker topology");
+  expect_eq(count_event(events, "probe-codec-filter"), 1U,
+            "output verification selects a compressed video stream");
+  expect_eq(count_event(events, "probe-exact-codec-filter"), 1U,
+            "output verification selects only the configured video codec");
+  expect_eq(count_event(events, "probe-h264-parser"), 1U,
+            "output verification uses the explicit H.264 parser");
+  expect_eq(count_event(events, "probe-parsebin"), 0U,
+            "output verification does not autoplug parser or decoder factories");
+  expect_eq(count_event(events, "probe-decoder-caps"), 1U,
+            "output verification requires compressed access-unit caps");
+  expect_eq(count_event(events, "decoder-element"), 0U,
+            "output verification never constructs a decoder element");
+  expect_eq(count_event(events, "raw-video-caps"), 0U,
+            "output verification never requests decoded pixels");
+  expect_eq(count_event(events, "discover-audio"), 0U,
+            "output verification never invokes GstDiscoverer");
+
+  auto retained_path = output_path;
+  retained_path += ".retained";
+  const auto retained_output = StableMediaFile::open(output_path);
+  std::filesystem::rename(output_path, retained_path);
+  {
+    std::ofstream substitute(output_path, std::ios::binary | std::ios::trunc);
+    substitute << "pathname substitute that must not be probed";
+  }
+  std::filesystem::remove(event_path);
+  verify_muxed_gpu_video_output(retained_output, Codec::H264, Format::Mp4, worker,
+                                std::chrono::seconds(10));
+  events = read_events(event_path);
+  expect_eq(count_event(events, "probe-fd-source"), 1U,
+            "output verification transfers the retained readable authority");
+  expect_eq(count_event(events, "probe-file-source"), 0U,
+            "output verification never reopens the substituted diagnostic pathname");
+  std::filesystem::remove(output_path);
+  std::filesystem::rename(retained_path, output_path);
+
+  std::filesystem::remove(event_path);
+  set_scenario("probe-av1-exact-frame-count");
+  verify_muxed_gpu_video_output(output_path, Codec::AV1, Format::Mkv, worker,
+                                std::chrono::seconds(10));
+  events = read_events(event_path);
+  expect_eq(count_event(events, "probe-av1-parser"), 1U,
+            "AV1 output verification uses the explicit AV1 parser");
+  expect_eq(count_event(events, "probe-exact-codec-filter"), 1U,
+            "AV1 output verification selects only AV1 samples");
+  expect_eq(count_event(events, "decoder-element"), 0U,
+            "AV1 output verification never constructs a decoder");
+
+  std::filesystem::remove(event_path);
+  set_scenario("probe-exact-frame-count");
+  verify_muxed_gpu_video_output(output_path, Codec::H264, Format::Flv, worker,
+                                std::chrono::seconds(10));
+  events = read_events(event_path);
+  expect_eq(count_event(events, "probe-flv-demux"), 1U,
+            "FLV output verification uses the explicit compressed demuxer");
+  expect_eq(count_event(events, "decoder-element"), 0U,
+            "FLV output verification never constructs a decoder");
+
+  std::filesystem::remove(event_path);
+  set_scenario("probe-video-caps-zero-samples");
+  expect_encode_error(
+      [&] {
+        verify_muxed_gpu_video_output(output_path, Codec::H264, Format::Mp4, worker,
+                                      std::chrono::seconds(10));
+      },
+      "found no H.264, HEVC, or AV1 moving-video stream",
+      "video caps without a compressed sample are rejected before publication");
+  events = read_events(event_path);
+  expect_eq(count_event(events, "probe-codec-filter"), 1U,
+            "zero-sample fixture still exposes selected compressed video caps");
+  expect_eq(count_event(events, "probe-parsebin"), 0U,
+            "zero-sample verification does not enable autoplugging");
+  expect_eq(count_event(events, "decoder-element"), 0U,
+            "zero-sample verification does not fall back to a decoder");
+
+  std::filesystem::remove(event_path);
+  set_scenario("probe-timeout");
+  std::atomic<bool> cancel{false};
+  std::thread requester([&] {
+    (void)wait_for_event(event_path, "pull-probe");
+    cancel.store(true, std::memory_order_release);
+  });
+  const auto started = std::chrono::steady_clock::now();
+  bool cancellation_reported = false;
+  try {
+    verify_muxed_gpu_video_output(output_path, Codec::H264, Format::Mp4, worker,
+                                  std::chrono::seconds(30),
+                                  [&] { return cancel.load(std::memory_order_acquire); });
+  } catch (const GpuVideoProbeCancelled&) {
+    cancellation_reported = true;
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: output verification returned the wrong cancellation error: " << error.what()
+              << '\n';
+    ++failures;
+  }
+  requester.join();
+  expect_true(cancellation_reported, "output verification preserves explicit probe cancellation");
+  expect_true(std::chrono::steady_clock::now() - started < std::chrono::seconds(3),
+              "output-verification cancellation does not wait for the parser timeout");
+
+  std::uint32_t cancellation_queries = 0;
+  cancellation_reported = false;
+  try {
+    verify_muxed_gpu_video_output(output_path, Codec::H264, Format::Mp4, worker,
+                                  std::chrono::seconds(10),
+                                  [&] { return cancellation_queries++ == 0U; });
+  } catch (const GpuVideoProbeCancelled&) {
+    cancellation_reported = true;
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: one-shot output cancellation returned the wrong error: " << error.what()
+              << '\n';
+    ++failures;
+  }
+  expect_true(cancellation_reported,
+              "one-shot cancellation remains distinguishable without callback relatching");
+  std::filesystem::remove(output_path);
 }
 
 void compressed_audio_backpressure_bounds_packets_and_bytes(
@@ -702,13 +970,15 @@ void compressed_audio_prime_failures_release_resources(const std::filesystem::pa
   for (const auto& [scenario, error] : std::vector<std::pair<std::string_view, std::string_view>>{
            {"audio-prime-timeout", "timed out waiting"},
            {"audio-invalid-segment-time", "cannot be converted to stream time"},
+           {"audio-seek-error", "failed to seek compressed audio"},
        }) {
     std::filesystem::remove(event_path);
     set_scenario(scenario);
     expect_audio_error(
         [&] {
           (void)AudioPassthroughSource::open(
-              {.segments = {{.path = "first.mp4", .video_duration_ns = 80'000'000ULL}}});
+              {.segments = {{.path = "first.mp4", .video_duration_ns = 80'000'000ULL}},
+               .start_time_ns = scenario == "audio-seek-error" ? 20'000'000ULL : 0ULL});
         },
         error, "audio prime failure is reported");
     const auto events = read_events(event_path);
@@ -723,6 +993,40 @@ void compressed_audio_prime_failures_release_resources(const std::filesystem::pa
     expect_eq(count_event(events, "unref-discoverer"), 1U,
               "audio prime failure releases its discoverer");
   }
+}
+
+void compressed_audio_opening_observer_interrupts_discovery(
+    const std::filesystem::path& event_path) {
+  using namespace std::chrono_literals;
+  std::filesystem::remove(event_path);
+  set_scenario("audio-stop-blocked-discovery");
+  std::atomic<AudioPassthroughSource*> opening_source{nullptr};
+  auto opening = std::async(std::launch::async, [&] {
+    return AudioPassthroughSource::open(
+        {.segments = {{.path = "second.mp4", .video_duration_ns = 80'000'000ULL}},
+         .read_timeout = std::chrono::seconds(30)},
+        [&](AudioPassthroughSource* source) {
+          opening_source.store(source, std::memory_order_release);
+          return true;
+        });
+  });
+
+  expect_true(wait_for_event(event_path, "discover-audio-blocked"),
+              "audio discovery blocks after its opening observer attaches");
+  auto* partial_source = opening_source.load(std::memory_order_acquire);
+  expect_true(partial_source != nullptr, "opening observer exposes the partial audio source");
+  if (partial_source != nullptr) {
+    partial_source->request_stop();
+  }
+  expect_true(opening.wait_for(500ms) == std::future_status::ready,
+              "partial audio stop interrupts initial stream discovery");
+  auto source = opening.get();
+  expect_true(opening_source.load(std::memory_order_acquire) == nullptr,
+              "audio opening observer is cleared before return");
+  expect_true(source.read().status == AudioPassthroughStatus::EndOfStream,
+              "interrupted audio open returns in the stopped state");
+  expect_eq(count_event(read_events(event_path), "unref-discoverer"), 1U,
+            "interrupted initial audio discovery releases its discoverer");
 }
 
 void compressed_audio_stop_interrupts_concurrent_read(const std::filesystem::path& event_path) {
@@ -773,6 +1077,190 @@ void compressed_audio_stop_interrupts_discovery(const std::filesystem::path& eve
             "interrupted segment discovery releases every discoverer");
 }
 
+GpuPreviewConfig preview_config() {
+  return {
+      .width = 1280,
+      .height = 720,
+      .fps_numerator = 30,
+      .fps_denominator = 1,
+      .window_handle = 42,
+      .pool_capacity = 2,
+      .acquire_timeout = std::chrono::milliseconds(5),
+      .startup_timeout = std::chrono::milliseconds(5),
+  };
+}
+
+void gpu_preview_startup_failures_release_partial_resources(
+    const std::shared_ptr<const NvbufSurfaceRuntime>& runtime,
+    const std::filesystem::path& event_path) {
+  struct Failure {
+    std::string_view scenario;
+    std::string_view error;
+  };
+  constexpr Failure failures_to_test[] = {
+      {"init-error", "fake initialization failure"},
+      {"encode-parse-error", "fake parse failure"},
+      {"encode-parse-partial-error", "fake partial parse failure"},
+      {"encode-missing-source", "missing appsrc, overlay, or bus"},
+      {"encode-missing-preview-sink", "missing appsrc, overlay, or bus"},
+      {"encode-missing-bus", "missing appsrc, overlay, or bus"},
+      {"encode-state-error", "failed to enter PLAYING"},
+      {"encode-startup-timeout", "timed out"},
+      {"encode-startup-wrong-state", "timed out"},
+  };
+  for (const auto& failure : failures_to_test) {
+    std::filesystem::remove(event_path);
+    set_scenario(failure.scenario);
+    expect_preview_error([&] { (void)GpuPreviewSession::open(preview_config(), runtime); },
+                         failure.error, failure.scenario);
+    if (failure.scenario == "encode-parse-partial-error") {
+      expect_eq(count_event(read_events(event_path), "unref-pipeline"), 1U,
+                "partial preview parse pipeline is released");
+    }
+  }
+}
+
+void gpu_preview_presents_from_a_bounded_nvmm_pool(
+    const std::shared_ptr<const NvbufSurfaceRuntime>& runtime,
+    const std::filesystem::path& event_path) {
+  std::filesystem::remove(event_path);
+  set_scenario("encode-success");
+  auto trace = std::make_shared<Trace>();
+  auto preview = GpuPreviewSession::open(preview_config(), runtime, trace);
+  auto frame = preview.acquire_frame();
+  expect_true(frame.view().width() == 1280U && frame.view().height() == 720U,
+              "preview lease exposes its CUDA NV12 geometry");
+  preview.present(std::move(frame), 0, 33'333'333);
+  preview.stop();
+  expect_eq(trace->allocated.load(), 2U, "preview preallocates its bounded NVMM pool");
+  expect_eq(trace->submitted.load(), 1U, "preview submits one NVMM surface");
+  expect_eq(trace->released.load(), 1U, "preview surface returns through wrapped callback");
+  const auto events = read_events(event_path);
+  expect_eq(count_event(events, "overlay-window-42"), 1U,
+            "preview binds the GStreamer overlay to the Qt native window");
+  expect_eq(count_event(events, "push-buffer"), 1U,
+            "preview pushes the NVMM descriptor exactly once");
+}
+
+void gpu_preview_backpressure_releases_on_stop(
+    const std::shared_ptr<const NvbufSurfaceRuntime>& runtime) {
+  set_scenario("encode-pool-backpressure");
+  auto trace = std::make_shared<Trace>();
+  auto preview = GpuPreviewSession::open(preview_config(), runtime, trace);
+  for (std::uint64_t index = 0; index < 2; ++index) {
+    auto frame = preview.acquire_frame();
+    preview.present(std::move(frame), index, 1);
+  }
+  try {
+    (void)preview.acquire_frame();
+    std::cerr << "FAIL: bounded GPU preview pool did not time out\n";
+    ++failures;
+  } catch (const GpuPreviewError& error) {
+    expect_true(std::string_view(error.what()).find("timed out waiting") != std::string_view::npos,
+                "preview pool timeout is explicit");
+  }
+  preview.stop();
+  expect_eq(trace->released.load(), 2U, "preview stop releases retained downstream surfaces");
+  try {
+    (void)preview.acquire_frame();
+    std::cerr << "FAIL: stopped GPU preview accepted another frame\n";
+    ++failures;
+  } catch (const GpuPreviewError& error) {
+    expect_true(std::string_view(error.what()).find("no longer accepting") !=
+                    std::string_view::npos,
+                "stopped preview admission is closed");
+  }
+}
+
+void gpu_preview_rejects_timestamps_and_foreign_leases_without_consuming_them(
+    const std::shared_ptr<const NvbufSurfaceRuntime>& runtime) {
+  set_scenario("encode-success");
+  auto preview = GpuPreviewSession::open(preview_config(), runtime);
+  auto frame = preview.acquire_frame();
+  expect_preview_error([&] { preview.present(std::move(frame), 0, 0); }, "timestamps",
+                       "zero preview duration");
+  expect_true(static_cast<bool>(frame), "timestamp rejection retains the preview lease");
+  expect_preview_error(
+      [&] { preview.present(std::move(frame), std::numeric_limits<std::uint64_t>::max(), 1); },
+      "timestamps", "unset preview timestamp");
+  expect_preview_error(
+      [&] { preview.present(std::move(frame), std::numeric_limits<std::uint64_t>::max() - 1, 2); },
+      "timestamps", "overflowing preview timestamp");
+  preview.present(std::move(frame), 0, 1);
+
+  auto encoder = open_session(runtime);
+  auto foreign = encoder.acquire_frame();
+  expect_preview_error([&] { preview.present(std::move(foreign), 1, 1); }, "does not belong",
+                       "foreign encoder lease");
+  expect_true(static_cast<bool>(foreign), "foreign lease rejection does not consume its owner");
+}
+
+void gpu_preview_failures_are_sticky_and_release_pool_ownership(
+    const std::shared_ptr<const NvbufSurfaceRuntime>& runtime) {
+  {
+    set_scenario("encode-wrap-error");
+    auto trace = std::make_shared<Trace>();
+    auto preview = GpuPreviewSession::open(preview_config(), runtime, trace);
+    auto frame = preview.acquire_frame();
+    expect_preview_error([&] { preview.present(std::move(frame), 0, 1); }, "failed to wrap",
+                         "preview wrapped-buffer allocation failure");
+    expect_eq(trace->released.load(), 1U, "preview wrap failure returns the pool slot");
+  }
+  {
+    set_scenario("encode-push-error");
+    auto trace = std::make_shared<Trace>();
+    auto preview = GpuPreviewSession::open(preview_config(), runtime, trace);
+    auto frame = preview.acquire_frame();
+    expect_preview_error([&] { preview.present(std::move(frame), 0, 1); }, "flow status",
+                         "preview appsrc push failure");
+    expect_eq(trace->released.load(), 1U, "preview push rejection returns the pool slot");
+    expect_preview_error([&] { (void)preview.acquire_frame(); }, "flow status",
+                         "preview push rejection remains sticky");
+  }
+  {
+    set_scenario("encode-bus-error");
+    auto preview = GpuPreviewSession::open(preview_config(), runtime);
+    auto frame = preview.acquire_frame();
+    preview.present(std::move(frame), 0, 1);
+    expect_preview_error([&] { (void)preview.acquire_frame(); }, "fake encoder failure",
+                         "preview bus error is reported");
+    expect_preview_error([&] { (void)preview.acquire_frame(); }, "fake encoder failure",
+                         "preview bus error remains sticky");
+  }
+  {
+    set_scenario("encode-early-eos");
+    auto preview = GpuPreviewSession::open(preview_config(), runtime);
+    expect_preview_error([&] { (void)preview.acquire_frame(); }, "unexpected EOS",
+                         "preview rejects downstream EOS");
+  }
+}
+
+void gpu_preview_leases_survive_session_destruction(
+    const std::shared_ptr<const NvbufSurfaceRuntime>& runtime) {
+  set_scenario("encode-success");
+  auto trace = std::make_shared<Trace>();
+  std::optional<GpuEncodeFrameLease> outstanding;
+  {
+    auto preview = GpuPreviewSession::open(preview_config(), runtime, trace);
+    outstanding.emplace(preview.acquire_frame());
+  }
+  expect_true(outstanding->view().width() == 1280U,
+              "outstanding preview lease retains its CUDA NV12 view");
+  outstanding.reset();
+  expect_eq(trace->released.load(), 1U,
+            "last outstanding preview lease releases its retained pool");
+
+  set_scenario("encode-pool-backpressure");
+  trace = std::make_shared<Trace>();
+  {
+    auto preview = GpuPreviewSession::open(preview_config(), runtime, trace);
+    auto submitted = preview.acquire_frame();
+    preview.present(std::move(submitted), 0, 1);
+  }
+  expect_eq(trace->released.load(), 1U,
+            "preview destruction releases a downstream-retained surface");
+}
+
 } // namespace
 
 int main() {
@@ -780,14 +1268,19 @@ int main() {
   const auto gstreamer = find_fake_runtime_runfile("fake_gstreamer_runtime");
   const auto nvbufsurface = find_fake_runtime_runfile("fake_nvbufsurface.so");
   const auto cuda = find_fake_runtime_runfile("fake_cuda_driver");
+  const auto probe_worker = find_probe_worker_runfile();
   set_environment("RECO_GSTREAMER_DYLIB_PATH", gstreamer.string());
   set_environment("RECO_GSTAPP_DYLIB_PATH", gstreamer.string());
   set_environment("RECO_GLIB_DYLIB_PATH", gstreamer.string());
   set_environment("RECO_GSTPBUTILS_DYLIB_PATH", gstreamer.string());
   set_environment("RECO_GOBJECT_DYLIB_PATH", gstreamer.string());
+  set_environment("RECO_GSTVIDEO_DYLIB_PATH", gstreamer.string());
   set_environment("RECO_NVBUFSURFACE_DYLIB_PATH", nvbufsurface.string());
   set_environment("RECO_NVDS_UTILS_DYLIB_PATH", nvbufsurface.string());
   set_environment("RECO_CUDA_DRIVER_DYLIB_PATH", cuda.string());
+  set_environment("RECO_FAKE_CUDA_TOTAL_BYTES", std::to_string(8ULL * 1024ULL * 1024ULL * 1024ULL));
+  set_environment("RECO_FAKE_CUDA_FREE_BYTES", std::to_string(6ULL * 1024ULL * 1024ULL * 1024ULL));
+  set_environment("RECO_FAKE_CUDA_INTEGRATED", "0");
   const auto event_path =
       std::filesystem::temp_directory_path() /
       ("reco_fake_gpu_encode_events_" +
@@ -795,8 +1288,11 @@ int main() {
   set_environment("RECO_FAKE_GST_EVENT_PATH", event_path.string());
 
   try {
+    const FakeNvbufSurfaceControl nvbuf_control(nvbufsurface);
     const auto runtime = discover_nvbufsurface_runtime();
+    gpu_memory_preflight_prevents_partial_nvmm_pool_allocation(runtime, nvbuf_control);
     startup_failures_release_partial_resources(runtime, event_path);
+    encoder_opening_observer_interrupts_startup(runtime, event_path);
     wrapped_callbacks_and_move_assignment_release_exactly_once(runtime);
     wrapping_and_push_failures_preserve_pool_ownership(runtime);
     bus_errors_and_early_eos_are_sticky(runtime);
@@ -806,7 +1302,7 @@ int main() {
     concurrent_acquire_cannot_consume_final_eos(runtime, event_path);
     outstanding_leases_survive_session_destruction(runtime);
     compressed_audio_packets_use_the_bounded_audio_appsrc(runtime, event_path);
-    finalized_output_requires_a_discoverable_video_stream();
+    finalized_output_requires_a_compressed_video_sample(probe_worker, event_path);
     compressed_audio_backpressure_bounds_packets_and_bytes(runtime, event_path);
     compressed_audio_preserves_only_buffer_semantic_flags(runtime, event_path);
     finish_is_serialized_and_abort_interrupts_waits(runtime, event_path);
@@ -814,8 +1310,15 @@ int main() {
     compressed_audio_source_handles_absence_and_incompatible_caps(event_path);
     compressed_audio_preserves_stream_time_offsets(event_path);
     compressed_audio_prime_failures_release_resources(event_path);
+    compressed_audio_opening_observer_interrupts_discovery(event_path);
     compressed_audio_stop_interrupts_concurrent_read(event_path);
     compressed_audio_stop_interrupts_discovery(event_path);
+    gpu_preview_startup_failures_release_partial_resources(runtime, event_path);
+    gpu_preview_presents_from_a_bounded_nvmm_pool(runtime, event_path);
+    gpu_preview_backpressure_releases_on_stop(runtime);
+    gpu_preview_rejects_timestamps_and_foreign_leases_without_consuming_them(runtime);
+    gpu_preview_failures_are_sticky_and_release_pool_ownership(runtime);
+    gpu_preview_leases_survive_session_destruction(runtime);
   } catch (const std::exception& error) {
     std::cerr << "FAIL: unexpected top-level error: " << error.what() << '\n';
     ++failures;

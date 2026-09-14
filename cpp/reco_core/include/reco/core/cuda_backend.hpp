@@ -35,8 +35,12 @@ struct CudaComputeCapability {
 };
 
 struct CudaMemoryInfo {
+  /// Bytes currently available for CUDA allocations in the selected context.
   std::size_t free_bytes = 0;
+  /// Total bytes managed by CUDA for the selected device.
   std::size_t total_bytes = 0;
+  /// Whether the device shares physical memory with the host, as on Jetson.
+  bool integrated = false;
 };
 
 struct CudaDim3 {
@@ -122,6 +126,10 @@ class CudaSharedMemory;
 class CudaModule;
 class CudaKernel;
 class CudaValidatedSpan;
+class CudaExecutionStream;
+class CudaExecutionBatch;
+class CudaStereoStitchRenderer;
+class CudaRgbaToNv12Converter;
 
 /// Optional non-throwing trace sink for explicit CUDA backend operations.
 class CudaBackendTraceSink {
@@ -161,7 +169,8 @@ public:
   void ensure_primary_context(int ordinal = 0) const;
   /// Returns the process-local identity of the retained primary context.
   [[nodiscard]] std::uintptr_t primary_context_id(int ordinal = 0) const;
-  [[nodiscard]] CudaMemoryInfo memory_info() const;
+  /// Returns current memory capacity and topology for the selected device.
+  [[nodiscard]] CudaMemoryInfo memory_info(int ordinal = 0) const;
   [[nodiscard]] CudaDeviceBuffer allocate(std::size_t bytes) const;
   /// Allocates 2D storage with a driver-selected pitch valid for `cuMemcpy2D`.
   [[nodiscard]] CudaPitchedAllocation allocate_pitched(std::size_t width_bytes, std::size_t height,
@@ -194,6 +203,8 @@ public:
   [[nodiscard]] CudaKernel load_kernel_from_ptx(std::string_view ptx,
                                                 std::string_view function_name,
                                                 int device_ordinal = 0) const;
+  /// Returns the retained nonblocking stream and completion event shared by this device context.
+  [[nodiscard]] CudaExecutionStream execution_stream(int device_ordinal = 0) const;
   void synchronize() const;
 
 private:
@@ -202,6 +213,8 @@ private:
   friend class CudaModule;
   friend class CudaKernel;
   friend class CudaValidatedSpan;
+  friend class CudaExecutionStream;
+  friend class CudaExecutionBatch;
 
   struct Impl;
 
@@ -277,6 +290,69 @@ private:
   bool owns_shareable_handle_ = false;
 };
 
+/// Retained nonblocking CUDA stream with an event-scoped completion boundary.
+///
+/// Backends that share one loaded CUDA driver also share one execution stream per retained
+/// primary context. Copies retain the stream and its completion event. A batch can order multiple
+/// kernel launches before one host wait without synchronizing unrelated context work.
+class CudaExecutionStream {
+public:
+  CudaExecutionStream() = default;
+  CudaExecutionStream(const CudaExecutionStream&) noexcept = default;
+  CudaExecutionStream& operator=(const CudaExecutionStream&) noexcept = default;
+  CudaExecutionStream(CudaExecutionStream&&) noexcept = default;
+  CudaExecutionStream& operator=(CudaExecutionStream&&) noexcept = default;
+  ~CudaExecutionStream() = default;
+
+  [[nodiscard]] explicit operator bool() const { return state_ != nullptr; }
+  /// Process-local CUDA context identity owning this stream.
+  [[nodiscard]] std::uintptr_t context_id() const;
+  /// CUDA device ordinal owning this stream.
+  [[nodiscard]] int device_ordinal() const;
+  /// Exclusively acquires this stream for an ordered group of kernel launches.
+  [[nodiscard]] CudaExecutionBatch begin_batch() const;
+
+private:
+  friend class CudaBackend;
+  friend class CudaKernel;
+  friend class CudaExecutionBatch;
+
+  struct State;
+  explicit CudaExecutionStream(std::shared_ptr<State> state);
+
+  std::shared_ptr<State> state_;
+};
+
+/// Exclusive ordered launch group completed by one CUDA event and one host wait.
+///
+/// A live batch retains every validated span and loaded module submitted through it. If a batch is
+/// abandoned because validation or launch fails, destruction drains only its CUDA stream before
+/// releasing retained resources and restoring the caller context.
+class CudaExecutionBatch {
+public:
+  CudaExecutionBatch(const CudaExecutionBatch&) = delete;
+  CudaExecutionBatch& operator=(const CudaExecutionBatch&) = delete;
+  CudaExecutionBatch(CudaExecutionBatch&&) = delete;
+  CudaExecutionBatch& operator=(CudaExecutionBatch&&) = delete;
+  ~CudaExecutionBatch();
+
+  [[nodiscard]] explicit operator bool() const;
+  /// Records one completion event after all enqueued work and waits for that event on the host.
+  void wait();
+
+private:
+  friend class CudaExecutionStream;
+  friend class CudaKernel;
+  friend class CudaStereoStitchRenderer;
+  friend class CudaRgbaToNv12Converter;
+
+  struct Impl;
+  explicit CudaExecutionBatch(std::shared_ptr<CudaExecutionStream::State> stream);
+  void retain(CudaValidatedSpan span);
+
+  std::unique_ptr<Impl> impl_;
+};
+
 /// Shared owner for one loaded CUDA PTX module.
 ///
 /// Kernels resolved from a module keep its driver module alive after this handle is moved,
@@ -321,6 +397,13 @@ public:
   /// Launches and synchronizes in one CUDA context scope before restoring the caller context.
   /// Use this for kernels borrowing memory whose owners may be released when the call returns.
   void launch_and_synchronize(const CudaLaunchConfig& config, std::span<void*> args) const;
+  /// Launches on `stream` and waits for its completion event before restoring the caller context.
+  /// Unrelated work in the same CUDA context remains asynchronous.
+  void launch_and_synchronize(const CudaExecutionStream& stream, const CudaLaunchConfig& config,
+                              std::span<void*> args) const;
+  /// Enqueues a launch in an exclusive batch without recording or waiting for an event.
+  void enqueue(CudaExecutionBatch& batch, const CudaLaunchConfig& config,
+               std::span<void*> args) const;
   void launch(const CudaLaunchConfig& config, std::span<void*> args) const;
   void synchronize() const;
   void reset();

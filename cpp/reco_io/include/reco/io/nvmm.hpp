@@ -126,6 +126,10 @@ private:
 /// Rejects a second loaded NvBufSurface provider that could own decoded frames.
 [[nodiscard]] std::optional<std::string>
 validate_nvbufsurface_runtime_provenance(const std::shared_ptr<const NvbufSurfaceRuntime>& runtime);
+/// Queries the CUDA device used by a retained NvBufSurface runtime without allocating a surface.
+[[nodiscard]] core::CudaMemoryInfo
+query_nvmm_cuda_memory_info(const std::shared_ptr<const NvbufSurfaceRuntime>& runtime,
+                            std::uint32_t gpu_id = 0);
 
 enum class NvmmMemoryType : std::uint32_t {
   CudaDevice = 2,

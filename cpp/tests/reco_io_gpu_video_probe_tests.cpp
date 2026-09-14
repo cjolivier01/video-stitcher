@@ -2,6 +2,7 @@
 
 #include "gpu_video_probe_process_test.hpp"
 #include "reco/core/path.hpp"
+#include "reco/io/stable_media_file.hpp"
 
 #include "rules_cc/cc/runfiles/runfiles.h"
 
@@ -97,6 +98,17 @@ template <typename T, typename U> void expect_eq(T actual, U expected, std::stri
   }
 }
 
+void expect_verified_or_fail_closed(const std::shared_ptr<const StableMediaFile>& source,
+                                    std::string_view message) {
+  try {
+    source->verify_unchanged();
+  } catch (const std::exception& error) {
+    expect_true(std::string_view(error.what()).find("changed while it was retained") !=
+                    std::string_view::npos,
+                message);
+  }
+}
+
 template <typename Function>
 void expect_probe_error(Function&& function, std::string_view fragment, std::string_view message) {
   try {
@@ -178,6 +190,30 @@ wait_for_process_marker(const std::filesystem::path& path,
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
   return std::nullopt;
+}
+
+bool process_exists(std::uint64_t process_id) {
+#if defined(_WIN32)
+  if (process_id == 0 || process_id > std::numeric_limits<DWORD>::max()) {
+    return false;
+  }
+  const HANDLE process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                                     static_cast<DWORD>(process_id));
+  if (process == nullptr) {
+    return false;
+  }
+  DWORD status = 0;
+  const bool active = GetExitCodeProcess(process, &status) != 0 && status == STILL_ACTIVE;
+  (void)CloseHandle(process);
+  return active;
+#else
+  if (process_id == 0 ||
+      process_id > static_cast<std::uint64_t>(std::numeric_limits<pid_t>::max())) {
+    return false;
+  }
+  errno = 0;
+  return ::kill(static_cast<pid_t>(process_id), 0) == 0 || errno != ESRCH;
+#endif
 }
 
 #if defined(__APPLE__)
@@ -1515,6 +1551,40 @@ void probe_contracts(const std::filesystem::path& video_path,
               "HEVC elementary probe constructs only the requested parser");
 }
 
+void stable_probe_uses_transferred_descriptor(const std::filesystem::path& video_path) {
+  const auto moved = video_path.parent_path() / (video_path.filename().string() + ".retained");
+  const auto substitute =
+      video_path.parent_path() / (video_path.filename().string() + ".substitute");
+  try {
+    {
+      std::ofstream output(substitute, std::ios::binary);
+      output << "pathname substitute that must not be opened";
+    }
+    const auto retained = StableMediaFile::open(video_path);
+    auto config = container_config(video_path);
+    config.stable_source = retained->open_cursor();
+    std::filesystem::rename(video_path, moved);
+    std::filesystem::rename(substitute, video_path);
+    const auto result = reco::io::probe_gpu_video(config, probe_worker_path, 5'000'000'000ULL);
+    expect_eq(result.width, 3840U,
+              "probe worker consumes transferred stable descriptor during pathname substitution");
+    std::filesystem::rename(video_path, substitute);
+    std::filesystem::rename(moved, video_path);
+    expect_verified_or_fail_closed(retained,
+                                   "restored probe input reports only a retained-file change");
+    std::filesystem::remove(substitute);
+  } catch (const std::exception& error) {
+    std::error_code ignored;
+    if (std::filesystem::exists(moved, ignored)) {
+      std::filesystem::remove(video_path, ignored);
+      std::filesystem::rename(moved, video_path, ignored);
+    }
+    std::filesystem::remove(substitute, ignored);
+    std::cerr << "FAIL: stable probe descriptor race: " << error.what() << '\n';
+    ++failures;
+  }
+}
+
 void invalid_inputs_fail(const std::filesystem::path& video_path,
                          const std::filesystem::path& event_path) {
   constexpr std::uint64_t timeout_ns = 5'000'000'000ULL;
@@ -1565,8 +1635,8 @@ void invalid_inputs_fail(const std::filesystem::path& video_path,
             {"probe-stream-error", "playing state"},
             {"probe-async-error", "fake parser failure"},
             {"probe-buffered-async-error", "fake parser failure"},
-            {"probe-no-supported-video", "H.264 or HEVC"},
-            {"probe-missing-sample-caps", "H.264 or HEVC"},
+            {"probe-no-supported-video", "H.264, HEVC, or AV1"},
+            {"probe-missing-sample-caps", "H.264, HEVC, or AV1"},
             {"probe-missing-caps-structure", "no structure"},
             {"probe-wrong-codec-caps", "decoder-compatible"},
             {"probe-unparsed-caps", "decoder-compatible"},
@@ -1711,6 +1781,110 @@ void worker_ipc_failures_are_bounded(const std::filesystem::path& video_path) {
     expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
               std::string("invalid worker cleanup is certified: ") + std::string(scenario));
   }
+}
+
+void cancellation_terminates_an_active_probe_worker(const std::filesystem::path& video_path) {
+  const auto marker =
+      video_path.parent_path() / (video_path.filename().string() + ".cancelled-worker");
+  std::filesystem::remove(marker);
+  set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", marker.string());
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "block-input");
+
+  std::atomic<bool> cancel{false};
+  std::atomic<bool> cancellation_delivered{false};
+  std::optional<std::uint64_t> worker;
+  std::thread requester([&] {
+    worker =
+        wait_for_process_marker(marker, std::chrono::steady_clock::now() + std::chrono::seconds(2));
+    cancel.store(true, std::memory_order_release);
+  });
+
+  const auto started = std::chrono::steady_clock::now();
+  bool cancelled = false;
+  try {
+    (void)reco::io::probe_gpu_video(container_config(video_path), fake_probe_worker_path,
+                                    30'000'000'000ULL, [&] {
+                                      if (!cancel.load(std::memory_order_acquire)) {
+                                        return false;
+                                      }
+                                      bool expected = false;
+                                      return cancellation_delivered.compare_exchange_strong(
+                                          expected, true, std::memory_order_acq_rel);
+                                    });
+  } catch (const GpuVideoProbeCancelled&) {
+    cancelled = true;
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: active probe cancellation returned the wrong error: " << error.what()
+              << '\n';
+    ++failures;
+  }
+  requester.join();
+
+  expect_true(worker.has_value(), "active probe worker reports its process ID before cancellation");
+  expect_true(cancellation_delivered.load(std::memory_order_acquire),
+              "active probe observes its one-shot cancellation request");
+  expect_true(cancelled, "active probe reports explicit cancellation");
+  expect_true(std::chrono::steady_clock::now() - started < std::chrono::seconds(3),
+              "active probe cancellation returns within the cleanup bound");
+  if (worker.has_value()) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (process_exists(*worker) && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    expect_true(!process_exists(*worker), "active probe cancellation removes the worker process");
+  }
+  expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
+            "active probe cancellation releases its aggregate memory reservation");
+
+  set_environment("RECO_FAKE_PROBE_WORKER_PID_PATH", "");
+  set_environment("RECO_FAKE_PROBE_WORKER_SCENARIO", "valid-metadata");
+  std::filesystem::remove(marker);
+}
+
+void cancellation_interrupts_linux_executable_snapshot(const std::filesystem::path& video_path) {
+#if defined(__linux__)
+  const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("reco_probe_snapshot_cancel_" + std::to_string(unique));
+  const auto worker = root / "padded-probe-worker";
+  std::error_code cleanup_error;
+  try {
+    std::filesystem::create_directories(root);
+    std::filesystem::copy_file(fake_probe_worker_path, worker);
+    std::filesystem::permissions(worker, std::filesystem::perms::owner_write,
+                                 std::filesystem::perm_options::add);
+    std::filesystem::resize_file(worker, 64ULL * 1024ULL * 1024ULL);
+
+    std::atomic<unsigned int> cancellation_checks{0};
+    const auto started = std::chrono::steady_clock::now();
+    bool cancelled = false;
+    try {
+      (void)reco::io::probe_gpu_video(container_config(video_path), worker, 30'000'000'000ULL, [&] {
+        return cancellation_checks.fetch_add(1, std::memory_order_acq_rel) + 1U == 7U;
+      });
+    } catch (const GpuVideoProbeCancelled&) {
+      cancelled = true;
+    } catch (const std::exception& error) {
+      std::cerr << "FAIL: executable snapshot cancellation returned the wrong error: "
+                << error.what() << '\n';
+      ++failures;
+    }
+    expect_true(cancelled, "Linux executable snapshot reports explicit cancellation");
+    expect_true(cancellation_checks.load(std::memory_order_acquire) >= 7U,
+                "Linux executable snapshot checks cancellation at a copy boundary");
+    expect_true(std::chrono::steady_clock::now() - started < std::chrono::seconds(2),
+                "Linux executable snapshot cancellation is prompt");
+    expect_eq(reco::io::detail::reserved_probe_memory_bytes_for_test(), 0ULL,
+              "Linux executable snapshot cancellation releases its memory reservation");
+  } catch (const std::exception& error) {
+    std::cerr << "FAIL: Linux executable snapshot cancellation fixture failed: " << error.what()
+              << '\n';
+    ++failures;
+  }
+  std::filesystem::remove_all(root, cleanup_error);
+#else
+  (void)video_path;
+#endif
 }
 
 void rapid_posix_probe_launches_establish_process_groups(const std::filesystem::path& video_path) {
@@ -3041,7 +3215,7 @@ void windows_normal_exit_cancels_blocked_request_writer(const std::filesystem::p
     WindowsHandle caller_thread(caller_info.hThread);
     const auto caller_exit = WaitForSingleObject(caller_process.get(), 3'000);
     expect_true(caller_exit == WAIT_OBJECT_0,
-                "Windows normal worker exit cannot leave its maximum request writer blocked");
+                "Windows pre-write cancellation race cannot leave its request writer blocked");
     DWORD exit_code = EXIT_FAILURE;
     expect_true(caller_exit == WAIT_OBJECT_0 &&
                     GetExitCodeProcess(caller_process.get(), &exit_code) != 0 &&
@@ -4732,6 +4906,7 @@ int main(int argc, char** argv) {
   set_environment("RECO_FAKE_GST_EVENT_PATH", event_path.string());
 
   probe_contracts(video_path, event_path);
+  stable_probe_uses_transferred_descriptor(video_path);
 #if !defined(RECO_PROBE_TEST_FORCE_GUARDIAN_FALLBACKS)
   exhaustive_calibration_probe_scans_to_eos(video_path);
 #endif
@@ -4746,6 +4921,8 @@ int main(int argc, char** argv) {
   expect_eq(reco::io::detail::reserved_probe_worker_address_space_bytes_for_test(), 0ULL,
             "path tests leave no aggregate admission behind");
   worker_ipc_failures_are_bounded(video_path);
+  cancellation_terminates_an_active_probe_worker(video_path);
+  cancellation_interrupts_linux_executable_snapshot(video_path);
   rapid_posix_probe_launches_establish_process_groups(video_path);
   aggregate_worker_memory_budget_is_enforced();
   maximum_linux_snapshots_are_aggregate_bounded();

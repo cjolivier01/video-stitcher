@@ -1,4 +1,5 @@
 #include "reco/cli/cli.hpp"
+#include "reco/cli/interrupt.hpp"
 
 #include <cstdint>
 #include <filesystem>
@@ -117,6 +118,12 @@ int main(int argc, char** argv) {
     const auto command = std::get<reco::cli::Command>(std::move(parsed));
     auto executable = current_executable_path().value_or(argc > 0 ? std::filesystem::path(argv[0])
                                                                   : std::filesystem::path{});
+    if (std::holds_alternative<reco::cli::StitchCommand>(command) ||
+        std::holds_alternative<reco::cli::CalibrateCommand>(command)) {
+      reco::cli::detail::InterruptMonitor interrupts;
+      return reco::cli::run_command(command, std::cout, std::cerr, executable,
+                                    [&interrupts] { return interrupts.requested(); });
+    }
     return reco::cli::run_command(command, std::cout, std::cerr, executable);
   } catch (const std::exception& error) {
     std::cerr << "error: " << error.what() << '\n';
